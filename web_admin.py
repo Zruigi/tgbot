@@ -326,7 +326,8 @@ async def index_handler(request):
             try:
                 with open(html_path, 'r', encoding='utf-8') as f:
                     html = f.read()
-                return web.Response(text=inject_token(html, real_token), content_type='text/html')
+                return web.Response(text=inject_token(html, real_token), content_type='text/html',
+                    headers={'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache'})
             except Exception as e:
                 return web.Response(text=f"Error: {e}", status=500)
         else:
@@ -341,14 +342,16 @@ async def index_handler(request):
         try:
             with open(html_path, 'r', encoding='utf-8') as f:
                 html = f.read()
-            return web.Response(text=inject_token(html, token), content_type='text/html')
+            return web.Response(text=inject_token(html, token), content_type='text/html',
+                    headers={'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache'})
         except Exception as e:
             return web.Response(text=f"Error: {e}", status=500)
 
     # 普通访问，返回带登录界面的页面
     try:
         with open(html_path, 'r', encoding='utf-8') as f:
-            return web.Response(text=f.read(), content_type='text/html')
+            return web.Response(text=f.read(), content_type='text/html',
+                headers={'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache'})
     except Exception as e:
         logger.error(f"加载 admin_new.html 失败: {e}")
         old_path = os.path.join(os.path.dirname(__file__), 'admin.html')
