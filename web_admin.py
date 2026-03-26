@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 内置 Web 管理端，提供管理员来访用户界面
 """
@@ -2252,6 +2252,7 @@ async def start_web_server(bot):
     set_bot_instance(bot)
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_get('/', index_handler)
+    app.router.add_static('/static', __import__('os').path.join(__import__('os').path.dirname(__import__('os').path.abspath(__file__)), 'static'), show_index=False)
     app.router.add_post('/api/login', api_login)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/api/users', api_get_users)
