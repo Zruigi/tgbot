@@ -16,8 +16,26 @@ import weakref
 import re
 import aiosqlite
 import time
+import secrets
+import string
 from html import escape
 from typing import Optional, Dict
+
+# OTP 一次性登录凭证存储: {otp: {token, expire_at}}
+_otp_store: Dict[str, dict] = {}
+
+def generate_otp(token: str, ttl_seconds: int = 300) -> str:
+    """生成一次性登录凭证（8位字母数字，5分钟有效）"""
+    # 清理过期 OTP
+    now = time.time()
+    expired = [k for k, v in _otp_store.items() if v['expire_at'] < now]
+    for k in expired:
+        del _otp_store[k]
+    # 生成新 OTP
+    alphabet = string.ascii_letters + string.digits
+    otp = ''.join(secrets.choice(alphabet) for _ in range(12))
+    _otp_store[otp] = {'token': token, 'expire_at': now + ttl_seconds}
+    return otp
 
 logger = logging.getLogger(__name__)
 
@@ -285,27 +303,49 @@ async def api_login(request):
 
 
 async def index_handler(request):
-    """返回管理员前端页面 (支持免登 Token)"""
-    token = request.query.get('token')
-    if token == config.WEB_ADMIN_TOKEN:
-        # 带正确 Token 访问时，注入一段自动登录脚本
-        html_path = os.path.join(os.path.dirname(__file__), 'admin_new.html')
-        try:
-            with open(html_path, 'r', encoding='utf-8') as f:
-                html = f.read()
-            # 在 </head> 前注入自动登录脚本
-            auto_login = f"""
+    """返回管理员前端页面 (支持 OTP 一次性免登 + Token 直链)"""
+    html_path = os.path.join(os.path.dirname(__file__), 'admin_new.html')
+
+    def inject_token(html, token):
+        auto_login = f"""
     <script>
     localStorage.setItem('admin_token', '{token}');
     document.cookie = 'admin_token={token};max-age=604800;path=/';
     </script>"""
-            html = html.replace('</head>', auto_login + '\n</head>')
-            return web.Response(text=html, content_type='text/html')
+        return html.replace('</head>', auto_login + '\n</head>')
+
+    # 优先处理 OTP 一次性凭证
+    otp = request.query.get('otp')
+    if otp:
+        now = time.time()
+        otp_data = _otp_store.get(otp)
+        if otp_data and otp_data['expire_at'] > now:
+            real_token = otp_data['token']
+            del _otp_store[otp]  # 立即销毁，一次性
+            logger.info("OTP 登录成功，凭证已销毁")
+            try:
+                with open(html_path, 'r', encoding='utf-8') as f:
+                    html = f.read()
+                return web.Response(text=inject_token(html, real_token), content_type='text/html')
+            except Exception as e:
+                return web.Response(text=f"Error: {e}", status=500)
+        else:
+            return web.Response(
+                text="<h1 style='font-family:sans-serif;text-align:center;margin-top:20%;color:#e74c3c'>登录链接已失效或已使用，请重新获取</h1>",
+                content_type='text/html', status=403
+            )
+
+    # 兼容旧版 ?token= 直链
+    token = request.query.get('token')
+    if token == config.WEB_ADMIN_TOKEN:
+        try:
+            with open(html_path, 'r', encoding='utf-8') as f:
+                html = f.read()
+            return web.Response(text=inject_token(html, token), content_type='text/html')
         except Exception as e:
-            logger.error(f"加载 admin_new.html 失败: {e}")
             return web.Response(text=f"Error: {e}", status=500)
-        
-    html_path = os.path.join(os.path.dirname(__file__), 'admin_new.html')
+
+    # 普通访问，返回带登录界面的页面
     try:
         with open(html_path, 'r', encoding='utf-8') as f:
             return web.Response(text=f.read(), content_type='text/html')

@@ -189,15 +189,16 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return await admin_panel(update, context)
         
     elif data == "adm:open_web":
+        from web_admin import generate_otp
         server_ip = os.getenv("SERVER_IP", "43.135.141.154")
-        token = config.WEB_ADMIN_TOKEN
-        web_url = f"http://{server_ip}/?token={token}"
+        otp = generate_otp(config.WEB_ADMIN_TOKEN, ttl_seconds=300)
+        web_url = f"http://{server_ip}/?otp={otp}"
         await query.answer()
         await query.message.reply_text(
-            f"🌐 <b>Web 管理端直链</b>\n\n"
-            f"点击链接直接登录，无需输入 Token：\n"
-            f"<a href=\"{web_url}\">{web_url}</a>\n\n"
-            f"⚠️ 请勿将此链接分享给他人",
+            f"🌐 <b>Web 管理端一次性登录链接</b>\n\n"
+            f"🔐 此链接 <b>5分钟内有效</b>，使用一次后立即失效：\n"
+            f"<a href=\"{web_url}\">点击登录管理后台</a>\n\n"
+            f"⏱ 有效期：5分钟 | ♻️ 一次性：用后即毁",
             parse_mode="HTML",
             disable_web_page_preview=True
         )
