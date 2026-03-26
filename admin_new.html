@@ -2575,6 +2575,47 @@
                     finally { this.isMonitorLoading = false; }
                     this.loadUserQueryMonitors();
                     this.loadCounterpartyAliases();
+                    this.loadLedger();
+                },
+                selectMonitor(m) {
+                    this.activeMonitorId = m.monitor_id;
+                    this.activeMonitor = m;
+                    this.ledgerPage = 1;
+                    this.loadLedger();
+                },
+                selectAllMonitors() {
+                    this.activeMonitorId = null;
+                    this.activeMonitor = null;
+                    this.ledgerPage = 1;
+                    this.loadLedger();
+                },
+                async loadLedger() {
+                    this.ledgerLoading = true;
+                    try {
+                        const params = new URLSearchParams({
+                            period: this.ledgerPeriod,
+                            page: this.ledgerPage,
+                            page_size: 50,
+                        });
+                        if (this.activeMonitorId !== null) params.set('monitor_id', this.activeMonitorId);
+                        if (this.ledgerDirection) params.set('direction', this.ledgerDirection);
+                        const res = await fetch(`/api/monitors/transactions?${params}`);
+                        const json = await res.json();
+                        if (json.status === 'ok') {
+                            this.ledgerTxs = (json.txs || []).map(tx => ({...tx, _open: false}));
+                            this.ledgerSummary = json.summary || { inflow:0, outflow:0, profit:0, total_count:0 };
+                            this.ledgerTotal = json.total || 0;
+                            this.ledgerPage = json.page || 1;
+                            this.ledgerPages = json.pages || 1;
+                            const aliasMap = {};
+                            this.counterpartyAliases.forEach(a => { aliasMap[a.address] = a.name; });
+                            this.ledgerTxs.forEach(tx => {
+                                if (!tx.payer && tx.direction==='in' && aliasMap[tx.counterparty]) tx.payer = aliasMap[tx.counterparty];
+                                if (!tx.payee && tx.direction==='out' && aliasMap[tx.counterparty]) tx.payee = aliasMap[tx.counterparty];
+                            });
+                        }
+                    } catch(e): console.error(e);
+                    finally: this.ledgerLoading = false;
                 },
                 async loadUserQueryMonitors() {
                     try {
