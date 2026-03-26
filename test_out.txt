@@ -1,0 +1,4 @@
+step 1: python ok
+step 2: aiosqlite ok
+step 3: config ok
+step 4: database ok

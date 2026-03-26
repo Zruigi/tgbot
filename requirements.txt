@@ -1,0 +1,11 @@
+python-telegram-bot>=20.0
+ccxt
+aiosqlite
+python-dotenv
+aiohttp
+websockets
+Pillow
+pytesseract
+deep-translator
+langdetect
+openpyxl

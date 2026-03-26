@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.sqlite3
+*.pyc
+.venv/
+venv/
+*.log
+tessdata/
+minimal_bot.py
+test_*.py
+ARCHITECTURE_REPORT.md
+.trae/
+node_modules/
+dist/
+.DS_Store
+Thumbs.db
