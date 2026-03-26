@@ -2,7 +2,7 @@
 <html class="light" lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+    <meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" name="viewport"/>
     <title>Bot Admin - Dashboard</title>
     <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
     <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@200;300;400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
@@ -58,7 +58,7 @@
       }
     </script>
     <style>
-        body { font-family: 'Manrope', sans-serif; }
+        body { font-family: 'Manrope', sans-serif; font-size: 16px; padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }
         .material-symbols-outlined { 
             font-variation-settings: 'FILL' 0, 'wght' 300, 'GRAD' 0, 'opsz' 20;
             vertical-align: middle;
@@ -3697,14 +3697,15 @@
                     }
                 },
                 async deleteGroupMessage(m) {
-                    if (!this.selectedGroupId || !m.tg_msg_id) return;
+                    const groupId = this.selectedGroupRoomId || this.selectedGroupId;
+                    if (!groupId || !m.tg_msg_id) return;
                     if (!confirm('确认删除这条群消息？')) return;
                     try {
                         const res = await fetch('/api/group_messages/delete', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
-                                group_id: this.selectedGroupId,
+                                group_id: groupId,
                                 tg_msg_id: m.tg_msg_id,
                                 user_id: m.user_id
                             })
@@ -3712,6 +3713,7 @@
                         const json = await res.json();
                         if (json.status === 'ok') {
                             this.groupMessages = this.groupMessages.filter(x => x.msg_id !== m.msg_id);
+                            this.groupRoomMessages = (this.groupRoomMessages || []).filter(x => x.msg_id !== m.msg_id);
                         } else {
                             alert('删除失败: ' + (json.message || '未知错误'));
                         }

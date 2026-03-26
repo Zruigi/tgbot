@@ -194,7 +194,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         otp = generate_otp(config.WEB_ADMIN_TOKEN, ttl_seconds=300)
         web_url = f"{server_url}/?otp={otp}"
         await query.answer()
-        await query.message.reply_text(
+        sent = await query.message.reply_text(
             f"🌐 <b>Web 管理端一次性登录链接</b>\n\n"
             f"🔐 此链接 <b>5分钟内有效</b>，使用一次后立即失效：\n"
             f"<a href=\"{web_url}\">点击登录管理后台</a>\n\n"
@@ -202,6 +202,14 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="HTML",
             disable_web_page_preview=True
         )
+        # 5分钟后自动删除这条消息
+        async def _auto_delete():
+            await asyncio.sleep(300)
+            try:
+                await sent.delete()
+            except Exception:
+                pass
+        asyncio.create_task(_auto_delete())
         return None
 
     elif data == "adm:clear_cache":
