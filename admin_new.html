@@ -222,27 +222,18 @@
 </head>
 <body class="bg-surface text-on-surface antialiased overflow-hidden">
 
-    <!-- 登录界面 -->
+    <!-- 登录界面（无手动输入，仅通过OTP或token参数登录）-->
     <div id="login-screen" style="display:none;" class="fixed inset-0 z-[9999] flex items-center justify-center bg-gradient-to-br from-slate-900 via-blue-950 to-slate-900">
-        <div class="w-full max-w-sm mx-4">
-            <div class="text-center mb-8">
-                <span class="material-symbols-outlined text-primary text-5xl">smart_toy</span>
-                <h1 class="text-2xl font-black text-white mt-3 tracking-tight">Bot Admin</h1>
-                <p class="text-slate-400 text-sm mt-1">来访用户管理系统</p>
+        <div class="w-full max-w-sm mx-4 text-center">
+            <span class="material-symbols-outlined text-primary text-6xl">smart_toy</span>
+            <h1 class="text-2xl font-black text-white mt-3 tracking-tight">Bot Admin</h1>
+            <p class="text-slate-400 text-sm mt-2">请通过 Telegram Bot 获取登录链接</p>
+            <div class="bg-white/5 border border-white/10 rounded-2xl p-5 mt-6 text-left">
+                <p class="text-slate-300 text-sm">1. 打开 Telegram，向 Bot 发送 <code class="bg-white/10 px-1 rounded">/start</code></p>
+                <p class="text-slate-300 text-sm mt-2">2. 点击「🌐 Web 管理后台」按钮</p>
+                <p class="text-slate-300 text-sm mt-2">3. 点击 Bot 发送的链接即可登录</p>
+                <div id="login-error" class="text-red-400 text-xs mt-4 hidden">Token 已失效，请重新获取登录链接</div>
             </div>
-            <div class="bg-white/5 backdrop-blur border border-white/10 rounded-2xl p-6 shadow-2xl">
-                <label class="block text-slate-300 text-sm font-medium mb-2">访问令牌</label>
-                <input id="login-token-input" type="password" placeholder="请输入 Token..."
-                    class="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent text-sm"
-                    onkeydown="if(event.key==='Enter') doLogin()"
-                />
-                <div id="login-error" class="text-red-400 text-xs mt-2 hidden">Token 错误，请重试</div>
-                <button onclick="doLogin()"
-                    class="w-full mt-4 bg-primary hover:bg-primary/80 text-white font-bold py-3 rounded-xl transition-all text-sm tracking-wide">
-                    登 录
-                </button>
-            </div>
-            <p class="text-center text-slate-600 text-xs mt-4">© 2026 Bot Admin Platform</p>
         </div>
     </div>
 
@@ -4561,27 +4552,8 @@
     };
 
     async function doLogin() {
-        const token = document.getElementById('login-token-input').value.trim();
-        if (!token) return;
-        try {
-            const res = await _originalFetch('/api/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ token })
-            });
-            const data = await res.json();
-            if (data.status === 'ok') {
-                localStorage.setItem('admin_token', token);
-                setCookie('admin_token', token, 7);
-                document.getElementById('login-screen').style.display = 'none';
-                document.getElementById('app').style.display = '';
-                window.mountApp();
-            } else {
-                document.getElementById('login-error').classList.remove('hidden');
-            }
-        } catch(e) {
-            document.getElementById('login-error').classList.remove('hidden');
-        }
+        // 已移除手动输入，登录通过 Telegram OTP 链接进行
+        document.getElementById('login-error').classList.remove('hidden');
     }
 
     function checkLogin() {
