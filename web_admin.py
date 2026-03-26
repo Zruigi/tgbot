@@ -243,25 +243,32 @@ async def auth_middleware(request, handler):
     """
     2026 规格：Bearer Token 校验中间件。
     """
-    # 1. 静态资源与首页免登 (支持 Token 自动注入)
+    # 1. 静态资源与首页、登录接口免登
     if request.path in ['/', '/ws', '/api/login'] or request.path.startswith('/api/file/'):
         return await handler(request)
         
-    # 2. 检查 Token
-    auth_header = request.headers.get('Authorization')
-    cookie_token = request.cookies.get('admin_token')
+    # 2. 检查 Token（Header 或 Cookie）
+    auth_header = request.headers.get('Authorization', '')
+    cookie_token = request.cookies.get('admin_token', '')
     
     token = None
-    if auth_header and auth_header.startswith('Bearer '):
-        token = auth_header.split(' ')[1]
+    if auth_header.startswith('Bearer '):
+        token = auth_header[7:]
     elif cookie_token:
         token = cookie_token
         
-    # 3. 校验逻辑
+    # 3. 校验 Token
     if token == config.WEB_ADMIN_TOKEN:
         return await handler(request)
+
+    # 4. 真实来源是外网但经 nginx 转发后 remote 变为 127.0.0.1
+    # 通过 X-Real-IP 判断，只有真实来源是 127.0.0.1 才免登（本机直接访问）
+    real_ip = request.headers.get('X-Real-IP', '')
+    if not real_ip and request.remote == '127.0.0.1':
+        # 没有 X-Real-IP 说明是本机直接访问（非 nginx 代理），免登
+        return await handler(request)
         
-    logger.warning(f"拒绝未授权访问: {request.path} 来自 {request.remote}")
+    logger.warning(f"拒绝未授权访问: {request.path} 来自 {request.remote} real={real_ip}")
     return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
 
 
