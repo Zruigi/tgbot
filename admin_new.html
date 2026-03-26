@@ -2334,9 +2334,6 @@
                     revokeSyncChatId: null,
                     revokeSyncChatTitle: '',
                     revokeSyncChatLoading: false,
-                    revokeSyncChatId: null,
-                    revokeSyncChatTitle: '',
-                    revokeSyncChatLoading: false,
                     groupRoomMessages: [],
                     groupRoomAvatarMap: {}, // user_id -> avatar_file_id
                     groupAvatarMap: {}, // group_id -> avatar_file_id (群头像)
@@ -2928,17 +2925,6 @@
                     } catch (e) {
                         alert('发送失败: ' + e.message)
                     }
-                },
-                // --- 群组管理逻辑 ---
-                selectGroupRoom(group) {
-                    if (!group) return;
-                    this.selectedGroupRoomId = group.group_id;
-                    this.selectedGroupRoomTitle = group.group_title || `群组 ${group.group_id}`;
-                    this.selectedGroupRevokeSync = !!group.delete_on_revoke;
-                    this.groupRoomReplyingTo = null;
-                    this.groupRoomInput = '';
-                    this.groupRoomMessages = []; // 切换群时清空，触发首次加载逻辑
-                    this.refreshGroupRoomMessages();
                 },
                 async toggleGroupRevokeSync() {
                     if (!this.selectedGroupRoomId) return;
