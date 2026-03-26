@@ -2486,6 +2486,13 @@
                 const savedTab = localStorage.getItem('activeTab');
                 if (savedTab) this.activeTab = savedTab;
                 
+                // 确保所有弹窗初始关闭
+                this.showAdminPermissionModal = false;
+                this.showGroupMembersModal = false;
+                this.showMonitorAddressesModal = false;
+                this.showAddMonitorModal = false;
+                this.adminPermissionLoading = false;
+                
                 const savedUserId = localStorage.getItem('selectedUserId');
                 const savedUserName = localStorage.getItem('selectedUserName');
                 if (savedUserId) {
@@ -3558,6 +3565,7 @@
                         const res = await fetch(`/api/group_members/permissions?group_id=${this.selectedGroupId}&user_id=${member.user_id}`);
                         const json = await res.json();
                         if (json.status !== 'ok') {
+                            this.closeAdminPermissionModal();
                             alert('读取管理员权限失败: ' + (json.message || '未知错误'));
                             return;
                         }
@@ -3574,6 +3582,7 @@
                         }
                     } catch (e) {
                         console.error('加载管理员权限失败:', e);
+                        this.closeAdminPermissionModal();
                         alert('读取管理员权限失败，请稍后重试');
                     } finally {
                         this.adminPermissionLoading = false;
