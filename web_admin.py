@@ -1013,11 +1013,217 @@ async def api_batch_update_monitor_tx_meta(request):
 
 
 async def api_export_monitor_transactions(request):
-    """导出链上流水 Excel（可按地址/多个地址导出）"""
+    """导出链上流水 Excel（支持 day/week/month/year，自动列宽，对方地址别名填充）"""
     try:
         period = (request.query.get('period') or 'month').strip().lower()
-        if period not in ('day', 'week', 'month'):
+        if period not in ('day', 'week', 'month', 'year'):
             period = 'month'
+
+        uid = request.query.get('user_id')
+        user_id = int(uid) if uid else None
+
+        addresses_raw = (request.query.get('addresses') or '').strip()
+        addresses = [x.strip() for x in addresses_raw.split(',') if x.strip()] if addresses_raw else []
+
+        monitor_ids_raw = (request.query.get('monitor_ids') or '').strip()
+        monitor_ids = [int(x) for x in monitor_ids_raw.split(',') if x.strip().isdigit()] if monitor_ids_raw else []
+
+        annotated_only = (request.query.get('annotated_only') or 'false').lower() == 'true'
+
+        # 对方地址别名字典
+        alias_map = await database.get_counterparty_alias_map()
+
+        if period == 'year':
+            year_val = int(request.query.get('year') or datetime.now().year)
+            start_ms = int(datetime(year_val, 1, 1).timestamp() * 1000)
+            end_ms = int(datetime(year_val + 1, 1, 1).timestamp() * 1000)
+            rows = await database.get_monitor_transactions_for_export(
+                start_ms=start_ms, end_ms=end_ms,
+                user_id=user_id, addresses=addresses, monitor_ids=monitor_ids,
+                annotated_only=annotated_only,
+            )
+            pnl = {'start_ms': start_ms, 'end_ms': end_ms,
+                   'inflow': sum(float(r.get('amount') or 0) for r in rows if r.get('direction') == 'in'),
+                   'outflow': sum(float(r.get('amount') or 0) for r in rows if r.get('direction') == 'out'),
+                   'profit': 0}
+            pnl['profit'] = round(pnl['inflow'] - pnl['outflow'], 2)
+        else:
+            pnl = await database.get_monitor_pnl_summary(period, user_id=user_id, addresses=addresses, monitor_ids=monitor_ids)
+            rows = await database.get_monitor_transactions_for_export(
+                start_ms=pnl['start_ms'], end_ms=pnl['end_ms'],
+                user_id=user_id, addresses=addresses, monitor_ids=monitor_ids,
+                annotated_only=annotated_only,
+            )
+
+        try:
+            from openpyxl import Workbook
+            from openpyxl.utils import get_column_letter
+            from openpyxl.styles import Font, PatternFill, Alignment
+        except Exception:
+            return web.json_response({'status': 'error', 'message': '缺少 openpyxl 依赖，请先安装'}, status=500)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = '链上流水'
+        headers = ['时间', '地址备注', '地址', '网络', '方向', '金额(USDT)', '对方地址', '对方备注',
+                   '收入原因', '支出原因', '谁打款', '打款给谁', '风险等级', '风险备注', 'TXID']
+        ws.append(headers)
+        # 表头加粗+底色
+        header_fill = PatternFill('solid', fgColor='1E3A5F')
+        for col_idx, _ in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.font = Font(bold=True, color='FFFFFF')
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center')
+
+        # 监听地址备注 map
+        monitors_list = await database.get_all_monitors_for_admin(active_only=False)
+        addr_remark_map = {m['address']: (m.get('remark') or '') for m in monitors_list}
+
+        for r in rows:
+            dt = datetime.fromtimestamp(int(r['tx_timestamp']) / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            addr = r.get('address') or ''
+            counterparty = r.get('counterparty') or ''
+            # 自动填充付款方/收款方（若用户未填则用别名）
+            direction = r.get('direction', '')
+            payer_val = r.get('payer') or ''
+            payee_val = r.get('payee') or ''
+            if not payer_val and direction == 'in':
+                payer_val = alias_map.get(counterparty, '')
+            if not payee_val and direction == 'out':
+                payee_val = alias_map.get(counterparty, '')
+            ws.append([
+                dt,
+                addr_remark_map.get(addr, ''),
+                addr,
+                (r.get('network') or '').upper(),
+                '收入' if direction == 'in' else '支出',
+                float(r.get('amount') or 0),
+                counterparty,
+                alias_map.get(counterparty, ''),
+                r.get('income_reason') or '',
+                r.get('expense_reason') or '',
+                payer_val,
+                payee_val,
+                r.get('risk_level') or '',
+                r.get('risk_note') or '',
+                r.get('tx_id') or '',
+            ])
+
+        # 汇总 sheet
+        summary_ws = wb.create_sheet('汇总')
+        summary_ws.append(['周期', period])
+        summary_ws.append(['开始时间', datetime.fromtimestamp(pnl['start_ms'] / 1000).strftime('%Y-%m-%d %H:%M:%S')])
+        summary_ws.append(['结束时间', datetime.fromtimestamp(pnl['end_ms'] / 1000).strftime('%Y-%m-%d %H:%M:%S')])
+        summary_ws.append(['总收入(USDT)', round(float(pnl['inflow']), 2)])
+        summary_ws.append(['总支出(USDT)', round(float(pnl['outflow']), 2)])
+        summary_ws.append(['净利润(USDT)', round(float(pnl['profit']), 2)])
+        summary_ws.append(['流水总笔数', len(rows)])
+
+        # 年度月度明细 sheet（仅 year 导出时）
+        if period == 'year':
+            year_val2 = int(request.query.get('year') or datetime.now().year)
+            monthly = await database.get_year_monitor_summary(
+                user_id=user_id, addresses=addresses, monitor_ids=monitor_ids, year=year_val2
+            )
+            yw = wb.create_sheet(f'{year_val2}年月度汇总')
+            yw.append(['月份', '收入(USDT)', '支出(USDT)', '净利润(USDT)', '交易笔数'])
+            for mrow in monthly:
+                yw.append([f"{mrow['month']}月", mrow['inflow'], mrow['outflow'], mrow['profit'], mrow['tx_count']])
+            # 年度合计行
+            yw.append(['全年合计',
+                       round(sum(m['inflow'] for m in monthly), 2),
+                       round(sum(m['outflow'] for m in monthly), 2),
+                       round(sum(m['profit'] for m in monthly), 2),
+                       sum(m['tx_count'] for m in monthly)])
+
+        # 自动列宽（所有 sheet）
+        for sheet in wb.worksheets:
+            for col_cells in sheet.columns:
+                max_len = 0
+                col_letter = get_column_letter(col_cells[0].column)
+                for cell in col_cells:
+                    try:
+                        val = str(cell.value or '')
+                        # 中文字符宽度约2倍
+                        clen = sum(2 if '\u4e00' <= c <= '\u9fff' else 1 for c in val)
+                        max_len = max(max_len, clen)
+                    except Exception:
+                        pass
+                sheet.column_dimensions[col_letter].width = min(max(max_len + 2, 8), 60)
+
+        bio = io.BytesIO()
+        wb.save(bio)
+        bio.seek(0)
+
+        filename = f"monitor_export_{period}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return web.Response(
+            body=bio.getvalue(),
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+    except Exception as e:
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_get_counterparty_aliases(request):
+    """获取所有对方地址别名"""
+    try:
+        rows = await database.get_counterparty_aliases()
+        return web.json_response({'status': 'ok', 'data': rows})
+    except Exception as e:
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_upsert_counterparty_alias(request):
+    """新增或更新对方地址别名"""
+    try:
+        data = await request.json()
+        address = (data.get('address') or '').strip()
+        name = (data.get('name') or '').strip()
+        note = (data.get('note') or '').strip()
+        if not address or not name:
+            return web.json_response({'status': 'error', 'message': 'address 和 name 不能为空'}, status=400)
+        alias_id = await database.upsert_counterparty_alias(address, name, note)
+        return web.json_response({'status': 'ok', 'alias_id': alias_id})
+    except Exception as e:
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_delete_counterparty_alias(request):
+    """删除对方地址别名"""
+    try:
+        alias_id = int(request.match_info['alias_id'])
+        ok = await database.delete_counterparty_alias(alias_id)
+        if not ok:
+            return web.json_response({'status': 'error', 'message': '别名不存在'}, status=404)
+        return web.json_response({'status': 'ok'})
+    except Exception as e:
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_year_monitor_summary(request):
+    """年度月度盈亏汇总"""
+    try:
+        year = int(request.query.get('year') or datetime.now().year)
+        uid = request.query.get('user_id')
+        user_id = int(uid) if uid else None
+        addresses_raw = (request.query.get('addresses') or '').strip()
+        addresses = [x.strip() for x in addresses_raw.split(',') if x.strip()] if addresses_raw else []
+        monitor_ids_raw = (request.query.get('monitor_ids') or '').strip()
+        monitor_ids = [int(x) for x in monitor_ids_raw.split(',') if x.strip().isdigit()] if monitor_ids_raw else []
+        monthly = await database.get_year_monitor_summary(user_id=user_id, addresses=addresses, monitor_ids=monitor_ids, year=year)
+        total_inflow = round(sum(m['inflow'] for m in monthly), 2)
+        total_outflow = round(sum(m['outflow'] for m in monthly), 2)
+        total_profit = round(sum(m['profit'] for m in monthly), 2)
+        return web.json_response({
+            'status': 'ok',
+            'year': year,
+            'monthly': monthly,
+            'total': {'inflow': total_inflow, 'outflow': total_outflow, 'profit': total_profit}
+        })
+    except Exception as e:
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
 
         uid = request.query.get('user_id')
         user_id = int(uid) if uid else None
@@ -2034,6 +2240,10 @@ async def start_web_server(bot):
     app.router.add_post('/api/monitors/tx_meta', api_update_monitor_tx_meta)
     app.router.add_post('/api/monitors/tx_meta/batch', api_batch_update_monitor_tx_meta)
     app.router.add_get('/api/monitors/export', api_export_monitor_transactions)
+    app.router.add_get('/api/monitors/year_summary', api_year_monitor_summary)
+    app.router.add_get('/api/monitors/counterparty_aliases', api_get_counterparty_aliases)
+    app.router.add_post('/api/monitors/counterparty_aliases', api_upsert_counterparty_alias)
+    app.router.add_delete('/api/monitors/counterparty_aliases/{alias_id}', api_delete_counterparty_alias)
     app.router.add_get('/api/monitors/user_queries', api_list_user_query_monitors)
     app.router.add_post('/api/monitors/{monitor_id}/claim', api_claim_monitor)
     app.router.add_delete('/api/monitors/{monitor_id}', api_delete_monitor)

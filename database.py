@@ -150,6 +150,18 @@ async def init_db():
             logger.info("migrated address_monitors.owner_type")
         await db.commit()
 
+        # counterparty_aliases 表（对方地址→人名备注，全局共享）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS counterparty_aliases (
+                alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                address TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                note TEXT DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.commit()
+
         cursor = await db.execute("PRAGMA table_info(monitor_transactions)")
         tx_columns = [row[1] for row in await cursor.fetchall()]
         if tx_columns:
@@ -938,7 +950,13 @@ def _period_boundaries_ms(period: str, previous: bool = False) -> tuple[int, int
         if previous:
             start = start - timedelta(days=7)
             end = end - timedelta(days=7)
-    else:
+    elif period == 'year':
+        start = datetime(now.year, 1, 1)
+        end = datetime(now.year + 1, 1, 1)
+        if previous:
+            start = datetime(now.year - 1, 1, 1)
+            end = datetime(now.year, 1, 1)
+    else:  # month
         start = datetime(now.year, now.month, 1)
         if now.month == 12:
             end = datetime(now.year + 1, 1, 1)
@@ -2132,5 +2150,86 @@ async def get_expired_verify_sessions() -> list:
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+
+# ====== counterparty_aliases: 对方地址人名备注 ======
+
+async def get_counterparty_aliases() -> List[Dict[str, Any]]:
+    """获取所有对方地址备注"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM counterparty_aliases ORDER BY name ASC") as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+async def upsert_counterparty_alias(address: str, name: str, note: str = '') -> int:
+    """新增或更新对方地址备注，返回 alias_id"""
+    address = address.strip()
+    name = name.strip()
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """INSERT INTO counterparty_aliases (address, name, note)
+               VALUES (?, ?, ?)
+               ON CONFLICT(address) DO UPDATE SET name=excluded.name, note=excluded.note""",
+            (address, name, note)
+        )
+        await db.commit()
+        async with db.execute("SELECT alias_id FROM counterparty_aliases WHERE address=?", (address,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+async def delete_counterparty_alias(alias_id: int) -> bool:
+    """删除对方地址备注"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("DELETE FROM counterparty_aliases WHERE alias_id=?", (alias_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+async def get_counterparty_alias_map() -> Dict[str, str]:
+    """返回 {address: name} 字典，供导出时自动填充付款方/收款方"""
+    rows = await get_counterparty_aliases()
+    return {r['address']: r['name'] for r in rows}
+
+async def get_year_monitor_summary(user_id: Optional[int] = None,
+                                   addresses: Optional[List[str]] = None,
+                                   monitor_ids: Optional[List[int]] = None,
+                                   year: Optional[int] = None) -> List[Dict[str, Any]]:
+    """按月汇总全年收入/支出/净利润，返回12行列表"""
+    from datetime import datetime
+    now = datetime.now()
+    y = year or now.year
+    start_ms = int(datetime(y, 1, 1).timestamp() * 1000)
+    end_ms = int(datetime(y + 1, 1, 1).timestamp() * 1000)
+    scope_sql, scope_params = _build_monitor_scope(addresses=addresses, monitor_ids=monitor_ids, user_id=user_id)
+    sql = f"""
+        SELECT
+            CAST(strftime('%m', datetime(tx_timestamp/1000, 'unixepoch', 'localtime')) AS INTEGER) AS month,
+            SUM(CASE WHEN direction='in' THEN CAST(amount AS REAL) ELSE 0 END) AS inflow,
+            SUM(CASE WHEN direction='out' THEN CAST(amount AS REAL) ELSE 0 END) AS outflow,
+            SUM(CASE WHEN direction='in' THEN CAST(amount AS REAL) ELSE -CAST(amount AS REAL) END) AS profit,
+            COUNT(*) AS tx_count
+        FROM monitor_transactions
+        WHERE tx_timestamp >= ? AND tx_timestamp < ? {scope_sql}
+        GROUP BY month
+        ORDER BY month ASC
+    """
+    params: List[Union[int, str]] = [start_ms, end_ms]
+    params.extend(scope_params)
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+            month_map = {r['month']: dict(r) for r in rows}
+    result = []
+    for m in range(1, 13):
+        row = month_map.get(m, {'month': m, 'inflow': 0.0, 'outflow': 0.0, 'profit': 0.0, 'tx_count': 0})
+        result.append({
+            'month': m,
+            'inflow': round(float(row.get('inflow') or 0), 2),
+            'outflow': round(float(row.get('outflow') or 0), 2),
+            'profit': round(float(row.get('profit') or 0), 2),
+            'tx_count': int(row.get('tx_count') or 0),
+        })
+    return result
 
 

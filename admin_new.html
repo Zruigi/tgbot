@@ -987,17 +987,23 @@
 
                 <div class="bg-surface-container-lowest rounded-3xl border border-outline-variant/10 shadow-sm p-5 mb-6">
                     <div class="flex flex-wrap items-center gap-3">
-                        <button @click="setMonitorScopeAll" :class="monitorScopeMode === 'all' ? 'bg-primary text-on-primary' : 'bg-surface-container text-slate-600'" class="px-4 py-2 rounded-xl text-xs font-black transition-all">全部地址</button>
-                        <button @click="showMonitorAddressesModal = true" :class="monitorScopeMode !== 'all' ? 'bg-primary text-on-primary' : 'bg-surface-container text-slate-600'" class="px-4 py-2 rounded-xl text-xs font-black transition-all">已选地址({{ selectedMonitorIds.length }})</button>
+                        <button @click.prevent="setMonitorScopeAll" :class="monitorScopeMode === 'all' ? 'bg-primary text-on-primary' : 'bg-surface-container text-slate-600'" class="px-4 py-2 rounded-xl text-xs font-black transition-all">全部地址</button>
+                        <button @click.prevent="showMonitorAddressesModal = true" :class="monitorScopeMode !== 'all' ? 'bg-primary text-on-primary' : 'bg-surface-container text-slate-600'" class="px-4 py-2 rounded-xl text-xs font-black transition-all">已选地址({{ selectedMonitorIds.length }})</button>
                         <span class="text-xs text-slate-400">可在下方列表勾选 1 个或多个地址后自动统计</span>
-                        <div class="ml-auto flex items-center gap-2">
+                        <div class="ml-auto flex flex-wrap items-center gap-2">
                             <label class="flex items-center gap-2 text-xs text-slate-500 mr-2">
                                 <input type="checkbox" v-model="exportAnnotatedOnly" class="rounded border-outline-variant/40 text-primary focus:ring-primary/20"/>
                                 仅导出已填写业务信息
                             </label>
-                            <button @click="exportMonitorExcel('day')" class="px-3 py-2 bg-emerald-500/10 text-emerald-700 rounded-xl text-xs font-black">导出日表</button>
-                            <button @click="exportMonitorExcel('week')" class="px-3 py-2 bg-emerald-500/10 text-emerald-700 rounded-xl text-xs font-black">导出周表</button>
-                            <button @click="exportMonitorExcel('month')" class="px-3 py-2 bg-emerald-500/10 text-emerald-700 rounded-xl text-xs font-black">导出月表</button>
+                            <button @click.prevent="exportMonitorExcel('day')" class="px-3 py-2 bg-emerald-500/10 text-emerald-700 rounded-xl text-xs font-black">导出日表</button>
+                            <button @click.prevent="exportMonitorExcel('week')" class="px-3 py-2 bg-emerald-500/10 text-emerald-700 rounded-xl text-xs font-black">导出周表</button>
+                            <button @click.prevent="exportMonitorExcel('month')" class="px-3 py-2 bg-emerald-500/10 text-emerald-700 rounded-xl text-xs font-black">导出月表</button>
+                            <button @click.prevent="showYearSummaryModal = true; loadYearSummary()" class="px-3 py-2 bg-indigo-500/10 text-indigo-700 rounded-xl text-xs font-black flex items-center gap-1">
+                                <span class="material-symbols-outlined text-[14px]">calendar_month</span>年账单
+                            </button>
+                            <button @click.prevent="showAliasModal = true" class="px-3 py-2 bg-amber-500/10 text-amber-700 rounded-xl text-xs font-black flex items-center gap-1">
+                                <span class="material-symbols-outlined text-[14px]">contacts</span>地址备注
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -1079,57 +1085,138 @@
                         <span class="material-symbols-outlined text-6xl mb-4 opacity-20">wallet_off</span>
                         <p>暂无链上监听任务</p>
                     </div>
-                    <div v-else class="p-5 space-y-4">
-                        <div class="text-xs font-black text-slate-400 uppercase tracking-widest mb-2">我的监听地址（{{ monitors.length }}）</div>
-                        <div v-for="m in monitors" :key="m.monitor_id" class="bg-surface-container rounded-2xl border border-outline-variant/10 overflow-hidden">
-                            <!-- 地址卡片头部 -->
-                            <div class="flex flex-wrap items-center gap-3 px-5 py-4 border-b border-outline-variant/5">
-                                <input type="checkbox" :checked="selectedMonitorIds.includes(m.monitor_id)" @change="toggleMonitorSelection(m.monitor_id)" class="rounded border-outline-variant/40 text-primary focus:ring-primary/20" />
+                    <div v-else>
+                        <!-- 地址标签页 -->
+                        <div class="flex flex-wrap gap-2 px-5 pt-4 pb-2 border-b border-outline-variant/10">
+                            <button v-for="m in monitors" :key="'tab-'+m.monitor_id"
+                                @click.prevent="activeMonitorId = m.monitor_id"
+                                :class="activeMonitorId === m.monitor_id ? 'bg-primary text-on-primary shadow-md' : 'bg-surface-container text-slate-600 hover:bg-surface-container-high'"
+                                class="px-4 py-2 rounded-xl text-xs font-black transition-all flex items-center gap-2">
+                                <input type="checkbox" :checked="selectedMonitorIds.includes(m.monitor_id)" @change.stop="toggleMonitorSelection(m.monitor_id)" class="rounded border-outline-variant/40" @click.stop />
+                                <span class="px-1.5 py-0.5 rounded text-[9px] font-black" :class="activeMonitorId === m.monitor_id ? 'bg-white/20' : 'bg-primary/10 text-primary'">{{ String(m.network||'').toUpperCase() }}</span>
+                                <span class="max-w-[120px] truncate">{{ m.remark || m.address.slice(0,8)+'...' }}</span>
+                            </button>
+                        </div>
+                        <!-- 当前选中地址详情 -->
+                        <div v-for="m in monitors" :key="m.monitor_id" v-show="activeMonitorId === m.monitor_id" class="p-5">
+                            <div class="flex flex-wrap items-center gap-3 pb-4 border-b border-outline-variant/5">
                                 <span class="px-2 py-1 bg-primary/10 text-primary text-[10px] font-black rounded-lg">{{ String(m.network || '').toUpperCase() }}</span>
                                 <span v-if="m.risk_level === 'high'" class="px-2 py-1 rounded bg-red-100 text-red-600 text-[10px] font-black">⚠️ 高风险</span>
                                 <span v-else class="px-2 py-1 rounded bg-green-100 text-green-600 text-[10px] font-black">✓ 正常</span>
                                 <code class="font-mono text-xs text-slate-700 flex-1 truncate">{{ m.address }}</code>
                                 <div class="flex items-center gap-2 ml-auto">
                                     <input :value="m.remark || ''" @change="updateMonitorRemark(m, $event.target.value)" class="bg-surface-container-low border border-outline-variant/20 rounded-lg px-3 py-1.5 text-xs w-36" placeholder="备注/标签"/>
-                                    <a :href="m.network === 'trc20' ? 'https://tronscan.org/#/address/'+m.address : 'https://bscscan.com/address/'+m.address" target="_blank" class="p-2 bg-surface-container-low rounded-lg hover:bg-surface-container-high transition-all">
-                                        <span class="material-symbols-outlined text-sm text-slate-400">open_in_new</span>
-                                    </a>
-                                    <button @click="deleteMonitor(m.monitor_id)" class="p-2 bg-error/10 text-error rounded-lg hover:bg-error/20 transition-all">
-                                        <span class="material-symbols-outlined text-sm">delete</span>
-                                    </button>
+                                    <a :href="m.network === 'trc20' ? 'https://tronscan.org/#/address/'+m.address : 'https://bscscan.com/address/'+m.address" target="_blank" class="p-2 bg-surface-container-low rounded-lg hover:bg-surface-container-high transition-all"><span class="material-symbols-outlined text-sm text-slate-400">open_in_new</span></a>
+                                    <button @click.prevent="deleteMonitor(m.monitor_id)" class="p-2 bg-error/10 text-error rounded-lg hover:bg-error/20 transition-all"><span class="material-symbols-outlined text-sm">delete</span></button>
                                 </div>
                             </div>
                             <!-- 盈亏概览 -->
-                            <div class="flex items-center gap-6 px-5 py-3 bg-surface-container-lowest/50 border-b border-outline-variant/5 text-xs">
+                            <div class="flex items-center gap-6 py-3 text-xs rounded-xl px-4 my-3 bg-surface-container-lowest/50">
                                 <div><span class="text-slate-400">最后交易</span> <span class="font-bold ml-1">{{ m.last_tx_timestamp ? new Date(Number(m.last_tx_timestamp)).toLocaleString('zh-CN') : '未记录' }}</span></div>
                                 <div><span class="text-emerald-600 font-bold">↑ {{ Number(m.inflow_20 || 0).toFixed(2) }}</span></div>
                                 <div><span class="text-rose-600 font-bold">↓ {{ Number(m.outflow_20 || 0).toFixed(2) }}</span></div>
                                 <div :class="Number(m.profit_20 || 0) >= 0 ? 'text-green-600' : 'text-red-600'" class="font-black">净 {{ Number(m.profit_20 || 0).toFixed(2) }} USDT</div>
                             </div>
                             <!-- 近期交易内联记账 -->
-                            <div class="px-5 py-3">
-                                <div v-if="!m._txs" class="text-xs text-slate-400 cursor-pointer hover:text-primary" @click="loadMonitorTxs(m)">▶ 展开近期交易记录</div>
+                            <div>
+                                <div v-if="!m._txs" class="text-xs text-slate-400 cursor-pointer hover:text-primary flex items-center gap-1" @click.prevent="loadMonitorTxs(m)">
+                                    <span class="material-symbols-outlined text-[14px]">expand_more</span> 展开近期交易记录
+                                </div>
                                 <div v-else>
-                                    <div class="flex items-center justify-between mb-2">
-                                        <span class="text-xs font-black text-slate-500">近期交易记录</span>
-                                        <button @click="m._txs = null" class="text-[10px] text-slate-400 hover:text-slate-600">收起</button>
+                                    <div class="flex items-center justify-between mb-3">
+                                        <span class="text-xs font-black text-slate-500">近期交易记录（{{ m._txs.length }} 笔）</span>
+                                        <button @click.prevent="m._txs = null" class="text-[10px] text-slate-400 hover:text-slate-600">收起</button>
                                     </div>
                                     <div v-if="m._txs.length === 0" class="text-xs text-slate-300 italic py-2">暂无交易记录</div>
-                                    <div v-for="tx in m._txs" :key="tx.tx_id" class="flex flex-wrap items-center gap-2 py-2 border-b border-outline-variant/5 last:border-0">
-                                        <span class="text-[10px] text-slate-400 w-32">{{ new Date(Number(tx.tx_timestamp)).toLocaleString('zh-CN') }}</span>
-                                        <span :class="tx.direction === 'in' ? 'text-emerald-600 bg-emerald-50' : 'text-rose-600 bg-rose-50'" class="px-2 py-0.5 rounded text-[10px] font-black">{{ tx.direction === 'in' ? '收入' : '支出' }} {{ Number(tx.amount || 0).toFixed(2) }}</span>
-                                        <code class="font-mono text-[10px] text-slate-400 max-w-[120px] truncate">{{ tx.counterparty }}</code>
-                                        <input v-model="tx.income_reason" v-if="tx.direction === 'in'" class="flex-1 min-w-[80px] bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="收入原因"/>
-                                        <input v-model="tx.expense_reason" v-if="tx.direction === 'out'" class="flex-1 min-w-[80px] bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="支出原因"/>
-                                        <input v-model="tx.payer" class="w-24 bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="付款方"/>
-                                        <input v-model="tx.payee" class="w-24 bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="收款方"/>
-                                        <button @click="updateMonitorTxMeta(tx)" class="px-3 py-1 bg-primary/10 text-primary text-[10px] font-black rounded-lg hover:bg-primary/20 transition-all">保存</button>
+                                    <div v-for="tx in m._txs" :key="tx.tx_id" class="grid gap-1.5 py-3 border-b border-outline-variant/5 last:border-0">
+                                        <div class="flex flex-wrap items-center gap-2">
+                                            <span class="text-[10px] text-slate-400 w-36">{{ new Date(Number(tx.tx_timestamp)).toLocaleString('zh-CN') }}</span>
+                                            <span :class="tx.direction === 'in' ? 'text-emerald-600 bg-emerald-50' : 'text-rose-600 bg-rose-50'" class="px-2 py-0.5 rounded text-[10px] font-black">{{ tx.direction === 'in' ? '收入' : '支出' }} {{ Number(tx.amount || 0).toFixed(2) }} USDT</span>
+                                            <div class="flex items-center gap-1">
+                                                <code class="font-mono text-[10px] text-slate-400 max-w-[120px] truncate" :title="tx.counterparty">{{ tx.counterparty }}</code>
+                                                <span v-if="counterpartyAliases.find(a => a.address === tx.counterparty)" class="px-1.5 py-0.5 bg-amber-100 text-amber-700 text-[9px] font-black rounded">{{ counterpartyAliases.find(a => a.address === tx.counterparty).name }}</span>
+                                                <button @click.prevent="saveCounterpartyAlias(tx.counterparty)" class="text-[9px] text-slate-300 hover:text-amber-600 transition-colors" title="为此地址添加备注"><span class="material-symbols-outlined text-[12px]">person_add</span></button>
+                                            </div>
+                                        </div>
+                                        <div class="flex flex-wrap gap-2 mt-1">
+                                            <input v-model="tx.income_reason" v-if="tx.direction === 'in'" class="flex-1 min-w-[100px] bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="收入原因/意图"/>
+                                            <input v-model="tx.expense_reason" v-if="tx.direction === 'out'" class="flex-1 min-w-[100px] bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="支出原因/意图"/>
+                                            <input v-model="tx.payer" class="w-28 bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="付款方"/>
+                                            <input v-model="tx.payee" class="w-28 bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="收款方"/>
+                                            <button @click.prevent="updateMonitorTxMeta(tx)" class="px-3 py-1 bg-primary/10 text-primary text-[10px] font-black rounded-lg hover:bg-primary/20 transition-all">保存</button>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
                         </div>
                     </div>
                 </div>
+
+                <!-- 年账单弹窗 -->
+                <transition name="fade">
+                <div v-if="showYearSummaryModal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4" @click.self="showYearSummaryModal=false">
+                    <div class="bg-surface-container-lowest w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden">
+                        <div class="px-6 py-4 border-b border-outline-variant/10 flex items-center justify-between">
+                            <h3 class="text-base font-black flex items-center gap-2"><span class="material-symbols-outlined text-indigo-600">calendar_month</span>年度账单</h3>
+                            <div class="flex items-center gap-2">
+                                <input type="number" v-model.number="yearSummaryYear" min="2020" :max="new Date().getFullYear()" class="w-24 px-3 py-1.5 bg-surface-container border border-outline-variant/20 rounded-xl text-sm"/>
+                                <button @click.prevent="loadYearSummary" class="px-3 py-1.5 bg-primary text-on-primary text-xs font-black rounded-xl">查询</button>
+                                <button @click.prevent="exportMonitorExcel('year')" class="px-3 py-1.5 bg-emerald-500 text-white text-xs font-black rounded-xl">导出年表</button>
+                                <button @click.prevent="showYearSummaryModal=false" class="w-8 h-8 flex items-center justify-center hover:bg-surface-container rounded-full"><span class="material-symbols-outlined text-sm">close</span></button>
+                            </div>
+                        </div>
+                        <div v-if="isYearSummaryLoading" class="flex items-center justify-center py-12"><div class="w-8 h-8 border-4 border-primary/20 border-t-primary rounded-full animate-spin"></div></div>
+                        <div v-else-if="yearSummary" class="px-6 py-4">
+                            <div class="grid grid-cols-3 gap-3 mb-4">
+                                <div class="bg-emerald-50 rounded-2xl p-4 text-center"><div class="text-xs text-emerald-600 font-black mb-1">全年总收入</div><div class="text-xl font-black text-emerald-700">{{ Number(yearSummary.total.inflow||0).toFixed(2) }}</div></div>
+                                <div class="bg-rose-50 rounded-2xl p-4 text-center"><div class="text-xs text-rose-600 font-black mb-1">全年总支出</div><div class="text-xl font-black text-rose-700">{{ Number(yearSummary.total.outflow||0).toFixed(2) }}</div></div>
+                                <div class="rounded-2xl p-4 text-center" :class="Number(yearSummary.total.profit||0)>=0?'bg-green-50':'bg-red-50'"><div class="text-xs font-black mb-1" :class="Number(yearSummary.total.profit||0)>=0?'text-green-600':'text-red-600'">净利润</div><div class="text-xl font-black" :class="Number(yearSummary.total.profit||0)>=0?'text-green-700':'text-red-700'">{{ Number(yearSummary.total.profit||0).toFixed(2) }}</div></div>
+                            </div>
+                            <table class="w-full text-xs">
+                                <thead><tr class="bg-surface-container-low"><th class="px-3 py-2 text-left font-black text-slate-400">月份</th><th class="px-3 py-2 text-right font-black text-emerald-600">收入</th><th class="px-3 py-2 text-right font-black text-rose-600">支出</th><th class="px-3 py-2 text-right font-black">净利润</th><th class="px-3 py-2 text-right font-black text-slate-400">笔数</th></tr></thead>
+                                <tbody class="divide-y divide-outline-variant/5">
+                                    <tr v-for="row in yearSummary.monthly" :key="row.month" class="hover:bg-primary/5">
+                                        <td class="px-3 py-2 font-bold">{{ row.month }}月</td>
+                                        <td class="px-3 py-2 text-right text-emerald-600">{{ row.inflow.toFixed(2) }}</td>
+                                        <td class="px-3 py-2 text-right text-rose-600">{{ row.outflow.toFixed(2) }}</td>
+                                        <td class="px-3 py-2 text-right font-black" :class="row.profit>=0?'text-green-600':'text-red-600'">{{ row.profit.toFixed(2) }}</td>
+                                        <td class="px-3 py-2 text-right text-slate-400">{{ row.tx_count }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                </transition>
+
+                <!-- 对方地址备注管理弹窗 -->
+                <transition name="fade">
+                <div v-if="showAliasModal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4" @click.self="showAliasModal=false">
+                    <div class="bg-surface-container-lowest w-full max-w-xl rounded-3xl shadow-2xl overflow-hidden">
+                        <div class="px-6 py-4 border-b border-outline-variant/10 flex items-center justify-between">
+                            <h3 class="text-base font-black flex items-center gap-2"><span class="material-symbols-outlined text-amber-600">contacts</span>对方地址备注</h3>
+                            <button @click.prevent="showAliasModal=false" class="w-8 h-8 flex items-center justify-center hover:bg-surface-container rounded-full"><span class="material-symbols-outlined text-sm">close</span></button>
+                        </div>
+                        <div class="px-6 py-4 border-b border-outline-variant/10">
+                            <div class="flex gap-2">
+                                <input v-model="aliasForm.address" placeholder="对方地址" class="flex-1 px-3 py-2 bg-surface-container border border-outline-variant/20 rounded-xl text-xs"/>
+                                <input v-model="aliasForm.name" placeholder="备注名" class="w-28 px-3 py-2 bg-surface-container border border-outline-variant/20 rounded-xl text-xs"/>
+                                <input v-model="aliasForm.note" placeholder="备注说明（可选）" class="w-32 px-3 py-2 bg-surface-container border border-outline-variant/20 rounded-xl text-xs"/>
+                                <button @click.prevent="saveCounterpartyAliasDirect" :disabled="aliasLoading" class="px-4 py-2 bg-primary text-on-primary text-xs font-black rounded-xl">保存</button>
+                            </div>
+                        </div>
+                        <div class="max-h-80 overflow-y-auto no-scrollbar divide-y divide-outline-variant/5">
+                            <div v-if="counterpartyAliases.length===0" class="flex items-center justify-center py-8 text-slate-300 text-xs italic">暂无备注</div>
+                            <div v-for="a in counterpartyAliases" :key="a.alias_id" class="flex items-center gap-3 px-6 py-3 hover:bg-primary/5">
+                                <code class="font-mono text-[10px] text-slate-500 flex-1 truncate">{{ a.address }}</code>
+                                <span class="px-2 py-0.5 bg-amber-100 text-amber-700 text-xs font-black rounded-lg">{{ a.name }}</span>
+                                <span v-if="a.note" class="text-[10px] text-slate-400">{{ a.note }}</span>
+                                <button @click.prevent="deleteCounterpartyAlias(a.alias_id)" class="p-1 text-error hover:bg-error/10 rounded-lg"><span class="material-symbols-outlined text-[14px]">delete</span></button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                </transition>
 
                 <!-- 用户查询地址分区 -->
                 <div class="bg-surface-container-lowest rounded-3xl border border-outline-variant/10 shadow-sm overflow-hidden mt-6">
@@ -2187,6 +2274,18 @@
                     monitorScopeMode: 'all',
                     chartPeriod: 'day',
                     exportAnnotatedOnly: false,
+                    // 企业报表：对方地址别名
+                    counterpartyAliases: [],
+                    showAliasModal: false,
+                    aliasForm: { address: '', name: '', note: '' },
+                    aliasLoading: false,
+                    // 年账单
+                    yearSummary: null,
+                    yearSummaryYear: new Date().getFullYear(),
+                    isYearSummaryLoading: false,
+                    showYearSummaryModal: false,
+                    // 地址标签页切换
+                    activeMonitorId: null,
 
                     // 2026 规格：潜在用户
                     potentialUsers: [],
@@ -2470,10 +2569,15 @@
                         const json = await res.json();
                         if (json.status === 'ok') {
                             this.monitors = json.data;
+                            // 默认选中第一个地址
+                            if (json.data.length > 0 && !this.activeMonitorId) {
+                                this.activeMonitorId = json.data[0].monitor_id;
+                            }
                         }
                     } catch (e) { console.error(e) }
                     finally { this.isMonitorLoading = false; }
                     this.loadUserQueryMonitors();
+                    this.loadCounterpartyAliases();
                 },
                 async loadUserQueryMonitors() {
                     try {
@@ -2498,7 +2602,80 @@
                         const res = await fetch(`/api/monitors/pnl_summary?monitor_ids=${m.monitor_id}&addresses=${encodeURIComponent(m.address)}`);
                         const json = await res.json();
                         m._txs = (json.data && json.data.transactions) ? json.data.transactions : [];
+                        // 自动用别名填充付款方/收款方
+                        const aliasMap = {};
+                        this.counterpartyAliases.forEach(a => { aliasMap[a.address] = a.name; });
+                        m._txs.forEach(tx => {
+                            if (!tx.payer && tx.direction === 'in' && aliasMap[tx.counterparty]) tx.payer = aliasMap[tx.counterparty];
+                            if (!tx.payee && tx.direction === 'out' && aliasMap[tx.counterparty]) tx.payee = aliasMap[tx.counterparty];
+                        });
                     } catch(e) { m._txs = []; console.error(e); }
+                },
+                // 快速从交易记录里保存对方地址别名
+                async saveCounterpartyAlias(address) {
+                    if (!address) return;
+                    const name = prompt(`为地址 ${address.slice(0,12)}... 设置备注名：`);
+                    if (!name) return;
+                    try {
+                        const res = await fetch('/api/monitors/counterparty_aliases', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ address, name })
+                        });
+                        const json = await res.json();
+                        if (json.status === 'ok') {
+                            await this.loadCounterpartyAliases();
+                            // 刷新所有已展开的交易记录
+                            this.monitors.forEach(m => { if (m._txs) this.loadMonitorTxs(m); });
+                        }
+                    } catch(e) { console.error(e); }
+                },
+                async loadCounterpartyAliases() {
+                    try {
+                        const res = await fetch('/api/monitors/counterparty_aliases');
+                        const json = await res.json();
+                        if (json.status === 'ok') this.counterpartyAliases = json.data;
+                    } catch(e) { console.error(e); }
+                },
+                async deleteCounterpartyAlias(aliasId) {
+                    if (!confirm('确认删除此地址备注？')) return;
+                    try {
+                        const res = await fetch(`/api/monitors/counterparty_aliases/${aliasId}`, { method: 'DELETE' });
+                        if ((await res.json()).status === 'ok') this.loadCounterpartyAliases();
+                    } catch(e) { console.error(e); }
+                },
+                async saveCounterpartyAliasDirect() {
+                    const address = (this.aliasForm.address || '').trim();
+                    const name = (this.aliasForm.name || '').trim();
+                    if (!address || !name) { alert('地址和备注名不能为空'); return; }
+                    this.aliasLoading = true;
+                    try {
+                        const res = await fetch('/api/monitors/counterparty_aliases', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ address, name, note: this.aliasForm.note || '' })
+                        });
+                        const json = await res.json();
+                        if (json.status === 'ok') {
+                            this.aliasForm = { address: '', name: '', note: '' };
+                            await this.loadCounterpartyAliases();
+                            this.monitors.forEach(m => { if (m._txs) this.loadMonitorTxs(m); });
+                        } else { alert('保存失败: ' + json.message); }
+                    } catch(e) { console.error(e); }
+                    finally { this.aliasLoading = false; }
+                },
+                async loadYearSummary() {
+                    this.isYearSummaryLoading = true;
+                    try {
+                        const params = new URLSearchParams({ year: this.yearSummaryYear });
+                        if (this.monitorScopeMode !== 'all' && this.selectedMonitorIds.length > 0) {
+                            params.set('monitor_ids', this.selectedMonitorIds.join(','));
+                        }
+                        const res = await fetch(`/api/monitors/year_summary?${params}`);
+                        const json = await res.json();
+                        if (json.status === 'ok') this.yearSummary = json;
+                    } catch(e) { console.error(e); }
+                    finally { this.isYearSummaryLoading = false; }
                 },
                 async loadMonitorPnlSummary() {
                     try {
@@ -2528,6 +2705,9 @@
                 async exportMonitorExcel(period = 'month') {
                     try {
                         const params = new URLSearchParams({ period, annotated_only: String(!!this.exportAnnotatedOnly) });
+                        if (period === 'year') {
+                            params.set('year', this.yearSummaryYear);
+                        }
                         if (this.monitorScopeMode !== 'all' && this.selectedMonitorIds.length > 0) {
                             params.set('monitor_ids', this.selectedMonitorIds.join(','));
                             params.set('addresses', this.selectedMonitorAddresses.join(','));
