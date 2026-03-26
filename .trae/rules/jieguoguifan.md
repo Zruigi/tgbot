@@ -1,16 +1,17 @@
 ---
 alwaysApply: false
 description: TG Bot 项目完整规范文档 - 功能、架构、数据库、API、部署
-version: "3.1"
+version: "3.2"
 revision_date: "2026-03-26"
 ---
 
-# TG Bot 项目完整规范文档 v3.1 (2026-03-26)
+# TG Bot 项目完整规范文档 v3.2 (2026-03-26)
 
 ## 📋 版本与变更摘要
 
 | 版本 | 日期 | 变更内容 |
 |------|------|----------|
+| 3.2 | 2026-03-26 | **安全**：字段级 AES-256-GCM 加密（`services/field_crypto.py`），新增 `DB_ENCRYPT_KEY` 环境变量（32字节 base64url），加密格式 `ENC::<base64(nonce+ciphertext+tag)>`，`database.py` 全面接入 `encrypt()`/`decrypt()`（消息内容、钱包地址、备注、交易对手方）；**修复**：管理员在群聊中引用非 Bot 转发消息时静默忽略，不再回复「无法识别目标用户 ID」；**菜单 UX**：`/start` 菜单重设计，管理员与普通用户分别显示专属菜单、两列按钮布局，去除调试按钮；**管理后台入口**：`admin_dashboard` 改为 OTP 链接（5分钟有效），不再使用明文 token；**链上监听面板**：新增 `owner_type` 字段区分「管理员自有」vs「用户查询」，`get_all_monitors_for_admin` 只返回管理员自己的地址，新增 `get_user_query_addresses`/`claim_monitor_as_admin`，Web 端面板改为卡片式布局、内联交易记账编辑、「用户查询地址」独立分区支持一键转为我的监听 |
 | 3.1 | 2026-03-26 | 登录身份校验强化：`/api/login` 改为两步验证码流程（Step1 发码 / Step2 校验），通过 Notify Bot 向用户 Telegram 发送 6 位随机验证码；防暴力枚举（5次上限）、60s 发码频率限制、5分钟过期、验证后立即销毁；新增 `VerifyCodeRequest` 模型、`_gen_code()`、`_send_tg_message()`、`/api/login/verify` 路由；前端登录表单改为双步视图（step1/step2），支持「重新发送」；主控平台新增 `NOTIFY_BOT_TOKEN` 配置项 |
 | 3.0 | 2026-03-26 | 云端多租户部署方案：新增主控平台 `tgbot-platform/`，支持用户自助注册并输入 Bot Token 启动独立实例；USDT TRC20 金额指纹自动收款（每人小数唯一，自动匹配链上转账）；订阅到期自动掐断容器授权；用户门户前端（注册/登录/控制台/续费/套餐页）；修复 `config.py` 中 `DB_NAME` 支持 `os.getenv("DB_NAME")` 覆盖以实现租户数据隔离 |
 | 2.5 | 2026-03-25 | 手机端全分辨率响应式适配：左侧 sidebar 手机端隐藏，新增底部固定 Tab Bar（5个tab：会话/群组/群发/潜在/链上），支持 `env(safe-area-inset-bottom)` 安全区适配；聊天/群组工作台实现「列表→详情」双视图切换（`mobilePanelView`），详情页顶部新增返回按钮；群成员弹窗从 `max-w-2xl` 扩大到 `max-w-4xl`，成员列表从2列改为3列，工具栏固定不被撑大；群成员列表新增无限下滑加载（IntersectionObserver，初始30条，每次+20条），搜索变化自动重置；新增直接输入UID操作区（禁言/解禁/移除），不需要成员在列表中；群实际人数通过 `getChatMemberCount` API 获取显示 |
@@ -288,12 +289,15 @@ revision_date: "2026-03-26"
 |------|------|------|
 | monitor_id | INTEGER PK | 监听 ID |
 | user_id | INTEGER | 用户 ID |
-| address | TEXT | 钱包地址 |
+| address | TEXT | 钱包地址（AES-256-GCM 加密）|
 | network | TEXT | 网络 (TRC20/BSC) |
 | last_tx_timestamp | INTEGER | 最后交易时间 |
 | is_active | BOOLEAN | 是否活跃 |
-| remark | TEXT | 备注 |
+| remark | TEXT | 备注（AES-256-GCM 加密）|
 | risk_level | TEXT | 风险等级 |
+| risk_note | TEXT | 风险说明 |
+| created_at | DATETIME | 创建时间 |
+| owner_type | TEXT | 所有权类型：`admin_own`（管理员自有）/ `user`（用户查询，v3.2 新增）|
 
 #### 7. monitor_transactions (交易记录)
 
@@ -461,11 +465,14 @@ Cookie: admin_token={WEB_ADMIN_TOKEN}
 
 | 方法 | 路由 | 说明 |
 |------|------|------|
-| GET | /api/monitors | 列表 |
+| GET | /api/monitors | 列表（仅管理员自有地址）|
 | POST | /api/monitors | 新增 |
 | DELETE | /api/monitors/{id} | 删除 |
 | POST | /api/monitors/{id}/remark | 更新备注 |
 | GET | /api/monitors/pnl_summary | 盈亏汇总 |
+| GET | /api/monitors/export | 导出 Excel |
+| GET | /api/monitors/user_queries | 用户查询地址列表（v3.2 新增）|
+| POST | /api/monitors/{id}/claim | 将用户查询地址转为管理员自有（v3.2 新增）|
 
 ### 潜在用户接口
 
@@ -743,6 +750,77 @@ location /api/ {
 ---
 
 ## 已知问题与修复
+
+### 2026-03-26 新增/修复（v3.2）
+
+#### 1. 字段级 AES-256-GCM 加密
+
+**新增模块**：`services/field_crypto.py`
+
+- 密钥从环境变量 `DB_ENCRYPT_KEY` 读取（32字节 base64url 编码，无填充，44字符）
+- 加密格式：`ENC::<base64url(nonce[12] + ciphertext + tag[16])>`
+- 未加密明文字段透明读取（向后兼容）
+- `encrypt(text)` / `decrypt(text)` / `decrypt_list(rows, fields)` / `decrypt_dict(row, fields)` / `is_enabled()` 五个公开 API
+- `database.py` 全面接入：`messages.content`、`messages.original_text`、`messages.translated_text`、`messages.quoted_text`、`address_monitors.address`、`address_monitors.remark`、`monitor_transactions.address`、`monitor_transactions.counterparty`
+
+**生成密钥命令（服务器端）**：
+```bash
+dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr '+/' '-_' | tr -d '='
+# 输出 44 字符写入 .env：DB_ENCRYPT_KEY=xxxxxx...
+```
+
+**验证方式**：
+```sql
+-- 新消息应以 ENC:: 开头
+SELECT msg_id, content FROM messages ORDER BY msg_id DESC LIMIT 3;
+```
+
+#### 2. 群聊引用非 Bot 消息静默忽略
+
+**问题**：管理员在群聊中引用任意消息时，Bot 会回复「❌ 无法识别目标用户 ID」，对普通群成员可见，体验极差。
+
+**修复**：`handlers/customer_service.py` 中 `target_user_id` 为空时，检查 `chat.type` 是否为 `group`/`supergroup`，若是则直接 `return`，不发送任何回复。
+
+**代码位置**：`handlers/customer_service.py` 管理员回复逻辑段
+
+#### 3. `/start` 菜单 UX 重设计
+
+**改动**：`handlers/start.py`
+
+- 管理员与普通用户分别显示专属菜单文案与按钮
+- 按钮改为两列排布（`InlineKeyboardButton` 每行两个）
+- 去除「你的 ID: xxx (非管理员)」调试按钮
+- 管理员菜单：Web 管理后台、系统设置、现货行情、合约行情、监听钱包、我的列表、邮箱设置
+- 普通用户菜单：联系人工客服（置顶）+ 行情/监听/邮箱功能
+
+#### 4. 管理后台入口改为 OTP 链接
+
+**问题**：`admin_dashboard` 回调生成的链接包含明文 `WEB_ADMIN_TOKEN`，存在泄露风险。
+
+**修复**：`handlers/start.py` 中 `admin_dashboard` 回调改为调用 `web_admin.generate_otp()`，生成 5 分钟有效、一次性 OTP 参数链接（`?otp=xxx`）。
+
+#### 5. 链上监听面板数据隔离与 UI 重设计
+
+**问题**：`get_all_monitors_for_admin` 返回所有用户的监听地址，管理员后台会看到其他用户的数据。
+
+**数据库层改动**：
+- `address_monitors` 新增 `owner_type TEXT DEFAULT 'user'`
+- 迁移时自动将管理员地址标记为 `admin_own`
+- 新增 `get_user_query_addresses()` — 返回非管理员的查询地址
+- 新增 `claim_monitor_as_admin(monitor_id)` — 将指定地址转为管理员自有
+- 修改 `get_all_monitors_for_admin()` — 只返回 `owner_type = 'admin_own'` 的地址
+
+**API 层改动**：
+- 新增 `GET /api/monitors/user_queries`
+- 新增 `POST /api/monitors/{id}/claim`
+
+**前端 UI 改动**：
+- 监听地址列表从表格改为**卡片式布局**，每张卡片直接显示盈亏概览
+- 点击「展开近期交易记录」在卡片内内联编辑每笔（收入/支出原因、付款方、收款方）
+- 新增「用户查询地址」独立分区，支持一键「⊕ 转为我的监听」
+- 去除勾选列（选择功能保留用于导出统计）
+
+---
 
 ### 2026-03-25 修复（v2.4）
 
@@ -1034,6 +1112,8 @@ track_group_seen()
 | services/price_monitor.py | 行情监控 |
 | services/translator.py | 翻译服务 |
 | services/security_center.py | 安全核验 |
+| services/field_crypto.py | 字段级 AES-256-GCM 加密（v3.2 新增）|
+| handlers/start.py | /start 菜单（v3.2 重设计）|
 
 ### 外部接口
 

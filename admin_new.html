@@ -237,35 +237,35 @@
             
             <nav class="flex-1 flex flex-col px-2 py-4 space-y-1 overflow-y-auto no-scrollbar">
                 <div class="px-4 mb-2 hidden lg:block text-[10px] font-bold text-slate-400 uppercase tracking-widest">消息中心</div>
-                <a href="#" @click="activeTab = 'chat'" 
+                <a href="#" @click.prevent="activeTab = 'chat'" 
                    class="flex items-center px-4 py-3 rounded-xl group transition-all duration-200 active:scale-95 active:opacity-70"
                    :class="activeTab === 'chat' ? 'bg-primary/10 text-primary shadow-sm' : 'text-on-surface-variant hover:bg-surface-container-high hover:translate-x-0.5'">
                     <span class="material-symbols-outlined mr-3 transition-transform duration-200 group-active:scale-90">chat</span>
                     <span class="hidden lg:block font-bold text-sm">会话列表</span>
                 </a>
                 
-                <a href="#" @click="activeTab = 'broadcast'" 
+                <a href="#" @click.prevent="activeTab = 'broadcast'" 
                    class="flex items-center px-4 py-3 rounded-xl group transition-all duration-200 active:scale-95 active:opacity-70"
                    :class="activeTab === 'broadcast' ? 'bg-primary/10 text-primary shadow-sm' : 'text-on-surface-variant hover:bg-surface-container-high hover:translate-x-0.5'">
                     <span class="material-symbols-outlined mr-3 transition-transform duration-200 group-active:scale-90">campaign</span>
                     <span class="hidden lg:block font-bold text-sm">群发功能</span>
                 </a>
 
-                <a href="#" @click="activeTab = 'onchain_monitors'" 
+                <a href="#" @click.prevent="activeTab = 'onchain_monitors'" 
                    class="flex items-center px-4 py-3 rounded-xl group transition-all duration-200 active:scale-95 active:opacity-70"
                    :class="activeTab === 'onchain_monitors' ? 'bg-primary/10 text-primary shadow-sm' : 'text-on-surface-variant hover:bg-surface-container-high hover:translate-x-0.5'">
                     <span class="material-symbols-outlined mr-3 transition-transform duration-200 group-active:scale-90">account_balance_wallet</span>
                     <span class="hidden lg:block font-bold text-sm">链上监听</span>
                 </a>
 
-                <a href="#" @click="activeTab = 'potential_users'" 
+                <a href="#" @click.prevent="activeTab = 'potential_users'" 
                    class="flex items-center px-4 py-3 rounded-xl group transition-all duration-200 active:scale-95 active:opacity-70"
                    :class="activeTab === 'potential_users' ? 'bg-primary/10 text-primary shadow-sm' : 'text-on-surface-variant hover:bg-surface-container-high hover:translate-x-0.5'">
                     <span class="material-symbols-outlined mr-3 transition-transform duration-200 group-active:scale-90">person_add</span>
                     <span class="hidden lg:block font-bold text-sm">潜在用户</span>
                 </a>
 
-                <a href="#" @click="activeTab = 'group_management'" 
+                <a href="#" @click.prevent="activeTab = 'group_management'" 
                    class="flex items-center px-4 py-3 rounded-xl group transition-all duration-200 active:scale-95 active:opacity-70"
                    :class="activeTab === 'group_management' ? 'bg-primary/10 text-primary shadow-sm' : 'text-on-surface-variant hover:bg-surface-container-high hover:translate-x-0.5'">
                     <span class="material-symbols-outlined mr-3 transition-transform duration-200 group-active:scale-90">groups</span>

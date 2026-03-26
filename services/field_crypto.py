@@ -13,10 +13,12 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _key: Optional[bytes] = None
-_ENABLED = False
+_ENABLED: Optional[bool] = None  # None = 未初始化
 
 def _load_key():
     global _key, _ENABLED
+    if _ENABLED is not None:
+        return  # 已初始化，跳过
     raw = os.environ.get('DB_ENCRYPT_KEY', '').strip()
     if not raw:
         logger.warning('[FieldCrypto] DB_ENCRYPT_KEY 未设置，字段加密已禁用')
@@ -33,10 +35,9 @@ def _load_key():
         logger.error(f'[FieldCrypto] 密钥加载失败: {e}，加密已禁用')
         _ENABLED = False
 
-_load_key()
-
 def is_enabled() -> bool:
-    return _ENABLED
+    _load_key()
+    return bool(_ENABLED)
 
 def encrypt(plaintext: Optional[str]) -> Optional[str]:
     """加密字符串，返回 ENC::<base64> 格式，None 直接返回 None"""
