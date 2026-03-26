@@ -104,12 +104,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="HTML"
         )
     elif data == "admin_dashboard":
-        # 2026 规格：提供带免登 Token 的 Web 链接
-        admin_link = f"{config.WEB_BASE_URL}/?token={config.WEB_ADMIN_TOKEN}"
+        import os
+        from web_admin import generate_otp
+        server_url = os.getenv("SERVER_URL", f"http://{os.getenv('SERVER_IP', '43.135.141.154')}")
+        otp = generate_otp(config.WEB_ADMIN_TOKEN, ttl_seconds=300)
+        admin_link = f"{server_url}/?otp={otp}"
         text = (
             "🚀 <b>Web 管理端已准备就绪</b>\n\n"
-            "你可以点击下方按钮免密登录后台管理系统，实时处理客户消息、监控链上交易及查看潜在用户。\n\n"
-            "<i>提示：该链接包含管理凭证，请勿转发给他人。</i>"
+            "点击下方按钮免密登录后台管理系统。\n\n"
+            "⏱ 链接 <b>5分钟</b>内有效，使用一次后立即失效。"
         )
         keyboard = [
             [InlineKeyboardButton("🌐 立即进入管理后台", url=admin_link)],
