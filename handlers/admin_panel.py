@@ -190,9 +190,9 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         
     elif data == "adm:open_web":
         from web_admin import generate_otp
-        server_ip = os.getenv("SERVER_IP", "43.135.141.154")
+        server_url = os.getenv("SERVER_URL", f"http://{os.getenv('SERVER_IP', '43.135.141.154')}")
         otp = generate_otp(config.WEB_ADMIN_TOKEN, ttl_seconds=300)
-        web_url = f"http://{server_ip}/?otp={otp}"
+        web_url = f"{server_url}/?otp={otp}"
         await query.answer()
         await query.message.reply_text(
             f"🌐 <b>Web 管理端一次性登录链接</b>\n\n"
