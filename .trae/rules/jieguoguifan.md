@@ -1,16 +1,17 @@
 ---
 alwaysApply: false
 description: TG Bot 项目完整规范文档 - 功能、架构、数据库、API、部署
-version: "3.2"
-revision_date: "2026-03-26"
+version: "3.3"
+revision_date: "2026-03-27"
 ---
 
-# TG Bot 项目完整规范文档 v3.2 (2026-03-26)
+# TG Bot 项目完整规范文档 v3.3 (2026-03-27)
 
 ## 📋 版本与变更摘要
 
 | 版本 | 日期 | 变更内容 |
 |------|------|----------|
+| 3.3 | 2026-03-27 | **企业报表功能**：新增 `counterparty_aliases` 表（对方地址→人名备注，全局共享）；`_period_boundaries_ms` 支持 `year` 周期；新增 `get_year_monitor_summary()`（按月汇总全年收支）；新增 `get_counterparty_alias_map()`；Web 端新增 `GET/POST/DELETE /api/monitors/counterparty_aliases`、`GET /api/monitors/year_summary`；链上监听面板重构为地址标签页切换，交易记录自动用别名填充付款方/收款方，新增「地址备注」弹窗（全量管理）、「年账单」弹窗（月度汇总+导出）、「导出年表」Excel（含流水/月度汇总/全年合计三个 Sheet）；Excel 导出新增表头样式（深蓝底白字）、自动列宽（中文2倍宽）、对方地址备注列、地址备注列；修复所有侧边栏导航 `<a href="#">` 缺少 `.prevent` 导致点击后页面跳转的问题 |
 | 3.2 | 2026-03-26 | **安全**：字段级 AES-256-GCM 加密（`services/field_crypto.py`），新增 `DB_ENCRYPT_KEY` 环境变量（32字节 base64url），加密格式 `ENC::<base64(nonce+ciphertext+tag)>`，`database.py` 全面接入 `encrypt()`/`decrypt()`（消息内容、钱包地址、备注、交易对手方）；**修复**：管理员在群聊中引用非 Bot 转发消息时静默忽略，不再回复「无法识别目标用户 ID」；**菜单 UX**：`/start` 菜单重设计，管理员与普通用户分别显示专属菜单、两列按钮布局，去除调试按钮；**管理后台入口**：`admin_dashboard` 改为 OTP 链接（5分钟有效），不再使用明文 token；**链上监听面板**：新增 `owner_type` 字段区分「管理员自有」vs「用户查询」，`get_all_monitors_for_admin` 只返回管理员自己的地址，新增 `get_user_query_addresses`/`claim_monitor_as_admin`，Web 端面板改为卡片式布局、内联交易记账编辑、「用户查询地址」独立分区支持一键转为我的监听 |
 | 3.1 | 2026-03-26 | 登录身份校验强化：`/api/login` 改为两步验证码流程（Step1 发码 / Step2 校验），通过 Notify Bot 向用户 Telegram 发送 6 位随机验证码；防暴力枚举（5次上限）、60s 发码频率限制、5分钟过期、验证后立即销毁；新增 `VerifyCodeRequest` 模型、`_gen_code()`、`_send_tg_message()`、`/api/login/verify` 路由；前端登录表单改为双步视图（step1/step2），支持「重新发送」；主控平台新增 `NOTIFY_BOT_TOKEN` 配置项 |
 | 3.0 | 2026-03-26 | 云端多租户部署方案：新增主控平台 `tgbot-platform/`，支持用户自助注册并输入 Bot Token 启动独立实例；USDT TRC20 金额指纹自动收款（每人小数唯一，自动匹配链上转账）；订阅到期自动掐断容器授权；用户门户前端（注册/登录/控制台/续费/套餐页）；修复 `config.py` 中 `DB_NAME` 支持 `os.getenv("DB_NAME")` 覆盖以实现租户数据隔离 |
@@ -183,7 +184,7 @@ revision_date: "2026-03-26"
 
 | 文件 | 状态 | 说明 |
 |------|------|------|
-| `crypto_bot.sqlite3` | 活跃 | 主数据库，包含 19 个表 |
+| `crypto_bot.sqlite3` | 活跃 | 主数据库，包含 20 个表（v3.3 新增 counterparty_aliases）|
 | `bot.db` | 废弃 | 空表，已停用 |
 
 ### 表结构与字段
@@ -310,8 +311,26 @@ revision_date: "2026-03-26"
 | direction | TEXT | 方向 (in/out) |
 | amount | REAL | 金额 |
 | token_symbol | TEXT | 代币符号 |
-| tx_timestamp | INTEGER | 交易时间 |
+| tx_timestamp | INTEGER | 交易时间（ms） |
+| counterparty | TEXT | 对方地址（AES-256-GCM 加密）|
 | risk_level | TEXT | 风险等级 |
+| risk_note | TEXT | 风险说明 |
+| income_reason | TEXT | 收入原因（v3.2 新增）|
+| expense_reason | TEXT | 支出原因（v3.2 新增）|
+| payer | TEXT | 付款方（v3.2 新增）|
+| payee | TEXT | 收款方（v3.2 新增）|
+
+#### 8. counterparty_aliases (对方地址备注，v3.3 新增)
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| alias_id | INTEGER PK | 自增 ID |
+| address | TEXT UNIQUE | 对方地址（链上） |
+| name | TEXT | 备注人名 |
+| note | TEXT | 说明备注（可选）|
+| created_at | DATETIME | 创建时间 |
+
+**用途**：全局共享的地址→人名映射表。导出 Excel 时自动填充「对方备注」列；展开交易记录时自动将已知地址补入付款方/收款方字段，无需每笔手动填写。
 
 ### 索引策略
 
@@ -469,8 +488,14 @@ Cookie: admin_token={WEB_ADMIN_TOKEN}
 | POST | /api/monitors | 新增 |
 | DELETE | /api/monitors/{id} | 删除 |
 | POST | /api/monitors/{id}/remark | 更新备注 |
-| GET | /api/monitors/pnl_summary | 盈亏汇总 |
-| GET | /api/monitors/export | 导出 Excel |
+| GET | /api/monitors/pnl_summary | 盈亏汇总（day/week/month）|
+| GET | /api/monitors/export | 导出 Excel（day/week/month/year，自动列宽，别名填充）|
+| GET | /api/monitors/year_summary | 年度月度盈亏汇总（v3.3 新增）|
+| GET | /api/monitors/counterparty_aliases | 获取所有对方地址备注（v3.3 新增）|
+| POST | /api/monitors/counterparty_aliases | 新增/更新对方地址备注（v3.3 新增）|
+| DELETE | /api/monitors/counterparty_aliases/{id} | 删除对方地址备注（v3.3 新增）|
+| POST | /api/monitors/tx_meta | 更新单笔交易业务字段 |
+| POST | /api/monitors/tx_meta/batch | 批量更新交易业务字段 |
 | GET | /api/monitors/user_queries | 用户查询地址列表（v3.2 新增）|
 | POST | /api/monitors/{id}/claim | 将用户查询地址转为管理员自有（v3.2 新增）|
 
@@ -750,6 +775,59 @@ location /api/ {
 ---
 
 ## 已知问题与修复
+
+### 2026-03-27 新增/修复（v3.3）
+
+#### 1. 企业报表功能全面升级
+
+**新增数据库表** `counterparty_aliases`：
+- 全局共享的链上地址→人名备注映射
+- `UNIQUE(address)` 约束，同一地址只有一条记录（upsert 语义）
+- 新增函数：`get_counterparty_aliases()`、`upsert_counterparty_alias()`、`delete_counterparty_alias()`、`get_counterparty_alias_map()`
+
+**`_period_boundaries_ms` 新增 `year` 周期**：
+- `year`：当年 1 月 1 日 00:00 → 次年 1 月 1 日 00:00
+- `previous=True` 时返回上一年范围
+
+**新增 `get_year_monitor_summary()`**：
+- 按月汇总全年收入/支出/净利润/交易笔数，返回固定 12 行
+- 无数据的月份自动补 0，前端无需额外处理
+
+**Excel 导出全面重构**（`api_export_monitor_transactions`）：
+- 支持 `period=year`，自动生成「链上流水」+「汇总」+「{year}年月度汇总」三个 Sheet
+- 表头深蓝底（`#1E3A5F`）白字加粗居中
+- 新增「地址备注」「对方备注」两列，自动从 `addr_remark_map` / `alias_map` 填充
+- 付款方/收款方若用户未填则自动用别名补全（`direction=in` 填付款方，`direction=out` 填收款方）
+- 所有 Sheet 自动列宽：中文字符按 2 倍宽计算，最小 8，最大 60
+
+**前端链上监听面板重构**：
+- 地址列表改为**标签页切换**：每个监听地址是一个标签按钮，点击切换，内嵌勾选框同步统计范围
+- 交易记录展开时自动用 `counterpartyAliases` 补填付款方/收款方
+- 交易行新增 `👤` 按钮（`person_add`）快速为对方地址命名
+- 新增「地址备注」按钮 → 弹出全量管理面板（新增/删除）
+- 新增「年账单」按钮 → 弹出年度月度汇总弹窗（支持切换年份、查询、导出年表）
+- 导出工具栏新增「导出年表」按钮
+
+**新增 JS 方法**：
+- `loadCounterpartyAliases()` — 加载所有别名
+- `saveCounterpartyAlias(address)` — 快速为地址命名（prompt）
+- `saveCounterpartyAliasDirect()` — 弹窗表单直接保存
+- `deleteCounterpartyAlias(aliasId)` — 删除别名
+- `loadYearSummary()` — 加载年度月度汇总
+- `loadMonitors()` 改造 — 加载完成后默认选中第一个地址标签，同时加载别名
+- `loadMonitorTxs(m)` 改造 — 展开交易时自动用别名填充付款方/收款方
+
+#### 2. 侧边栏导航 `href="#"` 缺少 `.prevent` 修复
+
+**问题**：所有桌面端侧边栏 `<a href="#" @click="activeTab = 'xxx'">` 点击时浏览器触发默认跳转行为，Vue 的 `@click` 虽然执行了 `activeTab` 切换，但随即页面滚动到顶部或触发 hashchange，导致 Tab 切换看起来无效或功能入口「不存在」。
+
+**受影响的 Tab**：`chat`、`broadcast`、`onchain_monitors`、`potential_users`、`group_management`
+
+**修复**：所有桌面端侧边栏导航按钮的 `@click` 改为 `@click.prevent`，移动端底部 Tab Bar 已使用 `@click.prevent` 不受影响。
+
+**代码位置**：`admin_new.html` 侧边栏导航区域（第 254、258、260 行附近）
+
+---
 
 ### 2026-03-26 新增/修复（v3.2）
 
@@ -1103,7 +1181,7 @@ track_group_seen()
 |------|------|
 | main.py | 系统入口、revoke_sync_loop |
 | config.py | 全局配置 |
-| database.py | 数据库层（19 个表） |
+| database.py | 数据库层（20 个表，v3.3 新增 counterparty_aliases）|
 | web_admin.py | Web 后台 API |
 | admin_new.html | Web 前端（Vue 3） |
 | handlers/customer_service.py | 客服系统 |
