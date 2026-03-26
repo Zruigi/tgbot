@@ -1032,16 +1032,16 @@
                             <div class="flex-1 min-w-0">
                                 <div class="flex items-center gap-2 mb-1">
                                     <span v-if="activeMonitorId===null" class="px-2 py-0.5 bg-primary/10 text-primary text-[10px] font-black rounded">全部</span>
-                                    <template v-else><span class="px-2 py-0.5 text-[10px] font-black rounded" :class="activeMonitor?.network==='trc20'?'bg-red-100 text-red-600':'bg-yellow-100 text-yellow-700'">{{ String(activeMonitor?.network||'').toUpperCase() }}</span></template>
-                                    <span class="text-sm font-black">{{ activeMonitorId===null?'全部地址汇总':(activeMonitor?.remark||'未命名地址') }}</span>
+                                    <template v-else><span class="px-2 py-0.5 text-[10px] font-black rounded" :class="(activeMonitor && activeMonitor.network)==='trc20'?'bg-red-100 text-red-600':'bg-yellow-100 text-yellow-700'">{{ String((activeMonitor && activeMonitor.network)||'').toUpperCase() }}</span></template>
+                                    <span class="text-sm font-black">{{ activeMonitorId===null?'全部地址汇总':((activeMonitor && activeMonitor.remark)||'未命名地址') }}</span>
                                 </div>
                                 <div v-if="activeMonitorId!==null" class="flex items-center gap-2">
-                                    <code class="font-mono text-xs text-slate-400 truncate max-w-xs">{{ activeMonitor?.address }}</code>
-                                    <a :href="activeMonitor?.network==='trc20'?'https://tronscan.org/#/address/'+(activeMonitor?.address||''):'https://bscscan.com/address/'+(activeMonitor?.address||'')" target="_blank" class="text-slate-300 hover:text-primary"><span class="material-symbols-outlined text-[14px]">open_in_new</span></a>
+                                    <code class="font-mono text-xs text-slate-400 truncate max-w-xs">{{ activeMonitor && activeMonitor.address }}</code>
+                                    <a :href="(activeMonitor && activeMonitor.network==='trc20')?'https://tronscan.org/#/address/'+(activeMonitor.address||''):'https://bscscan.com/address/'+((activeMonitor && activeMonitor.address)||'')" target="_blank" class="text-slate-300 hover:text-primary"><span class="material-symbols-outlined text-[14px]">open_in_new</span></a>
                                 </div>
                             </div>
                             <div class="flex items-center gap-2">
-                                <input v-if="activeMonitorId!==null" :value="activeMonitor?.remark||''" @change="updateMonitorRemark(activeMonitor,$event.target.value)" placeholder="备注名" class="px-3 py-1.5 bg-surface-container border border-outline-variant/20 rounded-xl text-xs w-28"/>
+                                <input v-if="activeMonitorId!==null" :value="(activeMonitor && activeMonitor.remark)||''" @change="updateMonitorRemark(activeMonitor,$event.target.value)" placeholder="备注名" class="px-3 py-1.5 bg-surface-container border border-outline-variant/20 rounded-xl text-xs w-28"/>
                                 <button @click.prevent="showYearSummaryModal=true;loadYearSummary()" class="px-3 py-1.5 bg-indigo-500/10 text-indigo-700 rounded-xl text-xs font-black flex items-center gap-1"><span class="material-symbols-outlined text-[13px]">calendar_month</span>年账单</button>
                                 <button @click.prevent="exportMonitorExcel(ledgerPeriod)" class="px-3 py-1.5 bg-emerald-500/10 text-emerald-700 rounded-xl text-xs font-black flex items-center gap-1"><span class="material-symbols-outlined text-[13px]">download</span>导出</button>
                                 <button v-if="activeMonitorId!==null" @click.prevent="deleteMonitor(activeMonitorId)" class="p-1.5 bg-error/10 text-error rounded-xl"><span class="material-symbols-outlined text-[16px]">delete</span></button>
