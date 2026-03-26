@@ -1166,6 +1166,37 @@ async def api_export_monitor_transactions(request):
         return web.json_response({'status': 'error', 'message': str(e)}, status=500)
 
 
+async def api_get_monitor_transactions(request):
+    """按地址+周期分页查询流水（Stripe风格账单面板）"""
+    try:
+        monitor_id = request.query.get('monitor_id')
+        monitor_id = int(monitor_id) if monitor_id else None
+        period = (request.query.get('period') or 'month').strip().lower()
+        if period not in ('day', 'week', 'month', 'year'):
+            period = 'month'
+        direction_filter = request.query.get('direction') or None
+        page = max(1, int(request.query.get('page') or 1))
+        page_size = min(200, max(10, int(request.query.get('page_size') or 50)))
+        uid = request.query.get('user_id')
+        user_id = int(uid) if uid else None
+        result = await database.get_monitor_transactions_paged(
+            monitor_id=monitor_id,
+            period=period,
+            direction_filter=direction_filter,
+            page=page,
+            page_size=page_size,
+            user_id=user_id,
+        )
+        # 用别名自动填充 counterparty_name
+        alias_map = await database.get_counterparty_alias_map()
+        for tx in result['txs']:
+            cp = tx.get('counterparty') or ''
+            tx['counterparty_name'] = alias_map.get(cp, '')
+        return web.json_response({'status': 'ok', **result})
+    except Exception as e:
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
 async def api_get_counterparty_aliases(request):
     """获取所有对方地址别名"""
     try:
@@ -2240,6 +2271,7 @@ async def start_web_server(bot):
     app.router.add_post('/api/monitors/tx_meta', api_update_monitor_tx_meta)
     app.router.add_post('/api/monitors/tx_meta/batch', api_batch_update_monitor_tx_meta)
     app.router.add_get('/api/monitors/export', api_export_monitor_transactions)
+    app.router.add_get('/api/monitors/transactions', api_get_monitor_transactions)
     app.router.add_get('/api/monitors/year_summary', api_year_monitor_summary)
     app.router.add_get('/api/monitors/counterparty_aliases', api_get_counterparty_aliases)
     app.router.add_post('/api/monitors/counterparty_aliases', api_upsert_counterparty_alias)

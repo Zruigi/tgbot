@@ -1141,6 +1141,89 @@ async def get_monitor_transactions_for_export(start_ms: int, end_ms: int, user_i
             return decrypt_list([dict(r) for r in rows], ['address', 'counterparty'])
 
 
+async def get_monitor_transactions_paged(
+    monitor_id: Optional[int] = None,
+    period: str = 'month',
+    direction_filter: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """按地址+周期+方向分页查询流水，含汇总统计，识别 TRX 能量费"""
+    start_ms, end_ms = _period_boundaries_ms(period)
+    where_parts = ["tx_timestamp >= ?", "tx_timestamp < ?"]
+    params: List[Union[int, str]] = [start_ms, end_ms]
+
+    if monitor_id is not None:
+        where_parts.append("monitor_id = ?")
+        params.append(int(monitor_id))
+    elif user_id is not None:
+        where_parts.append("user_id = ?")
+        params.append(int(user_id))
+
+    if direction_filter in ('in', 'out'):
+        where_parts.append("direction = ?")
+        params.append(direction_filter)
+
+    where_sql = " AND ".join(where_parts)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        # 汇总统计（不受方向过滤影响）
+        sum_where = " AND ".join(where_parts[:2 + (1 if monitor_id is not None or user_id is not None else 0)])
+        sum_params = params[:2 + (1 if monitor_id is not None or user_id is not None else 0)]
+        async with db.execute(
+            f"SELECT SUM(CASE WHEN direction='in' THEN amount ELSE 0 END) AS inflow, "
+            f"SUM(CASE WHEN direction='out' THEN amount ELSE 0 END) AS outflow, "
+            f"COUNT(*) AS total_count "
+            f"FROM monitor_transactions WHERE {sum_where}",
+            tuple(sum_params)
+        ) as cur:
+            summary_row = await cur.fetchone()
+            inflow = float(summary_row['inflow'] or 0)
+            outflow = float(summary_row['outflow'] or 0)
+            total_count_all = int(summary_row['total_count'] or 0)
+
+        # 总行数（含方向过滤）
+        async with db.execute(
+            f"SELECT COUNT(*) FROM monitor_transactions WHERE {where_sql}",
+            tuple(params)
+        ) as cur:
+            cnt = await cur.fetchone()
+            total = int(cnt[0] or 0)
+
+        offset = (page - 1) * page_size
+        async with db.execute(
+            f"SELECT * FROM monitor_transactions WHERE {where_sql} "
+            f"ORDER BY tx_timestamp DESC LIMIT ? OFFSET ?",
+            tuple(params) + (page_size, offset)
+        ) as cur:
+            rows = await cur.fetchall()
+            txs = decrypt_list([dict(r) for r in rows], ['address', 'counterparty'])
+
+    # 识别 TRX 能量费用：token_symbol 含 TRX 且 amount < 50，标记 is_energy_fee
+    for tx in txs:
+        sym = (tx.get('token_symbol') or '').upper()
+        amt = float(tx.get('amount') or 0)
+        tx['is_energy_fee'] = (sym == 'TRX' and amt < 50)
+        tx['is_large_trx'] = (sym == 'TRX' and amt >= 50)  # 大额TRX租能量，需确认
+
+    return {
+        'txs': txs,
+        'total': total,
+        'page': page,
+        'page_size': page_size,
+        'pages': max(1, (total + page_size - 1) // page_size),
+        'summary': {
+            'inflow': round(inflow, 2),
+            'outflow': round(outflow, 2),
+            'profit': round(inflow - outflow, 2),
+            'total_count': total_count_all,
+            'start_ms': start_ms,
+            'end_ms': end_ms,
+        }
+    }
+
 async def get_monitor_transactions_list(period: str = 'month', user_id: Optional[int] = None,
                                         addresses: Optional[List[str]] = None,
                                         monitor_ids: Optional[List[int]] = None,
