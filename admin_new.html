@@ -4428,17 +4428,29 @@
         document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 UTC;path=/';
     }
 
+    // 全局 fetch 拦截器，自动注入 Token
+    const _originalFetch = window.fetch.bind(window);
+    window.fetch = function(url, options = {}) {
+        const token = localStorage.getItem('admin_token');
+        if (token && typeof url === 'string' && url.startsWith('/api/')) {
+            options.headers = options.headers || {};
+            options.headers['Authorization'] = 'Bearer ' + token;
+        }
+        return _originalFetch(url, options);
+    };
+
     async function doLogin() {
         const token = document.getElementById('login-token-input').value.trim();
         if (!token) return;
         try {
-            const res = await fetch('/api/login', {
+            const res = await _originalFetch('/api/login', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ token })
             });
             const data = await res.json();
             if (data.status === 'ok') {
+                localStorage.setItem('admin_token', token);
                 setCookie('admin_token', token, 7);
                 document.getElementById('login-screen').style.display = 'none';
                 document.getElementById('app').style.display = '';
@@ -4451,26 +4463,26 @@
     }
 
     function checkLogin() {
-        const token = getCookie('admin_token');
+        const token = localStorage.getItem('admin_token') || getCookie('admin_token');
         const loginScreen = document.getElementById('login-screen');
         const appDiv = document.getElementById('app');
         if (token) {
-            // 验证 token 有效性
-            fetch('/api/login', {
+            _originalFetch('/api/login', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ token })
             }).then(r => r.json()).then(data => {
                 if (data.status === 'ok') {
+                    localStorage.setItem('admin_token', token);
                     loginScreen.style.display = 'none';
                     appDiv.style.display = '';
                 } else {
+                    localStorage.removeItem('admin_token');
                     deleteCookie('admin_token');
                     loginScreen.style.display = 'flex';
                     appDiv.style.display = 'none';
                 }
             }).catch(() => {
-                // 网络错误时也显示登录界面
                 loginScreen.style.display = 'flex';
                 appDiv.style.display = 'none';
             });
