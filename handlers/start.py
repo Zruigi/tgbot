@@ -30,44 +30,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not user:
         return
 
-    keyboard = [
-        [InlineKeyboardButton("📈 查看现货价格", callback_data="spot_price")],
-        [InlineKeyboardButton("📉 查看合约价格", callback_data="futures_price")],
-        [InlineKeyboardButton("👛 监听 USDT 地址", callback_data="wallet_monitor")],
-        [InlineKeyboardButton("📋 我的监听地址", callback_data="wallet_my_list")],
-        [InlineKeyboardButton("📧 邮箱设置", callback_data="email_settings")],
-    ]
-    
     logger.info(f"Checking access for user {user.id} (Config ADMIN_ID: {config.ADMIN_ID})")
-    
+
     if str(user.id) == str(config.ADMIN_ID):
-        keyboard.insert(0, [InlineKeyboardButton("🎧 进入双向客服模式 (测试)", callback_data="cs_mode_test")])
-        keyboard.insert(1, [InlineKeyboardButton("👥 来访用户(Web管理端)", callback_data="admin_dashboard")])
-        keyboard.append([InlineKeyboardButton("🛠 全部监听管理 (测试)", callback_data="wallet_admin_all")])
-        keyboard.append([InlineKeyboardButton("🔄 一键重启 Bot（测试）", callback_data="restart_bot")])
+        # 管理员菜单
+        keyboard = [
+            [InlineKeyboardButton("🌐 Web 管理后台", callback_data="admin_dashboard"),
+             InlineKeyboardButton("⚙️ 系统设置", callback_data="adm:main")],
+            [InlineKeyboardButton("📈 现货行情", callback_data="spot_price"),
+             InlineKeyboardButton("📉 合约行情", callback_data="futures_price")],
+            [InlineKeyboardButton("👛 监听钱包地址", callback_data="wallet_monitor"),
+             InlineKeyboardButton("📋 我的监听列表", callback_data="wallet_my_list")],
+            [InlineKeyboardButton("📧 邮箱设置", callback_data="email_settings")],
+        ]
+        text = (
+            f"👋 欢迎回来，{user.mention_html()}\n\n"
+            "<b>管理员控制台</b> — 请选择功能："
+        )
     else:
-        # 如果不是管理员，增加一个调试按钮显示当前 ID
-        keyboard.insert(0, [InlineKeyboardButton(f"你的 ID: {user.id} (非管理员)", callback_data="debug_id")])
-        keyboard.insert(1, [InlineKeyboardButton("💬 联系人工", callback_data="contact_admin")])
+        # 普通用户菜单
+        keyboard = [
+            [InlineKeyboardButton("💬 联系人工客服", callback_data="contact_admin")],
+            [InlineKeyboardButton("📈 现货行情", callback_data="spot_price"),
+             InlineKeyboardButton("📉 合约行情", callback_data="futures_price")],
+            [InlineKeyboardButton("👛 监听钱包地址", callback_data="wallet_monitor"),
+             InlineKeyboardButton("📋 我的监听列表", callback_data="wallet_my_list")],
+            [InlineKeyboardButton("📧 邮箱设置", callback_data="email_settings")],
+        ]
+        text = (
+            f"👋 你好，{user.mention_html()}！\n\n"
+            "我是智能助手，可以帮你：\n"
+            "• 📊 查看实时币价行情\n"
+            "• 👛 监听 USDT 钱包变动\n"
+            "• 💬 联系人工客服\n\n"
+            "<i>也可以直接发消息给我，我会转达给客服。</i>"
+        )
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    username_text = f"@{user.username}" if user.username else "-"
-    text = (
-        f"你好，{user.mention_html()}\n"
-        f"用户名: <code>{username_text}</code>\n"
-        f"UserID: <code>{user.id}</code>\n\n"
-        "你可以直接发送消息，机器人会转发给管理员。"
-    )
 
     # 智能判断：是新消息还是回调按钮点击
     if update.message:
         await update.message.reply_html(text, reply_markup=reply_markup)
     elif update.callback_query:
-        # 如果是回调，尝试编辑原消息
         try:
             await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
         except Exception as e:
-            # 如果无法编辑（例如消息内容没变），则尝试发送新消息
             if update.callback_query and update.callback_query.message:
                 await update.callback_query.message.reply_html(text, reply_markup=reply_markup)
             else:

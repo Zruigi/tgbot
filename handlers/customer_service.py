@@ -910,6 +910,10 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await database.update_admin_info(user_id, admin_tg_name)
 
     if not target_user_id:
+        # 如果是群聊中引用的消息，静默忽略（不是Bot转发的通知消息）
+        chat = user_message.chat
+        if chat and chat.type in ('group', 'supergroup'):
+            return
         await user_message.reply_text("❌ 无法识别目标用户 ID。请确保你回复的是机器人转发给你的通知或消息。", parse_mode="HTML")
         return
 
