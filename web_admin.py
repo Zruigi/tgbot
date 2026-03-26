@@ -288,10 +288,22 @@ async def index_handler(request):
     """返回管理员前端页面 (支持免登 Token)"""
     token = request.query.get('token')
     if token == config.WEB_ADMIN_TOKEN:
-        # 如果带了正确 Token 访问首页，将其存入 Cookie 以便后续请求
-        response = web.Response(text="", status=302, headers={'Location': '/'})
-        response.set_cookie('admin_token', token, max_age=86400 * 7, httponly=True)
-        return response
+        # 带正确 Token 访问时，注入一段自动登录脚本
+        html_path = os.path.join(os.path.dirname(__file__), 'admin_new.html')
+        try:
+            with open(html_path, 'r', encoding='utf-8') as f:
+                html = f.read()
+            # 在 </head> 前注入自动登录脚本
+            auto_login = f"""
+    <script>
+    localStorage.setItem('admin_token', '{token}');
+    document.cookie = 'admin_token={token};max-age=604800;path=/';
+    </script>"""
+            html = html.replace('</head>', auto_login + '\n</head>')
+            return web.Response(text=html, content_type='text/html')
+        except Exception as e:
+            logger.error(f"加载 admin_new.html 失败: {e}")
+            return web.Response(text=f"Error: {e}", status=500)
         
     html_path = os.path.join(os.path.dirname(__file__), 'admin_new.html')
     try:
@@ -299,7 +311,6 @@ async def index_handler(request):
             return web.Response(text=f.read(), content_type='text/html')
     except Exception as e:
         logger.error(f"加载 admin_new.html 失败: {e}")
-        # 降级方案
         old_path = os.path.join(os.path.dirname(__file__), 'admin.html')
         if os.path.exists(old_path):
             with open(old_path, 'r', encoding='utf-8') as f:

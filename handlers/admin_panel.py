@@ -7,6 +7,7 @@
 """
 import logging
 import asyncio
+import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 import config
@@ -75,7 +76,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📝 翻译提示词", callback_data="adm:prompt")],
         [InlineKeyboardButton("🔄 刷新潜在用户", callback_data="adm:sync_potential")],
         [InlineKeyboardButton(f"{'🛡️' if ocr_enabled else '🔓'} OCR 强核验开关", callback_data="adm:ocr_toggle")],
-        [InlineKeyboardButton("🧹 清理缓存", callback_data="adm:clear_cache"), InlineKeyboardButton("🔙 返回", callback_data="back_to_start")]
+        [InlineKeyboardButton("🧹 清理缓存", callback_data="adm:clear_cache"), InlineKeyboardButton("🔙 返回", callback_data="back_to_start")],
+        [InlineKeyboardButton("🌐 打开 Web 管理端", callback_data="adm:open_web")]
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -186,6 +188,21 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await database.save_admin_setting("ocr_force_enabled", str(not curr).lower())
         return await admin_panel(update, context)
         
+    elif data == "adm:open_web":
+        server_ip = os.getenv("SERVER_IP", "43.135.141.154")
+        token = config.WEB_ADMIN_TOKEN
+        web_url = f"http://{server_ip}/?token={token}"
+        await query.answer()
+        await query.message.reply_text(
+            f"🌐 <b>Web 管理端直链</b>\n\n"
+            f"点击链接直接登录，无需输入 Token：\n"
+            f"<a href=\"{web_url}\">{web_url}</a>\n\n"
+            f"⚠️ 请勿将此链接分享给他人",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return None
+
     elif data == "adm:clear_cache":
         if context.user_data is not None:
             context.user_data.clear()
