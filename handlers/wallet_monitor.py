@@ -52,39 +52,35 @@ async def handle_address_input(update: Update, context: ContextTypes.DEFAULT_TYP
         latest_timestamp = None
         async with httpx.AsyncClient(timeout=20.0) as client:
             if network == 'trc20':
-                url = f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20"
+                url = f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20?limit=20&order_by=block_timestamp,desc"
                 headers = {"TRON-PRO-API-KEY": config.TRONGRID_API_KEY}
                 resp = await client.get(url, headers=headers)
                 data = resp.json()
                 if data.get('success') and 'data' in data:
-                    # 获取该地址的第一笔交易（通常是最新的一笔）作为初始时间戳
-                    if data['data']:
-                        latest_timestamp = data['data'][0]['block_timestamp']
-                        
-                    for tx in data['data'][:5]: # 取最近5笔
-                        if tx.get('token_info', {}).get('address') == 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t':
-                            val = float(tx['value']) / (10**6)
-                            direct = "📥 转入" if tx['to'] == address else "📤 转出"
-                            dt = datetime.fromtimestamp(tx['block_timestamp']/1000).strftime('%m-%d %H:%M')
-                            recent_txs.append(f"{direct} {val:.2f} USDT ({dt})")
+                    usdt_txs = [tx for tx in data['data'] if tx.get('token_info', {}).get('address') == 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t']
+                    if usdt_txs:
+                        latest_timestamp = usdt_txs[0]['block_timestamp']
+                    for tx in usdt_txs[:10]:
+                        val = float(tx['value']) / (10**6)
+                        direct = "📥 转入" if tx['to'] == address else "📤 转出"
+                        dt = datetime.fromtimestamp(tx['block_timestamp']/1000).strftime('%Y-%m-%d %H:%M')
+                        recent_txs.append(f"{direct} {val:.2f} USDT ({dt})")
             
             elif network == 'bsc':
                 url = (
                     f"https://api.bscscan.com/api?module=account&action=tokentx"
                     f"&contractaddress=0x55d398326f99059fF775485246999027B3197955"
-                    f"&address={address}&sort=desc&apikey={config.BSCSCAN_API_KEY}"
+                    f"&address={address}&sort=desc&page=1&offset=20&apikey={config.BSCSCAN_API_KEY}"
                 )
                 resp = await client.get(url)
                 data = resp.json()
                 if data.get('status') == '1' and 'result' in data:
                     if data['result']:
-                        # BSC 返回的是秒级，转换为毫秒
                         latest_timestamp = int(data['result'][0]['timeStamp']) * 1000
-                        
-                    for tx in data['result'][:5]:
+                    for tx in data['result'][:10]:
                         val = float(tx['value']) / (10**18)
                         direct = "📥 转入" if tx['to'].lower() == address.lower() else "📤 转出"
-                        dt = datetime.fromtimestamp(int(tx['timeStamp'])).strftime('%m-%d %H:%M')
+                        dt = datetime.fromtimestamp(int(tx['timeStamp'])).strftime('%Y-%m-%d %H:%M')
                         recent_txs.append(f"{direct} {val:.2f} USDT ({dt})")
 
         # 构建回复内容

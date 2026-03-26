@@ -160,7 +160,7 @@ async def _query_address_snapshot(address: str, network: str) -> dict:
 
             # 2. TRC20 transactions (24h stats + recent)
             try:
-                url = f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20?limit=50"
+                url = f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20?limit=50&order_by=block_timestamp,desc"
                 resp = await client.get(url, headers=headers)
                 rows = resp.json().get('data') or []
                 recent = []
@@ -171,7 +171,7 @@ async def _query_address_snapshot(address: str, network: str) -> dict:
                     val = round(float(tx.get('value') or 0) / 1e6, 2)
                     direction = '转入' if str(tx.get('to') or '') == address else '转出'
                     tx_time = datetime.fromtimestamp(ts/1000).strftime('%Y-%m-%d %H:%M:%S') if ts else ''
-                    if len(recent) < 5:
+                    if len(recent) < 10:
                         recent.append({'time': tx_time, 'direction': direction, 'amount': val})
                     if ts >= since_ms:
                         if direction == '转入':
