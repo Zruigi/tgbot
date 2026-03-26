@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import calendar
 from typing import Optional, List, Dict, Any, Union
 from config import DB_NAME, ADMIN_ID
+from services.field_crypto import encrypt, decrypt, decrypt_list, decrypt_dict
 
 logger = logging.getLogger(__name__)
 
@@ -616,6 +617,11 @@ async def save_message(
     import uuid
     if not trace_id:
         trace_id = str(uuid.uuid4())
+    # 加密敏感字段
+    content = encrypt(content)
+    original_text = encrypt(original_text)
+    translated_text = encrypt(translated_text)
+    quoted_text = encrypt(quoted_text)
     async with aiosqlite.connect(DB_NAME) as db:
         # 1. 存入 messages 主表
         cur = await db.execute(
@@ -826,6 +832,9 @@ async def get_chat_history(user_id: int, limit: int = 50, offset: int = 0):
             rows = await cursor.fetchall()
             messages = [dict(row) for row in rows]
             messages.reverse() # 前端需要按时间顺序列出（旧到新），所以反转返回
+            # 解密敏感字段
+            _enc_fields = ['content', 'original_text', 'translated_text', 'quoted_text']
+            messages = decrypt_list(messages, _enc_fields)
             return messages
 
 async def get_active_alerts():
@@ -848,7 +857,8 @@ async def get_active_monitors():
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM address_monitors WHERE is_active = 1") as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            result = [dict(row) for row in rows]
+            return decrypt_list(result, ['address', 'remark'])
 
 async def update_monitor_timestamp(monitor_id: int, timestamp: int):
     """更新钱包监听的最后交易时间戳"""
@@ -900,7 +910,7 @@ async def save_monitor_transaction(tx_id: str, monitor_id: int, user_id: int, ad
             """INSERT OR IGNORE INTO monitor_transactions
                (tx_id, monitor_id, user_id, address, network, direction, amount, token_symbol, tx_timestamp, counterparty, risk_level, risk_note)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (tx_id, monitor_id, user_id, address, network, direction, amount, token_symbol, tx_timestamp, counterparty, risk_level, risk_note),
+            (tx_id, monitor_id, user_id, encrypt(address), network, direction, amount, token_symbol, tx_timestamp, encrypt(counterparty), risk_level, risk_note),
         )
         await db.commit()
         return cur.rowcount > 0
@@ -1103,7 +1113,7 @@ async def get_monitor_transactions_for_export(start_ms: int, end_ms: int, user_i
         db.row_factory = aiosqlite.Row
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            return decrypt_list([dict(r) for r in rows], ['address', 'counterparty'])
 
 
 async def get_monitor_transactions_list(period: str = 'month', user_id: Optional[int] = None,
@@ -1126,7 +1136,7 @@ async def get_monitor_transactions_list(period: str = 'month', user_id: Optional
         db.row_factory = aiosqlite.Row
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            return decrypt_list([dict(r) for r in rows], ['address', 'counterparty'])
 
 async def get_monitors_by_user(user_id: int, active_only: bool = True):
     """获取某用户绑定的钱包监听记录"""
@@ -1138,7 +1148,7 @@ async def get_monitors_by_user(user_id: int, active_only: bool = True):
         q += " ORDER BY monitor_id DESC"
         async with db.execute(q, (user_id,)) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            return decrypt_list([dict(row) for row in rows], ['address', 'remark'])
 
 
 async def get_all_monitors_for_admin(active_only: bool = True):
@@ -1192,14 +1202,21 @@ async def deactivate_monitor_admin(monitor_id: int) -> bool:
 
 async def save_wallet_monitor(user_id: int, address: str, network: str, initial_timestamp: Optional[int] = None, remark: str = ''):
     """保存钱包监听地址（同一用户+地址+网络只保留一条，并支持初始化时间戳避免历史推送）"""
+    enc_address = encrypt(address)
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
             "SELECT monitor_id FROM address_monitors WHERE user_id = ? AND address = ? AND network = ?",
-            (user_id, address, network),
+            (user_id, enc_address, network),
         ) as cursor:
             row = await cursor.fetchone()
+        if not row:
+            # 兼容旧明文地址
+            async with db.execute(
+                "SELECT monitor_id FROM address_monitors WHERE user_id = ? AND address = ? AND network = ?",
+                (user_id, address, network),
+            ) as cursor:
+                row = await cursor.fetchone()
         if row:
-            # 如果已存在，更新为活跃状态，如果提供了时间戳则更新时间戳
             if initial_timestamp is not None:
                 await db.execute(
                     "UPDATE address_monitors SET is_active = 1, last_tx_timestamp = ?, remark = ? WHERE monitor_id = ?",
@@ -1213,8 +1230,9 @@ async def save_wallet_monitor(user_id: int, address: str, network: str, initial_
         else:
             await db.execute(
                 "INSERT INTO address_monitors (user_id, address, network, remark, is_active, last_tx_timestamp) VALUES (?, ?, ?, ?, 1, ?)",
-                (user_id, address, network, remark or '', initial_timestamp),
+                (user_id, enc_address, network, remark or '', initial_timestamp),
             )
+        await db.commit()
         await db.commit()
 
 async def save_pending_admin_msg(msg_uuid: str, admin_id: int, content: Optional[str], msg_type: str = 'text', file_id: Optional[str] = None):
