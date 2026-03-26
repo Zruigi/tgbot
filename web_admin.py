@@ -850,6 +850,32 @@ async def api_create_monitor(request):
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
+async def api_list_user_query_monitors(request):
+    """列出其他用户的查询地址（非管理员自有）"""
+    try:
+        rows = await database.get_user_query_addresses(active_only=True)
+        for row in rows:
+            txs = await database.get_recent_monitor_transactions(row['monitor_id'], limit=10)
+            row['inflow_20'] = round(sum(t['amount'] for t in txs if t.get('direction') == 'in'), 2)
+            row['outflow_20'] = round(sum(t['amount'] for t in txs if t.get('direction') == 'out'), 2)
+        return web.json_response({"status": "ok", "data": rows})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def api_claim_monitor(request):
+    """将用户查询地址转为管理员自有监听地址"""
+    try:
+        monitor_id = int(request.match_info['monitor_id'])
+        ok = await database.claim_monitor_as_admin(monitor_id)
+        if ok:
+            await notify_web_clients("monitor_update", {"action": "claimed", "monitor_id": monitor_id})
+            return web.json_response({"status": "ok"})
+        return web.json_response({"status": "error", "message": "未找到该地址"}, status=404)
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
 async def api_delete_monitor(request):
     """删除钱包监听（管理端）"""
     try:
@@ -2003,6 +2029,8 @@ async def start_web_server(bot):
     app.router.add_post('/api/monitors/tx_meta', api_update_monitor_tx_meta)
     app.router.add_post('/api/monitors/tx_meta/batch', api_batch_update_monitor_tx_meta)
     app.router.add_get('/api/monitors/export', api_export_monitor_transactions)
+    app.router.add_get('/api/monitors/user_queries', api_list_user_query_monitors)
+    app.router.add_post('/api/monitors/{monitor_id}/claim', api_claim_monitor)
     app.router.add_delete('/api/monitors/{monitor_id}', api_delete_monitor)
     app.router.add_post('/api/monitors/{monitor_id}/remark', api_update_monitor_remark)
     app.router.add_get('/api/potential_users/tags', api_get_potential_tags) # 必须早于 potential_users

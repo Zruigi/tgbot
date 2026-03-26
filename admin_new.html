@@ -1101,36 +1101,86 @@
                         <span class="material-symbols-outlined text-6xl mb-4 opacity-20">wallet_off</span>
                         <p>暂无链上监听任务</p>
                     </div>
-                    <div v-else class="overflow-x-auto">
-                        <table class="w-full text-left border-collapse">
-                            <thead>
-                                <tr class="bg-surface-container-low border-b border-outline-variant/10">
-                                    <th class="px-4 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">选择</th>
-                                    <th class="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">监听ID</th>
-                                    <th class="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">用户ID</th>
-                                    <th class="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">地址</th>
-                                    <th class="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">网络</th>
-                                    <th class="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">备注</th>
-                                    <th class="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">风险</th>
-                                    <th class="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">近20笔盈亏</th>
-                                    <th class="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400">最后交易时间</th>
-                                    <th class="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-slate-400 text-right">操作</th>
-                                </tr>
-                            </thead>
-                            <tbody class="divide-y divide-outline-variant/5">
-                                <tr v-for="m in monitors" :key="m.monitor_id" class="hover:bg-primary/5 transition-colors">
-                                    <td class="px-4 py-4 text-xs">
-                                        <input type="checkbox" :checked="selectedMonitorIds.includes(m.monitor_id)" @change="toggleMonitorSelection(m.monitor_id)" class="rounded border-outline-variant/40 text-primary focus:ring-primary/20" />
-                                    </td>
-                                    <td class="px-6 py-4 text-xs font-bold">#{{ m.monitor_id }}</td>
-                                    <td class="px-6 py-4 text-xs">{{ m.user_id }}</td>
-                                    <td class="px-6 py-4 text-xs font-mono text-slate-700 max-w-[420px] truncate">{{ m.address }}</td>
-                                    <td class="px-6 py-4">
-                                        <span class="px-2 py-1 bg-primary/10 text-primary text-[10px] font-black rounded-lg">{{ String(m.network || '').toUpperCase() }}</span>
-                                    </td>
-                                    <td class="px-6 py-4 text-xs">
-                                        <div class="flex items-center gap-2">
-                                            <input :value="m.remark || ''" @change="updateMonitorRemark(m, $event.target.value)" class="bg-surface-container border-none rounded px-2 py-1 text-xs w-40" placeholder="可备注为客户钱包"/>
+                    <div v-else class="p-5 space-y-4">
+                        <div class="text-xs font-black text-slate-400 uppercase tracking-widest mb-2">我的监听地址（{{ monitors.length }}）</div>
+                        <div v-for="m in monitors" :key="m.monitor_id" class="bg-surface-container rounded-2xl border border-outline-variant/10 overflow-hidden">
+                            <!-- 地址卡片头部 -->
+                            <div class="flex flex-wrap items-center gap-3 px-5 py-4 border-b border-outline-variant/5">
+                                <input type="checkbox" :checked="selectedMonitorIds.includes(m.monitor_id)" @change="toggleMonitorSelection(m.monitor_id)" class="rounded border-outline-variant/40 text-primary focus:ring-primary/20" />
+                                <span class="px-2 py-1 bg-primary/10 text-primary text-[10px] font-black rounded-lg">{{ String(m.network || '').toUpperCase() }}</span>
+                                <span v-if="m.risk_level === 'high'" class="px-2 py-1 rounded bg-red-100 text-red-600 text-[10px] font-black">⚠️ 高风险</span>
+                                <span v-else class="px-2 py-1 rounded bg-green-100 text-green-600 text-[10px] font-black">✓ 正常</span>
+                                <code class="font-mono text-xs text-slate-700 flex-1 truncate">{{ m.address }}</code>
+                                <div class="flex items-center gap-2 ml-auto">
+                                    <input :value="m.remark || ''" @change="updateMonitorRemark(m, $event.target.value)" class="bg-surface-container-low border border-outline-variant/20 rounded-lg px-3 py-1.5 text-xs w-36" placeholder="备注/标签"/>
+                                    <a :href="m.network === 'trc20' ? 'https://tronscan.org/#/address/'+m.address : 'https://bscscan.com/address/'+m.address" target="_blank" class="p-2 bg-surface-container-low rounded-lg hover:bg-surface-container-high transition-all">
+                                        <span class="material-symbols-outlined text-sm text-slate-400">open_in_new</span>
+                                    </a>
+                                    <button @click="deleteMonitor(m.monitor_id)" class="p-2 bg-error/10 text-error rounded-lg hover:bg-error/20 transition-all">
+                                        <span class="material-symbols-outlined text-sm">delete</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <!-- 盈亏概览 -->
+                            <div class="flex items-center gap-6 px-5 py-3 bg-surface-container-lowest/50 border-b border-outline-variant/5 text-xs">
+                                <div><span class="text-slate-400">最后交易</span> <span class="font-bold ml-1">{{ m.last_tx_timestamp ? new Date(Number(m.last_tx_timestamp)).toLocaleString('zh-CN') : '未记录' }}</span></div>
+                                <div><span class="text-emerald-600 font-bold">↑ {{ Number(m.inflow_20 || 0).toFixed(2) }}</span></div>
+                                <div><span class="text-rose-600 font-bold">↓ {{ Number(m.outflow_20 || 0).toFixed(2) }}</span></div>
+                                <div :class="Number(m.profit_20 || 0) >= 0 ? 'text-green-600' : 'text-red-600'" class="font-black">净 {{ Number(m.profit_20 || 0).toFixed(2) }} USDT</div>
+                            </div>
+                            <!-- 近期交易内联记账 -->
+                            <div class="px-5 py-3">
+                                <div v-if="!m._txs" class="text-xs text-slate-400 cursor-pointer hover:text-primary" @click="loadMonitorTxs(m)">▶ 展开近期交易记录</div>
+                                <div v-else>
+                                    <div class="flex items-center justify-between mb-2">
+                                        <span class="text-xs font-black text-slate-500">近期交易记录</span>
+                                        <button @click="m._txs = null" class="text-[10px] text-slate-400 hover:text-slate-600">收起</button>
+                                    </div>
+                                    <div v-if="m._txs.length === 0" class="text-xs text-slate-300 italic py-2">暂无交易记录</div>
+                                    <div v-for="tx in m._txs" :key="tx.tx_id" class="flex flex-wrap items-center gap-2 py-2 border-b border-outline-variant/5 last:border-0">
+                                        <span class="text-[10px] text-slate-400 w-32">{{ new Date(Number(tx.tx_timestamp)).toLocaleString('zh-CN') }}</span>
+                                        <span :class="tx.direction === 'in' ? 'text-emerald-600 bg-emerald-50' : 'text-rose-600 bg-rose-50'" class="px-2 py-0.5 rounded text-[10px] font-black">{{ tx.direction === 'in' ? '收入' : '支出' }} {{ Number(tx.amount || 0).toFixed(2) }}</span>
+                                        <code class="font-mono text-[10px] text-slate-400 max-w-[120px] truncate">{{ tx.counterparty }}</code>
+                                        <input v-model="tx.income_reason" v-if="tx.direction === 'in'" class="flex-1 min-w-[80px] bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="收入原因"/>
+                                        <input v-model="tx.expense_reason" v-if="tx.direction === 'out'" class="flex-1 min-w-[80px] bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="支出原因"/>
+                                        <input v-model="tx.payer" class="w-24 bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="付款方"/>
+                                        <input v-model="tx.payee" class="w-24 bg-surface-container border border-outline-variant/20 rounded-lg px-2 py-1 text-[10px]" placeholder="收款方"/>
+                                        <button @click="updateMonitorTxMeta(tx)" class="px-3 py-1 bg-primary/10 text-primary text-[10px] font-black rounded-lg hover:bg-primary/20 transition-all">保存</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 用户查询地址分区 -->
+                <div class="bg-surface-container-lowest rounded-3xl border border-outline-variant/10 shadow-sm overflow-hidden mt-6">
+                    <div class="px-6 py-4 border-b border-outline-variant/10 flex items-center justify-between">
+                        <div>
+                            <h3 class="text-sm font-black">用户查询地址</h3>
+                            <p class="text-xs text-slate-400 mt-0.5">机器人用户查询过的地址，可一键转为我的监听地址</p>
+                        </div>
+                        <button @click="loadUserQueryMonitors" class="p-2 bg-surface-container hover:bg-surface-container-high rounded-xl transition-all">
+                            <span class="material-symbols-outlined text-sm text-slate-400">refresh</span>
+                        </button>
+                    </div>
+                    <div v-if="!userQueryMonitors.length" class="flex flex-col items-center justify-center py-12 text-slate-300">
+                        <span class="material-symbols-outlined text-4xl mb-2 opacity-20">search</span>
+                        <p class="text-xs italic">暂无用户查询地址</p>
+                    </div>
+                    <div v-else class="divide-y divide-outline-variant/5">
+                        <div v-for="m in userQueryMonitors" :key="m.monitor_id" class="flex flex-wrap items-center gap-3 px-5 py-4 hover:bg-primary/5 transition-colors">
+                            <span class="px-2 py-1 bg-slate-100 text-slate-500 text-[10px] font-black rounded-lg">{{ String(m.network || '').toUpperCase() }}</span>
+                            <code class="font-mono text-xs text-slate-700 flex-1 min-w-0 truncate">{{ m.address }}</code>
+                            <span class="text-[10px] text-slate-400">用户 {{ m.user_id }}</span>
+                            <span class="text-[10px] text-slate-400">{{ m.last_tx_timestamp ? new Date(Number(m.last_tx_timestamp)).toLocaleString('zh-CN') : '未查询' }}</span>
+                            <div class="flex items-center gap-2">
+                                <a :href="m.network === 'trc20' ? 'https://tronscan.org/#/address/'+m.address : 'https://bscscan.com/address/'+m.address" target="_blank" class="px-3 py-1.5 bg-surface-container text-slate-500 text-[10px] font-black rounded-lg hover:bg-surface-container-high transition-all">浏览器查看</a>
+                                <button @click="claimMonitor(m)" class="px-3 py-1.5 bg-primary/10 text-primary text-[10px] font-black rounded-lg hover:bg-primary/20 transition-all">⊕ 转为我的监听</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
                                         </div>
                                     </td>
                                     <td class="px-6 py-4 text-xs">
@@ -2209,6 +2259,7 @@
                     },
                     isMonitorLoading: false,
                     showMonitorAddressesModal: false,
+                    userQueryMonitors: [],
                     monitorPnl: {
                         day: { inflow: 0, outflow: 0, profit: 0 },
                         week: { inflow: 0, outflow: 0, profit: 0 },
@@ -2504,6 +2555,32 @@
                         }
                     } catch (e) { console.error(e) }
                     finally { this.isMonitorLoading = false; }
+                    this.loadUserQueryMonitors();
+                },
+                async loadUserQueryMonitors() {
+                    try {
+                        const res = await fetch('/api/monitors/user_queries');
+                        const json = await res.json();
+                        if (json.status === 'ok') this.userQueryMonitors = json.data;
+                    } catch (e) { console.error(e); }
+                },
+                async claimMonitor(m) {
+                    if (!confirm(`将地址 ${m.address} 转为您的监听地址？`)) return;
+                    try {
+                        const res = await fetch(`/api/monitors/${m.monitor_id}/claim`, { method: 'POST' });
+                        const json = await res.json();
+                        if (json.status === 'ok') {
+                            this.userQueryMonitors = this.userQueryMonitors.filter(x => x.monitor_id !== m.monitor_id);
+                            this.loadMonitors();
+                        } else { alert('操作失败: ' + json.message); }
+                    } catch (e) { console.error(e); }
+                },
+                async loadMonitorTxs(m) {
+                    try {
+                        const res = await fetch(`/api/monitors/pnl_summary?monitor_ids=${m.monitor_id}&addresses=${encodeURIComponent(m.address)}`);
+                        const json = await res.json();
+                        m._txs = (json.data && json.data.transactions) ? json.data.transactions : [];
+                    } catch(e) { m._txs = []; console.error(e); }
                 },
                 async loadMonitorPnlSummary() {
                     try {

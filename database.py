@@ -142,6 +142,13 @@ async def init_db():
             await db.execute("ALTER TABLE address_monitors ADD COLUMN created_at DATETIME DEFAULT NULL")
             await db.execute("UPDATE address_monitors SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
             logger.info("migrated address_monitors.created_at")
+        if 'owner_type' not in monitor_columns:
+            await db.execute("ALTER TABLE address_monitors ADD COLUMN owner_type TEXT DEFAULT 'user'")
+            # 将管理员自己的地址标记为 admin_own
+            from config import ADMIN_ID
+            await db.execute("UPDATE address_monitors SET owner_type = 'admin_own' WHERE user_id = ?", (int(ADMIN_ID),))
+            logger.info("migrated address_monitors.owner_type")
+        await db.commit()
 
         cursor = await db.execute("PRAGMA table_info(monitor_transactions)")
         tx_columns = [row[1] for row in await cursor.fetchall()]
@@ -1152,16 +1159,42 @@ async def get_monitors_by_user(user_id: int, active_only: bool = True):
 
 
 async def get_all_monitors_for_admin(active_only: bool = True):
-    """管理端：列出所有监听记录（含 user_id）"""
+    """管理端：列出管理员自己的监听地址（owner_type=admin_own）"""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        q = "SELECT * FROM address_monitors"
+        q = "SELECT * FROM address_monitors WHERE (owner_type = 'admin_own' OR user_id = ?)"
+        params = [int(ADMIN_ID)]
         if active_only:
-            q += " WHERE is_active = 1"
+            q += " AND is_active = 1"
         q += " ORDER BY monitor_id DESC"
-        async with db.execute(q) as cursor:
+        async with db.execute(q, params) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            return decrypt_list([dict(row) for row in rows], ['address', 'remark'])
+
+
+async def get_user_query_addresses(active_only: bool = True):
+    """管理端：列出其他用户（非管理员）的查询地址"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        q = "SELECT am.*, u.email FROM address_monitors am LEFT JOIN users u ON am.user_id = u.user_id WHERE am.user_id != ? AND (am.owner_type IS NULL OR am.owner_type = 'user')"
+        params = [int(ADMIN_ID)]
+        if active_only:
+            q += " AND am.is_active = 1"
+        q += " ORDER BY am.monitor_id DESC"
+        async with db.execute(q, params) as cursor:
+            rows = await cursor.fetchall()
+            return decrypt_list([dict(row) for row in rows], ['address', 'remark'])
+
+
+async def claim_monitor_as_admin(monitor_id: int) -> bool:
+    """将用户查询地址转为管理员自有监听地址"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE address_monitors SET owner_type = 'admin_own', user_id = ? WHERE monitor_id = ?",
+            (int(ADMIN_ID), monitor_id)
+        )
+        await db.commit()
+        return True
 
 
 async def deactivate_wallet_monitor(monitor_id: int, operator_user_id: int) -> bool:
