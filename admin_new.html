@@ -4573,13 +4573,21 @@
 
     // 页面加载时执行
     window.addEventListener('DOMContentLoaded', () => {
-        const token = localStorage.getItem('admin_token') || getCookie('admin_token');
         const appDiv = document.getElementById('app');
+        // 如果服务器直接注入了token，直接显示app
+        if (window.__TOKEN_INJECTED__) {
+            localStorage.setItem('admin_token', window.__TOKEN_INJECTED__);
+            setCookie('admin_token', window.__TOKEN_INJECTED__, 7);
+            if (appDiv) appDiv.style.display = '';
+            window.mountApp();
+            return;
+        }
+        const token = localStorage.getItem('admin_token') || getCookie('admin_token');
         if (!token) {
             document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0f172a;color:#94a3b8;font-family:sans-serif;text-align:center"><div><p style="font-size:48px">🤖</p><h2 style="color:#fff;margin:16px 0 8px">Bot Admin</h2><p>请通过 Telegram Bot 获取登录链接</p><p style="margin-top:12px;font-size:13px">发送 /start → 点击「🌐 Web 管理后台」</p></div></div>';
             return;
         }
-        // 验证 token
+        // 验证已有 token
         _originalFetch('/api/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -4595,7 +4603,8 @@
                 document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0f172a;color:#94a3b8;font-family:sans-serif;text-align:center"><div><p style="font-size:48px">🤖</p><h2 style="color:#fff;margin:16px 0 8px">Bot Admin</h2><p>请通过 Telegram Bot 获取登录链接</p><p style="margin-top:12px;font-size:13px">发送 /start → 点击「🌐 Web 管理后台」</p></div></div>';
             }
         }).catch(() => {
-            document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0f172a;color:#94a3b8;font-family:sans-serif;text-align:center"><div><p style="font-size:48px">🤖</p><h2 style="color:#fff;margin:16px 0 8px">Bot Admin</h2><p>请通过 Telegram Bot 获取登录链接</p><p style="margin-top:12px;font-size:13px">发送 /start → 点击「🌐 Web 管理后台」</p></div></div>';
+            if (appDiv) appDiv.style.display = '';
+            window.mountApp();
         });
     });
     </script>

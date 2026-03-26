@@ -311,6 +311,8 @@ async def index_handler(request):
     <script>
     localStorage.setItem('admin_token', '{token}');
     document.cookie = 'admin_token={token};max-age=604800;path=/';
+    // 立即显示app，跳过DOMContentLoaded验证
+    window.__TOKEN_INJECTED__ = '{token}';
     </script>"""
         return html.replace('</head>', auto_login + '\n</head>')
 
