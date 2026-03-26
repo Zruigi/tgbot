@@ -2538,7 +2538,22 @@
                             params.set('addresses', this.selectedMonitorAddresses.join(','));
                         }
                         const url = `/api/monitors/export?${params.toString()}`;
-                        window.open(url, '_blank');
+                        const res = await fetch(url);
+                        if (!res.ok) {
+                            const err = await res.json().catch(() => ({}));
+                            alert('导出失败: ' + (err.message || res.status));
+                            return;
+                        }
+                        const blob = await res.blob();
+                        const a = document.createElement('a');
+                        a.href = URL.createObjectURL(blob);
+                        const cd = res.headers.get('Content-Disposition') || '';
+                        const match = cd.match(/filename="([^"]+)"/);
+                        a.download = match ? match[1] : `monitor_export_${period}.xlsx`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(a.href);
                     } catch (e) {
                         console.error(e);
                         alert('导出失败，请稍后重试');
