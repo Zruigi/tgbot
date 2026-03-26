@@ -221,6 +221,31 @@
     </style>
 </head>
 <body class="bg-surface text-on-surface antialiased overflow-hidden">
+
+    <!-- 登录界面 -->
+    <div id="login-screen" style="display:none;" class="fixed inset-0 z-[9999] flex items-center justify-center bg-gradient-to-br from-slate-900 via-blue-950 to-slate-900">
+        <div class="w-full max-w-sm mx-4">
+            <div class="text-center mb-8">
+                <span class="material-symbols-outlined text-primary text-5xl">smart_toy</span>
+                <h1 class="text-2xl font-black text-white mt-3 tracking-tight">Bot Admin</h1>
+                <p class="text-slate-400 text-sm mt-1">来访用户管理系统</p>
+            </div>
+            <div class="bg-white/5 backdrop-blur border border-white/10 rounded-2xl p-6 shadow-2xl">
+                <label class="block text-slate-300 text-sm font-medium mb-2">访问令牌</label>
+                <input id="login-token-input" type="password" placeholder="请输入 Token..."
+                    class="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent text-sm"
+                    onkeydown="if(event.key==='Enter') doLogin()"
+                />
+                <div id="login-error" class="text-red-400 text-xs mt-2 hidden">Token 错误，请重试</div>
+                <button onclick="doLogin()"
+                    class="w-full mt-4 bg-primary hover:bg-primary/80 text-white font-bold py-3 rounded-xl transition-all text-sm tracking-wide">
+                    登 录
+                </button>
+            </div>
+            <p class="text-center text-slate-600 text-xs mt-4">© 2026 Bot Admin Platform</p>
+        </div>
+    </div>
+
     <div id="app" class="flex h-screen w-full relative flex-col md:flex-row">
         <!-- Sidebar Navigation - 桌面端左侧，手机端隐藏 -->
         <aside class="hidden md:flex flex-col h-full bg-surface-container w-20 lg:w-72 z-20 transition-all duration-100 ease-in-out border-r border-outline-variant/20">
@@ -4386,6 +4411,77 @@
                 }
             }
         }).mount('#app')
+    </script>
+
+    <script>
+    // ====== 登录逻辑 ======
+    function getCookie(name) {
+        const v = document.cookie.match('(^|;)\\s*' + name + '\\s*=\\s*([^;]+)');
+        return v ? v.pop() : '';
+    }
+    function setCookie(name, value, days) {
+        const d = new Date();
+        d.setTime(d.getTime() + days * 864e5);
+        document.cookie = name + '=' + value + ';expires=' + d.toUTCString() + ';path=/';
+    }
+    function deleteCookie(name) {
+        document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 UTC;path=/';
+    }
+
+    async function doLogin() {
+        const token = document.getElementById('login-token-input').value.trim();
+        if (!token) return;
+        try {
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token })
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                setCookie('admin_token', token, 7);
+                document.getElementById('login-screen').style.display = 'none';
+                document.getElementById('app').style.display = '';
+            } else {
+                document.getElementById('login-error').classList.remove('hidden');
+            }
+        } catch(e) {
+            document.getElementById('login-error').classList.remove('hidden');
+        }
+    }
+
+    function checkLogin() {
+        const token = getCookie('admin_token');
+        const loginScreen = document.getElementById('login-screen');
+        const appDiv = document.getElementById('app');
+        if (token) {
+            // 验证 token 有效性
+            fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token })
+            }).then(r => r.json()).then(data => {
+                if (data.status === 'ok') {
+                    loginScreen.style.display = 'none';
+                    appDiv.style.display = '';
+                } else {
+                    deleteCookie('admin_token');
+                    loginScreen.style.display = 'flex';
+                    appDiv.style.display = 'none';
+                }
+            }).catch(() => {
+                // 网络错误时也显示登录界面
+                loginScreen.style.display = 'flex';
+                appDiv.style.display = 'none';
+            });
+        } else {
+            loginScreen.style.display = 'flex';
+            appDiv.style.display = 'none';
+        }
+    }
+
+    // 页面加载时执行
+    window.addEventListener('DOMContentLoaded', checkLogin);
     </script>
 </body>
 </html>

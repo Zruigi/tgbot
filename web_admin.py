@@ -244,7 +244,7 @@ async def auth_middleware(request, handler):
     2026 规格：Bearer Token 校验中间件。
     """
     # 1. 静态资源与首页免登 (支持 Token 自动注入)
-    if request.path in ['/', '/ws'] or request.path.startswith('/api/file/'):
+    if request.path in ['/', '/ws', '/api/login'] or request.path.startswith('/api/file/'):
         return await handler(request)
         
     # 2. 检查 Token
@@ -261,13 +261,20 @@ async def auth_middleware(request, handler):
     if token == config.WEB_ADMIN_TOKEN:
         return await handler(request)
         
-    # 4. 2026 增强：本地开发环境免登 (127.0.0.1)
-    if request.remote == '127.0.0.1' or request.host.startswith('localhost:'):
-        # logger.debug("本地回环访问: 自动跳过 Token 校验")
-        return await handler(request)
-        
     logger.warning(f"拒绝未授权访问: {request.path} 来自 {request.remote}")
     return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
+
+
+async def api_login(request):
+    """Token 登录校验接口"""
+    try:
+        data = await request.json()
+        token = (data.get('token') or '').strip()
+        if token == config.WEB_ADMIN_TOKEN:
+            return web.json_response({"status": "ok"})
+        return web.json_response({"status": "error", "message": "Token 错误"}, status=401)
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=400)
 
 
 async def index_handler(request):
@@ -1919,6 +1926,7 @@ async def start_web_server(bot):
     set_bot_instance(bot)
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_get('/', index_handler)
+    app.router.add_post('/api/login', api_login)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/api/users', api_get_users)
     app.router.add_get('/api/messages/{user_id}', api_get_messages)
