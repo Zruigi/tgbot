@@ -246,7 +246,7 @@
         </div>
     </div>
 
-    <div id="app" class="flex h-screen w-full relative flex-col md:flex-row">
+    <div id="app" style="display:none;" class="flex h-screen w-full relative flex-col md:flex-row">
         <!-- Sidebar Navigation - 桌面端左侧，手机端隐藏 -->
         <aside class="hidden md:flex flex-col h-full bg-surface-container w-20 lg:w-72 z-20 transition-all duration-100 ease-in-out border-r border-outline-variant/20">
             <div class="flex items-center px-6 py-6 border-b border-outline-variant/10">
@@ -4539,7 +4539,16 @@
             options.headers = options.headers || {};
             options.headers['Authorization'] = 'Bearer ' + token;
         }
-        return _originalFetch(url, options);
+        return _originalFetch(url, options).then(response => {
+            if (response.status === 401 && typeof url === 'string' && url.startsWith('/api/')) {
+                localStorage.removeItem('admin_token');
+                deleteCookie('admin_token');
+                document.getElementById('login-screen').style.display = 'flex';
+                const appDiv = document.getElementById('app');
+                if (appDiv) appDiv.style.display = 'none';
+            }
+            return response;
+        });
     };
 
     async function doLogin() {
@@ -4596,7 +4605,36 @@
     }
 
     // 页面加载时执行
-    window.addEventListener('DOMContentLoaded', checkLogin);
+    window.addEventListener('DOMContentLoaded', () => {
+        const token = localStorage.getItem('admin_token') || getCookie('admin_token');
+        const loginScreen = document.getElementById('login-screen');
+        const appDiv = document.getElementById('app');
+        if (!token) {
+            loginScreen.style.display = 'flex';
+            if (appDiv) appDiv.style.display = 'none';
+            return;
+        }
+        // 先验证 token 再显示 app
+        _originalFetch('/api/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token })
+        }).then(r => r.json()).then(data => {
+            if (data.status === 'ok') {
+                localStorage.setItem('admin_token', token);
+                loginScreen.style.display = 'none';
+                if (appDiv) appDiv.style.display = '';
+            } else {
+                localStorage.removeItem('admin_token');
+                deleteCookie('admin_token');
+                loginScreen.style.display = 'flex';
+                if (appDiv) appDiv.style.display = 'none';
+            }
+        }).catch(() => {
+            loginScreen.style.display = 'flex';
+            if (appDiv) appDiv.style.display = 'none';
+        });
+    });
     </script>
 </body>
 </html>
