@@ -9,6 +9,7 @@ import config
 import database
 import aiohttp
 import re
+from services.secret_manager import SecretManager
 from deep_translator import GoogleTranslator
 from services.security_shield import shield_text, unshield_text, verify_address_consistency
 
@@ -216,16 +217,32 @@ async def translate_text_advanced(text: str, system_prompt: str, user_prompt: st
     # 2026 修复：此处 text 参数已在外部 user_prompt 中构造，不再二次拼接
     if not user_prompt: return ""
     
-    current_model = await database.get_admin_setting("llm_model", config.LLM_MODEL_NAME)
-    api_url = await database.get_admin_setting("llm_base_url", config.LLM_BASE_URL)
+    api_mode = await database.get_admin_setting("llm_api_mode", "rented")
     
-    api_key = None
-    if 'deepseek' in current_model.lower():
-        api_key = await database.get_admin_setting("llm_api_key_deepseek") or config.DEEPSEEK_API_KEY
-    elif 'gemini' in current_model.lower():
-        api_key = await database.get_admin_setting("llm_api_key_gemini") or config.GEMINI_API_KEY
+    if api_mode == "rented":
+        # 租用模式：强制使用 config 中的预置配置
+        current_model = config.LLM_MODEL_NAME
+        api_url = config.LLM_BASE_URL
+        api_key = config.LLM_API_KEY or config.GEMINI_API_KEY or config.DEEPSEEK_API_KEY
+        logger.info(f"Using Rented API Mode: {current_model}")
     else:
-        api_key = await database.get_admin_setting("llm_api_key_generic") or config.LLM_API_KEY
+        # 自有模式：优先从数据库读取用户配置
+        current_model = await database.get_admin_setting("llm_model", config.LLM_MODEL_NAME)
+        api_url = await database.get_admin_setting("llm_base_url", config.LLM_BASE_URL)
+        
+        api_key = None
+        # 先尝试获取用户自定义的通用 Key
+        custom_key = await SecretManager.get_config("LLM_API_KEY", default=None)
+        if custom_key:
+            api_key = custom_key
+        else:
+            # 回退到具体的 API Key 类型
+            if 'deepseek' in current_model.lower():
+                api_key = await SecretManager.get_config("DEEPSEEK_API_KEY", default=config.DEEPSEEK_API_KEY)
+            elif 'gemini' in current_model.lower():
+                api_key = await SecretManager.get_config("GEMINI_API_KEY", default=config.GEMINI_API_KEY)
+            else:
+                api_key = await SecretManager.get_config("LLM_API_KEY", default=config.LLM_API_KEY)
     
     if not api_key:
         raise ValueError("Missing valid API Key for 2026 models")

@@ -23,6 +23,7 @@ env/
 *.db
 
 # 日志
+logs/
 *.log
 security.log
 
@@ -45,3 +46,7 @@ tg_ver.txt
 
 # tessdata（二进制，不提交）
 tessdata/
+node_modules/
+venv/
+dist/
+*.sqlite3

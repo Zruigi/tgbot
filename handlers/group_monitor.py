@@ -467,6 +467,10 @@ async def track_group_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if _avatar:
                 await database.update_user_avatar(message.from_user.id, _avatar)
 
+        # ===== 频道关注验证拦截 =====
+        if message.from_user and not message.from_user.is_bot:
+            await _check_channel_verify(update, context, chat.id, message)
+
         # P2-1：群内地址自动识别与一次性查询（含同地址冷却去重）
         await _handle_group_address_auto_query(update, context)
             
@@ -642,6 +646,126 @@ async def handle_group_left_member(update: Update, context: ContextTypes.DEFAULT
 
     except Exception as e:
         logger.error("更新成员状态失败: %s", e)
+
+
+# 频道验证冷却缓存：避免对同一用户在短时间内重复调用 get_chat_member
+# 格式：(group_id, user_id) -> timestamp
+_verify_cooldown: dict = {}
+VERIFY_COOLDOWN_SECS = 30  # 30秒内同一用户只检测一次
+
+
+async def _check_channel_verify(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    group_id: int,
+    message,
+) -> None:
+    """
+    频道关注验证拦截器：
+    - 仅当群组开启 verify_type='channel' 且 verify_channel_id 非空时生效
+    - 管理员/群主免检
+    - is_verified=True 的成员直接放行
+    - 未验证成员：实时调用 get_chat_member；通过则更新 DB；未通过则删消息+发提示
+    """
+    import time
+    try:
+        # 频道身份/匿名身份发言（sender_chat 存在）不做“用户关注频道”校验
+        if message.sender_chat:
+            return
+
+        # 非用户消息无需校验（避免对系统消息/匿名主体误判）
+        if not message.from_user:
+            return
+
+        async with database.aiosqlite.connect(database.DB_NAME) as db:
+            db.row_factory = database.aiosqlite.Row
+            async with db.execute(
+                "SELECT verify_enabled, verify_type, verify_channel_id, verify_msg_template FROM tracked_groups WHERE group_id=?",
+                (group_id,)
+            ) as cur:
+                row = await cur.fetchone()
+
+        if not row or not row['verify_enabled'] or row['verify_type'] != 'channel':
+            return
+        channel_id = row['verify_channel_id']
+        if not channel_id:
+            return
+
+        user = message.from_user
+        user_id = user.id
+        user_name = user.first_name or user.username or f'UID{user_id}'
+
+        # Telegram 系统账号/桥接协议账号放行（避免被误判为普通待验证用户）
+        if user_id == 777000:
+            return
+
+        # 管理员/群主免检
+        try:
+            member_status = await context.bot.get_chat_member(chat_id=group_id, user_id=user_id)
+            if member_status.status in ('administrator', 'creator'):
+                return
+        except Exception:
+            pass
+
+        # 冷却期内已知已验证则跳过
+        cache_key = (group_id, user_id)
+        now = time.time()
+        if cache_key in _verify_cooldown and now - _verify_cooldown[cache_key] < VERIFY_COOLDOWN_SECS:
+            return
+        _verify_cooldown[cache_key] = now
+
+        # 检查 DB 中 is_verified
+        is_verified = await database.get_member_verified(group_id, user_id)
+        if is_verified:
+            return
+
+        # 实时调用 Telegram 检测频道成员资格
+        from handlers.join_verify import _check_channel_membership
+        in_channel = await _check_channel_membership(context.bot, user_id, channel_id)
+
+        if in_channel:
+            # 通过：更新 DB，放行
+            await database.set_member_verified(group_id, user_id)
+            logger.info("[频道验证] 用户 %s 已关注频道 %s，放行", user_id, channel_id)
+            return
+
+        # 未通过：删除消息 + 发临时提示
+        try:
+            await context.bot.delete_message(chat_id=group_id, message_id=message.message_id)
+        except Exception as del_err:
+            logger.warning("[频道验证] 删除消息失败: %s", del_err)
+
+        # 构建提示文案
+        template = row['verify_msg_template'] or (
+            f"🚫 {user_name}，请先关注频道 {channel_id} 后再发言！"
+        )
+        tip_text = template.replace('{user}', f'<a href="tg://user?id={user_id}">{user_name}</a>') \
+                            .replace('{channel}', str(channel_id))
+
+        try:
+            tip_msg = await context.bot.send_message(
+                chat_id=group_id,
+                text=tip_text,
+                parse_mode='HTML'
+            )
+            # 5秒后自动删除提示
+            import asyncio
+            asyncio.create_task(_auto_delete_msg(context.bot, group_id, tip_msg.message_id, 5))
+        except Exception as tip_err:
+            logger.warning("[频道验证] 发送提示失败: %s", tip_err)
+
+    except Exception as e:
+        logger.error("[频道验证] 拦截异常: %s", e)
+
+
+async def _auto_delete_msg(bot, chat_id: int, message_id: int, delay: int) -> None:
+    """延迟删除消息"""
+    import asyncio
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
 
 
 # 2026 优化：使用显式媒体过滤器，确保表情包、图片等均能触发活跃状态更新

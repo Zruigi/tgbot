@@ -90,11 +90,29 @@ class MediaProcessor:
         """将媒体文件转码为 MP4 (H.264 + AAC)"""
         output_path = os.path.join(self.temp_dir, f"{uuid.uuid4()}.mp4")
         
-        # 针对 TGS (Lottie) 的特殊处理预留钩子
+        # 针对 TGS (Lottie) 的特殊处理
         if input_path.endswith('.tgs'):
-            # TODO: 实现 TGS 转 MP4 (需要 rlottie 或类似工具)
-            # 目前暂不支持 TGS 直接转码，先返回 None 触发兜底
-            return None
+            try:
+                # 优先尝试 ffmpeg 直接解码 TGS（依赖 ffmpeg 构建包含 rlottie 支持）
+                tgs_cmd = [
+                    'ffmpeg', '-y', '-i', input_path,
+                    '-r', '30',
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                    '-movflags', '+faststart',
+                    '-pix_fmt', 'yuv420p',
+                    '-vf', "scale='min(1280,iw)':-2",
+                    output_path
+                ]
+                process = await asyncio.create_subprocess_exec(
+                    *tgs_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                _, stderr = await process.communicate()
+                if process.returncode == 0:
+                    return output_path
+
+                logger.warning(f"TGS direct transcoding failed, fallback to generic path: {stderr.decode()}")
+            except Exception as e:
+                logger.warning(f"TGS direct transcoding exception, fallback to generic path: {e}")
 
         try:
             # FFmpeg 转码命令

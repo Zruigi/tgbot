@@ -1,0 +1,123 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; }
+
+/* ── 移动端视口策略：使用动态 viewport 变量，避免 Telegram WebView 键盘遮挡 ── */
+:root {
+  --app-vh: 1vh;
+  --kb-offset: 0px;
+}
+
+html, body {
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+  min-height: calc(var(--app-vh, 1vh) * 100);
+  touch-action: pan-x pan-y;
+  -webkit-overflow-scrolling: touch;
+}
+
+#app {
+  width: 100%;
+  height: calc(var(--app-vh, 1vh) * 100);
+  min-height: calc(var(--app-vh, 1vh) * 100);
+  overflow: hidden;
+}
+
+/* ── iOS 输入框防自动放大（<16px 会触发 Safari 缩放）── */
+/* 视觉上保持 14px，实际 font-size=16px 再 scale 回来 */
+input, textarea, select {
+  font-size: 16px !important;
+  transform-origin: left top;
+}
+@media (max-width: 768px) {
+  input, textarea, select {
+    font-size: 16px !important;
+  }
+}
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+.cartesian-grid {
+  background-image: linear-gradient(rgba(148,163,184,.10) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148,163,184,.10) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.animate-in { animation: fadeIn 0.3s ease-out; }
+.fade-in { animation: fadeIn 0.3s ease-out; }
+.zoom-in-95 { animation: zoomIn95 0.2s ease-out; }
+.slide-in-from-right { animation: slideInRight 0.3s ease-out; }
+.slide-in-from-right-4 { animation: slideInRight4 0.3s ease-out; }
+.duration-300 { animation-duration: 0.3s; }
+.duration-500 { animation-duration: 0.5s; }
+
+@keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+@keyframes zoomIn95 { from { opacity:0; transform:scale(0.95); } to { opacity:1; transform:scale(1); } }
+@keyframes slideInRight { from { opacity:0; transform:translateX(16px); } to { opacity:1; transform:translateX(0); } }
+@keyframes slideInRight4 { from { opacity:0; transform:translateX(8px); } to { opacity:1; transform:translateX(0); } }
+
+@keyframes card-select {
+  0% { transform: scale(1); }
+  50% { transform: scale(0.97); }
+  100% { transform: scale(0.99); }
+}
+
+@keyframes highlight-fade {
+  0% { background: rgba(36,161,222,0.25); }
+  100% { background: transparent; }
+}
+
+.highlight-anim { animation: highlight-fade 1.5s ease-out forwards; }
+
+@keyframes message-slide {
+  from { opacity:0; transform:translateY(8px); }
+  to { opacity:1; transform:translateY(0); }
+}
+
+.msg-enter { animation: message-slide 0.2s ease-out forwards; }
+
+.fade-enter-active, .fade-leave-active { transition: opacity 0.2s; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+
+/* ── 图片消息容器：防加载跳动 + 方向对齐 ── */
+.message-media-shell {
+  /* 最小高度占位，防止图片加载前气泡高度突变 */
+  min-height: 48px;
+  /* 宽高比保持，防止布局抖动 */
+  contain: layout;
+}
+
+/* 他人消息：媒体左对齐 */
+.items-start .message-media-shell {
+  display: flex;
+  justify-content: flex-start;
+  align-items: flex-start;
+}
+
+/* 自己消息：媒体右对齐 */
+.items-end .message-media-shell {
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
+}
+
+/* 图片本体：统一最大尺寸，aspect-ratio 占位 */
+.message-media-shell img,
+.message-media-shell video {
+  max-width: min(260px, 72vw);
+  max-height: 320px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 10px;
+  display: block;
+  /* 占位背景，加载中不留白 */
+  background-color: rgba(0, 0, 0, 0.04);
+  /* 防止加载前宽高为0导致跳动 */
+  min-width: 48px;
+  min-height: 48px;
+}

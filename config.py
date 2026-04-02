@@ -33,6 +33,19 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 支持通过环境变量 DB_NAME 覆盖（多租户部署时由主控平台注入）
 DB_NAME = os.getenv("DB_NAME") or os.path.join(BASE_DIR, "crypto_bot.sqlite3")
 
+# --- 日志配置 ---
+LOG_DIR = os.getenv("LOG_DIR", os.path.join(BASE_DIR, "logs"))
+LOG_RETENTION_HOURS = int(os.getenv("LOG_RETENTION_HOURS", "48"))
+
+LOG_APP_DIR = os.path.join(LOG_DIR, "app")
+LOG_TUNNEL_DIR = os.path.join(LOG_DIR, "tunnel")
+LOG_RUNTIME_DIR = os.path.join(LOG_DIR, "runtime")
+
+BOT_LOG_PATH = os.path.join(LOG_APP_DIR, "bot.log")
+BACKEND_LOG_PATH = os.path.join(LOG_APP_DIR, "backend.log")
+CLOUDFLARED_LOG_PATH = os.path.join(LOG_TUNNEL_DIR, "cloudflared.log")
+CLOUDFLARED_STDOUT_PATH = os.path.join(LOG_TUNNEL_DIR, "cloudflared.stdout")
+
 # --- OCR 配置 (用于地址截图验证) ---
 # TESSERACT_CMD: Tesseract 执行文件路径。
 # 如果为 None，系统会尝试自动探测 (Windows 常见路径或 Linux 默认路径)。
@@ -53,8 +66,81 @@ DEFAULT_LLM = os.getenv("DEFAULT_LLM", "gemini")
 
 # --- Web 管理端配置 ---
 WEB_ADMIN_TOKEN = os.getenv("WEB_ADMIN_TOKEN", "bot_admin_secret_2026")
-WEB_BASE_URL = os.getenv("WEB_BASE_URL", "http://127.0.0.1:8080")
+
+# --- 安全加固配置 ---
+import hashlib as _hashlib
+import time as _time
+
+class SecurityConfig:
+    """安全相关配置，集中管理凭证哈希与速率限制参数"""
+    # 存储 WEB_ADMIN_TOKEN 的 SHA256 哈希（避免明文比较泄露原始 Token）
+    # 若环境变量 ADMIN_TOKEN_HASH 存在则使用，否则在运行时动态生成（兼容旧部署）
+    ADMIN_TOKEN_HASH: str = os.getenv(
+        "ADMIN_TOKEN_HASH",
+        _hashlib.sha256(os.getenv("WEB_ADMIN_TOKEN", "bot_admin_secret_2026").encode()).hexdigest()
+    )
+    TOKEN_EXPIRY_DAYS: int = 90
+    OTP_EXPIRY_SECONDS: int = 300       # 5 分钟
+    MAX_LOGIN_ATTEMPTS: int = 5         # 登录速率限制：5次/分钟
+    RATE_LIMIT_WINDOW: int = 60         # 速率限制窗口（秒）
+    RATE_LIMIT_MAX_CALLS: int = 60      # 通用 API 调用上限（次/分钟）
+
+def verify_admin_token(token: str) -> bool:
+    """使用 SHA256 哈希比较校验 Admin Token，防止时序攻击"""
+    import hmac
+    token_hash = _hashlib.sha256(token.encode()).hexdigest()
+    return hmac.compare_digest(token_hash, SecurityConfig.ADMIN_TOKEN_HASH)
+
+def _detect_web_base_url() -> str:
+    """Web 地址解析：环境变量优先，探测次之，最后回退本地地址"""
+    # 1) FRONTEND_URL 显式配置优先（防止隧道环境误探测到 127.0.0.1）
+    frontend_env = os.getenv("FRONTEND_URL", "").strip()
+    if frontend_env:
+        return frontend_env.rstrip("/")
+
+    # 2) WEB_BASE_URL 显式配置优先于自动探测
+    web_base_env = os.getenv("WEB_BASE_URL", "").strip()
+    if web_base_env:
+        return web_base_env.rstrip("/")
+
+    # 3) 再尝试从 cloudflared.log 探测最新 trycloudflare URL
+    try:
+        log_path = CLOUDFLARED_LOG_PATH
+        if os.path.exists(log_path):
+            import re
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            matches = re.findall(r'https://[\w\-]+\.trycloudflare\.com', content)
+            if matches:
+                return matches[-1].rstrip("/")
+    except Exception:
+        pass
+
+    return "http://127.0.0.1:80"
+
+WEB_BASE_URL = _detect_web_base_url()
+
+# 前端 UI 地址（优先使用显式 FRONTEND_URL）
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip().rstrip("/") or WEB_BASE_URL
+
+# --- 管理员 TG ID 列表 (支持多管理员) ---
+# 默认包含 ADMIN_ID，可通过 ADMIN_TG_IDS 环境变量追加（逗号分隔）
+def _parse_admin_ids():
+    ids = set()
+    if ADMIN_ID:
+        ids.add(ADMIN_ID)
+    extra = os.getenv("ADMIN_TG_IDS", "")
+    for s in extra.split(","):
+        s = s.strip()
+        if s.isdigit():
+            ids.add(int(s))
+    return ids
+
+ADMIN_TG_IDS: set = set()  # populated after ADMIN_ID is confirmed valid
 
 # --- 校验配置 ---
 if not BOT_TOKEN or not ADMIN_ID:
     raise ValueError("请在 .env 文件中设置 BOT_TOKEN 和 ADMIN_ID")
+
+# Populate ADMIN_TG_IDS after validation
+ADMIN_TG_IDS = _parse_admin_ids()

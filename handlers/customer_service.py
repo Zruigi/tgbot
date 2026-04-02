@@ -473,7 +473,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             last_msg = chat_history[0]
             msg_content = last_msg.get('content', '')
-            msg_type = last_msg.get('type', 'text')
+            msg_type = last_msg.get('msg_type', 'text')
             file_id = last_msg.get('file_id')
             
             all_users = await database.get_inbox_list()
@@ -540,7 +540,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                         
                         caption_text = admin_tag
                         if content:
-                            caption_text += f"\n{escape(final_send_content)}"
+                            caption_text += f"\n{escape(content)}"
                         
                         if msg_type in ['sticker', 'video_note']:
                             await safe_send_media(

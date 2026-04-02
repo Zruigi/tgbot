@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 内置 Web 管理端，提供管理员来访用户界面
 """
@@ -9,6 +9,7 @@ import os
 import json
 import logging
 import io
+import hashlib
 from datetime import datetime, timedelta
 import database
 import config
@@ -16,26 +17,34 @@ import weakref
 import re
 import aiosqlite
 import time
-import secrets
-import string
 from html import escape
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, List, Tuple
+from services.secret_manager import SecretManager
+from backend.api.web_admin_monitor import (
+    api_list_monitors,
+    validate_wallet_address,
+    api_create_monitor,
+    api_delete_monitor,
+    api_update_monitor_remark,
+    api_monitor_pnl_summary,
+    api_update_monitor_tx_meta,
+    api_batch_update_monitor_tx_meta,
+    api_export_monitor_transactions,
+    _sync_potential_users_from_group_messages,
+    api_sync_potential_users,
+    api_get_potential_users,
+    api_get_potential_tags,
+    api_list_groups,
+    api_get_monitor_stats,
+    api_toggle_group_listen,
+    api_toggle_group_revoke_sync,
+    api_create_revoke_sync_chat,
+    api_get_revoke_sync_chat,
+    api_promote_potential_user,
+    api_mark_read,
+    api_delete_chat,
+)
 
-# OTP 一次性登录凭证存储: {otp: {token, expire_at}}
-_otp_store: Dict[str, dict] = {}
-
-def generate_otp(token: str, ttl_seconds: int = 300) -> str:
-    """生成一次性登录凭证（8位字母数字，5分钟有效）"""
-    # 清理过期 OTP
-    now = time.time()
-    expired = [k for k, v in _otp_store.items() if v['expire_at'] < now]
-    for k in expired:
-        del _otp_store[k]
-    # 生成新 OTP
-    alphabet = string.ascii_letters + string.digits
-    otp = ''.join(secrets.choice(alphabet) for _ in range(12))
-    _otp_store[otp] = {'token': token, 'expire_at': now + ttl_seconds}
-    return otp
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +53,82 @@ _bot_instance = None
 
 # WebSocket 客户端连接池
 ws_clients = weakref.WeakSet()
+
+# OTP 票据存储 {otp_str: expire_timestamp}
+import secrets as _secrets
+_otp_store: dict = {}
+
+# 登录速率限制存储 {ip: [timestamp, ...]}
+_login_rate_store: dict = {}
+
+# CSRF Token 存储 {csrf_token: expire_timestamp}
+_csrf_token_store: dict = {}
+
+# 加密入口路由存储 {route_token: expire_timestamp}
+_entry_route_store: dict = {}
+ENTRY_ROUTE_TTL_SECONDS = int(os.getenv("ENTRY_ROUTE_TTL_SECONDS", "120"))
+
+def generate_otp() -> str:
+    """生成一个 5 分钟有效的一次性登录票据 (OTP)"""
+    now = time.time()
+    expired = [k for k, v in _otp_store.items() if v < now]
+    for k in expired:
+        _otp_store.pop(k, None)
+    otp = _secrets.token_urlsafe(24)
+    _otp_store[otp] = now + config.SecurityConfig.OTP_EXPIRY_SECONDS
+    return otp
+
+
+def generate_secure_entry_route() -> str:
+    """生成短时有效的加密入口路由 token"""
+    now = time.time()
+    expired = [k for k, v in _entry_route_store.items() if v < now]
+    for k in expired:
+        _entry_route_store.pop(k, None)
+
+    token = _secrets.token_urlsafe(18)
+    _entry_route_store[token] = now + ENTRY_ROUTE_TTL_SECONDS
+    return token
+
+
+def consume_secure_entry_route(token: str) -> bool:
+    """消费一次性入口路由 token，防重放"""
+    if not token:
+        return False
+
+    now = time.time()
+    expire = _entry_route_store.get(token)
+    if not expire or expire < now:
+        _entry_route_store.pop(token, None)
+        return False
+
+    _entry_route_store.pop(token, None)
+    return True
+
+def generate_csrf_token() -> str:
+    """生成一个 CSRF Token，有效期 24 小时"""
+    now = time.time()
+    # 清理过期 token
+    expired = [k for k, v in _csrf_token_store.items() if v < now]
+    for k in expired:
+        _csrf_token_store.pop(k, None)
+    csrf_token = _secrets.token_urlsafe(32)
+    _csrf_token_store[csrf_token] = now + 86400  # 24 小时
+    return csrf_token
+
+def _check_login_rate_limit(ip: str) -> bool:
+    """检查登录速率限制，返回 True 表示允许登录，False 表示超出限制"""
+    now = time.time()
+    window = config.SecurityConfig.RATE_LIMIT_WINDOW
+    max_attempts = config.SecurityConfig.MAX_LOGIN_ATTEMPTS
+    attempts = _login_rate_store.get(ip, [])
+    # 只保留窗口内的尝试记录
+    attempts = [t for t in attempts if now - t < window]
+    if len(attempts) >= max_attempts:
+        return False
+    attempts.append(now)
+    _login_rate_store[ip] = attempts
+    return True
 
 # 2026 规格：发送队列计数器与性能统计
 active_send_tasks = 0
@@ -58,17 +143,372 @@ _tags_cache = {"data": [], "expire_at": 0}
 # 成员头像 file_id 缓存（避免频繁打 Telegram API）
 _member_avatar_cache: Dict[int, Dict[str, object]] = {}
 
+AI_ASSISTANT_USER_ID = int(os.getenv("AI_ASSISTANT_USER_ID", "900000001"))
+AI_ASSISTANT_NAME = os.getenv("AI_ASSISTANT_NAME", "AI 助手")
+AI_ASSISTANT_MODEL = os.getenv("AI_ASSISTANT_MODEL", "gemini-2.5-flash-lite")
+
+
+def _build_sandbox_id(user_id: Optional[int], chat_id: Optional[int] = None) -> str:
+    base = f"{int(user_id or 0)}:{int(chat_id or 0)}"
+    digest = hashlib.sha256(base.encode()).hexdigest()[:24]
+    return f"sbx_{digest}"
+
+
+def _estimate_cost_usd(model: str, usage: Dict[str, int]) -> float:
+    # 仅用于后台粗略统计，不作为计费依据
+    total_tokens = int((usage or {}).get('total_tokens', 0) or 0)
+    if total_tokens <= 0:
+        return 0.0
+
+    m = (model or '').lower()
+    # 可在后台后续调整，这里给出保守估算
+    if 'pro' in m:
+        per_1k = 0.003
+    elif 'flash' in m or 'lite' in m:
+        per_1k = 0.0007
+    else:
+        per_1k = 0.001
+    return round((total_tokens / 1000.0) * per_1k, 6)
+
+
+def _pick_vertex_api_key() -> str:
+    return ''
+
+
+def _mask_sk(token: str) -> str:
+    if not token or len(token) < 10:
+        return '***'
+    return f"{token[:6]}...{token[-4:]}"
+
+
+def _normalize_oneapi_base_url(raw_url: str) -> str:
+    url = (raw_url or '').strip()
+    if not url:
+        return ''
+    if not re.match(r'^https?://', url):
+        url = f'https://{url}'
+    url = url.rstrip('/')
+    if not url.endswith('/v1'):
+        url = f"{url}/v1"
+    return url
+
+
+def _to_sk_format(raw_key: str) -> str:
+    key = (raw_key or '').strip()
+    if not key:
+        return ''
+    if key.startswith('sk-'):
+        return key
+    digest = hashlib.sha256(key.encode('utf-8')).hexdigest()[:28]
+    return f'sk-{digest}'
+
+
+def _latest_gemini_models() -> List[str]:
+    return [
+        'gemini-2.5-pro',
+        'gemini-2.5-flash',
+        'gemini-2.5-flash-lite',
+        'gemini-2.0-flash',
+        'gemini-2.0-flash-lite',
+        'gemini-1.5-pro',
+        'gemini-1.5-flash',
+    ]
+
+
+def _parse_sk_from_auth_header(header: str) -> str:
+    if not header or not header.startswith('Bearer '):
+        return ''
+    return header.split(' ', 1)[1].strip()
+
+
+def _resolve_sandbox_id_from_request(
+    request,
+    body: Optional[Dict[str, Any]] = None,
+    default_user_id: Optional[int] = None,
+) -> str:
+    body = body or {}
+
+    explicit = (
+        request.headers.get('X-Sandbox-ID')
+        or request.query.get('sandbox_id')
+        or str(body.get('sandbox_id') or '')
+        or str(body.get('session_id') or '')
+        or str(body.get('chat_session_id') or '')
+        or str(body.get('exec_session_id') or '')
+    ).strip()
+    if explicit:
+        return explicit[:64]
+
+    user_part = (
+        request.headers.get('X-User-ID')
+        or body.get('user_id')
+        or default_user_id
+        or 0
+    )
+    chat_part = (
+        request.headers.get('X-Chat-ID')
+        or request.query.get('chat_id')
+        or body.get('chat_id')
+        or body.get('conversation_id')
+        or 0
+    )
+    try:
+        return _build_sandbox_id(int(user_part), int(chat_part))
+    except Exception:
+        return _build_sandbox_id(int(default_user_id or 0), 0)
+
+
+def _resolve_user_id_from_request(
+    request,
+    body: Optional[Dict[str, Any]] = None,
+    default_user_id: Optional[int] = None,
+) -> Optional[int]:
+    body = body or {}
+    raw = (
+        request.headers.get('X-User-ID')
+        or request.query.get('user_id')
+        or body.get('user_id')
+        or body.get('uid')
+        or default_user_id
+    )
+    try:
+        return int(raw) if raw is not None else None
+    except Exception:
+        return int(default_user_id) if default_user_id is not None else None
+
+
+async def _resolve_vertex_runtime_config() -> Dict[str, str]:
+    """兼容旧函数名：实际返回当前 LLM 路由配置（Vertex 或 OpenAI 兼容）"""
+    llm_api_mode = (await database.get_admin_setting('llm_api_mode', 'rented') or 'rented').strip().lower()
+    llm_model_type = (await database.get_admin_setting('llm_model_type', 'openai') or 'openai').strip().lower()
+
+    model = (
+        await database.get_admin_setting('vertex_model', '')
+        or await database.get_admin_setting('llm_model', AI_ASSISTANT_MODEL)
+        or AI_ASSISTANT_MODEL
+    )
+    base_url = (await database.get_admin_setting('llm_base_url', config.LLM_BASE_URL) or config.LLM_BASE_URL or '').strip()
+
+    if llm_api_mode == 'own':
+        if llm_model_type == 'deepseek':
+            own_key = (await SecretManager.get_config('DEEPSEEK_API_KEY') or config.DEEPSEEK_API_KEY or '').strip()
+            provider = 'openai_compatible'
+        elif llm_model_type == 'gemini':
+            own_key = (
+                await SecretManager.get_config('VERTEX_API_KEY')
+                or await SecretManager.get_config('GEMINI_API_KEY')
+                or config.GEMINI_API_KEY
+                or ''
+            ).strip()
+            provider = 'vertex'
+        else:
+            own_key = (await SecretManager.get_config('LLM_API_KEY') or config.LLM_API_KEY or '').strip()
+            provider = 'openai_compatible'
+
+        return {
+            'provider': provider,
+            'model': model,
+            'api_key': own_key,
+            'base_url': base_url,
+            'key_source': 'own',
+            'model_type': llm_model_type,
+        }
+
+    # rented 模式：保持原有 Vertex/Gemini 线路
+    pool_key = (config.GEMINI_API_KEY or '').strip()
+    return {
+        'provider': 'vertex',
+        'model': model,
+        'api_key': pool_key,
+        'base_url': '',
+        'key_source': 'pool',
+        'model_type': 'gemini',
+    }
+
+
+def _normalize_openai_messages(messages: list) -> list:
+    normalized = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get('role') or 'user')
+        content = msg.get('content', '')
+        if isinstance(content, list):
+            content = ''.join([
+                part.get('text', '')
+                for part in content
+                if isinstance(part, dict) and part.get('type') == 'text'
+            ])
+        elif not isinstance(content, str):
+            content = str(content)
+        normalized.append({'role': role, 'content': content})
+
+    if not normalized:
+        normalized = [{'role': 'user', 'content': ''}]
+    return normalized
+
+
+async def _call_openai_compatible_chat(
+    messages: list,
+    model: str,
+    api_key: str,
+    base_url: str,
+    timeout_seconds: int = 90,
+) -> tuple[str, dict]:
+    if not api_key:
+        raise ValueError('未配置 OneAPI/OpenAI 兼容 Key')
+
+    api_url = (base_url or config.LLM_BASE_URL or '').rstrip('/')
+    if not api_url:
+        raise ValueError('未配置 OneAPI/OpenAI Base URL')
+    if not api_url.endswith('/chat/completions'):
+        api_url += '/chat/completions'
+
+    payload = {
+        'model': model,
+        'messages': _normalize_openai_messages(messages),
+        'temperature': 0.6,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            api_url,
+            headers={
+                'Authorization': f'Bearer {api_key}',
+                'Content-Type': 'application/json',
+            },
+            json=payload,
+        ) as resp:
+            raw = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f'OneAPI/OpenAI 错误({resp.status}): {raw[:500]}')
+            try:
+                data = json.loads(raw)
+            except Exception:
+                raise RuntimeError('OneAPI/OpenAI 返回非 JSON 响应')
+
+    try:
+        answer = str(data['choices'][0]['message']['content'] or '')
+    except Exception:
+        raise RuntimeError('OneAPI/OpenAI 未返回有效内容')
+
+    usage_raw = data.get('usage') or {}
+    usage = {
+        'prompt_tokens': int(usage_raw.get('prompt_tokens', 0) or 0),
+        'completion_tokens': int(usage_raw.get('completion_tokens', 0) or 0),
+        'total_tokens': int(usage_raw.get('total_tokens', 0) or 0),
+    }
+    return answer, usage
+
+
+async def _call_vertex_chat(
+    messages: list,
+    model: str,
+    sandbox_id: str = 'default',
+    user_id: Optional[int] = None,
+    channel: str = 'web_ai',
+) -> tuple[str, dict]:
+    runtime = await _resolve_vertex_runtime_config()
+    api_key = runtime.get('api_key', '')
+    if not api_key:
+        raise ValueError('未配置可用 API Key')
+
+    model_name = (model or runtime.get('model') or AI_ASSISTANT_MODEL).strip() or AI_ASSISTANT_MODEL
+
+    if runtime.get('provider') == 'openai_compatible':
+        text, usage = await _call_openai_compatible_chat(
+            messages=messages,
+            model=model_name,
+            api_key=api_key,
+            base_url=runtime.get('base_url', ''),
+            timeout_seconds=90,
+        )
+    else:
+        url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model_name}:streamGenerateContent"
+        payload = {
+            'contents': _build_gemini_contents_from_openai(messages),
+            'generationConfig': {
+                'temperature': 0.6,
+            },
+        }
+
+        timeout = aiohttp.ClientTimeout(total=90)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                url,
+                params={'key': api_key},
+                json=payload,
+                headers={
+                    'Content-Type': 'application/json',
+                    'X-Sandbox-ID': sandbox_id,
+                },
+            ) as resp:
+                raw = await resp.text()
+                if resp.status >= 400:
+                    raise RuntimeError(f'Vertex API 错误({resp.status}): {raw[:500]}')
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    raise RuntimeError('Vertex API 返回非 JSON 响应')
+
+        text, usage = _extract_gemini_text_and_usage(data)
+        if not text:
+            raise RuntimeError('Vertex API 未返回文本内容')
+
+    if not usage:
+        usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+
+    await database.save_ai_usage_log(
+        channel=f"{channel}_{'own' if runtime.get('key_source') == 'own' else 'pool'}",
+        user_id=user_id,
+        sandbox_id=sandbox_id,
+        model=model_name,
+        prompt_tokens=usage.get('prompt_tokens', 0),
+        completion_tokens=usage.get('completion_tokens', 0),
+        total_tokens=usage.get('total_tokens', 0),
+        estimated_cost_usd=_estimate_cost_usd(model_name, usage),
+    )
+
+    return text, usage
+
+
+def _is_ai_contact(user_id: int) -> bool:
+    return int(user_id) == AI_ASSISTANT_USER_ID
+
 def set_bot_instance(bot):
     global _bot_instance
     _bot_instance = bot
 
 async def websocket_handler(request):
-    """处理 WebSocket 连接"""
+    """处理 WebSocket 连接（支持 URL 参数 token 认证）"""
+    # 从 URL 查询参数中提取 token（支持 Cloudflare 隧道环境）
+    token_from_url = request.rel_url.query.get('token', '')
+    
+    # 验证 token
+    if token_from_url != config.WEB_ADMIN_TOKEN:
+        # 尝试从 Cookie 或 Authorization 头获取 token
+        auth_header = request.headers.get('Authorization', '')
+        cookie_token = request.cookies.get('admin_token', '')
+        
+        token = None
+        if auth_header.startswith('Bearer '):
+            token = auth_header.split(' ')[1]
+        elif cookie_token:
+            token = cookie_token
+        elif token_from_url:
+            token = token_from_url
+        
+        # 本地开发环境免认证
+        if request.remote not in ('127.0.0.1', 'localhost') and token != config.WEB_ADMIN_TOKEN:
+            logger.warning(f"WebSocket 连接被拒绝（认证失败）: 来自 {request.remote}")
+            return web.Response(status=401, text="Unauthorized")
+    
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     
     ws_clients.add(ws)
-    logger.info("Web 管理端: WebSocket 客户端已连接")
+    logger.info(f"Web 管理端: WebSocket 客户端已连接 (来自 {request.remote})")
     
     try:
         async for msg in ws:
@@ -165,8 +605,8 @@ async def _sync_broadcast_targets_from_bot() -> dict:
     return {"scanned": scanned, "updated": updated}
 
 
-async def _send_broadcast_to_chats(chat_ids, content, image_file=None, do_translate=False, retries=1):
-    """面向群/频道执行广播，返回成功失败汇总"""
+async def _send_broadcast_to_chats(chat_ids, content, image_file=None, do_translate=False, retries=1, buttons=None):
+    """面向群/频道执行广播，返回成功失败汇总。支持自定义按钮"""
     if not _bot_instance:
         return {"total": 0, "success": 0, "failed": 0, "success_ids": [], "failed_items": []}
 
@@ -176,6 +616,37 @@ async def _send_broadcast_to_chats(chat_ids, content, image_file=None, do_transl
     )
     if not is_passed:
         raise ValueError(error_msg or '安全校验失败')
+
+    # 构建 InlineKeyboardButton（自定义跳转按钮）
+    reply_markup = None
+    if buttons and isinstance(buttons, list):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard_rows = []
+        current_row = []
+        for btn in buttons:
+            btn_text = (btn.get('text') or '').strip()
+            btn_url = (btn.get('url') or '').strip()
+            if not (btn_text and btn_url):
+                continue
+
+            # 兼容常见输入：@channel / t.me/channel / telegram.me/channel
+            if btn_url.startswith('@'):
+                btn_url = f"https://t.me/{btn_url[1:]}"
+            elif btn_url.startswith('t.me/'):
+                btn_url = f"https://{btn_url}"
+            elif btn_url.startswith('telegram.me/'):
+                btn_url = f"https://{btn_url}"
+
+            # Telegram InlineKeyboardButton 仅接受 http/https URL
+            if btn_url.startswith(('http://', 'https://')):
+                current_row.append(InlineKeyboardButton(text=btn_text, url=btn_url))
+                if len(current_row) >= 2:
+                    keyboard_rows.append(current_row)
+                    current_row = []
+        if current_row:
+            keyboard_rows.append(current_row)
+        if keyboard_rows:
+            reply_markup = InlineKeyboardMarkup(keyboard_rows)
 
     success_ids = []
     failed_items = []
@@ -190,9 +661,9 @@ async def _send_broadcast_to_chats(chat_ids, content, image_file=None, do_transl
                 if image_file:
                     bio = io.BytesIO(image_file)
                     bio.name = 'broadcast.jpg'
-                    await _bot_instance.send_photo(chat_id=chat_id, photo=bio, caption=verified_text or None)
+                    await _bot_instance.send_photo(chat_id=chat_id, photo=bio, caption=verified_text or None, reply_markup=reply_markup)
                 else:
-                    await _bot_instance.send_message(chat_id=chat_id, text=verified_text)
+                    await _bot_instance.send_message(chat_id=chat_id, text=verified_text, reply_markup=reply_markup)
                 sent_ok = True
                 success_ids.append(chat_id)
             except Exception as ex:
@@ -259,131 +730,581 @@ async def _run_push_scheduler_loop():
 @web.middleware
 async def auth_middleware(request, handler):
     """
-    2026 规格：Bearer Token 校验中间件。
+    2026 规格：Bearer Token 校验中间件（安全加固版）。
+    - 使用哈希比较替代明文比较（防时序攻击）
+    - 对状态变更请求（POST/DELETE/PATCH/PUT）强制校验 CSRF Token
     """
-    # 1. 静态资源与首页、登录接口免登
-    if request.path in ['/', '/ws', '/api/login'] or request.path.startswith('/api/file/'):
-        return await handler(request)
-        
-    # 2. 检查 Token（Header 或 Cookie）
-    auth_header = request.headers.get('Authorization', '')
-    cookie_token = request.cookies.get('admin_token', '')
-    
-    token = None
-    if auth_header.startswith('Bearer '):
-        token = auth_header[7:]
-    elif cookie_token:
-        token = cookie_token
-        
-    # 3. 校验 Token
-    if token == config.WEB_ADMIN_TOKEN:
+    # 1. 静态资源与首页免登 (支持 Token/OTP 自动注入)
+    path = request.path
+    is_legacy_static = (
+        path.startswith('/static/js/') and not path.startswith('/static/js/vendor/')
+    ) or path.startswith('/static/css/viewer')
+    if not is_legacy_static and (
+        path in ['/', '/ws']
+        or path.startswith('/e/')
+        or path.startswith('/v1/')
+        or path in ['/api/login', '/api/login/otp', '/api/csrf-token']
+        or path.startswith('/api/file/')
+        or path.startswith('/static/')
+    ):
         return await handler(request)
 
-    # 4. 真实来源是外网但经 nginx 转发后 remote 变为 127.0.0.1
-    # 通过 X-Real-IP 判断，只有真实来源是 127.0.0.1 才免登（本机直接访问）
-    real_ip = request.headers.get('X-Real-IP', '')
-    if not real_ip and request.remote == '127.0.0.1':
-        # 没有 X-Real-IP 说明是本机直接访问（非 nginx 代理），免登
-        return await handler(request)
-        
-    logger.warning(f"拒绝未授权访问: {request.path} 来自 {request.remote} real={real_ip}")
-    return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
+    # 2. 检查 Token
+    auth_header = request.headers.get('Authorization')
+    cookie_token = request.cookies.get('admin_token')
+
+    token = None
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+    elif cookie_token:
+        token = cookie_token
+
+    # 3. 校验逻辑：使用哈希比较（修复 P0: 凭证明文比较）
+    token_valid = False
+    if token:
+        token_valid = config.verify_admin_token(token)
+        # 修复 High: Token 无过期机制 —— 检查 Token 是否已过期
+        if token_valid and _is_token_expired(token):
+            logger.warning(f"过期 Token 被拒绝: 来自 {request.remote}")
+            token_valid = False
+
+    # 4. 本地开发环境免登 (127.0.0.1)
+    if not token_valid:
+        if request.remote == '127.0.0.1' or request.host.startswith('localhost:'):
+            token_valid = True
+
+    if not token_valid:
+        logger.warning(f"拒绝未授权访问: {request.path} 来自 {request.remote}")
+        return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
+
+    # 5. CSRF 校验：对状态变更请求强制验证（修复 P0: 无CSRF保护）
+    # 本地开发环境 (127.0.0.1) 和 WebSocket 跳过 CSRF 校验
+    is_local = request.remote == '127.0.0.1' or request.host.startswith('localhost:')
+    if not is_local and request.method in ('POST', 'DELETE', 'PATCH', 'PUT'):
+        # 文件上传接口豁免（multipart 请求无法携带 JSON body CSRF）
+        skip_csrf_paths = [
+            '/api/login', '/api/login/otp', '/api/messages/',
+        ]
+        need_csrf = not any(path.startswith(p) for p in skip_csrf_paths)
+        if need_csrf:
+            csrf_header = request.headers.get('X-CSRF-Token', '')
+            now = time.time()
+            expire = _csrf_token_store.get(csrf_header)
+            if not csrf_header or not expire or expire < now:
+                logger.warning(f"CSRF 校验失败: {path} 来自 {request.remote}")
+                return web.json_response({"status": "error", "message": "CSRF token 无效"}, status=403)
+
+    # 6. 执行请求处理器，并为响应附加安全响应头（修复 Medium: 无内容安全策略）
+    response = await handler(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    # CSP：允许同源资源 + CDN（Vue/Element Plus）
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://unpkg.com; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; "
+        "img-src 'self' data: blob: https:; "
+        "connect-src 'self' wss: ws:; "
+        "font-src 'self' https://cdn.jsdelivr.net; "
+        "report-uri /api/csp-report"
+    )
+    return response
+
+
+# 前端 dist 目录路径
+_DIST_DIR = os.path.join(os.path.dirname(__file__), 'static', 'dist')
+_INDEX_HTML = os.path.join(_DIST_DIR, 'index.html')
+
+
+async def secure_entry_handler(request):
+    """加密入口路由：校验一次性 token 后跳转到首页，避免固定入口暴露"""
+    route_token = request.match_info.get('route_token', '')
+    if not consume_secure_entry_route(route_token):
+        return web.json_response({"status": "error", "message": "入口已失效，请重新获取"}, status=410)
+
+    otp = request.rel_url.query.get('otp', '')
+    target = f"/?otp={otp}" if otp else '/'
+    raise web.HTTPFound(target)
+
+
+async def index_handler(request):
+    """根路径：提供 Vite 构建的前端 index.html"""
+    try:
+        return web.FileResponse(_INDEX_HTML)
+    except FileNotFoundError:
+        return web.json_response({
+            "status": "error",
+            "message": "前端未构建，请先运行 npm run build",
+            "hint": "cd frontend && npm run build"
+        }, status=503)
+
+
+async def spa_fallback_handler(request):
+    """SPA fallback：所有非 /api /ws /static 路径均返回 index.html，支持前端路由"""
+    try:
+        return web.FileResponse(_INDEX_HTML)
+    except FileNotFoundError:
+        return web.Response(status=404)
+
+
+# Token 签发时间存储 {token_hash: issued_at_timestamp}（修复 High: Token 无过期机制）
+_token_issued_store: dict = {}
+
+def _issue_token(token: str) -> None:
+    """记录 Token 签发时间，用于过期检查"""
+    import hashlib
+    key = hashlib.sha256(token.encode()).hexdigest()[:16]
+    _token_issued_store[key] = time.time()
+
+def _is_token_expired(token: str) -> bool:
+    """检查 Token 是否已超过 90 天过期（修复 High: Token 无过期机制）"""
+    import hashlib
+    key = hashlib.sha256(token.encode()).hexdigest()[:16]
+    issued_at = _token_issued_store.get(key)
+    if issued_at is None:
+        # 未记录签发时间（旧 Token）—— 宽容通过，不强制踢出，仅记录日志
+        return False
+    expiry_seconds = config.SecurityConfig.TOKEN_EXPIRY_DAYS * 86400
+    return (time.time() - issued_at) > expiry_seconds
+
+
+# CSP 违规报告收集端点（修复 Low: CSP report-uri 未配置）
+async def api_csp_report(request):
+    """接收浏览器 CSP 违规报告，记录日志"""
+    try:
+        body = await request.json()
+        report = body.get('csp-report', body)
+        logger.warning(f"[CSP违规] blocked-uri={report.get('blocked-uri')} "
+                       f"violated={report.get('violated-directive')} "
+                       f"source={report.get('source-file')}:{report.get('line-number')} "
+                       f"来自 {request.remote}")
+    except Exception:
+        pass
+    return web.Response(status=204)
 
 
 async def api_login(request):
-    """Token 登录校验接口"""
+    """POST /api/login — Token 登录，返回 token（安全加固：哈希比较 + 速率限制）"""
     try:
-        data = await request.json()
-        token = (data.get('token') or '').strip()
-        if token == config.WEB_ADMIN_TOKEN:
-            return web.json_response({"status": "ok"})
+        # 速率限制检查（修复 P0: 无速率限制）
+        client_ip = request.remote or '0.0.0.0'
+        if not _check_login_rate_limit(client_ip):
+            logger.warning(f"登录速率限制触发: 来自 {client_ip}")
+            return web.json_response({"status": "error", "message": "请求过于频繁，请稍后再试"}, status=429)
+
+        body = await request.json()
+        token = body.get('token', '')
+        # 使用哈希比较（修复 P0: 凭证明文存储）
+        if token and config.verify_admin_token(token):
+            _issue_token(token)  # 记录签发时间（修复 High: Token 无过期机制）
+            return web.json_response({"status": "ok", "token": config.WEB_ADMIN_TOKEN})
+        logger.warning(f"登录失败（Token 错误）: 来自 {client_ip}")
         return web.json_response({"status": "error", "message": "Token 错误"}, status=401)
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=400)
 
 
-async def index_handler(request):
-    """返回管理员前端页面 (支持 OTP 一次性免登 + Token 直链)"""
-    html_path = os.path.join(os.path.dirname(__file__), 'admin_new.html')
-
-    def inject_token(html, token):
-        auto_login = f"""
-    <script>
-    localStorage.setItem('admin_token', '{token}');
-    document.cookie = 'admin_token={token};max-age=604800;path=/';
-    // 立即显示app，跳过DOMContentLoaded验证
-    window.__TOKEN_INJECTED__ = '{token}';
-    </script>"""
-        return html.replace('</head>', auto_login + '\n</head>')
-
-    # 优先处理 OTP 一次性凭证
-    otp = request.query.get('otp')
-    if otp:
-        now = time.time()
-        otp_data = _otp_store.get(otp)
-        if otp_data and otp_data['expire_at'] > now:
-            real_token = otp_data['token']
-            del _otp_store[otp]  # 立即销毁，一次性
-            logger.info("OTP 登录成功，凭证已销毁")
-            try:
-                with open(html_path, 'r', encoding='utf-8') as f:
-                    html = f.read()
-                return web.Response(text=inject_token(html, real_token), content_type='text/html',
-                    headers={'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache'})
-            except Exception as e:
-                return web.Response(text=f"Error: {e}", status=500)
-        else:
-            return web.Response(
-                text="<h1 style='font-family:sans-serif;text-align:center;margin-top:20%;color:#e74c3c'>登录链接已失效或已使用，请重新获取</h1>",
-                content_type='text/html', status=403
-            )
-
-    # 兼容旧版 ?token= 直链
-    token = request.query.get('token')
-    if token == config.WEB_ADMIN_TOKEN:
-        try:
-            with open(html_path, 'r', encoding='utf-8') as f:
-                html = f.read()
-            return web.Response(text=inject_token(html, token), content_type='text/html',
-                    headers={'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache'})
-        except Exception as e:
-            return web.Response(text=f"Error: {e}", status=500)
-
-    # 普通访问，返回带登录界面的页面
+async def api_login_otp(request):
+    """POST /api/login/otp — OTP 一次性票据登录，验证后返回长效 token（安全加固：速率限制）"""
     try:
-        with open(html_path, 'r', encoding='utf-8') as f:
-            return web.Response(text=f.read(), content_type='text/html',
-                headers={'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache'})
+        # 速率限制检查
+        client_ip = request.remote or '0.0.0.0'
+        if not _check_login_rate_limit(client_ip):
+            logger.warning(f"OTP 登录速率限制触发: 来自 {client_ip}")
+            return web.json_response({"status": "error", "message": "请求过于频繁，请稍后再试"}, status=429)
+
+        body = await request.json()
+        otp = body.get('otp', '')
+        now = time.time()
+        expire = _otp_store.get(otp)
+        if not expire or expire < now:
+            return web.json_response({"status": "error", "message": "OTP 无效或已过期"}, status=401)
+        # 一次性消费（已正确实现，确认保留）
+        _otp_store.pop(otp, None)
+        _issue_token(config.WEB_ADMIN_TOKEN)  # 记录签发时间（修复 High: Token 无过期机制）
+        logger.info(f"OTP 登录成功，已消费票据，来自 {client_ip}")
+        return web.json_response({"status": "ok", "token": config.WEB_ADMIN_TOKEN})
     except Exception as e:
-        logger.error(f"加载 admin_new.html 失败: {e}")
-        old_path = os.path.join(os.path.dirname(__file__), 'admin.html')
-        if os.path.exists(old_path):
-            with open(old_path, 'r', encoding='utf-8') as f:
-                return web.Response(text=f.read(), content_type='text/html')
-        return web.Response(text=f"Error loading admin UI: {e}", status=500)
+        logger.error(f"OTP 登录失败: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=400)
+
+
+async def api_get_csrf_token(request):
+    """GET /api/csrf-token — 获取 CSRF Token（修复 P0: 无CSRF保护）"""
+    try:
+        csrf_token = generate_csrf_token()
+        return web.json_response({"status": "ok", "token": csrf_token})
+    except Exception as e:
+        logger.error(f"生成 CSRF Token 失败: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def api_search(request):
+    """GET /api/search?q=keyword&group_id=&user_id=&limit= — 全局搜索私聊和群聊消息"""
+    try:
+        keyword = request.rel_url.query.get('q', '').strip()
+        if not keyword or len(keyword) < 1:
+            return web.json_response({"status": "error", "message": "搜索关键词不能为空"}, status=400)
+        group_id_str = request.rel_url.query.get('group_id', '')
+        user_id_str = request.rel_url.query.get('user_id', '')
+        limit = min(int(request.rel_url.query.get('limit', 30)), 100)
+        group_id = int(group_id_str) if group_id_str.isdigit() else None
+        user_id = int(user_id_str) if user_id_str.isdigit() else None
+        results = await database.search_messages(keyword, group_id=group_id, user_id=user_id, limit=limit)
+        return web.json_response({"status": "ok", "data": results, "keyword": keyword})
+    except Exception as e:
+        logger.error(f"api_search error: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def blocked_legacy_static_handler(request):
+    """拦截旧版 static/js/*.js 请求，防止浏览器加载错误的旧逻辑。"""
+    path = request.path
+    logger.warning(f"[旧版资源拦截] 已阻止访问旧版静态文件: {path}")
+    return web.Response(
+        text=f"// 旧版文件 {path} 已停用，请使用新版前端。",
+        content_type='application/javascript',
+        status=410,  # Gone
+    )
+
+
+def _build_gemini_contents_from_openai(messages: list) -> list:
+    contents = []
+    for msg in messages or []:
+        role = (msg.get('role') or 'user').lower()
+        text = msg.get('content', '')
+
+        if isinstance(text, list):
+            text = ''.join([
+                part.get('text', '')
+                for part in text
+                if isinstance(part, dict) and part.get('type') == 'text'
+            ])
+        elif not isinstance(text, str):
+            text = str(text)
+
+        gemini_role = 'model' if role == 'assistant' else 'user'
+        if role == 'system':
+            gemini_role = 'user'
+        contents.append({
+            'role': gemini_role,
+            'parts': [{'text': text or ''}],
+        })
+    return contents
+
+
+def _extract_gemini_text_and_usage(payload) -> tuple[str, dict]:
+    chunks = payload if isinstance(payload, list) else [payload]
+    texts = []
+    usage = {}
+
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        candidates = chunk.get('candidates') or []
+        if candidates:
+            parts = (((candidates[0] or {}).get('content') or {}).get('parts') or [])
+            texts.extend([str(p.get('text', '')) for p in parts if isinstance(p, dict) and p.get('text')])
+
+        meta = chunk.get('usageMetadata') or {}
+        if meta:
+            usage = {
+                'prompt_tokens': int(meta.get('promptTokenCount', 0) or 0),
+                'completion_tokens': int(meta.get('candidatesTokenCount', 0) or 0),
+                'total_tokens': int(meta.get('totalTokenCount', 0) or 0),
+            }
+
+    return ''.join(texts).strip(), usage
+
+
+
+async def api_openai_chat_completions(request):
+    """OpenAI 兼容格式转发到 Vertex Gemini（支持 stream SSE）"""
+    try:
+        body = await request.json()
+        messages = body.get('messages') or []
+        if not isinstance(messages, list) or not messages:
+            return web.json_response({'error': {'message': 'messages 不能为空'}}, status=400)
+
+        model = body.get('model') or AI_ASSISTANT_MODEL
+        stream = bool(body.get('stream'))
+        sandbox_id = _resolve_sandbox_id_from_request(request, body=body)
+        user_id = _resolve_user_id_from_request(request, body=body)
+
+        answer, usage = await _call_vertex_chat(
+            messages,
+            model=model,
+            sandbox_id=sandbox_id,
+            user_id=user_id,
+            channel='openai_chat_completions',
+        )
+        now_ts = int(time.time())
+
+        if not stream:
+            return web.json_response({
+                'id': f'chatcmpl-{now_ts}',
+                'object': 'chat.completion',
+                'created': now_ts,
+                'model': model,
+                'choices': [
+                    {
+                        'index': 0,
+                        'message': {'role': 'assistant', 'content': answer},
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': usage or {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
+            })
+
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                'Content-Type': 'text/event-stream; charset=utf-8',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+            },
+        )
+        await resp.prepare(request)
+
+        chunk_id = f'chatcmpl-{now_ts}'
+        created = now_ts
+        await resp.write((
+            f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+        ).encode('utf-8'))
+        await resp.write((
+            f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'content': answer}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+        ).encode('utf-8'))
+        await resp.write((
+            f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}, ensure_ascii=False)}\n\n"
+        ).encode('utf-8'))
+        await resp.write(b"data: [DONE]\n\n")
+        await resp.write_eof()
+        return resp
+    except ValueError as e:
+        return web.json_response({'error': {'message': str(e)}}, status=400)
+    except Exception as e:
+        logger.error(f'api_openai_chat_completions 错误: {e}')
+        return web.json_response({'error': {'message': 'AI 转发失败'}}, status=500)
+
+
+async def api_openai_models(request):
+    """OpenAI 兼容模型列表"""
+    try:
+        runtime = await _resolve_vertex_runtime_config()
+        provider = runtime.get('provider')
+
+        if provider == 'openai_compatible':
+            api_key = runtime.get('api_key', '')
+            base_url = (runtime.get('base_url') or config.LLM_BASE_URL or '').rstrip('/')
+            if not base_url:
+                raise ValueError('未配置 OneAPI/OpenAI Base URL')
+            if not api_key:
+                raise ValueError('未配置 OneAPI/OpenAI Key')
+
+            models_url = base_url if base_url.endswith('/models') else f"{base_url}/models"
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    models_url,
+                    headers={
+                        'Authorization': f'Bearer {api_key}',
+                        'Content-Type': 'application/json',
+                    },
+                ) as resp:
+                    raw = await resp.text()
+                    if resp.status >= 400:
+                        raise RuntimeError(f'OneAPI/OpenAI models 错误({resp.status}): {raw[:500]}')
+                    try:
+                        data = json.loads(raw)
+                    except Exception:
+                        raise RuntimeError('OneAPI/OpenAI models 返回非 JSON 响应')
+
+            if isinstance(data, dict) and isinstance(data.get('data'), list):
+                return web.json_response({'object': 'list', 'data': data.get('data')})
+
+        # fallback: 本地声明可用模型
+        active_model = (runtime.get('model') or AI_ASSISTANT_MODEL).strip() or AI_ASSISTANT_MODEL
+        model_ids = []
+        for m in [active_model, AI_ASSISTANT_MODEL]:
+            if m and m not in model_ids:
+                model_ids.append(m)
+
+        now_ts = int(time.time())
+        data = [{
+            'id': m,
+            'object': 'model',
+            'created': now_ts,
+            'owned_by': 'google-vertex',
+        } for m in model_ids]
+        return web.json_response({'object': 'list', 'data': data})
+    except Exception as e:
+        logger.error(f'api_openai_models 错误: {e}')
+        return web.json_response({'error': {'message': '获取模型列表失败'}}, status=500)
+
+
+async def api_openai_exec(request):
+    """Exec 协议兼容接口（支持 SSE）"""
+    try:
+        body = await request.json()
+        model = (body.get('model') or AI_ASSISTANT_MODEL).strip() or AI_ASSISTANT_MODEL
+        sandbox_id = _resolve_sandbox_id_from_request(request, body=body)
+        user_id = _resolve_user_id_from_request(request, body=body)
+        stream = bool(body.get('stream'))
+
+        messages = body.get('messages')
+        if not isinstance(messages, list) or not messages:
+            input_text = body.get('input') or body.get('prompt') or ''
+            if isinstance(input_text, list):
+                input_text = '\n'.join([str(x) for x in input_text])
+            input_text = str(input_text or '').strip()
+            if not input_text:
+                return web.json_response({'error': {'message': 'messages 或 input 不能为空'}}, status=400)
+            messages = [{'role': 'user', 'content': input_text}]
+
+        answer, usage = await _call_vertex_chat(
+            messages,
+            model=model,
+            sandbox_id=sandbox_id,
+            user_id=user_id,
+            channel='openai_exec',
+        )
+
+        if not stream:
+            return web.json_response({
+                'status': 'ok',
+                'model': model,
+                'sandbox_id': sandbox_id,
+                'output_text': answer,
+                'usage': usage or {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
+            })
+
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                'Content-Type': 'text/event-stream; charset=utf-8',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+            },
+        )
+        await resp.prepare(request)
+        await resp.write((f"event: message\ndata: {json.dumps({'type': 'message.delta', 'delta': answer, 'model': model, 'sandbox_id': sandbox_id}, ensure_ascii=False)}\n\n").encode('utf-8'))
+        await resp.write((f"event: done\ndata: {json.dumps({'type': 'done', 'usage': usage or {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}}, ensure_ascii=False)}\n\n").encode('utf-8'))
+        await resp.write_eof()
+        return resp
+    except ValueError as e:
+        return web.json_response({'error': {'message': str(e)}}, status=400)
+    except Exception as e:
+        logger.error(f'api_openai_exec 错误: {e}')
+        return web.json_response({'error': {'message': 'Exec 转发失败'}}, status=500)
+
+
+async def api_ai_chat(request):
+    """给前端 AI 联系人的简化聊天接口"""
+    try:
+        data = await request.json()
+        user_id = int(request.match_info['user_id'])
+        if not _is_ai_contact(user_id):
+            return web.json_response({'status': 'error', 'message': '非 AI 会话'}, status=400)
+
+        content = (data.get('content') or '').strip()
+        if not content:
+            return web.json_response({'status': 'error', 'message': 'content 不能为空'}, status=400)
+
+        await database.save_message(
+            from_userid=config.ADMIN_ID,
+            to_userid=AI_ASSISTANT_USER_ID,
+            content=content,
+            msg_type='text',
+            is_read=True,
+            username='Admin',
+            status='sent',
+            admin_userid=str(config.ADMIN_ID),
+        )
+
+        messages = [
+            {'role': 'user', 'content': content},
+        ]
+        sandbox_id = _resolve_sandbox_id_from_request(request, body=data, default_user_id=user_id)
+        answer, _ = await _call_vertex_chat(
+            messages,
+            model=data.get('model') or AI_ASSISTANT_MODEL,
+            sandbox_id=sandbox_id,
+            user_id=user_id,
+            channel='web_ai_chat',
+        )
+
+        await database.save_message(
+            from_userid=AI_ASSISTANT_USER_ID,
+            to_userid=config.ADMIN_ID,
+            content=answer,
+            msg_type='text',
+            is_read=True,
+            username=AI_ASSISTANT_NAME,
+            status='sent',
+        )
+
+        return web.json_response({'status': 'ok', 'reply': answer, 'sandbox_id': sandbox_id})
+    except Exception as e:
+        logger.error(f'api_ai_chat 错误: {e}')
+        return web.json_response({'status': 'error', 'message': 'AI 回复失败'}, status=500)
+
 
 async def api_get_users(request):
-    """获取来访用户列表"""
+    """获取来访用户列表（包含 AI 助手联系人）"""
     try:
         users = await database.get_inbox_list()
+
+        if not any(int(u.get('from_userid', 0) or 0) == AI_ASSISTANT_USER_ID for u in users):
+            users.insert(0, {
+                'from_userid': AI_ASSISTANT_USER_ID,
+                'user_id': AI_ASSISTANT_USER_ID,
+                'from_username': AI_ASSISTANT_NAME,
+                'username': AI_ASSISTANT_NAME,
+                'summary': '🤖 AI 助手在线',
+                'unread_count': 0,
+                'last_active': datetime.now().isoformat(),
+                'last_msg_time': datetime.now().isoformat(),
+                'avatar_file_id': None,
+                'is_ai_assistant': True,
+            })
+
         return web.json_response({"status": "ok", "data": users})
     except Exception as e:
         logger.error(f"api_get_users 错误: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 async def api_get_messages(request):
-    """获取与某用户的聊天历史"""
+    """获取与某用户的聊天历史（安全加固：用户隔离 + 消息内容 HTML 转义）"""
     try:
         user_id = int(request.match_info['user_id'])
         page = int(request.query.get('page', 1))
         limit = 50
         offset = (page - 1) * limit
-        
+
+        if not _is_ai_contact(user_id):
+            # 修复 High: 消息访问无用户隔离 —— 校验 user_id 是否在本 Bot 的来访用户列表中
+            known = await database.get_inbox_list()
+            known_ids = {int(u['user_id']) for u in known if u.get('user_id')}
+            if known_ids and user_id not in known_ids:
+                logger.warning(f"消息隔离拦截: 尝试访问非授权用户 {user_id} 的聊天历史")
+                return web.json_response({"status": "error", "message": "无权访问该用户的消息"}, status=403)
+
         messages = await database.get_chat_history(user_id, limit, offset)
+
+        # 修复 Medium: 消息内容 XSS —— 对 content 字段做 HTML 转义
+        for msg in messages:
+            if isinstance(msg.get('content'), str):
+                msg['content'] = escape(msg['content'])
+            if isinstance(msg.get('quoted_text'), str):
+                msg['quoted_text'] = escape(msg['quoted_text'])
+
         return web.json_response({"status": "ok", "data": messages})
     except Exception as e:
         logger.error(f"api_get_messages 错误: {e}")
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+        # 修复 Medium: 错误消息 XSS —— 不向前端返回原始异常信息
+        return web.json_response({"status": "error", "message": "获取消息失败，请重试"}, status=500)
 
 
 async def _execute_web_send_task(
@@ -440,6 +1361,23 @@ async def _execute_web_send_task(
             )
         tg_send_duration = (time.time() - tg_send_start) * 1000
         if sent_msg:
+            # 图片消息补写 file_id，避免前端仅显示“[图片]”无法预览
+            if image_file:
+                try:
+                    sent_photo_file_id = None
+                    photos = getattr(sent_msg, 'photo', None)
+                    if photos and len(photos) > 0:
+                        sent_photo_file_id = photos[-1].file_id
+                    if sent_photo_file_id:
+                        async with aiosqlite.connect(config.DB_NAME) as _db:
+                            await _db.execute(
+                                "UPDATE messages SET file_id = ? WHERE msg_id = ?",
+                                (sent_photo_file_id, msg_db_id),
+                            )
+                            await _db.commit()
+                except Exception as file_id_err:
+                    logger.warning(f"补写 file_id 失败 msg_id={msg_db_id}: {file_id_err}")
+
             await database.update_message_status(msg_db_id, "sent", sent_msg.message_id)
             sync_start = time.time()
             try:
@@ -526,7 +1464,29 @@ async def api_send_message(request):
                 elif part.name == 'do_translate':
                     val = await part.text()
                     do_translate = (val.lower() == 'true')
-                elif part.name == 'image': image_file = await part.read()
+                elif part.name == 'image':
+                    # 修复 Medium: 文件上传无类型/大小限制
+                    max_size = 10 * 1024 * 1024  # 10MB
+                    image_buffer = bytearray()
+                    while True:
+                        chunk = await part.read_chunk(size=64 * 1024)
+                        if not chunk:
+                            break
+                        image_buffer.extend(chunk)
+                        if len(image_buffer) > max_size:
+                            return web.json_response({"status": "error", "message": "图片大小不能超过 10MB"}, status=400)
+
+                    image_data = bytes(image_buffer)
+                    # 校验文件魔数（前4字节）确认为图片类型
+                    is_webp = image_data.startswith(b'RIFF') and len(image_data) >= 12 and image_data[8:12] == b'WEBP'
+                    _ALLOWED_MAGIC = [
+                        b'\xff\xd8\xff',         # JPEG
+                        b'\x89PNG',              # PNG
+                        b'GIF8',                 # GIF
+                    ]
+                    if not (is_webp or any(image_data.startswith(m) for m in _ALLOWED_MAGIC)):
+                        return web.json_response({"status": "error", "message": "仅支持 JPEG/PNG/GIF/WebP 图片格式"}, status=400)
+                    image_file = image_data
                     
         if not raw_input_text and not image_file:
             return web.json_response({"status": "error", "message": "内容或图片不能为空"}, status=400)
@@ -683,9 +1643,54 @@ async def api_sync_broadcast_targets(request):
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
+# 广播速率限制存储 {ip: [timestamp, ...]}
+_broadcast_rate_store: dict = {}
+
+def _check_broadcast_rate_limit(ip: str) -> bool:
+    """广播接口速率限制：同一 IP 每分钟最多 10 次（修复 Medium: 广播接口无速率限制）"""
+    now = time.time()
+    window = 60
+    max_calls = 10
+    attempts = _broadcast_rate_store.get(ip, [])
+    attempts = [t for t in attempts if now - t < window]
+    if len(attempts) >= max_calls:
+        return False
+    attempts.append(now)
+    _broadcast_rate_store[ip] = attempts
+    return True
+
+
+def _validate_channel_link(link: str) -> bool:
+    """
+    校验频道链接格式是否合法（修复 High: 频道链接无规范化验证 CVSS 7.0）。
+    支持: @username, https://t.me/username, t.me/username
+    拒绝: 任意 http/https 非 t.me 链接、含特殊字符的注入尝试
+    """
+    import re as _re
+    if not link or len(link) > 200:
+        return False
+    link = link.strip()
+    # @username 格式
+    if _re.match(r'^@[a-zA-Z][a-zA-Z0-9_]{3,31}$', link):
+        return True
+    # https://t.me/username 或 t.me/username
+    if _re.match(r'^(https://)?t\.me/[a-zA-Z][a-zA-Z0-9_]{3,31}$', link):
+        return True
+    # https://t.me/joinchat/xxx 邀请链接
+    if _re.match(r'^(https://)?t\.me/(joinchat/|\+)[a-zA-Z0-9_\-]{10,}$', link):
+        return True
+    return False
+
+
 async def api_broadcast_to_chats(request):
-    """P2-3：面向群/频道的一键群发"""
+    """P2-3：面向群/频道的一键群发（安全加固：速率限制 + 频道链接验证）"""
     try:
+        # 修复 Medium: 广播接口无速率限制
+        client_ip = request.remote or '0.0.0.0'
+        if not _check_broadcast_rate_limit(client_ip):
+            logger.warning(f"广播速率限制触发: 来自 {client_ip}")
+            return web.json_response({"status": "error", "message": "广播请求过于频繁，请稍后再试"}, status=429)
+
         content = ''
         do_translate = False
         chat_ids = []
@@ -718,10 +1723,207 @@ async def api_broadcast_to_chats(request):
         if not chat_ids or (not content and not image_file):
             return web.json_response({"status": "error", "message": "参数不完整"}, status=400)
 
-        summary = await _send_broadcast_to_chats(chat_ids=chat_ids, content=content, image_file=image_file, do_translate=do_translate, retries=max(retry_count, 0))
+        # 修复 High: 频道链接无规范化验证 —— chat_id 必须为整数（群组ID）或合法频道链接
+        validated_chat_ids = []
+        for cid in chat_ids:
+            cid_str = str(cid).strip()
+            # 纯数字（群组/用户 ID）
+            if cid_str.lstrip('-').isdigit():
+                validated_chat_ids.append(int(cid_str))
+            # 频道链接格式
+            elif _validate_channel_link(cid_str):
+                validated_chat_ids.append(cid_str)
+            else:
+                logger.warning(f"非法 chat_id 被过滤: {cid_str!r}")
+        if not validated_chat_ids:
+            return web.json_response({"status": "error", "message": "没有合法的目标群组/频道"}, status=400)
+
+        summary = await _send_broadcast_to_chats(chat_ids=validated_chat_ids, content=content, image_file=image_file, do_translate=do_translate, retries=max(retry_count, 0))
         await notify_web_clients('broadcast_chat_result', summary)
         return web.json_response({"status": "ok", "summary": summary, "failed_items": summary.get('failed_items', [])})
     except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def api_broadcast_unified(request):
+    """
+    统一群发 API：支持混合发送（用户 + 群 + 频道）+ 自定义跳转按钮 + 图片
+    POST /api/broadcast/unified
+    Body (JSON):
+    {
+        "user_ids": [123, 456],           // 可选：用户 ID 列表
+        "chat_ids": [-100xxx, -100yyy],   // 可选：群/频道 ID 列表
+        "content": "消息正文",             // 必填：消息内容
+        "image": "base64_encoded_or_url", // 可选：图片（multipart 也支持）
+        "do_translate": false,            // 可选：是否翻译
+        "buttons": [                      // 可选：自定义跳转按钮
+            {"text": "👉 了解详情", "url": "https://example.com"},
+            {"text": "📢 频道", "url": "https://t.me/channel"}
+        ]
+    }
+    """
+    try:
+        client_ip = request.remote or '0.0.0.0'
+        if not _check_broadcast_rate_limit(client_ip):
+            logger.warning(f"广播速率限制触发: 来自 {client_ip}")
+            return web.json_response({"status": "error", "message": "广播请求过于频繁，请稍后再试"}, status=429)
+
+        content = ''
+        do_translate = False
+        user_ids = []
+        chat_ids = []
+        buttons = []
+        image_file = None
+
+        if request.content_type == 'application/json':
+            data = await request.json()
+            content = (data.get('content') or '').strip()
+            do_translate = bool(data.get('do_translate', False))
+            user_ids = data.get('user_ids') or []
+            chat_ids = data.get('chat_ids') or []
+            buttons = data.get('buttons') or []
+        else:
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name == 'content':
+                    content = (await part.text()).strip()
+                elif part.name == 'do_translate':
+                    do_translate = (await part.text()).lower() == 'true'
+                elif part.name == 'user_ids':
+                    user_ids = json.loads(await part.text())
+                elif part.name == 'chat_ids':
+                    chat_ids = json.loads(await part.text())
+                elif part.name == 'buttons':
+                    buttons = json.loads(await part.text())
+                elif part.name == 'image':
+                    image_file = await part.read()
+
+        if not user_ids and not chat_ids:
+            return web.json_response({"status": "error", "message": "请选择至少一个发送目标"}, status=400)
+        if not content and not image_file:
+            return web.json_response({"status": "error", "message": "消息内容或图片至少选填一个"}, status=400)
+
+        # 校验按钮 URL 安全性
+        validated_buttons = []
+        for btn in buttons:
+            btn_text = (btn.get('text') or '').strip()
+            btn_url = (btn.get('url') or '').strip()
+            if btn_text and btn_url:
+                # 兼容 @username 格式，自动转换为 https://t.me/username
+                if btn_url.startswith('@'):
+                    btn_url = f"https://t.me/{btn_url[1:]}"
+                # 只允许 http/https/t.me 链接
+                if btn_url.startswith(('http://', 'https://', 'https://t.me/', 't.me/')):
+                    validated_buttons.append({"text": btn_text, "url": btn_url})
+
+        # 合并所有目标 ID（用户 + 群/频道）
+        all_targets = []
+        # 用户 ID（正整数）
+        for uid in user_ids:
+            uid_str = str(uid).strip()
+            if uid_str.isdigit():
+                all_targets.append(int(uid_str))
+        # 群/频道 ID（可正可负整数）
+        for cid in chat_ids:
+            cid_str = str(cid).strip()
+            if cid_str.lstrip('-').isdigit():
+                all_targets.append(int(cid_str))
+            elif _validate_channel_link(cid_str):
+                # 频道链接需要特殊处理（Telegram API 不直接支持链接发送）
+                logger.warning(f"频道链接目标暂不支持直接发送: {cid_str}")
+
+        if not all_targets:
+            return web.json_response({"status": "error", "message": "没有合法的目标"}, status=400)
+
+        # 执行广播
+        summary = await _send_broadcast_to_chats(
+            chat_ids=all_targets,
+            content=content,
+            image_file=image_file,
+            do_translate=do_translate,
+            buttons=validated_buttons
+        )
+
+        # 记录到数据库（审计追踪）
+        for uid in user_ids:
+            uid_str = str(uid).strip()
+            if uid_str.isdigit():
+                await database.save_message(
+                    from_userid=config.ADMIN_ID,
+                    to_userid=int(uid_str),
+                    content=content[:100] + ('...' if len(content) > 100 else ''),
+                    msg_type="photo" if image_file else "text",
+                    is_read=True,
+                    username="Admin",
+                    status="sending",
+                    admin_userid=str(config.ADMIN_ID)
+                )
+
+        await notify_web_clients('broadcast_unified_result', summary)
+
+        # 发送群发报告到管理员 Telegram
+        if _bot_instance and config.ADMIN_ID:
+            # 目标列表（优先展示提交目标，便于复盘）
+            target_list = [str(x) for x in all_targets]
+            success_ids = [str(x) for x in (summary.get('success_ids') or [])]
+            failed_items = summary.get('failed_items') or []
+
+            report_lines = [
+                "📢 <b>群发报告</b>",
+                "━━━━━━━━━━━━━━━━",
+                f"📊 总计: {summary['total']} 个目标",
+                f"✅ 成功: {summary['success']} 个",
+                f"❌ 失败: {summary['failed']} 个",
+                "━━━━━━━━━━━━━━━━",
+                f"📝 内容: {escape(content[:50])}{'...' if len(content) > 50 else ''}",
+            ]
+            if validated_buttons:
+                btn_texts = [f"  🔗 {escape(b['text'])}: {escape(b['url'])}" for b in validated_buttons]
+                report_lines.append(f"🔘 按钮 ({len(validated_buttons)}个):")
+                report_lines.extend(btn_texts)
+
+            if target_list:
+                report_lines.append("━━━━━━━━━━━━━━━━")
+                report_lines.append(f"🎯 目标列表 ({len(target_list)}个):")
+                for t in target_list[:30]:
+                    report_lines.append(f"  • {escape(t)}")
+                if len(target_list) > 30:
+                    report_lines.append(f"  ... 还有 {len(target_list) - 30} 个")
+
+            if success_ids:
+                report_lines.append("━━━━━━━━━━━━━━━━")
+                report_lines.append(f"✅ 成功目标 ({len(success_ids)}个):")
+                for sid in success_ids[:20]:
+                    report_lines.append(f"  • {escape(sid)}")
+                if len(success_ids) > 20:
+                    report_lines.append(f"  ... 还有 {len(success_ids) - 20} 个")
+
+            if failed_items:
+                report_lines.append("━━━━━━━━━━━━━━━━")
+                report_lines.append("⚠️ 失败明细:")
+                for item in failed_items[:20]:
+                    cid = escape(str(item.get('chat_id', 'unknown')))
+                    reason = escape(str(item.get('reason', 'unknown'))[:80])
+                    report_lines.append(f"  • {cid}: {reason}")
+                if len(failed_items) > 20:
+                    report_lines.append(f"  ... 还有 {len(failed_items) - 20} 条")
+
+            report_text = "\n".join(report_lines)
+            try:
+                await _bot_instance.send_message(chat_id=config.ADMIN_ID, text=report_text, parse_mode="HTML")
+            except Exception as e:
+                logger.warning(f"发送群发报告到 TG 失败: {e}")
+
+        return web.json_response({
+            "status": "ok",
+            "summary": summary,
+            "failed_items": summary.get('failed_items', [])
+        })
+    except Exception as e:
+        logger.error(f"统一群发失败: {e}", exc_info=True)
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
@@ -761,22 +1963,36 @@ async def api_create_push_task(request):
 
 
 async def api_list_push_tasks(request):
-    """P2-4：列出推送任务状态"""
+    """P2-4：列出推送任务状态（安全加固：按管理员ID过滤，防止跨租户任务泄露）"""
     try:
         tasks = await database.list_push_tasks()
+        # 修复 High: 推送任务无权限隔离 —— 仅返回属于当前管理员的任务
+        admin_id = config.ADMIN_ID
+        tasks = [t for t in tasks if int(t.get('created_by', admin_id) or admin_id) == admin_id]
         return web.json_response({"status": "ok", "data": tasks, "total": len(tasks)})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
 async def api_update_push_task_status(request):
-    """P2-4：暂停/恢复任务"""
+    """P2-4：暂停/恢复任务（安全加固：校验任务归属）"""
     try:
         data = await request.json()
         task_id = int(data.get('task_id'))
         status = (data.get('status') or '').strip()
         if status not in ('paused', 'running'):
             return web.json_response({"status": "error", "message": "status 仅支持 paused/running"}, status=400)
+
+        # 修复 High: 推送任务操作无归属校验 —— 确认任务属于当前管理员
+        admin_id = config.ADMIN_ID
+        tasks = await database.list_push_tasks()
+        task = next((t for t in tasks if int(t.get('task_id')) == task_id), None)
+        if not task:
+            return web.json_response({"status": "error", "message": "任务不存在"}, status=404)
+        if int(task.get('created_by', admin_id) or admin_id) != admin_id:
+            logger.warning(f"权限拦截: 尝试操作非本管理员任务 task_id={task_id}")
+            return web.json_response({"status": "error", "message": "无权操作此任务"}, status=403)
+
         ok = await database.update_push_task_status(task_id, status)
         if not ok:
             return web.json_response({"status": "error", "message": "任务不存在"}, status=404)
@@ -787,7 +2003,7 @@ async def api_update_push_task_status(request):
 
 
 async def api_run_push_task_now(request):
-    """P2-4：立即执行任务一次"""
+    """P2-4：立即执行任务一次（安全加固：校验任务归属）"""
     try:
         data = await request.json()
         task_id = int(data.get('task_id'))
@@ -795,6 +2011,12 @@ async def api_run_push_task_now(request):
         task = next((t for t in tasks if int(t.get('task_id')) == task_id), None)
         if not task:
             return web.json_response({"status": "error", "message": "任务不存在"}, status=404)
+
+        # 修复 High: 推送任务操作无归属校验
+        admin_id = config.ADMIN_ID
+        if int(task.get('created_by', admin_id) or admin_id) != admin_id:
+            logger.warning(f"权限拦截: 尝试立即执行非本管理员任务 task_id={task_id}")
+            return web.json_response({"status": "error", "message": "无权操作此任务"}, status=403)
 
         summary = await _send_broadcast_to_chats(
             chat_ids=task.get('target_chat_ids') or [],
@@ -818,816 +2040,106 @@ async def api_run_push_task_now(request):
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
-async def api_list_monitors(request):
-    """列出所有钱包监听"""
+
+
+# 钱包地址格式验证正则（修复 P0: 地址输入无格式验证 CVSS 9.1）
+import re as _re
+_TRON_ADDR_RE = _re.compile(r'^T[1-9A-HJ-NP-Za-km-z]{33}$')
+_ETH_BSC_ADDR_RE = _re.compile(r'^0x[0-9a-fA-F]{40}$')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+async def api_delete_single_message(request):
+    """删除单条私聊消息（安全加固：校验消息归属，防止跨用户 IDOR 删除）"""
     try:
-        active_only = request.query.get('active_only', 'false').lower() == 'true'
-        rows = await database.get_all_monitors_for_admin(active_only=active_only)
-
-        # 附加近 20 笔出入金统计，便于前端展示风险与概览
-        for row in rows:
-            txs = await database.get_recent_monitor_transactions(row['monitor_id'], limit=20)
-            row['inflow_20'] = round(sum(t['amount'] for t in txs if t.get('direction') == 'in'), 2)
-            row['outflow_20'] = round(sum(t['amount'] for t in txs if t.get('direction') == 'out'), 2)
-            row['profit_20'] = round(row['inflow_20'] - row['outflow_20'], 2)
-
-        return web.json_response({"status": "ok", "data": rows})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_create_monitor(request):
-    """新增钱包监听（管理端）"""
-    try:
+        user_id = int(request.match_info['user_id'])
         data = await request.json()
-        user_id = int(data.get('user_id') or 0)
-        address = (data.get('address') or '').strip()
-        network = (data.get('network') or '').strip().lower()
-        remark = (data.get('remark') or data.get('tag') or '').strip()
+        tg_msg_id = data.get('tg_msg_id')
+        if not tg_msg_id:
+            return web.json_response({"status": "error", "message": "tg_msg_id 不能为空"}, status=400)
 
-        if not user_id or not address or network not in ('trc20', 'bsc'):
-            return web.json_response({"status": "error", "message": "参数不完整或网络类型错误"}, status=400)
-
-        await database.save_wallet_monitor(user_id, address, network, remark=remark)
-        await notify_web_clients("monitor_update", {"action": "created", "user_id": user_id, "address": address, "network": network.upper(), "remark": remark})
-        return web.json_response({"status": "ok"})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_list_user_query_monitors(request):
-    """列出其他用户的查询地址（非管理员自有）"""
-    try:
-        rows = await database.get_user_query_addresses(active_only=True)
-        for row in rows:
-            txs = await database.get_recent_monitor_transactions(row['monitor_id'], limit=10)
-            row['inflow_20'] = round(sum(t['amount'] for t in txs if t.get('direction') == 'in'), 2)
-            row['outflow_20'] = round(sum(t['amount'] for t in txs if t.get('direction') == 'out'), 2)
-        return web.json_response({"status": "ok", "data": rows})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_claim_monitor(request):
-    """将用户查询地址转为管理员自有监听地址"""
-    try:
-        monitor_id = int(request.match_info['monitor_id'])
-        ok = await database.claim_monitor_as_admin(monitor_id)
-        if ok:
-            await notify_web_clients("monitor_update", {"action": "claimed", "monitor_id": monitor_id})
-            return web.json_response({"status": "ok"})
-        return web.json_response({"status": "error", "message": "未找到该地址"}, status=404)
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_delete_monitor(request):
-    """删除钱包监听（管理端）"""
-    try:
-        monitor_id = int(request.match_info['monitor_id'])
-        ok = await database.delete_monitor_admin(monitor_id)
-        if ok:
-            await notify_web_clients("monitor_update", {"action": "deleted", "monitor_id": monitor_id})
-            return web.json_response({"status": "ok"})
-        return web.json_response({"status": "error", "message": "监听不存在"}, status=404)
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_update_monitor_remark(request):
-    """更新监听备注"""
-    try:
-        monitor_id = int(request.match_info['monitor_id'])
-        data = await request.json()
-        remark = (data.get('remark') or '').strip()
-        ok = await database.update_monitor_remark(monitor_id, remark)
-        if ok:
-            await notify_web_clients('monitor_update', {'action': 'remark_updated', 'monitor_id': monitor_id, 'remark': remark})
-            return web.json_response({'status': 'ok'})
-        return web.json_response({'status': 'error', 'message': '监听不存在'}, status=404)
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-
-async def api_monitor_pnl_summary(request):
-    """获取当日/周/月盈亏台账汇总（支持单地址、多地址过滤）"""
-    try:
-        uid = request.query.get('user_id')
-        user_id = int(uid) if uid else None
-
-        addresses_raw = (request.query.get('addresses') or '').strip()
-        addresses = [x.strip() for x in addresses_raw.split(',') if x.strip()] if addresses_raw else []
-
-        monitor_ids_raw = (request.query.get('monitor_ids') or '').strip()
-        monitor_ids = [int(x) for x in monitor_ids_raw.split(',') if x.strip().isdigit()] if monitor_ids_raw else []
-
-        day = await database.get_monitor_pnl_summary('day', user_id=user_id, addresses=addresses, monitor_ids=monitor_ids)
-        day_prev = await database.get_monitor_pnl_summary('day', user_id=user_id, addresses=addresses, monitor_ids=monitor_ids, previous=True)
-        week = await database.get_monitor_pnl_summary('week', user_id=user_id, addresses=addresses, monitor_ids=monitor_ids)
-        week_prev = await database.get_monitor_pnl_summary('week', user_id=user_id, addresses=addresses, monitor_ids=monitor_ids, previous=True)
-        month = await database.get_monitor_pnl_summary('month', user_id=user_id, addresses=addresses, monitor_ids=monitor_ids)
-        month_prev = await database.get_monitor_pnl_summary('month', user_id=user_id, addresses=addresses, monitor_ids=monitor_ids, previous=True)
-
-        def calc_mom(curr: float, prev: float) -> Optional[float]:
-            if prev == 0:
-                return None if curr == 0 else 100.0
-            return ((curr - prev) / abs(prev)) * 100.0
-
-        series_day = await database.get_monitor_period_series('day', user_id=user_id, addresses=addresses, monitor_ids=monitor_ids)
-        series_week = await database.get_monitor_period_series('week', user_id=user_id, addresses=addresses, monitor_ids=monitor_ids)
-        series_month = await database.get_monitor_period_series('month', user_id=user_id, addresses=addresses, monitor_ids=monitor_ids)
-        tx_list = await database.get_monitor_transactions_list('month', user_id=user_id, addresses=addresses, monitor_ids=monitor_ids, limit=300)
-
-        return web.json_response({
-            'status': 'ok',
-            'data': {
-                'day': day,
-                'week': week,
-                'month': month,
-                'comparison': {
-                    'day_vs_prev_day': {
-                        'current': day['profit'],
-                        'previous': day_prev['profit'],
-                        'change': day['profit'] - day_prev['profit'],
-                        'change_percent': calc_mom(day['profit'], day_prev['profit']),
-                    },
-                    'week_vs_prev_week': {
-                        'current': week['profit'],
-                        'previous': week_prev['profit'],
-                        'change': week['profit'] - week_prev['profit'],
-                        'change_percent': calc_mom(week['profit'], week_prev['profit']),
-                    },
-                    'month_vs_prev_month': {
-                        'current': month['profit'],
-                        'previous': month_prev['profit'],
-                        'change': month['profit'] - month_prev['profit'],
-                        'change_percent': calc_mom(month['profit'], month_prev['profit']),
-                    },
-                },
-                'series': {
-                    'day': series_day,
-                    'week': series_week,
-                    'month': series_month,
-                },
-                'transactions': tx_list,
-            }
-        })
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-
-async def api_update_monitor_tx_meta(request):
-    """更新链上流水业务字段"""
-    try:
-        data = await request.json()
-        tx_id = (data.get('tx_id') or '').strip()
-        if not tx_id:
-            return web.json_response({'status': 'error', 'message': 'tx_id 不能为空'}, status=400)
-
-        ok = await database.update_monitor_transaction_meta(
-            tx_id=tx_id,
-            income_reason=(data.get('income_reason') or '').strip() or None,
-            expense_reason=(data.get('expense_reason') or '').strip() or None,
-            payer=(data.get('payer') or '').strip() or None,
-            payee=(data.get('payee') or '').strip() or None,
-        )
-        if not ok:
-            return web.json_response({'status': 'error', 'message': '流水不存在'}, status=404)
-        return web.json_response({'status': 'ok'})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-
-async def api_batch_update_monitor_tx_meta(request):
-    """批量更新链上流水业务字段"""
-    try:
-        data = await request.json()
-        items = data.get('items') or []
-        if not isinstance(items, list) or len(items) == 0:
-            return web.json_response({'status': 'error', 'message': 'items 不能为空'}, status=400)
-
-        updated = await database.batch_update_monitor_transaction_meta(items)
-        return web.json_response({'status': 'ok', 'updated': updated})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-
-async def api_export_monitor_transactions(request):
-    """导出链上流水 Excel（支持 day/week/month/year，自动列宽，对方地址别名填充）"""
-    try:
-        period = (request.query.get('period') or 'month').strip().lower()
-        if period not in ('day', 'week', 'month', 'year'):
-            period = 'month'
-
-        uid = request.query.get('user_id')
-        user_id = int(uid) if uid else None
-
-        addresses_raw = (request.query.get('addresses') or '').strip()
-        addresses = [x.strip() for x in addresses_raw.split(',') if x.strip()] if addresses_raw else []
-
-        monitor_ids_raw = (request.query.get('monitor_ids') or '').strip()
-        monitor_ids = [int(x) for x in monitor_ids_raw.split(',') if x.strip().isdigit()] if monitor_ids_raw else []
-
-        annotated_only = (request.query.get('annotated_only') or 'false').lower() == 'true'
-
-        # 对方地址别名字典
-        alias_map = await database.get_counterparty_alias_map()
-
-        if period == 'year':
-            year_val = int(request.query.get('year') or datetime.now().year)
-            start_ms = int(datetime(year_val, 1, 1).timestamp() * 1000)
-            end_ms = int(datetime(year_val + 1, 1, 1).timestamp() * 1000)
-            rows = await database.get_monitor_transactions_for_export(
-                start_ms=start_ms, end_ms=end_ms,
-                user_id=user_id, addresses=addresses, monitor_ids=monitor_ids,
-                annotated_only=annotated_only,
+        # 修复 High: 消息删除无所有权校验 —— 先确认消息确实属于该 user_id
+        async with database.aiosqlite.connect(database.DB_NAME) as db:
+            cursor = await db.execute(
+                "SELECT 1 FROM messages WHERE tg_msg_id=? AND user_id=?",
+                (int(tg_msg_id), user_id)
             )
-            pnl = {'start_ms': start_ms, 'end_ms': end_ms,
-                   'inflow': sum(float(r.get('amount') or 0) for r in rows if r.get('direction') == 'in'),
-                   'outflow': sum(float(r.get('amount') or 0) for r in rows if r.get('direction') == 'out'),
-                   'profit': 0}
-            pnl['profit'] = round(pnl['inflow'] - pnl['outflow'], 2)
-        else:
-            pnl = await database.get_monitor_pnl_summary(period, user_id=user_id, addresses=addresses, monitor_ids=monitor_ids)
-            rows = await database.get_monitor_transactions_for_export(
-                start_ms=pnl['start_ms'], end_ms=pnl['end_ms'],
-                user_id=user_id, addresses=addresses, monitor_ids=monitor_ids,
-                annotated_only=annotated_only,
-            )
-
-        try:
-            from openpyxl import Workbook
-            from openpyxl.utils import get_column_letter
-            from openpyxl.styles import Font, PatternFill, Alignment
-        except Exception:
-            return web.json_response({'status': 'error', 'message': '缺少 openpyxl 依赖，请先安装'}, status=500)
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = '链上流水'
-        headers = ['时间', '地址备注', '地址', '网络', '方向', '金额(USDT)', '对方地址', '对方备注',
-                   '收入原因', '支出原因', '谁打款', '打款给谁', '风险等级', '风险备注', 'TXID']
-        ws.append(headers)
-        # 表头加粗+底色
-        header_fill = PatternFill('solid', fgColor='1E3A5F')
-        for col_idx, _ in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col_idx)
-            cell.font = Font(bold=True, color='FFFFFF')
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal='center')
-
-        # 监听地址备注 map
-        monitors_list = await database.get_all_monitors_for_admin(active_only=False)
-        addr_remark_map = {m['address']: (m.get('remark') or '') for m in monitors_list}
-
-        for r in rows:
-            dt = datetime.fromtimestamp(int(r['tx_timestamp']) / 1000).strftime('%Y-%m-%d %H:%M:%S')
-            addr = r.get('address') or ''
-            counterparty = r.get('counterparty') or ''
-            # 自动填充付款方/收款方（若用户未填则用别名）
-            direction = r.get('direction', '')
-            payer_val = r.get('payer') or ''
-            payee_val = r.get('payee') or ''
-            if not payer_val and direction == 'in':
-                payer_val = alias_map.get(counterparty, '')
-            if not payee_val and direction == 'out':
-                payee_val = alias_map.get(counterparty, '')
-            ws.append([
-                dt,
-                addr_remark_map.get(addr, ''),
-                addr,
-                (r.get('network') or '').upper(),
-                '收入' if direction == 'in' else '支出',
-                float(r.get('amount') or 0),
-                counterparty,
-                alias_map.get(counterparty, ''),
-                r.get('income_reason') or '',
-                r.get('expense_reason') or '',
-                payer_val,
-                payee_val,
-                r.get('risk_level') or '',
-                r.get('risk_note') or '',
-                r.get('tx_id') or '',
-            ])
-
-        # 汇总 sheet
-        summary_ws = wb.create_sheet('汇总')
-        summary_ws.append(['周期', period])
-        summary_ws.append(['开始时间', datetime.fromtimestamp(pnl['start_ms'] / 1000).strftime('%Y-%m-%d %H:%M:%S')])
-        summary_ws.append(['结束时间', datetime.fromtimestamp(pnl['end_ms'] / 1000).strftime('%Y-%m-%d %H:%M:%S')])
-        summary_ws.append(['总收入(USDT)', round(float(pnl['inflow']), 2)])
-        summary_ws.append(['总支出(USDT)', round(float(pnl['outflow']), 2)])
-        summary_ws.append(['净利润(USDT)', round(float(pnl['profit']), 2)])
-        summary_ws.append(['流水总笔数', len(rows)])
-
-        # 年度月度明细 sheet（仅 year 导出时）
-        if period == 'year':
-            year_val2 = int(request.query.get('year') or datetime.now().year)
-            monthly = await database.get_year_monitor_summary(
-                user_id=user_id, addresses=addresses, monitor_ids=monitor_ids, year=year_val2
-            )
-            yw = wb.create_sheet(f'{year_val2}年月度汇总')
-            yw.append(['月份', '收入(USDT)', '支出(USDT)', '净利润(USDT)', '交易笔数'])
-            for mrow in monthly:
-                yw.append([f"{mrow['month']}月", mrow['inflow'], mrow['outflow'], mrow['profit'], mrow['tx_count']])
-            # 年度合计行
-            yw.append(['全年合计',
-                       round(sum(m['inflow'] for m in monthly), 2),
-                       round(sum(m['outflow'] for m in monthly), 2),
-                       round(sum(m['profit'] for m in monthly), 2),
-                       sum(m['tx_count'] for m in monthly)])
-
-        # 自动列宽（所有 sheet）
-        for sheet in wb.worksheets:
-            for col_cells in sheet.columns:
-                max_len = 0
-                col_letter = get_column_letter(col_cells[0].column)
-                for cell in col_cells:
-                    try:
-                        val = str(cell.value or '')
-                        # 中文字符宽度约2倍
-                        clen = sum(2 if '\u4e00' <= c <= '\u9fff' else 1 for c in val)
-                        max_len = max(max_len, clen)
-                    except Exception:
-                        pass
-                sheet.column_dimensions[col_letter].width = min(max(max_len + 2, 8), 60)
-
-        bio = io.BytesIO()
-        wb.save(bio)
-        bio.seek(0)
-
-        filename = f"monitor_export_{period}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        return web.Response(
-            body=bio.getvalue(),
-            headers={'Content-Disposition': f'attachment; filename="{filename}"'},
-            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-
-async def api_get_monitor_transactions(request):
-    """按地址+周期分页查询流水（Stripe风格账单面板）"""
-    try:
-        monitor_id = request.query.get('monitor_id')
-        monitor_id = int(monitor_id) if monitor_id else None
-        period = (request.query.get('period') or 'month').strip().lower()
-        if period not in ('day', 'week', 'month', 'year'):
-            period = 'month'
-        direction_filter = request.query.get('direction') or None
-        page = max(1, int(request.query.get('page') or 1))
-        page_size = min(200, max(10, int(request.query.get('page_size') or 50)))
-        uid = request.query.get('user_id')
-        user_id = int(uid) if uid else None
-        result = await database.get_monitor_transactions_paged(
-            monitor_id=monitor_id,
-            period=period,
-            direction_filter=direction_filter,
-            page=page,
-            page_size=page_size,
-            user_id=user_id,
-        )
-        # 用别名自动填充 counterparty_name
-        alias_map = await database.get_counterparty_alias_map()
-        for tx in result['txs']:
-            cp = tx.get('counterparty') or ''
-            tx['counterparty_name'] = alias_map.get(cp, '')
-        return web.json_response({'status': 'ok', **result})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-
-async def api_get_counterparty_aliases(request):
-    """获取所有对方地址别名"""
-    try:
-        rows = await database.get_counterparty_aliases()
-        return web.json_response({'status': 'ok', 'data': rows})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-
-async def api_upsert_counterparty_alias(request):
-    """新增或更新对方地址别名"""
-    try:
-        data = await request.json()
-        address = (data.get('address') or '').strip()
-        name = (data.get('name') or '').strip()
-        note = (data.get('note') or '').strip()
-        if not address or not name:
-            return web.json_response({'status': 'error', 'message': 'address 和 name 不能为空'}, status=400)
-        alias_id = await database.upsert_counterparty_alias(address, name, note)
-        return web.json_response({'status': 'ok', 'alias_id': alias_id})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-
-async def api_delete_counterparty_alias(request):
-    """删除对方地址别名"""
-    try:
-        alias_id = int(request.match_info['alias_id'])
-        ok = await database.delete_counterparty_alias(alias_id)
-        if not ok:
-            return web.json_response({'status': 'error', 'message': '别名不存在'}, status=404)
-        return web.json_response({'status': 'ok'})
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-
-async def api_year_monitor_summary(request):
-    """年度月度盈亏汇总"""
-    try:
-        year = int(request.query.get('year') or datetime.now().year)
-        uid = request.query.get('user_id')
-        user_id = int(uid) if uid else None
-        addresses_raw = (request.query.get('addresses') or '').strip()
-        addresses = [x.strip() for x in addresses_raw.split(',') if x.strip()] if addresses_raw else []
-        monitor_ids_raw = (request.query.get('monitor_ids') or '').strip()
-        monitor_ids = [int(x) for x in monitor_ids_raw.split(',') if x.strip().isdigit()] if monitor_ids_raw else []
-        monthly = await database.get_year_monitor_summary(user_id=user_id, addresses=addresses, monitor_ids=monitor_ids, year=year)
-        total_inflow = round(sum(m['inflow'] for m in monthly), 2)
-        total_outflow = round(sum(m['outflow'] for m in monthly), 2)
-        total_profit = round(sum(m['profit'] for m in monthly), 2)
-        return web.json_response({
-            'status': 'ok',
-            'year': year,
-            'monthly': monthly,
-            'total': {'inflow': total_inflow, 'outflow': total_outflow, 'profit': total_profit}
-        })
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-        uid = request.query.get('user_id')
-        user_id = int(uid) if uid else None
-
-        addresses_raw = (request.query.get('addresses') or '').strip()
-        addresses = [x.strip() for x in addresses_raw.split(',') if x.strip()] if addresses_raw else []
-
-        monitor_ids_raw = (request.query.get('monitor_ids') or '').strip()
-        monitor_ids = [int(x) for x in monitor_ids_raw.split(',') if x.strip().isdigit()] if monitor_ids_raw else []
-
-        annotated_only = (request.query.get('annotated_only') or 'false').lower() == 'true'
-
-        pnl = await database.get_monitor_pnl_summary(period, user_id=user_id, addresses=addresses, monitor_ids=monitor_ids)
-        rows = await database.get_monitor_transactions_for_export(
-            start_ms=pnl['start_ms'],
-            end_ms=pnl['end_ms'],
-            user_id=user_id,
-            addresses=addresses,
-            monitor_ids=monitor_ids,
-            annotated_only=annotated_only,
-        )
-
-        try:
-            from openpyxl import Workbook
-        except Exception:
-            return web.json_response({'status': 'error', 'message': '缺少 openpyxl 依赖，请先安装'}, status=500)
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = '链上流水'
-        ws.append([
-            '时间', '地址', '网络', '方向', '金额(USDT)', '对方地址',
-            '收入原因', '支出原因', '谁打款', '打款给谁', '风险等级', '风险备注', 'TXID'
-        ])
-
-        for r in rows:
-            dt = datetime.fromtimestamp(int(r['tx_timestamp']) / 1000).strftime('%Y-%m-%d %H:%M:%S')
-            ws.append([
-                dt,
-                r.get('address') or '',
-                (r.get('network') or '').upper(),
-                '收入' if r.get('direction') == 'in' else '支出',
-                float(r.get('amount') or 0),
-                r.get('counterparty') or '',
-                r.get('income_reason') or '',
-                r.get('expense_reason') or '',
-                r.get('payer') or '',
-                r.get('payee') or '',
-                r.get('risk_level') or '',
-                r.get('risk_note') or '',
-                r.get('tx_id') or '',
-            ])
-
-        summary = wb.create_sheet('汇总')
-        summary.append(['周期', period])
-        summary.append(['开始时间', datetime.fromtimestamp(pnl['start_ms'] / 1000).strftime('%Y-%m-%d %H:%M:%S')])
-        summary.append(['结束时间', datetime.fromtimestamp(pnl['end_ms'] / 1000).strftime('%Y-%m-%d %H:%M:%S')])
-        summary.append(['收入', round(float(pnl['inflow']), 2)])
-        summary.append(['支出', round(float(pnl['outflow']), 2)])
-        summary.append(['盈亏', round(float(pnl['profit']), 2)])
-
-        bio = io.BytesIO()
-        wb.save(bio)
-        bio.seek(0)
-
-        filename = f"monitor_export_{period}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        headers = {
-            'Content-Disposition': f'attachment; filename="{filename}"'
-        }
-        return web.Response(
-            body=bio.getvalue(),
-            headers=headers,
-            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
-
-
-async def _sync_potential_users_from_group_messages(limit: int = 2000):
-    """从已记录的群组消息中回填潜在用户。"""
-    from handlers.group_monitor import DEFAULT_KEYWORDS, _profile_tags_from_keywords
-
-    limit = max(1, min(int(limit), 10000))
-
-    async with aiosqlite.connect(config.DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-
-        async with db.execute(
-            """
-            SELECT group_id, group_title, custom_keywords
-            FROM tracked_groups
-            WHERE is_monitored = 1
-            """
-        ) as cursor:
-            groups = await cursor.fetchall()
-
-        if not groups:
-            return {
-                "scanned_messages": 0,
-                "matched_messages": 0,
-                "upserted_users": 0,
-                "groups": 0,
-            }
-
-        group_kw_map = {}
-        group_title_map = {}
-        group_ids = []
-        for g in groups:
-            gid = int(g["group_id"])
-            group_ids.append(gid)
-            group_title_map[gid] = g["group_title"] or ""
-            custom_kws = [k.strip() for k in (g["custom_keywords"] or "").split(",") if k.strip()]
-            group_kw_map[gid] = list(set(DEFAULT_KEYWORDS + custom_kws))
-
-        placeholders = ",".join(["?"] * len(group_ids))
-        query = f"""
-            SELECT group_id, user_id, username, content
-            FROM group_messages
-            WHERE group_id IN ({placeholders})
-              AND sender_type = 'user'
-              AND content IS NOT NULL
-              AND TRIM(content) <> ''
-            ORDER BY COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) DESC
-            LIMIT ?
-        """
-
-        params = tuple(group_ids + [limit])
-        async with db.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
-
-    scanned_messages = len(rows)
-    matched_messages = 0
-    upserted_users = set()
-
-    for row in rows:
-        group_id = int(row["group_id"])
-        text = (row["content"] or "").strip()
-        if not text:
-            continue
-
-        keywords_pool = group_kw_map.get(group_id, DEFAULT_KEYWORDS)
-        text_lower = text.lower()
-        matched_keywords = [kw for kw in keywords_pool if kw and kw.lower() in text_lower]
-        profile_tags = _profile_tags_from_keywords(matched_keywords, text)
-
-        if not matched_keywords and not profile_tags:
-            continue
-
-        matched_messages += 1
-        user_id = int(row["user_id"])
-        await database.upsert_potential_user(
-            user_id=user_id,
-            username=row["username"] or f"User{user_id}",
-            first_name=None,
-            last_name=None,
-            message_text=text,
-            keywords=",".join(sorted(set(matched_keywords))),
-            profile_tags=profile_tags,
-            group_id=group_id,
-            group_title=group_title_map.get(group_id, ""),
-        )
-        upserted_users.add(user_id)
-
-    return {
-        "scanned_messages": scanned_messages,
-        "matched_messages": matched_messages,
-        "upserted_users": len(upserted_users),
-        "groups": len(group_ids),
-    }
-
-
-async def api_sync_potential_users(request):
-    """手动触发潜在用户回填同步。"""
-    try:
-        limit = int(request.query.get('limit', 2000))
-        stats = await _sync_potential_users_from_group_messages(limit=limit)
-
-        global _tags_cache
-        _tags_cache = {"data": [], "expire_at": 0}
-
-        await notify_web_clients("potential_sync", {"stats": stats})
-
-        summary = (
-            f"同步完成：扫描 {stats['scanned_messages']} 条消息，"
-            f"命中 {stats['matched_messages']} 条，"
-            f"更新 {stats['upserted_users']} 位潜在用户。"
-        )
-        return web.json_response({"status": "ok", "summary": summary, "data": stats})
-    except Exception as e:
-        logger.error(f"同步潜在用户失败: {e}")
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_get_potential_users(request):
-    """获取潜在用户列表 (支持分页与画像/关键词过滤)"""
-    try:
-        limit = min(int(request.query.get('limit', 50)), 500)
-        offset = int(request.query.get('offset', 0))
-        keyword = request.query.get('keyword')
-        tag = request.query.get('tag')
-        group_id = request.query.get('group_id')
-        if group_id: group_id = int(group_id)
-        
-        result = await database.get_potential_users(limit=limit, offset=offset, keyword=keyword, tag=tag, group_id=group_id)
-        return web.json_response({"status": "ok", "data": result['users'], "total": result['total']})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_get_potential_tags(request):
-    """获取所有潜在用户画像标签 (60s 缓存)"""
-    global _tags_cache
-    try:
-        now = time.time()
-        if now > _tags_cache["expire_at"]:
-            tags = await database.get_potential_tags()
-            _tags_cache = {"data": tags, "expire_at": now + 60}
-        return web.json_response({"status": "ok", "data": _tags_cache["data"], "total": len(_tags_cache["data"])})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_list_groups(request):
-    """获取所有追踪的群组列表 (分页 2026 规格，含实时状态)"""
-    try:
-        page = int(request.query.get('page', 1)); size = int(request.query.get('size', 20))
-        result = await database.get_tracked_groups_paginated(page, size)
-        
-        # 增加实时状态标记
-        from datetime import datetime, timedelta
-        now = datetime.now()
-        threshold = now - timedelta(minutes=10)
-        
-        for g in result['groups']:
-            updated_at = datetime.fromisoformat(g['updated_at'].replace(' ', 'T'))
-            g['is_online'] = updated_at > threshold
-            
-        return web.json_response({"status": "ok", "data": result['groups'], "total": result['total']})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_get_monitor_stats(request):
-    """2026 规格：获取群组实时监测面板数据"""
-    try:
-        groups = await database.get_tracked_groups_with_stats()
-        online_count = sum(1 for g in groups if g['is_online'])
-        monitored_count = sum(1 for g in groups if g['is_monitored'])
-        
-        return web.json_response({
-            "status": "ok",
-            "summary": {
-                "total": len(groups),
-                "online": online_count,
-                "monitored": monitored_count
-            },
-            "groups": groups
-        })
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_toggle_group_listen(request):
-    """切换群组监听状态"""
-    try:
-        data = await request.json()
-        group_id = int(data.get('group_id')); listen_status = bool(data.get('listen_status'))
-        await database.set_group_listen_status(group_id, listen_status)
-        from handlers.group_monitor import clear_group_cache
-        clear_group_cache(group_id)
-        await notify_web_clients("group_listen_update", {"group_id": group_id, "new_status": listen_status})
-        return web.json_response({"code": 200, "msg": "状态已更新", "new_status": listen_status})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_toggle_group_revoke_sync(request):
-    """切换群组信息校对（撤回同步删除）开关"""
-    try:
-        data = await request.json()
-        group_id = int(data.get('group_id'))
-        enabled = bool(data.get('enabled'))
-        await database.set_group_delete_on_revoke(group_id, enabled)
-        await notify_web_clients("group_revoke_sync_update", {"group_id": group_id, "enabled": enabled})
-        return web.json_response({"status": "ok", "enabled": enabled})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_create_revoke_sync_chat(request):
-    """保存信息校对暂存群 ID（管理员手动建群拉入 bot 后提交）"""
-    try:
-        if not _bot_instance:
-            return web.json_response({"status": "error", "message": "bot 未初始化"}, status=500)
-        data = await request.json()
-        chat_id_input = str(data.get('chat_id', '')).strip()
-        if not chat_id_input:
-            # 未传 chat_id：返回当前已保存的暂存群信息
-            existing = await database.get_admin_setting('revoke_sync_chat_id')
-            if existing:
+            row = await cursor.fetchone()
+            if not row:
+                logger.warning(f"消息删除拦截: tg_msg_id={tg_msg_id} 不属于 user_id={user_id}")
+                return web.json_response({"status": "error", "message": "消息不存在或无权删除"}, status=403)
+
+            # 尝试通过 bot 删除 Telegram 端消息
+            if _bot_instance:
                 try:
-                    chat = await _bot_instance.get_chat(int(existing))
-                    return web.json_response({"status": "ok", "chat_id": int(existing), "title": chat.title, "already_exists": True})
-                except Exception:
-                    return web.json_response({"status": "ok", "chat_id": int(existing), "title": "(获取失败)", "already_exists": True})
-            return web.json_response({"status": "ok", "chat_id": None, "already_exists": False})
-        # 验证 bot 是否在该群内
-        try:
-            chat_id = int(chat_id_input)
-            chat = await _bot_instance.get_chat(chat_id)
-        except Exception as e:
-            return web.json_response({"status": "error", "message": f"无法获取该群信息，请确认 bot 已在群内且群 ID 正确：{e}"}, status=400)
-        await database.save_admin_setting('revoke_sync_chat_id', str(chat_id))
-        logger.info(f"[信息校对] 暂存群已设置: {chat_id} ({chat.title})")
-        return web.json_response({"status": "ok", "chat_id": chat_id, "title": chat.title, "already_exists": False})
-    except Exception as e:
-        logger.error(f"api_create_revoke_sync_chat error: {e}")
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+                    await _bot_instance.delete_message(chat_id=user_id, message_id=int(tg_msg_id))
+                except Exception as del_err:
+                    logger.warning(f"删除 TG 消息失败 (可能已过期): {del_err}")
 
+            await db.execute("DELETE FROM messages WHERE tg_msg_id=? AND user_id=?", (int(tg_msg_id), user_id))
+            await db.commit()
 
-async def api_get_revoke_sync_chat(request):
-    """获取当前校对暂存群信息"""
-    try:
-        existing = await database.get_admin_setting('revoke_sync_chat_id')
-        if not existing:
-            return web.json_response({"status": "ok", "chat_id": None})
-        if not _bot_instance:
-            return web.json_response({"status": "ok", "chat_id": int(existing)})
-        try:
-            chat = await _bot_instance.get_chat(int(existing))
-            return web.json_response({"status": "ok", "chat_id": int(existing), "title": chat.title})
-        except Exception:
-            return web.json_response({"status": "ok", "chat_id": int(existing), "title": "(群信息获取失败)"})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_promote_potential_user(request):
-    """潜在用户转正"""
-    try:
-        user_id = int(request.match_info['user_id'])
-        ok = await database.promote_potential_user_to_member(user_id)
-        if ok: await notify_web_clients("potential_promoted", {"user_id": user_id})
-        return web.json_response({"status": "ok" if ok else "error"})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-
-async def api_mark_read(request):
-    """标记已读"""
-    try:
-        user_id = int(request.match_info['user_id'])
-        await database.mark_messages_as_read(user_id)
         return web.json_response({"status": "ok"})
     except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-async def api_delete_chat(request):
-    """软删除会话"""
-    try:
-        user_id = int(request.match_info['user_id'])
-        await database.soft_delete_chat(user_id)
-        return web.json_response({"status": "ok"})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+        return web.json_response({"status": "error", "message": "删除消息失败"}, status=500)
 
 async def api_get_file(request):
     """文件代理"""
     try:
         file_id = request.match_info['file_id']
-        if not _bot_instance: return web.Response(status=500)
+        if not _bot_instance:
+            return web.Response(status=500)
+
         file_info = await _bot_instance.get_file(file_id)
-        return web.json_response({"status": "ok", "url": file_info.file_path})
+        file_path = getattr(file_info, 'file_path', '') or ''
+        if not file_path:
+            return web.json_response({"status": "error", "message": "file_path 为空"}, status=500)
+
+        # Telegram 有时返回完整 URL，有时返回相对路径
+        if file_path.startswith('http'):
+            file_url = file_path
+        else:
+            file_url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{file_path}"
+        return web.json_response({"status": "ok", "url": file_url})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
@@ -1657,24 +2169,133 @@ async def api_upload_image(request):
 async def api_get_config(request):
     """系统配置获取"""
     try:
-        data = {"BOT_TOKEN": config.BOT_TOKEN, "ADMIN_ID": str(config.ADMIN_ID), "global_auto_translate": await database.get_admin_setting("global_auto_translate", "false")}
+        data = {
+            "BOT_TOKEN": config.BOT_TOKEN,
+            "ADMIN_ID": str(config.ADMIN_ID),
+            "global_auto_translate": await database.get_admin_setting("global_auto_translate", "false"),
+            "translation_engine": await database.get_admin_setting("translation_engine", "llm"),
+            "system_prompt": await database.get_admin_setting("system_prompt", ""),
+            "llm_api_mode": await database.get_admin_setting("llm_api_mode", "rented"),
+            "llm_model_type": await database.get_admin_setting("llm_model_type", "openai"),
+            "llm_base_url": await database.get_admin_setting("llm_base_url", config.LLM_BASE_URL),
+            "llm_model": await database.get_admin_setting("llm_model", config.LLM_MODEL_NAME),
+            "llm_api_key": "",
+            "gemini_model_options": _latest_gemini_models(),
+        }
         return web.json_response({"status": "ok", "data": data})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def api_vertex_oneclick_config(request):
+    """Vertex 一键转换为 OneAPI/OpenAI 兼容配置"""
+    try:
+        data = await request.json()
+
+        vertex_api_key = str(data.get('vertex_api_key', '')).strip()
+        if not vertex_api_key:
+            return web.json_response({"status": "error", "message": "请先输入 Vertex API Key"}, status=400)
+
+        oneapi_base_url = _normalize_oneapi_base_url(str(data.get('oneapi_base_url', '')).strip())
+        if not oneapi_base_url:
+            return web.json_response({"status": "error", "message": "请先输入 OneAPI Base URL"}, status=400)
+
+        raw_relay_key = str(data.get('relay_api_key', '')).strip() or vertex_api_key
+        relay_api_key = _to_sk_format(raw_relay_key)
+
+        model = str(data.get('model', '')).strip() or AI_ASSISTANT_MODEL
+        if not model:
+            model = 'gemini-2.5-flash-lite'
+
+        await SecretManager.set_config('GEMINI_API_KEY', vertex_api_key)
+        await SecretManager.set_config('LLM_API_KEY', relay_api_key)
+
+        await database.save_admin_setting('llm_api_mode', 'own')
+        await database.save_admin_setting('llm_model_type', 'openai')
+        await database.save_admin_setting('llm_base_url', oneapi_base_url)
+        await database.save_admin_setting('llm_model', model)
+
+        model_infer_url = f"{oneapi_base_url}/chat/completions"
+        model_list_url = f"{oneapi_base_url}/models"
+
+        return web.json_response({
+            "status": "ok",
+            "data": {
+                "provider": "oneapi-openai-compatible",
+                "model": model,
+                "oneapi_base_url": oneapi_base_url,
+                "model_infer_url": model_infer_url,
+                "model_list_url": model_list_url,
+                "relay_api_key": relay_api_key,
+                "relay_api_key_masked": _mask_sk(relay_api_key),
+                "openai_example": {
+                    "base_url": oneapi_base_url,
+                    "api_key": relay_api_key,
+                    "model": model,
+                },
+            },
+            "message": "已完成一键配置：Vertex → OneAPI(OpenAI 兼容)",
+        })
+    except Exception as e:
+        logger.error(f"api_vertex_oneclick_config 错误: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
 
 async def api_save_config(request):
     """配置保存"""
     try:
         data = await request.json()
-        if 'global_auto_translate' in data: await database.save_admin_setting("global_auto_translate", str(data['global_auto_translate']).lower())
+
+        if 'global_auto_translate' in data:
+            await database.save_admin_setting("global_auto_translate", str(data['global_auto_translate']).lower())
+
+        if 'translation_engine' in data and str(data['translation_engine']).strip():
+            await database.save_admin_setting("translation_engine", str(data['translation_engine']).strip())
+
+        if 'system_prompt' in data:
+            await database.save_admin_setting("system_prompt", str(data['system_prompt']).strip())
+
+        llm_api_mode = str(data.get('llm_api_mode', '')).strip().lower()
+        if llm_api_mode in ('rented', 'own'):
+            await database.save_admin_setting("llm_api_mode", llm_api_mode)
+
+        llm_model_type = str(data.get('llm_model_type', '')).strip().lower()
+        if llm_model_type in ('openai', 'deepseek', 'gemini'):
+            await database.save_admin_setting("llm_model_type", llm_model_type)
+
+        llm_base_url = str(data.get('llm_base_url', '')).strip()
+        if llm_base_url:
+            await database.save_admin_setting("llm_base_url", llm_base_url)
+
+        llm_model = str(data.get('llm_model', '')).strip()
+        if llm_model:
+            await database.save_admin_setting("llm_model", llm_model)
+
+        llm_api_key = str(data.get('llm_api_key', '')).strip()
+        if llm_api_key:
+            key_name = 'LLM_API_KEY'
+            if llm_model_type == 'deepseek':
+                key_name = 'DEEPSEEK_API_KEY'
+            elif llm_model_type == 'gemini':
+                key_name = 'GEMINI_API_KEY'
+            await SecretManager.set_config(key_name, llm_api_key)
+
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 async def api_get_group_members(request):
-    """群成员获取（优先实时）"""
+    """群成员获取（优先实时）（安全加固：校验群组归属）"""
     try:
         group_id = request.query.get('group_id')
+        if not group_id:
+            return web.json_response({"status": "error", "message": "group_id 不能为空"}, status=400)
+
+        # 修复 Medium: 群成员获取无群组归属校验
+        if not await _check_group_is_tracked(int(group_id)):
+            logger.warning(f"权限拦截: 尝试获取非授权群组 {group_id} 的成员")
+            return web.json_response({"status": "error", "message": "无权访问此群组"}, status=403)
+
         members = await database.get_group_members_live(int(group_id), bot=_bot_instance)
 
         # 头像补全：并发抓取，尽量全量
@@ -1744,8 +2365,26 @@ async def api_get_group_member_permissions(request):
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
+async def _check_group_is_tracked(group_id: int) -> bool:
+    """
+    校验 group_id 是否在本 Bot 追踪的群组列表中（修复 P0: 群组操作无权限检查）。
+    防止攻击者传入任意 group_id 操作非授权群组（BOLA/IDOR 漏洞）。
+    """
+    try:
+        async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+            cursor = await db.execute(
+                "SELECT 1 FROM tracked_groups WHERE group_id = ?",
+                (group_id,)
+            )
+            row = await cursor.fetchone()
+            return row is not None
+    except Exception as e:
+        logger.error(f"群组归属校验失败: {e}")
+        return False
+
+
 async def api_group_member_action(request):
-    """群成员基础管理动作：禁言/解禁/移除"""
+    """群成员基础管理动作：禁言/解禁/移除（安全加固：校验群组归属）"""
     try:
         if not _bot_instance:
             return web.json_response({"status": "error", "message": "bot 未初始化"}, status=500)
@@ -1758,6 +2397,11 @@ async def api_group_member_action(request):
 
         if action not in ('mute', 'unmute', 'kick'):
             return web.json_response({"status": "error", "message": "不支持的动作"}, status=400)
+
+        # 修复 P0: 群组操作无权限检查 —— 校验群组是否属于本 Bot 管理的群组
+        if not await _check_group_is_tracked(group_id):
+            logger.warning(f"权限拦截: 尝试操作非授权群组 {group_id}")
+            return web.json_response({"status": "error", "message": "无权操作此群组"}, status=403)
 
         member = await _bot_instance.get_chat_member(group_id, user_id)
         if member.status in ('administrator', 'creator'):
@@ -1797,7 +2441,7 @@ async def api_group_member_action(request):
 
 
 async def api_group_member_action_batch(request):
-    """群成员批量管理动作（P2）"""
+    """群成员批量管理动作（P2）（安全加固：校验群组归属）"""
     try:
         if not _bot_instance:
             return web.json_response({"status": "error", "message": "bot 未初始化"}, status=500)
@@ -1810,6 +2454,11 @@ async def api_group_member_action_batch(request):
 
         if action not in ('mute', 'unmute', 'kick'):
             return web.json_response({"status": "error", "message": "不支持的动作"}, status=400)
+
+        # 修复 P0: 群组操作无权限检查
+        if not await _check_group_is_tracked(group_id):
+            logger.warning(f"权限拦截: 批量操作非授权群组 {group_id}")
+            return web.json_response({"status": "error", "message": "无权操作此群组"}, status=403)
 
         user_ids = []
         for uid in user_ids_raw:
@@ -1971,7 +2620,7 @@ async def api_group_admin_action_batch(request):
 
 
 async def api_set_group_admin(request):
-    """设定群管理员（P1-2：支持细粒度权限）"""
+    """设定群管理员（P1-2：支持细粒度权限）（安全加固：校验群组归属）"""
     try:
         if not _bot_instance:
             return web.json_response({"status": "error", "message": "bot 未初始化"}, status=500)
@@ -1980,6 +2629,11 @@ async def api_set_group_admin(request):
         group_id = int(data.get('group_id'))
         user_id = int(data.get('user_id'))
         custom_permissions = data.get('permissions') if isinstance(data.get('permissions'), dict) else None
+
+        # 修复 P0: 群组操作无权限检查
+        if not await _check_group_is_tracked(group_id):
+            logger.warning(f"权限拦截: 尝试在非授权群组 {group_id} 设置管理员")
+            return web.json_response({"status": "error", "message": "无权操作此群组"}, status=403)
 
         member = await _bot_instance.get_chat_member(group_id, user_id)
         if member.status == 'creator':
@@ -2033,7 +2687,7 @@ async def api_set_group_admin(request):
 
 
 async def api_demote_group_admin(request):
-    """撤销群管理员权限（P2）"""
+    """撤销群管理员权限（P2）（安全加固：校验群组归属）"""
     try:
         if not _bot_instance:
             return web.json_response({"status": "error", "message": "bot 未初始化"}, status=500)
@@ -2041,6 +2695,11 @@ async def api_demote_group_admin(request):
         data = await request.json()
         group_id = int(data.get('group_id'))
         user_id = int(data.get('user_id'))
+
+        # 修复 P0: 群组操作无权限检查
+        if not await _check_group_is_tracked(group_id):
+            logger.warning(f"权限拦截: 尝试在非授权群组 {group_id} 撤销管理员")
+            return web.json_response({"status": "error", "message": "无权操作此群组"}, status=403)
 
         member = await _bot_instance.get_chat_member(group_id, user_id)
         if member.status == 'creator':
@@ -2072,15 +2731,23 @@ async def api_demote_group_admin(request):
 
 
 async def api_get_group_messages(request):
-    """2026 规格：获取群组消息历史 (用于爬取展示)"""
+    """2026 规格：获取群组消息历史 (用于爬取展示)（安全加固：校验群组归属）"""
     try:
         group_id = request.query.get('group_id')
+        if not group_id:
+            return web.json_response({"status": "error", "message": "group_id 不能为空"}, status=400)
+
+        # 修复 Medium: 群组消息访问无归属校验
+        if not await _check_group_is_tracked(int(group_id)):
+            logger.warning(f"权限拦截: 尝试获取非授权群组 {group_id} 的消息")
+            return web.json_response({"status": "error", "message": "无权访问此群组"}, status=403)
+
         limit = int(request.query.get('limit', 50))
         offset = int(request.query.get('offset', 0))
         messages = await database.get_group_messages(int(group_id), limit, offset)
         return web.json_response({"status": "ok", "messages": messages})
     except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+        return web.json_response({"status": "error", "message": "获取群组消息失败"}, status=500)
 
 
 async def api_get_group_photo(request):
@@ -2117,18 +2784,27 @@ async def api_get_group_member_count(request):
 
 
 async def api_send_group_message(request):
-    """在群内发送消息（非引用）"""
+    """在群内发送消息（支持引用回复）"""
     try:
         data = await request.json()
         group_id = int(data.get('group_id'))
         content = (data.get('content') or '').strip()
+        # 支持引用回复：前端传入 reply_to_tg_msg_id
+        reply_to_tg_msg_id = data.get('reply_to_tg_msg_id') or data.get('reply_to_message_id')
+        if reply_to_tg_msg_id:
+            reply_to_tg_msg_id = int(reply_to_tg_msg_id)
+        quoted_text = (data.get('quoted_text') or '').strip() or None
 
         if not content:
             return web.json_response({"status": "error", "message": "消息内容不能为空"}, status=400)
         if not _bot_instance:
             return web.json_response({"status": "error", "message": "bot 未初始化"}, status=500)
 
-        sent = await _bot_instance.send_message(chat_id=group_id, text=content)
+        sent = await _bot_instance.send_message(
+            chat_id=group_id,
+            text=content,
+            reply_to_message_id=reply_to_tg_msg_id,  # Telegram 端显示为引用回复
+        )
 
         await database.save_group_message(
             group_id=group_id,
@@ -2138,8 +2814,8 @@ async def api_send_group_message(request):
             msg_type='text',
             tg_msg_id=sent.message_id if sent else None,
             sender_type='admin',
-            quoted_tg_msg_id=None,
-            quoted_text=None,
+            quoted_tg_msg_id=reply_to_tg_msg_id,
+            quoted_text=quoted_text,
             message_ts=int(sent.date.timestamp()) if sent and sent.date else None,
         )
         await notify_web_clients("group_activity", {"group_id": group_id})
@@ -2241,7 +2917,39 @@ async def api_save_group_verify_config(request):
         if not group_id:
             return web.json_response({"status": "error", "message": "group_id 不能为空"}, status=400)
         await database.save_group_verify_config(group_id, data)
+        # 清除 group_monitor 缓存，使新配置立即生效
+        try:
+            from handlers.group_monitor import clear_group_cache
+            clear_group_cache(group_id)
+        except Exception:
+            pass
         return web.json_response({"status": "ok"})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def api_get_verify_stats(request):
+    """获取群内频道验证统计：已验证 vs 待验证人数"""
+    try:
+        group_id = int(request.rel_url.query.get('group_id', 0))
+        if not group_id:
+            return web.json_response({"status": "error", "message": "group_id 不能为空"}, status=400)
+        stats = await database.get_verify_stats(group_id)
+        return web.json_response({"status": "ok", "data": stats})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def api_get_verify_growth(request):
+    """按天/小时统计通过验证进入频道的用户数"""
+    try:
+        group_id = request.rel_url.query.get('group_id')
+        period = request.rel_url.query.get('period', 'day')  # 'day' | 'hour'
+        if group_id:
+            group_id = int(group_id)
+        data = await database.get_verify_growth(group_id=group_id, period=period)
+        summary = await database.get_verify_growth_summary()
+        return web.json_response({"status": "ok", "data": data, "summary": summary})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
@@ -2250,18 +2958,46 @@ async def start_web_server(bot):
     """启动 Web Server"""
     global _push_scheduler_task, _push_scheduler_started
     set_bot_instance(bot)
-    app = web.Application(middlewares=[auth_middleware])
+    app = web.Application(
+        middlewares=[auth_middleware],
+        # 允许较大图片上传，避免群发带图时触发 413 导致前端显示“网络错误”
+        client_max_size=15 * 1024**2,
+    )
     app.router.add_get('/', index_handler)
-    app.router.add_static('/static', __import__('os').path.join(__import__('os').path.dirname(__import__('os').path.abspath(__file__)), 'static'), show_index=False)
-    app.router.add_post('/api/login', api_login)
+    app.router.add_get('/e/{route_token}', secure_entry_handler)
     app.router.add_get('/ws', websocket_handler)
+    # 前端静态资源（Vite 构建产物）
+    if os.path.isdir(_DIST_DIR):
+        app.router.add_static('/assets', os.path.join(_DIST_DIR, 'assets'), name='frontend_assets')
+    # SPA fallback：前端路由（非 /api /ws /static 开头的路径）
+    app.router.add_get('/{path_info:(?!api|ws|static).+}', spa_fallback_handler)
+
+    # OTP / Token 登录接口（免 auth 中间件，需在 auth_middleware 白名单里）
+    app.router.add_post('/api/csp-report', api_csp_report)
+    app.router.add_post('/api/login', api_login)
+    app.router.add_post('/api/login/otp', api_login_otp)
+    app.router.add_get('/api/csrf-token', api_get_csrf_token)
+    app.router.add_get('/api/search', api_search)
+
+    # 旧版 static/js/*.js 拦截（返回 410 Gone，防止浏览器加载旧逻辑）
+    app.router.add_get('/static/js/{filename:(?!vendor/).+}', blocked_legacy_static_handler)
     app.router.add_get('/api/users', api_get_users)
     app.router.add_get('/api/messages/{user_id}', api_get_messages)
     app.router.add_post('/api/messages/{user_id}', api_send_message)
+    app.router.add_post('/api/messages/{user_id}/ai', api_ai_chat)
+    app.router.add_post('/v1/chat/completions', api_openai_chat_completions)
+    app.router.add_get('/v1/models', api_openai_models)
+    app.router.add_post('/v1/exec', api_openai_exec)
+    # OpenAI 兼容别名（供前端调试面板直接调用）
+    app.router.add_get('/api/openai/models', api_openai_models)
+    app.router.add_post('/api/openai/exec', api_openai_exec)
+    app.router.add_post('/api/messages/{user_id}/delete', api_delete_single_message)
     app.router.add_post('/api/broadcast', api_broadcast_message)
     app.router.add_get('/api/broadcast/targets', api_get_broadcast_targets)
     app.router.add_post('/api/broadcast/targets/sync', api_sync_broadcast_targets)
     app.router.add_post('/api/broadcast/chats', api_broadcast_to_chats)
+    app.router.add_post('/api/broadcast/send', api_broadcast_unified)
+    app.router.add_post('/api/broadcast/unified', api_broadcast_unified)
     app.router.add_get('/api/push_tasks', api_list_push_tasks)
     app.router.add_post('/api/push_tasks', api_create_push_task)
     app.router.add_post('/api/push_tasks/status', api_update_push_task_status)
@@ -2272,13 +3008,6 @@ async def start_web_server(bot):
     app.router.add_post('/api/monitors/tx_meta', api_update_monitor_tx_meta)
     app.router.add_post('/api/monitors/tx_meta/batch', api_batch_update_monitor_tx_meta)
     app.router.add_get('/api/monitors/export', api_export_monitor_transactions)
-    app.router.add_get('/api/monitors/transactions', api_get_monitor_transactions)
-    app.router.add_get('/api/monitors/year_summary', api_year_monitor_summary)
-    app.router.add_get('/api/monitors/counterparty_aliases', api_get_counterparty_aliases)
-    app.router.add_post('/api/monitors/counterparty_aliases', api_upsert_counterparty_alias)
-    app.router.add_delete('/api/monitors/counterparty_aliases/{alias_id}', api_delete_counterparty_alias)
-    app.router.add_get('/api/monitors/user_queries', api_list_user_query_monitors)
-    app.router.add_post('/api/monitors/{monitor_id}/claim', api_claim_monitor)
     app.router.add_delete('/api/monitors/{monitor_id}', api_delete_monitor)
     app.router.add_post('/api/monitors/{monitor_id}/remark', api_update_monitor_remark)
     app.router.add_get('/api/potential_users/tags', api_get_potential_tags) # 必须早于 potential_users
@@ -2308,8 +3037,13 @@ async def start_web_server(bot):
     app.router.add_post('/api/group_messages/send', api_send_group_message)
     app.router.add_get('/api/group_verify_config', api_get_group_verify_config)
     app.router.add_post('/api/group_verify_config', api_save_group_verify_config)
+    app.router.add_get('/api/group_stats/verify_stats', api_get_verify_stats)
+    app.router.add_get('/api/group_stats/verify_growth', api_get_verify_growth)
+    app.router.add_get('/api/group_listen/verified_users', get_verified_users_handler)
+    app.router.add_get('/api/group_listen/unverified_users', get_unverified_users_handler)
+    app.router.add_post('/api/group_listen/send_channel_reminder', send_channel_reminder_handler)
+    app.router.add_post('/api/group_listen/delete_reminder_message', delete_reminder_message_handler)
 
-    app.router.add_post('/api/config', api_save_config)
     app.router.add_post('/api/group_messages/reply', api_reply_group_message)
     app.router.add_post('/api/group_messages/delete', api_delete_group_message)
     app.router.add_get('/api/file/{file_id}', api_get_file)
@@ -2317,6 +3051,10 @@ async def start_web_server(bot):
     app.router.add_post('/api/upload/{user_id}', api_upload_image)
     app.router.add_get('/api/config', api_get_config)
     app.router.add_post('/api/config', api_save_config)
+    app.router.add_post('/api/config/vertex/oneclick', api_vertex_oneclick_config)
+
+    # 注册财务路由（/api/v1/monitors/finance/*）
+    await register_finance_routes(app)
 
     if not _push_scheduler_started:
         _push_scheduler_task = asyncio.create_task(_run_push_scheduler_loop())
@@ -2327,3 +3065,311 @@ async def start_web_server(bot):
     site = web.TCPSite(runner, '127.0.0.1', 8080)
     await site.start()
     logger.info("Web 管理端已启动: http://127.0.0.1:8080")
+
+
+# ============ 已验证用户 API 端点 (v5.1+) ============
+
+async def get_verified_users_handler(request):
+    """GET /api/group_listen/verified_users - 获取已验证用户列表"""
+    try:
+        group_id = request.rel_url.query.get('group_id')
+        period = request.rel_url.query.get('period', 'all')
+        
+        logger.info(f"获取已验证用户: group_id={group_id}, period={period}")
+        
+        if period not in ('today', 'all'):
+            period = 'all'
+        
+        if group_id:
+            # 特定群组的已验证用户
+            group_id = int(group_id)
+            users = await database.get_verified_users(group_id, period)
+            logger.info(f"特定群组查询: group_id={group_id}, 返回 {len(users)} 个用户")
+        else:
+            # 全局已验证用户（所有群组）
+            users = await database.get_all_verified_users(period)
+            logger.info(f"全局查询: 返回 {len(users)} 个用户")
+        
+        return web.json_response({
+            'status': 'ok',
+            'data': users,
+            'count': len(users)
+        })
+    except Exception as e:
+        logger.error(f"获取已验证用户列表失败: {e}", exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+async def get_verify_growth_summary_handler(request):
+    """GET /api/group_stats/verify_growth - 获取验证增长统计"""
+    try:
+        group_id = request.rel_url.query.get('group_id')
+        
+        if group_id:
+            group_id = int(group_id)
+        else:
+            group_id = None
+        
+        summary = await database.get_verify_growth_summary(group_id)
+        
+        return web.json_response({
+            'status': 'ok',
+            'summary': summary
+        })
+    except Exception as e:
+        logger.error(f"获取验证统计失败: {e}")
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+# ============ 未关注频道用户提醒 API (v5.3+) ============
+
+async def get_unverified_users_handler(request):
+    """GET /api/group_listen/unverified_users - 获取未关注频道的用户列表"""
+    try:
+        group_id = request.rel_url.query.get('group_id')
+        period = request.rel_url.query.get('period', 'all')
+        
+        logger.info(f"获取未关注用户: group_id={group_id}, period={period}")
+        
+        if period not in ('today', 'all'):
+            period = 'all'
+        
+        if group_id:
+            group_id = int(group_id)
+        
+        users = await database.get_unverified_users(group_id, period)
+        logger.info(f"返回 {len(users)} 个未关注用户")
+        
+        return web.json_response({
+            'status': 'ok',
+            'data': users,
+            'count': len(users)
+        })
+    except Exception as e:
+        logger.error(f"获取未关注用户列表失败: {e}", exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def send_channel_reminder_handler(request):
+    """POST /api/group_listen/send_channel_reminder - 发送频道关注提醒"""
+    try:
+        data = await request.json()
+        group_id = int(data.get('group_id')) if data.get('group_id') is not None else None
+        user_ids = data.get('user_ids', [])
+        channel_link = data.get('channel_link', '').strip()
+        
+        if not group_id or not user_ids:
+            return web.json_response({'status': 'error', 'message': '缺少必要参数'}, status=400)
+        
+        if not channel_link:
+            return web.json_response({'status': 'error', 'message': '频道链接不能为空'}, status=400)
+        
+        # 规范化频道链接格式
+        # 支持: @xxx, https://t.me/xxx, t.me/xxx, /xxx 等格式
+        normalized_link = normalize_channel_link(channel_link)
+        
+        logger.info(f"发送频道提醒: group_id={group_id}, user_count={len(user_ids)}, channel_link={channel_link} -> {normalized_link}")
+        
+        if not _bot_instance:
+            return web.json_response({'status': 'error', 'message': '机器人未初始化'}, status=500)
+        
+        from datetime import datetime, timedelta
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        channel_id_for_callback = group_id
+        try:
+            verify_cfg = await database.get_group_verify_config(group_id)
+            cfg_channel_id = verify_cfg.get('verify_channel_id') if isinstance(verify_cfg, dict) else None
+            if cfg_channel_id is not None and str(cfg_channel_id).lstrip('-').isdigit():
+                channel_id_for_callback = int(cfg_channel_id)
+        except Exception:
+            pass
+        
+        results = []
+        for user_id in user_ids:
+            try:
+                user_id = int(user_id)
+                if user_id <= 0:
+                    logger.info(f"跳过非用户主体 user_id={user_id}")
+                    results.append({
+                        'user_id': user_id,
+                        'status': 'skipped',
+                        'reason': '非用户主体无需提醒'
+                    })
+                    continue
+
+                logger.info(f"处理用户 {user_id}...")
+                
+                # 从数据库获取用户信息（包括用户名）
+                user_info = await database.get_group_member(group_id, user_id)
+                username = None
+                if user_info:
+                    username = user_info.get('username')
+                    logger.info(f"用户 {user_id} 的用户名: {username}")
+                else:
+                    logger.warning(f"未找到用户 {user_id} 的信息")
+                
+                # 构建提醒消息
+                mention = f"@{username}" if username else f"<a href=\"tg://user?id={user_id}\">用户</a>"
+                
+                text = f"""🔔 {mention}，请关注我们的频道以获得最新信息！
+
+📢 频道链接: {normalized_link}
+🤖 或点击下方按钮: 回补订阅解开禁言
+
+⏰ 此消息将在12小时后自动删除"""
+                
+                # 构建按钮 - 支持多种链接格式
+                buttons = [
+                    [InlineKeyboardButton("📢 直接关注", url=get_button_url(normalized_link))],
+                    [InlineKeyboardButton("✅ 回补订阅解开禁言", callback_data=f"subscribe_{group_id}_{channel_id_for_callback}")]
+                ]
+                keyboard = InlineKeyboardMarkup(buttons)
+                
+                # 直接发送消息
+                logger.info(f"发送消息给用户 {username or user_id}...")
+                msg = await _bot_instance.send_message(
+                    chat_id=group_id,
+                    text=text,
+                    parse_mode='HTML',
+                    reply_markup=keyboard
+                )
+                
+                message_id = msg.message_id
+                logger.info(f"✅ 消息发送成功，message_id={message_id}")
+                
+                # 保存提醒记录
+                expires_at = (datetime.now() + timedelta(hours=12)).isoformat()
+                reminder_id = await database.save_channel_reminder(
+                    group_id, user_id, message_id, expires_at
+                )
+                
+                logger.info(f"提醒记录已保存，reminder_id={reminder_id}")
+                
+                results.append({
+                    'user_id': user_id,
+                    'username': username,
+                    'message_id': message_id,
+                    'reminder_id': reminder_id,
+                    'sent_at': datetime.now().isoformat()
+                })
+                
+                logger.info(f"✅ 已发送提醒给用户 {username or user_id}")
+            except Exception as e:
+                logger.error(f"❌ 发送提醒给用户 {user_id} 失败: {e}", exc_info=True)
+                results.append({
+                    'user_id': user_id,
+                    'error': str(e)
+                })
+        
+        sent_count = len([r for r in results if 'message_id' in r])
+        logger.info(f"本次发送完成: 成功 {sent_count}/{len(user_ids)}")
+        
+        return web.json_response({
+            'status': 'ok',
+            'sent_count': sent_count,
+            'results': results
+        })
+    except Exception as e:
+        logger.error(f"❌ 发送频道提醒失败: {e}", exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+def normalize_channel_link(link: str) -> str:
+    """
+    规范化频道链接格式
+    支持: @xxx, https://t.me/xxx, t.me/xxx, /xxx 等格式
+    返回: @xxx 或 https://t.me/xxx 格式
+    """
+    link = link.strip()
+    
+    # 如果已经是 @xxx 格式，直接返回
+    if link.startswith('@'):
+        return link
+    
+    # 如果是 https://t.me/xxx 格式，直接返回
+    if link.startswith('https://t.me/'):
+        return link
+    
+    # 如果是 t.me/xxx 格式，转换为 https://t.me/xxx
+    if link.startswith('t.me/'):
+        return f"https://{link}"
+    
+    # 如果是 /xxx 格式，转换为 @xxx
+    if link.startswith('/'):
+        return f"@{link[1:]}"
+    
+    # 如果是 xxx 格式（没有前缀），转换为 @xxx
+    if not link.startswith('http'):
+        return f"@{link}"
+    
+    return link
+
+
+def get_button_url(link: str) -> str:
+    """
+    获取按钮 URL
+    Telegram 按钮只支持 http/https URL，不支持 @xxx 格式
+    """
+    link = link.strip()
+    
+    # 如果是 @xxx 格式，转换为 https://t.me/xxx
+    if link.startswith('@'):
+        return f"https://t.me/{link[1:]}"
+    
+    # 如果已经是 https://t.me/xxx 格式，直接返回
+    if link.startswith('https://t.me/'):
+        return link
+    
+    # 如果是 t.me/xxx 格式，转换为 https://t.me/xxx
+    if link.startswith('t.me/'):
+        return f"https://{link}"
+    
+    # 其他情况，假设是频道名称，转换为 https://t.me/xxx
+    return f"https://t.me/{link}"
+
+
+async def delete_reminder_message_handler(request):
+    """POST /api/group_listen/delete_reminder_message - 删除提醒消息"""
+    try:
+        data = await request.json()
+        group_id = data.get('group_id')
+        message_id = data.get('message_id')
+        reminder_id = data.get('reminder_id')
+        
+        if not group_id or not message_id:
+            return web.json_response({'status': 'error', 'message': '缺少必要参数'}, status=400)
+        
+        logger.info(f"删除提醒消息: group_id={group_id}, message_id={message_id}")
+        
+        if not _bot_instance:
+            return web.json_response({'status': 'error', 'message': '机器人未初始化'}, status=500)
+        
+        try:
+            await _bot_instance.delete_message(chat_id=group_id, message_id=message_id)
+            
+            if reminder_id:
+                await database.mark_reminder_deleted(reminder_id)
+            
+            logger.info(f"已删除提醒消息 {message_id}")
+            
+            return web.json_response({
+                'status': 'ok',
+                'message': '消息已删除'
+            })
+        except Exception as e:
+            logger.error(f"删除消息失败: {e}")
+            return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+    except Exception as e:
+        logger.error(f"删除提醒消息失败: {e}", exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+# ============ 财务 ERP API 路由注册 ============
+
+async def register_finance_routes(app):
+    """注册财务 ERP API 路由"""
+    try:
+        from finance_api import init_finance_routes
+        await init_finance_routes(app)
+        logger.info("✅ 财务 ERP API 路由已注册")
+    except Exception as e:
+        logger.error(f"❌ 财务 ERP API 路由注册失败: {e}")

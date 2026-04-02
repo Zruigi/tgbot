@@ -1,15 +1,16 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html class="light" lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" name="viewport"/>
     <title>Bot Admin - Dashboard</title>
-    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@200;300;400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
-    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/viewerjs/1.11.3/viewer.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/viewerjs/1.11.3/viewer.min.js"></script>
+    <script src="/static/js/vendor/tailwind.cdn.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@200;300;400;500;600;700;800&amp;display=swap" rel="stylesheet" media="print" onload="this.media='all'"/>
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet" media="print" onload="this.media='all'"/>
+    <script src="/static/js/vendor/vue.global.prod.js"></script>
+    <script> if(typeof Vue === 'undefined') document.write('<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"><\/script>'); </script>
+    <link rel="stylesheet" href="/static/css/viewer.min.css">
+    <script src="/static/js/vendor/viewer.min.js"></script>
     
     <script id="tailwind-config">
       tailwind.config = {
@@ -1143,6 +1144,7 @@
                             </div>
                             <div class="flex items-center gap-2">
                                 <button @click="viewGroupMembers(selectedGroupRoomId)" class="px-3 py-2 text-[11px] font-black rounded-xl bg-primary/10 text-primary hover:bg-primary/20 transition-all">成员管理</button>
+                                <button @click="openUnverifiedUsersModal(selectedGroupRoomId)" class="px-3 py-2 text-[11px] font-black rounded-xl bg-amber-100 text-amber-700 hover:bg-amber-200 transition-all" title="查看未关注频道的用户">👤 未关注</button>
                                 <button @click="openVerifyConfig(selectedGroupRoomId)" class="px-3 py-2 text-[11px] font-black rounded-xl transition-all"
                                         :class="groupVerifyConfig[selectedGroupRoomId]&&groupVerifyConfig[selectedGroupRoomId].verify_enabled ? 'bg-green-100 text-green-700 hover:bg-green-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'">
                                     <span class="material-symbols-outlined text-[12px] align-middle">verified_user</span> 入群验证
@@ -1664,6 +1666,90 @@
         <!-- Group Members Modal -->
         <transition name="fade">
             <div v-if="showGroupMembersModal" class="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-black/50 backdrop-blur-sm">
+<!-- 未关注用户弹窗 - 在 showGroupMembersModal 弹窗之前添加 -->
+<div v-if="showUnverifiedUsersModal" class="fixed inset-0 z-[105] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div class="bg-surface rounded-3xl shadow-2xl w-full max-w-md max-h-[80vh] flex flex-col overflow-hidden">
+        <!-- 弹窗头部 -->
+        <div class="px-6 py-4 border-b border-outline-variant/10 flex items-center justify-between bg-surface-container-lowest/50">
+            <div class="flex items-center gap-3">
+                <span class="material-symbols-outlined text-amber-600 text-[24px]">person_alert</span>
+                <div>
+                    <h3 class="text-lg font-black">未关注的人</h3>
+                    <p class="text-[11px] text-slate-400 mt-0.5">共 {{ unverifiedUsersForModal.length }} 人</p>
+                </div>
+            </div>
+            <button @click="showUnverifiedUsersModal = false" class="w-10 h-10 flex items-center justify-center hover:bg-surface-container-high rounded-full transition-colors">
+                <span class="material-symbols-outlined">close</span>
+            </button>
+        </div>
+
+        <!-- 加载状态 -->
+        <div v-if="unverifiedUsersLoading" class="flex-1 flex flex-col items-center justify-center py-20 space-y-4">
+            <div class="w-10 h-10 border-4 border-amber-500/20 border-t-amber-500 rounded-full animate-spin"></div>
+            <span class="text-sm text-slate-400">正在加载未关注用户...</span>
+        </div>
+
+        <!-- 空状态 -->
+        <div v-else-if="unverifiedUsersForModal.length === 0" class="flex-1 flex flex-col items-center justify-center py-20 text-slate-400 italic">
+            <span class="material-symbols-outlined text-5xl mb-4 opacity-20">check_circle</span>
+            <p class="font-bold">所有用户都已关注频道！</p>
+        </div>
+
+        <!-- 用户列表 -->
+        <div v-else class="flex-1 overflow-y-auto p-4 space-y-3 no-scrollbar">
+            <!-- 全选按钮 -->
+            <div class="flex items-center gap-2 px-4 py-2 bg-slate-50 rounded-xl">
+                <input type="checkbox" :checked="selectedUnverifiedUsers.size === unverifiedUsersForModal.length && unverifiedUsersForModal.length > 0"
+                       @change="selectAllUnverifiedUsers" class="w-4 h-4 cursor-pointer"/>
+                <span class="text-sm font-bold text-slate-600">全选 ({{ selectedUnverifiedUsers.size }}/{{ unverifiedUsersForModal.length }})</span>
+            </div>
+
+            <!-- 用户列表 -->
+            <div class="space-y-1.5">
+                <button v-for="user in unverifiedUsersForModal" :key="user.user_id"
+                        class="w-full flex items-center gap-3 px-4 py-3 rounded-2xl border transition-all active:scale-95"
+                        :class="selectedUnverifiedUsers.has(user.user_id) ? 'border-amber-500 bg-amber-50' : 'border-outline-variant/5 bg-surface-container-lowest hover:bg-surface-container-high'">
+                    <!-- 勾选框 -->
+                    <input type="checkbox" :checked="selectedUnverifiedUsers.has(user.user_id)"
+                           @change="toggleUnverifiedUserSelection(user.user_id)" class="w-4 h-4 cursor-pointer flex-shrink-0"/>
+                    
+                    <!-- 头像 -->
+                    <div class="w-10 h-10 rounded-xl flex-shrink-0 overflow-hidden bg-primary/10 flex items-center justify-center">
+                        <img v-if="user.avatar_file_id && fileUrls[user.avatar_file_id]" :src="fileUrls[user.avatar_file_id]" class="w-10 h-10 object-cover"/>
+                        <span v-else class="text-primary font-black text-sm">{{ (user.first_name || user.username || 'U').charAt(0).toUpperCase() }}</span>
+                    </div>
+                    
+                    <!-- 用户信息 -->
+                    <div class="flex-1 min-w-0">
+                        <div class="flex items-center gap-2">
+                            <span class="text-sm font-bold text-slate-800 truncate">{{ user.first_name || user.username || 'Unknown' }}</span>
+                        </div>
+                        <div class="text-[10px] text-slate-400 truncate">@{{ user.username || ('UID ' + user.user_id) }}</div>
+                    </div>
+                </button>
+            </div>
+        </div>
+
+        <!-- 底部按钮 -->
+        <div class="px-6 py-4 border-t border-outline-variant/10 flex justify-between bg-surface-container-lowest">
+            <div v-if="selectedUnverifiedUsers.size > 0" class="text-sm text-slate-500">
+                已选择 {{ selectedUnverifiedUsers.size }} 人
+            </div>
+            <div v-else></div>
+            
+            <div class="flex gap-2">
+                <button @click="sendUnverifiedReminders" 
+                        :disabled="selectedUnverifiedUsers.size === 0 || isSendingUnverifiedReminders"
+                        class="px-6 py-2.5 bg-amber-500 text-white text-sm font-black rounded-xl shadow-lg shadow-amber-500/20 hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                    {{ isSendingUnverifiedReminders ? '@提醒中...' : `@提醒关注 (${selectedUnverifiedUsers.size})` }}
+                </button>
+                <button @click="showUnverifiedUsersModal = false" class="px-8 py-2.5 bg-primary text-on-primary text-sm font-black rounded-xl shadow-lg shadow-primary/20 hover:scale-[1.02] active:scale-95 transition-all">
+                    关闭
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
                 <div class="bg-white w-full max-w-4xl rounded-3xl shadow-2xl overflow-clip flex flex-col max-h-[90vh] animate-in zoom-in-95 duration-200">
                     <div class="px-6 py-5 border-b border-slate-100 flex items-center justify-between">
                         <div class="flex items-center gap-3">
@@ -1986,8 +2072,6 @@
         </transition>
     </div>
 
-    <script src="/static/js/app.js"></script>
-
     <script>
     // ====== 登录逻辑 ======
     function getCookie(name) {
@@ -2021,43 +2105,41 @@
             return response;
         });
     };
-
-    // 页面加载时执行
-    window.addEventListener('DOMContentLoaded', () => {
+    </script>
+    <script src="/static/js/app.js"></script>
+    <script>
+    // app.js 加载完成后执行登录验证
+    (function() {
         const appDiv = document.getElementById('app');
-        // 如果服务器直接注入了token，直接显示app
         if (window.__TOKEN_INJECTED__) {
             localStorage.setItem('admin_token', window.__TOKEN_INJECTED__);
-            setCookie('admin_token', window.__TOKEN_INJECTED__, 7);
+            document.cookie = 'admin_token=' + window.__TOKEN_INJECTED__ + ';max-age=1800;path=/;SameSite=Strict';
             if (appDiv) appDiv.style.display = '';
-            window.mountApp();
+            window.mountApp && window.mountApp();
             return;
         }
-        const token = localStorage.getItem('admin_token') || getCookie('admin_token');
+        const token = localStorage.getItem('admin_token') || (document.cookie.match(/admin_token=([^;]+)/) || [])[1];
         if (!token) {
             document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0f172a;color:#94a3b8;font-family:sans-serif;text-align:center"><div><p style="font-size:48px">🤖</p><h2 style="color:#fff;margin:16px 0 8px">Bot Admin</h2><p>请通过 Telegram Bot 获取登录链接</p><p style="margin-top:12px;font-size:13px">发送 /start → 点击「🌐 Web 管理后台」</p></div></div>';
             return;
         }
-        // 验证已有 token
-        _originalFetch('/api/login', {
+        fetch('/api/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ token })
         }).then(r => r.json()).then(data => {
             if (data.status === 'ok') {
-                localStorage.setItem('admin_token', token);
                 if (appDiv) appDiv.style.display = '';
-                window.mountApp();
+                window.mountApp && window.mountApp();
             } else {
                 localStorage.removeItem('admin_token');
-                deleteCookie('admin_token');
                 document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0f172a;color:#94a3b8;font-family:sans-serif;text-align:center"><div><p style="font-size:48px">🤖</p><h2 style="color:#fff;margin:16px 0 8px">Bot Admin</h2><p>请通过 Telegram Bot 获取登录链接</p><p style="margin-top:12px;font-size:13px">发送 /start → 点击「🌐 Web 管理后台」</p></div></div>';
             }
         }).catch(() => {
             if (appDiv) appDiv.style.display = '';
-            window.mountApp();
+            window.mountApp && window.mountApp();
         });
-    });
+    })();
     </script>
 </body>
 </html>

@@ -6,6 +6,8 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import datetime, timedelta
+from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
@@ -45,6 +47,8 @@ from handlers.join_verify import (
 )
 from handlers.status import status_command, clear_command
 from handlers.admin_panel import admin_config_handler, sync_potential_command
+from handlers.channel_verify import handle_subscribe_button, handle_start_command_with_channel_check
+from handlers.reminder_cleanup import cleanup_expired_reminders
 import database
 from database import init_db
 from web_admin import start_web_server
@@ -52,11 +56,13 @@ from services.price_monitor import start_price_monitor
 from services.chain_monitor import start_chain_monitor
 
 # 配置日志
+for p in (config.LOG_DIR, config.LOG_APP_DIR, config.LOG_TUNNEL_DIR, config.LOG_RUNTIME_DIR):
+    os.makedirs(p, exist_ok=True)
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
     handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.FileHandler(config.BOT_LOG_PATH, encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -64,6 +70,89 @@ logging.basicConfig(
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 logger = logging.getLogger(__name__)
+
+async def migrate_legacy_log_files() -> None:
+    """将历史根目录日志迁移到 logs 目录"""
+    legacy_names = [
+        "bot.log",
+        "backend.log",
+        "cloudflared.log",
+        "cloudflared.stdout",
+        "cloudflared-8080.log",
+        "cloudflared-8080.stdout",
+        "bot_runtime.log",
+        "bot_stdout.log",
+        "bot_stderr.log",
+        "cf_frontend.log",
+        "cloudflared_frontend.log",
+    ]
+
+    category_map = {
+        "bot.log": config.LOG_APP_DIR,
+        "backend.log": config.LOG_APP_DIR,
+        "cloudflared.log": config.LOG_TUNNEL_DIR,
+        "cloudflared.stdout": config.LOG_TUNNEL_DIR,
+        "cloudflared-8080.log": config.LOG_TUNNEL_DIR,
+        "cloudflared-8080.stdout": config.LOG_TUNNEL_DIR,
+        "cloudflared_frontend.log": config.LOG_TUNNEL_DIR,
+        "cf_frontend.log": config.LOG_TUNNEL_DIR,
+        "bot_runtime.log": config.LOG_RUNTIME_DIR,
+        "bot_stdout.log": config.LOG_RUNTIME_DIR,
+        "bot_stderr.log": config.LOG_RUNTIME_DIR,
+    }
+
+    for name in legacy_names:
+        src = Path(config.BASE_DIR) / name
+        if not src.exists() or not src.is_file():
+            continue
+
+        dest_dir = Path(category_map.get(name, config.LOG_APP_DIR))
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        if name.startswith("cloudflared-8080"):
+            dest_name = name.replace("cloudflared-8080", "cloudflared")
+        else:
+            dest_name = name
+
+        dest = dest_dir / dest_name
+        if dest.exists():
+            continue
+
+        try:
+            src.rename(dest)
+            logger.info(f"[日志迁移] 已迁移: {name} -> {dest.relative_to(Path(config.BASE_DIR))}")
+        except Exception as e:
+            logger.warning(f"[日志迁移] 迁移失败 {name}: {e}")
+
+
+async def cleanup_old_logs() -> None:
+    """清理超过保留时长的日志文件"""
+    try:
+        retention = max(1, int(config.LOG_RETENTION_HOURS))
+    except Exception:
+        retention = 48
+
+    cutoff = datetime.now() - timedelta(hours=retention)
+    log_dir = Path(config.LOG_DIR)
+    if not log_dir.exists():
+        return
+
+    for path in log_dir.rglob("*.log"):
+        try:
+            mtime = datetime.fromtimestamp(path.stat().st_mtime)
+            if mtime < cutoff:
+                path.unlink(missing_ok=True)
+                logger.info(f"[日志清理] 已删除过期日志: {path.name}")
+        except Exception as e:
+            logger.warning(f"[日志清理] 删除日志失败 {path.name}: {e}")
+
+
+async def log_cleanup_loop() -> None:
+    """每小时执行一次日志清理"""
+    while True:
+        await cleanup_old_logs()
+        await asyncio.sleep(3600)
+
 
 async def revoke_sync_loop(bot) -> None:
     """定时对账：检查开启信息校对的群组，发现消息已被撤回则同步删除 web 记录
@@ -154,6 +243,18 @@ async def revoke_sync_loop(bot) -> None:
 async def post_init(application: Application) -> None:
     """Bot 启动后的初始化操作"""
     await init_db()
+    await migrate_legacy_log_files()
+    await cleanup_old_logs()
+    
+    # 初始化财务模块
+    try:
+        from finance_core import init_finance_db, init_default_chart_of_accounts
+        await init_finance_db()
+        await init_default_chart_of_accounts()
+        logger.info("✅ 财务模块数据库初始化完成")
+    except Exception as e:
+        logger.warning(f"财务模块初始化失败: {e}")
+    
     # 启动 Web 管理端
     await start_web_server(application.bot)
     
@@ -189,6 +290,9 @@ async def post_init(application: Application) -> None:
     asyncio.create_task(start_price_monitor(application))
     asyncio.create_task(start_chain_monitor(application))
     asyncio.create_task(revoke_sync_loop(application.bot))
+    asyncio.create_task(cleanup_expired_reminders(application.bot))  # v5.4: 频道提醒清理任务
+    asyncio.create_task(log_cleanup_loop())
+    logger.info(f"✅ 日志自动清理已启用，保留时长: {config.LOG_RETENTION_HOURS} 小时")
     logger.info("✅ 价格监控与链上监控引擎已挂载后台运行")
 
 async def debug_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -273,6 +377,10 @@ def main() -> None:
         button_callback,
         pattern="^(spot_price|futures_price|wallet_monitor|admin_dashboard|contact_admin|cs_mode_test|debug_id|back_to_start|restart_bot)$",
     ))
+    
+    # 频道验证处理器 (v5.4)
+    application.add_handler(CallbackQueryHandler(handle_subscribe_button, pattern='^subscribe_'))
+    application.add_handler(CommandHandler("start", handle_start_command_with_channel_check))
 
     # 全局拦截非管理员的消息，存入数据库并转发给管理员
     # 修复：只拦截私聊 (ChatType.PRIVATE) 中的消息，忽略群聊消息，防止群里别人说话也同步给客服

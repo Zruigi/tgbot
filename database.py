@@ -3,6 +3,7 @@
 异步数据库操作模块
 """
 import aiosqlite
+import aiohttp
 import logging
 import re
 import json
@@ -10,7 +11,6 @@ from datetime import datetime, timedelta
 import calendar
 from typing import Optional, List, Dict, Any, Union
 from config import DB_NAME, ADMIN_ID
-from services.field_crypto import encrypt, decrypt, decrypt_list, decrypt_dict
 
 logger = logging.getLogger(__name__)
 
@@ -142,25 +142,6 @@ async def init_db():
             await db.execute("ALTER TABLE address_monitors ADD COLUMN created_at DATETIME DEFAULT NULL")
             await db.execute("UPDATE address_monitors SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
             logger.info("migrated address_monitors.created_at")
-        if 'owner_type' not in monitor_columns:
-            await db.execute("ALTER TABLE address_monitors ADD COLUMN owner_type TEXT DEFAULT 'user'")
-            # 将管理员自己的地址标记为 admin_own
-            from config import ADMIN_ID
-            await db.execute("UPDATE address_monitors SET owner_type = 'admin_own' WHERE user_id = ?", (int(ADMIN_ID),))
-            logger.info("migrated address_monitors.owner_type")
-        await db.commit()
-
-        # counterparty_aliases 表（对方地址→人名备注，全局共享）
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS counterparty_aliases (
-                alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                address TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                note TEXT DEFAULT '',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        await db.commit()
 
         cursor = await db.execute("PRAGMA table_info(monitor_transactions)")
         tx_columns = [row[1] for row in await cursor.fetchall()]
@@ -249,7 +230,8 @@ async def init_db():
                 "（以下为可选补充，会附加在系统固定规则之后；留空亦可）\n"
                 "例如：优先保留用户语气；遇到合约/风控词务必译准确。"
             ),
-            "global_auto_translate": "false"
+            "global_auto_translate": "false",
+            "llm_api_mode": "rented"
         }
         for key, val in default_settings.items():
             await db.execute("INSERT OR IGNORE INTO admin_settings (key, value) VALUES (?, ?)", (key, val))
@@ -363,7 +345,10 @@ async def init_db():
                 group_id INTEGER NOT NULL,
                 group_title TEXT,
                 status TEXT DEFAULT 'active',
-                joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_verified BOOLEAN DEFAULT 0,
+                verified_at DATETIME DEFAULT NULL,
+                avatar_file_id TEXT DEFAULT NULL
             )
         ''')
         await db.execute(
@@ -404,6 +389,19 @@ async def init_db():
             await db.execute("ALTER TABLE group_messages ADD COLUMN message_ts INTEGER DEFAULT NULL")
             await db.execute("UPDATE group_messages SET message_ts = CAST(strftime('%s', timestamp) AS INTEGER)")
             logger.info("✅ 数据库迁移：已为 group_messages 添加 message_ts 字段并初始化数据")
+
+        # 检查并添加缺失的列 (group_members 迁移 - 验证字段)
+        cursor = await db.execute("PRAGMA table_info(group_members)")
+        gm_cols = [row[1] for row in await cursor.fetchall()]
+        if 'is_verified' not in gm_cols:
+            await db.execute("ALTER TABLE group_members ADD COLUMN is_verified BOOLEAN DEFAULT 0")
+            logger.info("✅ 数据库迁移：已为 group_members 添加 is_verified 字段")
+        if 'verified_at' not in gm_cols:
+            await db.execute("ALTER TABLE group_members ADD COLUMN verified_at DATETIME DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 group_members 添加 verified_at 字段")
+        if 'avatar_file_id' not in gm_cols:
+            await db.execute("ALTER TABLE group_members ADD COLUMN avatar_file_id TEXT DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 group_members 添加 avatar_file_id 字段")
 
         # 为 group_id 和 timestamp 创建索引以优化查询
         await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_query ON group_messages(group_id, timestamp DESC)")
@@ -524,6 +522,22 @@ async def init_db():
                     await db.execute("ALTER TABLE tracked_groups ADD COLUMN verify_channel_id TEXT DEFAULT NULL")
                 if 'verify_questions' not in columns:
                     await db.execute("ALTER TABLE tracked_groups ADD COLUMN verify_questions TEXT DEFAULT NULL")
+                if 'verify_msg_template' not in columns:
+                    logger.info("迁移 tracked_groups: 新增 verify_msg_template 列")
+                    await db.execute("ALTER TABLE tracked_groups ADD COLUMN verify_msg_template TEXT DEFAULT NULL")
+
+            # 1b-extra. 检查 group_members 的验证字段
+            async with db.execute("PRAGMA table_info(group_members)") as cursor:
+                gmbr_cols = [row[1] for row in await cursor.fetchall()]
+                if 'is_verified' not in gmbr_cols:
+                    logger.info("迁移 group_members: 新增 is_verified 列")
+                    await db.execute("ALTER TABLE group_members ADD COLUMN is_verified BOOLEAN DEFAULT 0")
+                if 'verified_at' not in gmbr_cols:
+                    logger.info("迁移 group_members: 新增 verified_at 列")
+                    await db.execute("ALTER TABLE group_members ADD COLUMN verified_at DATETIME DEFAULT NULL")
+                if 'pending_verify_msg_id' not in gmbr_cols:
+                    logger.info("迁移 group_members: 新增 pending_verify_msg_id 列")
+                    await db.execute("ALTER TABLE group_members ADD COLUMN pending_verify_msg_id INTEGER DEFAULT NULL")
 
             # 1b. 检查 group_messages 的 avatar_file_id 列
             async with db.execute("PRAGMA table_info(group_messages)") as cursor:
@@ -541,8 +555,58 @@ async def init_db():
         except Exception as e:
             logger.error("数据库迁移异常: %s", e)
 
+        # 20. chain_sync_state 表 (用于区块扫描架构)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS chain_sync_state (
+                network TEXT PRIMARY KEY,
+                last_scanned_block INTEGER DEFAULT 0,
+                last_scanned_ts INTEGER DEFAULT 0
+            )
+        ''')
+
+        # 21. tenant_configs 表 (v5.7 新增：加密存储 API 密钥与敏感配置)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS tenant_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT DEFAULT 'default',
+                config_key TEXT NOT NULL,
+                config_value TEXT, -- 存储 field_crypto.encrypt() 后的加密串
+                remark TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tenant_id, config_key)
+            )
+        ''')
+
+        # 22. ai_usage_logs 表（AI 用量统计）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS ai_usage_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel TEXT DEFAULT 'web_ai',
+                user_id INTEGER,
+                sandbox_id TEXT,
+                model TEXT,
+                prompt_tokens INTEGER DEFAULT 0,
+                completion_tokens INTEGER DEFAULT 0,
+                total_tokens INTEGER DEFAULT 0,
+                estimated_cost_usd REAL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # 23. oneapi_keys 表（OneAPI sk 映射）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS oneapi_keys (
+                sk_token TEXT PRIMARY KEY,
+                provider TEXT DEFAULT 'vertex_gemini',
+                model TEXT,
+                sandbox_id TEXT DEFAULT 'default',
+                is_active BOOLEAN DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         await db.commit()
-        logger.info("数据库初始化及迁移完成")
 
 async def get_admin_setting(key: str, default: Optional[str] = None):
     """获取管理员设置"""
@@ -556,6 +620,153 @@ async def save_admin_setting(key: str, value: str):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("INSERT OR REPLACE INTO admin_settings (key, value) VALUES (?, ?)", (key, str(value)))
         await db.commit()
+
+
+async def save_ai_usage_log(
+    channel: str,
+    user_id: Optional[int],
+    sandbox_id: str,
+    model: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    estimated_cost_usd: float = 0.0,
+):
+    """记录 AI 调用用量"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT INTO ai_usage_logs
+            (channel, user_id, sandbox_id, model, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                channel,
+                user_id,
+                sandbox_id,
+                model,
+                int(prompt_tokens or 0),
+                int(completion_tokens or 0),
+                int(total_tokens or 0),
+                float(estimated_cost_usd or 0.0),
+            ),
+        )
+        await db.commit()
+
+
+async def get_ai_usage_summary(days: int = 7) -> Dict[str, Any]:
+    """汇总 AI 用量（按最近 N 天）"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                COUNT(*) AS calls,
+                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+            FROM ai_usage_logs
+            WHERE created_at >= datetime('now', ?)
+            """,
+            (f"-{int(days)} day",),
+        ) as cursor:
+            summary_row = await cursor.fetchone()
+
+        async with db.execute(
+            """
+            SELECT model, COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS total_tokens
+            FROM ai_usage_logs
+            WHERE created_at >= datetime('now', ?)
+            GROUP BY model
+            ORDER BY total_tokens DESC
+            LIMIT 10
+            """,
+            (f"-{int(days)} day",),
+        ) as cursor:
+            model_rows = await cursor.fetchall()
+
+        async with db.execute(
+            """
+            SELECT sandbox_id, COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS total_tokens
+            FROM ai_usage_logs
+            WHERE created_at >= datetime('now', ?)
+            GROUP BY sandbox_id
+            ORDER BY total_tokens DESC
+            LIMIT 20
+            """,
+            (f"-{int(days)} day",),
+        ) as cursor:
+            sandbox_rows = await cursor.fetchall()
+
+    return {
+        "calls": int((summary_row or {}).get("calls", 0) if summary_row else 0),
+        "prompt_tokens": int((summary_row or {}).get("prompt_tokens", 0) if summary_row else 0),
+        "completion_tokens": int((summary_row or {}).get("completion_tokens", 0) if summary_row else 0),
+        "total_tokens": int((summary_row or {}).get("total_tokens", 0) if summary_row else 0),
+        "estimated_cost_usd": float((summary_row or {}).get("estimated_cost_usd", 0.0) if summary_row else 0.0),
+        "top_models": [dict(r) for r in (model_rows or [])],
+        "top_sandboxes": [dict(r) for r in (sandbox_rows or [])],
+    }
+
+
+async def save_oneapi_key(sk_token: str, provider: str, model: str, sandbox_id: str = 'default'):
+    """保存 OneAPI sk 映射"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT INTO oneapi_keys (sk_token, provider, model, sandbox_id, is_active, updated_at)
+            VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT(sk_token) DO UPDATE SET
+                provider=excluded.provider,
+                model=excluded.model,
+                sandbox_id=excluded.sandbox_id,
+                is_active=1,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (sk_token, provider, model, sandbox_id),
+        )
+        await db.commit()
+
+
+async def get_oneapi_key(sk_token: str) -> Optional[Dict[str, Any]]:
+    """读取 OneAPI sk 映射"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM oneapi_keys WHERE sk_token = ? AND is_active = 1",
+            (sk_token,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def list_oneapi_keys(limit: int = 50) -> List[Dict[str, Any]]:
+    """列出 OneAPI sk 映射（后台展示）"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT sk_token, provider, model, sandbox_id, is_active, created_at, updated_at
+            FROM oneapi_keys
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def deactivate_oneapi_key(sk_token: str) -> bool:
+    """停用 OneAPI sk"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "UPDATE oneapi_keys SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE sk_token = ?",
+            (sk_token,),
+        )
+        await db.commit()
+        return cur.rowcount > 0
 
 async def get_user(user_id: int):
     """获取用户信息"""
@@ -636,11 +847,6 @@ async def save_message(
     import uuid
     if not trace_id:
         trace_id = str(uuid.uuid4())
-    # 加密敏感字段
-    content = encrypt(content)
-    original_text = encrypt(original_text)
-    translated_text = encrypt(translated_text)
-    quoted_text = encrypt(quoted_text)
     async with aiosqlite.connect(DB_NAME) as db:
         # 1. 存入 messages 主表
         cur = await db.execute(
@@ -851,9 +1057,6 @@ async def get_chat_history(user_id: int, limit: int = 50, offset: int = 0):
             rows = await cursor.fetchall()
             messages = [dict(row) for row in rows]
             messages.reverse() # 前端需要按时间顺序列出（旧到新），所以反转返回
-            # 解密敏感字段
-            _enc_fields = ['content', 'original_text', 'translated_text', 'quoted_text']
-            messages = decrypt_list(messages, _enc_fields)
             return messages
 
 async def get_active_alerts():
@@ -876,8 +1079,7 @@ async def get_active_monitors():
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM address_monitors WHERE is_active = 1") as cursor:
             rows = await cursor.fetchall()
-            result = [dict(row) for row in rows]
-            return decrypt_list(result, ['address', 'remark'])
+            return [dict(row) for row in rows]
 
 async def update_monitor_timestamp(monitor_id: int, timestamp: int):
     """更新钱包监听的最后交易时间戳"""
@@ -929,7 +1131,7 @@ async def save_monitor_transaction(tx_id: str, monitor_id: int, user_id: int, ad
             """INSERT OR IGNORE INTO monitor_transactions
                (tx_id, monitor_id, user_id, address, network, direction, amount, token_symbol, tx_timestamp, counterparty, risk_level, risk_note)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (tx_id, monitor_id, user_id, encrypt(address), network, direction, amount, token_symbol, tx_timestamp, encrypt(counterparty), risk_level, risk_note),
+            (tx_id, monitor_id, user_id, address, network, direction, amount, token_symbol, tx_timestamp, counterparty, risk_level, risk_note),
         )
         await db.commit()
         return cur.rowcount > 0
@@ -950,13 +1152,7 @@ def _period_boundaries_ms(period: str, previous: bool = False) -> tuple[int, int
         if previous:
             start = start - timedelta(days=7)
             end = end - timedelta(days=7)
-    elif period == 'year':
-        start = datetime(now.year, 1, 1)
-        end = datetime(now.year + 1, 1, 1)
-        if previous:
-            start = datetime(now.year - 1, 1, 1)
-            end = datetime(now.year, 1, 1)
-    else:  # month
+    else:
         start = datetime(now.year, now.month, 1)
         if now.month == 12:
             end = datetime(now.year + 1, 1, 1)
@@ -1138,91 +1334,8 @@ async def get_monitor_transactions_for_export(start_ms: int, end_ms: int, user_i
         db.row_factory = aiosqlite.Row
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
-            return decrypt_list([dict(r) for r in rows], ['address', 'counterparty'])
+            return [dict(r) for r in rows]
 
-
-async def get_monitor_transactions_paged(
-    monitor_id: Optional[int] = None,
-    period: str = 'month',
-    direction_filter: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 50,
-    user_id: Optional[int] = None,
-) -> Dict[str, Any]:
-    """按地址+周期+方向分页查询流水，含汇总统计，识别 TRX 能量费"""
-    start_ms, end_ms = _period_boundaries_ms(period)
-    where_parts = ["tx_timestamp >= ?", "tx_timestamp < ?"]
-    params: List[Union[int, str]] = [start_ms, end_ms]
-
-    if monitor_id is not None:
-        where_parts.append("monitor_id = ?")
-        params.append(int(monitor_id))
-    elif user_id is not None:
-        where_parts.append("user_id = ?")
-        params.append(int(user_id))
-
-    if direction_filter in ('in', 'out'):
-        where_parts.append("direction = ?")
-        params.append(direction_filter)
-
-    where_sql = " AND ".join(where_parts)
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        # 汇总统计（不受方向过滤影响）
-        sum_where = " AND ".join(where_parts[:2 + (1 if monitor_id is not None or user_id is not None else 0)])
-        sum_params = params[:2 + (1 if monitor_id is not None or user_id is not None else 0)]
-        async with db.execute(
-            f"SELECT SUM(CASE WHEN direction='in' THEN amount ELSE 0 END) AS inflow, "
-            f"SUM(CASE WHEN direction='out' THEN amount ELSE 0 END) AS outflow, "
-            f"COUNT(*) AS total_count "
-            f"FROM monitor_transactions WHERE {sum_where}",
-            tuple(sum_params)
-        ) as cur:
-            summary_row = await cur.fetchone()
-            inflow = float(summary_row['inflow'] or 0)
-            outflow = float(summary_row['outflow'] or 0)
-            total_count_all = int(summary_row['total_count'] or 0)
-
-        # 总行数（含方向过滤）
-        async with db.execute(
-            f"SELECT COUNT(*) FROM monitor_transactions WHERE {where_sql}",
-            tuple(params)
-        ) as cur:
-            cnt = await cur.fetchone()
-            total = int(cnt[0] or 0)
-
-        offset = (page - 1) * page_size
-        async with db.execute(
-            f"SELECT * FROM monitor_transactions WHERE {where_sql} "
-            f"ORDER BY tx_timestamp DESC LIMIT ? OFFSET ?",
-            tuple(params) + (page_size, offset)
-        ) as cur:
-            rows = await cur.fetchall()
-            txs = decrypt_list([dict(r) for r in rows], ['address', 'counterparty'])
-
-    # 识别 TRX 能量费用：token_symbol 含 TRX 且 amount < 50，标记 is_energy_fee
-    for tx in txs:
-        sym = (tx.get('token_symbol') or '').upper()
-        amt = float(tx.get('amount') or 0)
-        tx['is_energy_fee'] = (sym == 'TRX' and amt < 50)
-        tx['is_large_trx'] = (sym == 'TRX' and amt >= 50)  # 大额TRX租能量，需确认
-
-    return {
-        'txs': txs,
-        'total': total,
-        'page': page,
-        'page_size': page_size,
-        'pages': max(1, (total + page_size - 1) // page_size),
-        'summary': {
-            'inflow': round(inflow, 2),
-            'outflow': round(outflow, 2),
-            'profit': round(inflow - outflow, 2),
-            'total_count': total_count_all,
-            'start_ms': start_ms,
-            'end_ms': end_ms,
-        }
-    }
 
 async def get_monitor_transactions_list(period: str = 'month', user_id: Optional[int] = None,
                                         addresses: Optional[List[str]] = None,
@@ -1244,7 +1357,7 @@ async def get_monitor_transactions_list(period: str = 'month', user_id: Optional
         db.row_factory = aiosqlite.Row
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
-            return decrypt_list([dict(r) for r in rows], ['address', 'counterparty'])
+            return [dict(r) for r in rows]
 
 async def get_monitors_by_user(user_id: int, active_only: bool = True):
     """获取某用户绑定的钱包监听记录"""
@@ -1256,46 +1369,20 @@ async def get_monitors_by_user(user_id: int, active_only: bool = True):
         q += " ORDER BY monitor_id DESC"
         async with db.execute(q, (user_id,)) as cursor:
             rows = await cursor.fetchall()
-            return decrypt_list([dict(row) for row in rows], ['address', 'remark'])
+            return [dict(row) for row in rows]
 
 
 async def get_all_monitors_for_admin(active_only: bool = True):
-    """管理端：列出管理员自己的监听地址（owner_type=admin_own）"""
+    """管理端：列出所有监听记录（含 user_id）"""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        q = "SELECT * FROM address_monitors WHERE (owner_type = 'admin_own' OR user_id = ?)"
-        params = [int(ADMIN_ID)]
+        q = "SELECT * FROM address_monitors"
         if active_only:
-            q += " AND is_active = 1"
+            q += " WHERE is_active = 1"
         q += " ORDER BY monitor_id DESC"
-        async with db.execute(q, params) as cursor:
+        async with db.execute(q) as cursor:
             rows = await cursor.fetchall()
-            return decrypt_list([dict(row) for row in rows], ['address', 'remark'])
-
-
-async def get_user_query_addresses(active_only: bool = True):
-    """管理端：列出其他用户（非管理员）的查询地址"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        q = "SELECT am.*, u.email FROM address_monitors am LEFT JOIN users u ON am.user_id = u.user_id WHERE am.user_id != ? AND (am.owner_type IS NULL OR am.owner_type = 'user')"
-        params = [int(ADMIN_ID)]
-        if active_only:
-            q += " AND am.is_active = 1"
-        q += " ORDER BY am.monitor_id DESC"
-        async with db.execute(q, params) as cursor:
-            rows = await cursor.fetchall()
-            return decrypt_list([dict(row) for row in rows], ['address', 'remark'])
-
-
-async def claim_monitor_as_admin(monitor_id: int) -> bool:
-    """将用户查询地址转为管理员自有监听地址"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE address_monitors SET owner_type = 'admin_own', user_id = ? WHERE monitor_id = ?",
-            (int(ADMIN_ID), monitor_id)
-        )
-        await db.commit()
-        return True
+            return [dict(row) for row in rows]
 
 
 async def deactivate_wallet_monitor(monitor_id: int, operator_user_id: int) -> bool:
@@ -1336,21 +1423,14 @@ async def deactivate_monitor_admin(monitor_id: int) -> bool:
 
 async def save_wallet_monitor(user_id: int, address: str, network: str, initial_timestamp: Optional[int] = None, remark: str = ''):
     """保存钱包监听地址（同一用户+地址+网络只保留一条，并支持初始化时间戳避免历史推送）"""
-    enc_address = encrypt(address)
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
             "SELECT monitor_id FROM address_monitors WHERE user_id = ? AND address = ? AND network = ?",
-            (user_id, enc_address, network),
+            (user_id, address, network),
         ) as cursor:
             row = await cursor.fetchone()
-        if not row:
-            # 兼容旧明文地址
-            async with db.execute(
-                "SELECT monitor_id FROM address_monitors WHERE user_id = ? AND address = ? AND network = ?",
-                (user_id, address, network),
-            ) as cursor:
-                row = await cursor.fetchone()
         if row:
+            # 如果已存在，更新为活跃状态，如果提供了时间戳则更新时间戳
             if initial_timestamp is not None:
                 await db.execute(
                     "UPDATE address_monitors SET is_active = 1, last_tx_timestamp = ?, remark = ? WHERE monitor_id = ?",
@@ -1364,9 +1444,8 @@ async def save_wallet_monitor(user_id: int, address: str, network: str, initial_
         else:
             await db.execute(
                 "INSERT INTO address_monitors (user_id, address, network, remark, is_active, last_tx_timestamp) VALUES (?, ?, ?, ?, 1, ?)",
-                (user_id, enc_address, network, remark or '', initial_timestamp),
+                (user_id, address, network, remark or '', initial_timestamp),
             )
-        await db.commit()
         await db.commit()
 
 async def save_pending_admin_msg(msg_uuid: str, admin_id: int, content: Optional[str], msg_type: str = 'text', file_id: Optional[str] = None):
@@ -1661,6 +1740,48 @@ async def mark_group_message_revoke_checked(group_id: int, tg_msg_id: int):
             (group_id, tg_msg_id),
         )
         await db.commit()
+
+
+async def search_messages(keyword: str, group_id: int = None, user_id: int = None, limit: int = 30):
+    """全局搜索私聊和群聊消息，返回匹配的消息片段列表"""
+    results = []
+    kw = f"%{keyword}%"
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        # 搜私聊消息
+        if user_id is None and group_id is None or user_id is not None:
+            uid_clause = "AND from_userid = ?" if user_id else ""
+            uid_params = (user_id,) if user_id else ()
+            async with db.execute(
+                f"""SELECT msg_id, tg_msg_id, from_userid AS user_id, NULL AS group_id,
+                           content, timestamp, 'chat' AS source_type
+                    FROM messages
+                    WHERE content LIKE ?
+                    {uid_clause}
+                    ORDER BY msg_id DESC LIMIT ?""",
+                (kw, *uid_params, limit)
+            ) as cur:
+                rows = await cur.fetchall()
+                results.extend([dict(r) for r in rows])
+        # 搜群聊消息
+        if user_id is None:
+            gid_clause = "AND group_id = ?" if group_id else ""
+            gid_params = (group_id,) if group_id else ()
+            async with db.execute(
+                f"""SELECT msg_id, tg_msg_id, user_id, group_id,
+                           content, COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) AS timestamp,
+                           'group' AS source_type, username
+                    FROM group_messages
+                    WHERE content LIKE ?
+                    {gid_clause}
+                    ORDER BY msg_id DESC LIMIT ?""",
+                (kw, *gid_params, limit)
+            ) as cur:
+                rows = await cur.fetchall()
+                results.extend([dict(r) for r in rows])
+    # 按时间倒序合并
+    results.sort(key=lambda x: x.get('timestamp') or 0, reverse=True)
+    return results[:limit]
 
 
 async def save_group_message(
@@ -2151,18 +2272,19 @@ async def get_group_verify_config(group_id: int) -> dict:
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT verify_enabled, verify_type, verify_timeout, verify_channel_id, verify_questions FROM tracked_groups WHERE group_id = ?",
+            "SELECT verify_enabled, verify_type, verify_timeout, verify_channel_id, verify_questions, verify_msg_template FROM tracked_groups WHERE group_id = ?",
             (group_id,)
         ) as cursor:
             row = await cursor.fetchone()
             if not row:
-                return {"verify_enabled": False, "verify_type": "captcha", "verify_timeout": 120, "verify_channel_id": None, "verify_questions": None}
+                return {"verify_enabled": False, "verify_type": "captcha", "verify_timeout": 120, "verify_channel_id": None, "verify_questions": None, "verify_msg_template": None}
             return {
                 "verify_enabled": bool(row["verify_enabled"]),
                 "verify_type": row["verify_type"] or "captcha",
                 "verify_timeout": row["verify_timeout"] or 120,
                 "verify_channel_id": row["verify_channel_id"],
                 "verify_questions": json.loads(row["verify_questions"]) if row["verify_questions"] else [],
+                "verify_msg_template": row["verify_msg_template"],
             }
 
 
@@ -2172,7 +2294,7 @@ async def save_group_verify_config(group_id: int, config: dict) -> None:
         await db.execute(
             """UPDATE tracked_groups SET
                 verify_enabled = ?, verify_type = ?, verify_timeout = ?,
-                verify_channel_id = ?, verify_questions = ?
+                verify_channel_id = ?, verify_questions = ?, verify_msg_template = ?
                WHERE group_id = ?""",
             (
                 1 if config.get("verify_enabled") else 0,
@@ -2180,10 +2302,87 @@ async def save_group_verify_config(group_id: int, config: dict) -> None:
                 config.get("verify_timeout", 120),
                 config.get("verify_channel_id"),
                 json.dumps(config.get("verify_questions", []), ensure_ascii=False) if config.get("verify_questions") else None,
+                config.get("verify_msg_template"),
                 group_id,
             )
         )
         await db.commit()
+
+
+async def get_member_verified(group_id: int, user_id: int) -> bool:
+    """检查成员是否已通过频道验证"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT is_verified FROM group_members WHERE group_id=? AND user_id=?",
+            (group_id, user_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return bool(row[0]) if row else False
+
+
+async def set_member_verified(group_id: int, user_id: int) -> None:
+    """标记成员为已验证"""
+    from datetime import datetime
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """INSERT INTO group_members (group_id, user_id, is_verified, verified_at)
+               VALUES (?, ?, 1, ?)
+               ON CONFLICT(group_id, user_id) DO UPDATE SET is_verified=1, verified_at=?""",
+            (group_id, user_id, now, now)
+        )
+        await db.commit()
+
+
+async def get_verify_stats(group_id: int) -> dict:
+    """获取群内验证统计：已验证 vs 待验证人数"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM group_members WHERE group_id=? AND is_verified=1", (group_id,)
+        ) as cur:
+            verified = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT COUNT(*) FROM group_members WHERE group_id=? AND (is_verified=0 OR is_verified IS NULL)", (group_id,)
+        ) as cur:
+            unverified = (await cur.fetchone())[0]
+    return {"verified": verified, "unverified": unverified, "total": verified + unverified}
+
+
+async def get_verify_growth(group_id: Optional[int] = None, period: str = 'day') -> list:
+    """按天/小时统计通过频道验证的用户数"""
+    if period == 'hour':
+        fmt = "%Y-%m-%d %H:00"
+        trunc = "strftime('%Y-%m-%d %H:00', verified_at)"
+    else:
+        fmt = "%Y-%m-%d"
+        trunc = "strftime('%Y-%m-%d', verified_at)"
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        if group_id:
+            sql = f"SELECT {trunc} as period, COUNT(*) as count FROM group_members WHERE group_id=? AND is_verified=1 AND verified_at IS NOT NULL GROUP BY period ORDER BY period DESC LIMIT 30"
+            params = (group_id,)
+        else:
+            sql = f"SELECT {trunc} as period, COUNT(*) as count FROM group_members WHERE is_verified=1 AND verified_at IS NOT NULL GROUP BY period ORDER BY period DESC LIMIT 30"
+            params = ()
+        async with db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [{"period": r["period"], "count": r["count"]} for r in rows]
+
+
+async def get_verify_growth_summary() -> dict:
+    """获取今日 & 总计引导关注数"""
+    from datetime import datetime
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM group_members WHERE is_verified=1 AND date(verified_at)=?", (today,)
+        ) as cur:
+            today_count = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT COUNT(*) FROM group_members WHERE is_verified=1"
+        ) as cur:
+            total_count = (await cur.fetchone())[0]
+    return {"today": today_count, "total": total_count}
 
 
 async def create_verify_session(group_id: int, user_id: int, username: str, first_name: str,
@@ -2235,84 +2434,554 @@ async def get_expired_verify_sessions() -> list:
             return [dict(r) for r in rows]
 
 
-# ====== counterparty_aliases: 对方地址人名备注 ======
 
-async def get_counterparty_aliases() -> List[Dict[str, Any]]:
-    """获取所有对方地址备注"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM counterparty_aliases ORDER BY name ASC") as cursor:
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
 
-async def upsert_counterparty_alias(address: str, name: str, note: str = '') -> int:
-    """新增或更新对方地址备注，返回 alias_id"""
-    address = address.strip()
-    name = name.strip()
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            """INSERT INTO counterparty_aliases (address, name, note)
-               VALUES (?, ?, ?)
-               ON CONFLICT(address) DO UPDATE SET name=excluded.name, note=excluded.note""",
-            (address, name, note)
-        )
-        await db.commit()
-        async with db.execute("SELECT alias_id FROM counterparty_aliases WHERE address=?", (address,)) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+# ============ 已验证用户相关函数 (v5.1+) ============
 
-async def delete_counterparty_alias(alias_id: int) -> bool:
-    """删除对方地址备注"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("DELETE FROM counterparty_aliases WHERE alias_id=?", (alias_id,))
-        await db.commit()
-        return cursor.rowcount > 0
-
-async def get_counterparty_alias_map() -> Dict[str, str]:
-    """返回 {address: name} 字典，供导出时自动填充付款方/收款方"""
-    rows = await get_counterparty_aliases()
-    return {r['address']: r['name'] for r in rows}
-
-async def get_year_monitor_summary(user_id: Optional[int] = None,
-                                   addresses: Optional[List[str]] = None,
-                                   monitor_ids: Optional[List[int]] = None,
-                                   year: Optional[int] = None) -> List[Dict[str, Any]]:
-    """按月汇总全年收入/支出/净利润，返回12行列表"""
-    from datetime import datetime
-    now = datetime.now()
-    y = year or now.year
-    start_ms = int(datetime(y, 1, 1).timestamp() * 1000)
-    end_ms = int(datetime(y + 1, 1, 1).timestamp() * 1000)
-    scope_sql, scope_params = _build_monitor_scope(addresses=addresses, monitor_ids=monitor_ids, user_id=user_id)
-    sql = f"""
-        SELECT
-            CAST(strftime('%m', datetime(tx_timestamp/1000, 'unixepoch', 'localtime')) AS INTEGER) AS month,
-            SUM(CASE WHEN direction='in' THEN CAST(amount AS REAL) ELSE 0 END) AS inflow,
-            SUM(CASE WHEN direction='out' THEN CAST(amount AS REAL) ELSE 0 END) AS outflow,
-            SUM(CASE WHEN direction='in' THEN CAST(amount AS REAL) ELSE -CAST(amount AS REAL) END) AS profit,
-            COUNT(*) AS tx_count
-        FROM monitor_transactions
-        WHERE tx_timestamp >= ? AND tx_timestamp < ? {scope_sql}
-        GROUP BY month
-        ORDER BY month ASC
+async def get_verified_users(group_id: int, period: str = 'all') -> list:
     """
-    params: List[Union[int, str]] = [start_ms, end_ms]
-    params.extend(scope_params)
+    查询群组中已验证的用户列表
+    
+    Args:
+        group_id: 群组 ID
+        period: 'today' 或 'all'
+    
+    Returns:
+        已验证用户列表，包含 user_id, username, first_name, avatar_file_id, verified_at
+    """
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(sql, tuple(params)) as cursor:
-            rows = await cursor.fetchall()
-            month_map = {r['month']: dict(r) for r in rows}
-    result = []
-    for m in range(1, 13):
-        row = month_map.get(m, {'month': m, 'inflow': 0.0, 'outflow': 0.0, 'profit': 0.0, 'tx_count': 0})
-        result.append({
-            'month': m,
-            'inflow': round(float(row.get('inflow') or 0), 2),
-            'outflow': round(float(row.get('outflow') or 0), 2),
-            'profit': round(float(row.get('profit') or 0), 2),
-            'tx_count': int(row.get('tx_count') or 0),
-        })
-    return result
+        
+        if period == 'today':
+            query = '''
+                SELECT 
+                    user_id,
+                    username,
+                    first_name,
+                    avatar_file_id,
+                    verified_at
+                FROM group_members
+                WHERE group_id = ?
+                  AND is_verified = 1
+                  AND DATE(verified_at) = DATE('now')
+                ORDER BY verified_at DESC
+            '''
+        else:
+            query = '''
+                SELECT 
+                    user_id,
+                    username,
+                    first_name,
+                    avatar_file_id,
+                    verified_at
+                FROM group_members
+                WHERE group_id = ?
+                  AND is_verified = 1
+                ORDER BY verified_at DESC
+            '''
+        
+        cursor = await db.execute(query, (group_id,))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
 
 
+async def get_verify_growth_summary(group_id: int = None) -> dict:
+    """获取验证增长统计摘要"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        if group_id:
+            cursor = await db.execute('''
+                SELECT 
+                    COUNT(CASE WHEN DATE(verified_at) = DATE('now') THEN 1 END) as today,
+                    COUNT(*) as total
+                FROM group_members
+                WHERE group_id = ? AND is_verified = 1
+            ''', (group_id,))
+        else:
+            cursor = await db.execute('''
+                SELECT 
+                    COUNT(CASE WHEN DATE(verified_at) = DATE('now') THEN 1 END) as today,
+                    COUNT(*) as total
+                FROM group_members
+                WHERE is_verified = 1
+            ''')
+        
+        row = await cursor.fetchone()
+        return {'today': row[0] if row else 0, 'total': row[1] if row else 0}
+
+
+async def get_all_verified_users(period: str = 'all') -> list:
+    """
+    查询所有群组中已验证的用户列表（全局统计）
+    
+    Args:
+        period: 'today' 或 'all'
+    
+    Returns:
+        已验证用户列表，包含 user_id, username, first_name, avatar_file_id, verified_at, group_id, group_title
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        
+        if period == 'today':
+            query = '''
+                SELECT 
+                    user_id,
+                    username,
+                    first_name,
+                    avatar_file_id,
+                    verified_at,
+                    group_id,
+                    group_title
+                FROM group_members
+                WHERE is_verified = 1
+                  AND DATE(verified_at) = DATE('now')
+                ORDER BY verified_at DESC
+            '''
+        else:
+            query = '''
+                SELECT 
+                    user_id,
+                    username,
+                    first_name,
+                    avatar_file_id,
+                    verified_at,
+                    group_id,
+                    group_title
+                FROM group_members
+                WHERE is_verified = 1
+                ORDER BY verified_at DESC
+            '''
+        
+        cursor = await db.execute(query)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+# ============ 未关注频道用户提醒功能 (v5.3+) ============
+
+async def get_unverified_users(group_id: int = None, period: str = 'all') -> list:
+    """
+    查询未关注频道的用户列表
+    
+    Args:
+        group_id: 群组 ID（可选，不传则返回全局）
+        period: 'today' 或 'all'
+    
+    Returns:
+        未关注用户列表
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        
+        if period == 'today':
+            if group_id:
+                query = '''
+                    SELECT 
+                        user_id, username, first_name, avatar_file_id,
+                        group_id, group_title, joined_at
+                    FROM group_members
+                    WHERE group_id = ? AND is_verified = 0
+                      AND DATE(joined_at) = DATE('now')
+                    ORDER BY joined_at DESC
+                '''
+                cursor = await db.execute(query, (group_id,))
+            else:
+                query = '''
+                    SELECT 
+                        user_id, username, first_name, avatar_file_id,
+                        group_id, group_title, joined_at
+                    FROM group_members
+                    WHERE is_verified = 0
+                      AND DATE(joined_at) = DATE('now')
+                    ORDER BY joined_at DESC
+                '''
+                cursor = await db.execute(query)
+        else:
+            if group_id:
+                query = '''
+                    SELECT 
+                        user_id, username, first_name, avatar_file_id,
+                        group_id, group_title, joined_at
+                    FROM group_members
+                    WHERE group_id = ? AND is_verified = 0
+                    ORDER BY joined_at DESC
+                '''
+                cursor = await db.execute(query, (group_id,))
+            else:
+                query = '''
+                    SELECT 
+                        user_id, username, first_name, avatar_file_id,
+                        group_id, group_title, joined_at
+                    FROM group_members
+                    WHERE is_verified = 0
+                    ORDER BY joined_at DESC
+                '''
+                cursor = await db.execute(query)
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def save_channel_reminder(group_id: int, user_id: int, message_id: int, expires_at: str) -> int:
+    """
+    保存频道关注提醒记录
+    
+    Args:
+        group_id: 群组 ID
+        user_id: 用户 ID
+        message_id: TG 消息 ID
+        expires_at: 过期时间
+    
+    Returns:
+        记录 ID
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute('''
+            INSERT INTO channel_follow_reminders 
+            (group_id, user_id, message_id, sent_at, expires_at, is_deleted)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, 0)
+        ''', (group_id, user_id, message_id, expires_at))
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_expired_reminders() -> list:
+    """获取已过期的提醒记录"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT * FROM channel_follow_reminders
+            WHERE is_deleted = 0 AND expires_at < CURRENT_TIMESTAMP
+        ''')
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def mark_reminder_deleted(reminder_id: int) -> None:
+    """标记提醒为已删除"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            UPDATE channel_follow_reminders
+            SET is_deleted = 1
+            WHERE id = ?
+        ''', (reminder_id,))
+        await db.commit()
+
+
+async def get_reminder_by_user_group(user_id: int, group_id: int) -> dict:
+    """获取用户在特定群组的提醒记录"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT * FROM channel_follow_reminders
+            WHERE user_id = ? AND group_id = ? AND is_deleted = 0
+            ORDER BY sent_at DESC LIMIT 1
+        ''', (user_id, group_id))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_group_member(group_id: int, user_id: int) -> dict:
+    """
+    获取群组成员信息
+    
+    Args:
+        group_id: 群组 ID
+        user_id: 用户 ID
+    
+    Returns:
+        成员信息字典，包含 username, first_name 等
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT user_id, username, first_name, last_name, avatar_file_id
+            FROM group_members
+            WHERE group_id = ? AND user_id = ?
+            LIMIT 1
+        ''', (group_id, user_id))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def _ensure_finance_exchange_rate_table(db: aiosqlite.Connection) -> None:
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS finance_exchange_rates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_symbol TEXT NOT NULL,
+            fiat_currency TEXT NOT NULL,
+            rate REAL NOT NULL,
+            rate_timestamp INTEGER NOT NULL,
+            source TEXT DEFAULT 'binance',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    await db.execute('''
+        CREATE INDEX IF NOT EXISTS idx_finance_exchange_rates_key
+        ON finance_exchange_rates(token_symbol, fiat_currency, rate_timestamp)
+    ''')
+
+
+async def _fetch_binance_spot_rate(token_symbol: str, fiat_currency: str) -> Optional[float]:
+    token = (token_symbol or '').upper()
+    fiat = (fiat_currency or 'USD').upper()
+
+    if token in ('USD', 'USDT', 'USDC') and fiat in ('USD', 'USDT'):
+        return 1.0
+
+    quote = 'USDT' if fiat in ('USD', 'USDT') else fiat
+    symbol = f"{token}{quote}"
+    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json()
+                price = payload.get('price')
+                return float(price) if price is not None else None
+    except Exception:
+        return None
+
+
+async def _get_or_fill_exchange_rate(
+    db: aiosqlite.Connection,
+    token_symbol: str,
+    fiat_currency: str,
+    tx_timestamp: Optional[int],
+    ledger_exchange_rate: Optional[float] = None,
+) -> float:
+    token = (token_symbol or '').upper()
+    fiat = (fiat_currency or 'USD').upper()
+    ts = int(tx_timestamp or datetime.now().timestamp())
+
+    if ledger_exchange_rate and float(ledger_exchange_rate) > 0:
+        return float(ledger_exchange_rate)
+
+    cursor = await db.execute(
+        '''
+        SELECT rate
+        FROM finance_exchange_rates
+        WHERE token_symbol = ? AND fiat_currency = ? AND rate_timestamp <= ?
+        ORDER BY rate_timestamp DESC
+        LIMIT 1
+        ''',
+        (token, fiat, ts),
+    )
+    row = await cursor.fetchone()
+    if row and row[0] is not None:
+        return float(row[0])
+
+    live_rate = await _fetch_binance_spot_rate(token, fiat)
+    if live_rate is None:
+        live_rate = 1.0 if token == fiat else 0.0
+
+    await db.execute(
+        '''
+        INSERT INTO finance_exchange_rates(token_symbol, fiat_currency, rate, rate_timestamp, source)
+        VALUES (?, ?, ?, ?, 'binance')
+        ''',
+        (token, fiat, live_rate, ts),
+    )
+    return float(live_rate)
+
+
+async def get_finance_summary_by_currency(user_id: int) -> Dict[str, Any]:
+    """多币种汇总：按 network, token_symbol 聚合统计。"""
+    async with aiosqlite.connect(DB_NAME, timeout=10) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            '''
+            SELECT
+                COALESCE(m.network, 'unknown') AS network,
+                l.token_symbol AS token_symbol,
+                COUNT(1) AS tx_count,
+                SUM(CASE WHEN l.direction = 'in' THEN CAST(l.amount AS REAL) ELSE 0 END) AS total_in,
+                SUM(CASE WHEN l.direction = 'out' THEN CAST(l.amount AS REAL) ELSE 0 END) AS total_out,
+                SUM(CASE WHEN l.reconciled_status = 'UNRECONCILED' THEN 1 ELSE 0 END) AS unreconciled_count
+            FROM finance_ledgers l
+            LEFT JOIN address_monitors m ON m.monitor_id = l.monitor_id
+            WHERE l.user_id = ?
+            GROUP BY COALESCE(m.network, 'unknown'), l.token_symbol
+            ORDER BY network, token_symbol
+            ''',
+            (user_id,),
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+
+        total_unreconciled = sum(int(r.get('unreconciled_count') or 0) for r in rows)
+        return {
+            'by_currency': rows,
+            'total_unreconciled': total_unreconciled,
+        }
+
+
+async def get_finance_unreconciled_with_fx(user_id: int, monitor_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """未对账流水：按交易时间匹配历史汇率，缺失时调用币安补全。"""
+    async with aiosqlite.connect(DB_NAME, timeout=10) as db:
+        db.row_factory = aiosqlite.Row
+        await _ensure_finance_exchange_rate_table(db)
+
+        query = '''
+            SELECT
+                l.ledger_id,
+                l.monitor_id,
+                l.direction,
+                l.amount,
+                l.token_symbol,
+                l.base_fiat_value,
+                l.fiat_currency,
+                l.exchange_rate,
+                l.counterparty,
+                l.tx_hash,
+                l.tx_timestamp,
+                l.created_at,
+                l.reconciled_status,
+                COALESCE(m.network, 'unknown') AS network,
+                a.code,
+                a.name
+            FROM finance_ledgers l
+            LEFT JOIN address_monitors m ON m.monitor_id = l.monitor_id
+            LEFT JOIN chart_of_accounts a ON a.account_id = l.account_id
+            WHERE l.user_id = ? AND l.reconciled_status = 'UNRECONCILED'
+        '''
+        params: List[Any] = [user_id]
+
+        if monitor_id is not None:
+            query += ' AND l.monitor_id = ?'
+            params.append(monitor_id)
+
+        query += ' ORDER BY l.tx_timestamp DESC LIMIT 500'
+
+        cursor = await db.execute(query, params)
+        rows = [dict(r) for r in await cursor.fetchall()]
+
+        for row in rows:
+            rate = await _get_or_fill_exchange_rate(
+                db,
+                token_symbol=row.get('token_symbol') or '',
+                fiat_currency=row.get('fiat_currency') or 'USD',
+                tx_timestamp=row.get('tx_timestamp'),
+                ledger_exchange_rate=row.get('exchange_rate'),
+            )
+            amount = float(row.get('amount') or 0)
+            fiat_value = float(row.get('base_fiat_value') or 0)
+            if fiat_value <= 0 and rate > 0:
+                fiat_value = round(amount * rate, 8)
+
+            row['exchange_rate_used'] = rate
+            row['fiat_value'] = fiat_value
+
+        await db.commit()
+        return rows
+
+
+async def reconcile_finance_ledger(
+    ledger_id: str,
+    account_code: str,
+    admin_userid: int,
+    amount: Optional[float] = None,
+    ip_address: Optional[str] = None,
+) -> bool:
+    """按 ledger_id 执行对账并记录审计日志。"""
+    async with aiosqlite.connect(DB_NAME, timeout=10) as db:
+        await db.execute('BEGIN IMMEDIATE')
+        try:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                'SELECT ledger_id, user_id, reconciled_status FROM finance_ledgers WHERE ledger_id = ?',
+                (ledger_id,),
+            )
+            ledger = await cursor.fetchone()
+            if not ledger or int(ledger['user_id']) != int(admin_userid):
+                await db.execute('ROLLBACK')
+                return False
+
+            if ledger['reconciled_status'] == 'RECONCILED':
+                await db.execute('ROLLBACK')
+                return True
+
+            cursor = await db.execute(
+                'SELECT account_id FROM chart_of_accounts WHERE code = ? AND is_active = 1',
+                (account_code,),
+            )
+            account = await cursor.fetchone()
+            if not account:
+                await db.execute('ROLLBACK')
+                raise ValueError(f'会计科目不存在: {account_code}')
+
+            await db.execute(
+                '''
+                UPDATE finance_ledgers
+                SET account_id = ?, reconciled_status = 'RECONCILED', updated_at = CURRENT_TIMESTAMP
+                WHERE ledger_id = ?
+                ''',
+                (int(account['account_id']), ledger_id),
+            )
+
+            await db.execute(
+                '''
+                INSERT INTO audit_logs(admin_userid, action, target_table, target_id, reason, ip_address)
+                VALUES (?, 'RECONCILE', 'finance_ledgers', ?, ?, ?)
+                ''',
+                (admin_userid, ledger_id, f'对账至科目 {account_code}' + (f' 金额 {amount}' if amount is not None else ''), ip_address),
+            )
+
+            await db.execute('COMMIT')
+            return True
+        except Exception:
+            await db.execute('ROLLBACK')
+            raise
+
+
+async def get_finance_category_tree() -> List[Dict[str, Any]]:
+    """获取会计科目树。"""
+    async with aiosqlite.connect(DB_NAME, timeout=10) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            '''
+            SELECT account_id, code, name, type, parent_id, description
+            FROM chart_of_accounts
+            WHERE is_active = 1
+            ORDER BY code
+            '''
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+
+    node_map: Dict[int, Dict[str, Any]] = {}
+    roots: List[Dict[str, Any]] = []
+
+    for r in rows:
+        node_map[int(r['account_id'])] = {
+            'id': r['account_id'],
+            'code': r['code'],
+            'name': r['name'],
+            'type': r['type'],
+            'parent_id': r['parent_id'],
+            'description': r.get('description'),
+            'children': [],
+        }
+
+    for r in rows:
+        node = node_map[int(r['account_id'])]
+        parent_id = r.get('parent_id')
+        if parent_id and int(parent_id) in node_map:
+            node_map[int(parent_id)]['children'].append(node)
+        else:
+            roots.append(node)
+
+    return roots
+
+# ============ 财务 ERP 模块初始化 ============
+
+async def init_finance_module():
+    """初始化财务 ERP 模块"""
+    try:
+        from finance_core import init_finance_db, init_default_chart_of_accounts
+        await init_finance_db()
+        await init_default_chart_of_accounts()
+        logger.info("✅ 财务 ERP 模块初始化完成")
+    except Exception as e:
+        logger.error(f"❌ 财务 ERP 模块初始化失败: {e}")
