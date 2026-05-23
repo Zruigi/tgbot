@@ -207,8 +207,29 @@ class MediaProcessor:
             logger.error(f"❌ [Media-Error] 处理失败: {e} (FileID: {file_id})")
             return False, None, None, str(e)
         finally:
+            # 清理下载的原始文件（如果与处理后文件不同）
             if local_path and local_path != processed_path and os.path.exists(local_path):
                 os.remove(local_path)
+
+    async def process_media_managed(self, file_id: Optional[str], msg_type: str):
+        """
+        上下文管理器版本的 process_media：自动清理临时文件。
+        用法:
+            async with processor.process_media_managed(file_id, msg_type) as (ok, path, thumb, err):
+                if ok: ...  # 使用 path 和 thumb
+            # 退出 with 块后自动清理
+        """
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _ctx():
+            ok, path, thumb, err = await self.process_media(file_id, msg_type)
+            try:
+                yield ok, path, thumb, err
+            finally:
+                self.cleanup(path, thumb)
+
+        return _ctx()
 
     def cleanup(self, *paths):
         """清理临时文件"""

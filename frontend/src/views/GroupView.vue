@@ -141,7 +141,10 @@
                      @change="toggleUserSelection(user.user_id)" />
               <div style="flex: 1; min-width: 0;">
                 <div style="font-size: 12px; font-weight: 600;">{{ user.first_name || user.username || 'Unknown' }}</div>
-                <div style="font-size: 11px; color: var(--text-muted);">@{{ user.username || ('UID ' + user.user_id) }}</div>
+                <a :href="tgUserProfileHref(user.user_id, user.username)"
+                   style="font-size: 11px; color: var(--text-muted);"
+                   class="hover:underline"
+                   @click.stop.prevent="openTgUserProfile(user.user_id, user.username)">{{ tgUserLinkLabel(user.user_id, user.username, user.first_name) }}</a>
               </div>
             </div>
           </div>
@@ -163,6 +166,7 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted } from 'vue'
 import { chatApi } from '@/api'
+import { openTgUserProfile, tgUserProfileHref, tgUserLinkLabel } from '@/utils/tgUserLink'
 
 interface Group {
   group_id: number

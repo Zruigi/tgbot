@@ -8,6 +8,15 @@ from dotenv import load_dotenv
 # 加载 .env 文件中的环境变量
 load_dotenv()
 
+
+def _first_non_empty_env(*keys: str, default: str = "") -> str:
+    """按顺序读取环境变量，返回第一个非空值。"""
+    for key in keys:
+        value = os.getenv(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
 # --- Telegram Bot 配置 ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -22,8 +31,21 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 
 # --- 区块链 API 配置 ---
-TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "")
-BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
+# 兼容旧命名：DMV(=TRC20 TronGrid key), BC(=BSCScan key)
+TRONGRID_API_KEY = _first_non_empty_env(
+    "TRONGRID_API_KEY",
+    "DMV",
+    "DMV_API_KEY",
+    "DMV_API_TOKEN",
+    "DMV_TOKEN",
+)
+BSCSCAN_API_KEY = _first_non_empty_env(
+    "BSCSCAN_API_KEY",
+    "BC",
+    "BC_API_KEY",
+    "BC_API_TOKEN",
+    "BC_TOKEN",
+)
 
 # --- 币安 API (公开，无需 Key) ---
 # CCXT 会自动使用币安的公共 API，这里无需特别设置
@@ -34,17 +56,31 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.getenv("DB_NAME") or os.path.join(BASE_DIR, "crypto_bot.sqlite3")
 
 # --- 日志配置 ---
-LOG_DIR = os.getenv("LOG_DIR", os.path.join(BASE_DIR, "logs"))
+DEFAULT_LOG_DIR = "/home/ubuntu/tgbot/logs"
+LOG_DIR = os.getenv("LOG_DIR", DEFAULT_LOG_DIR)
+if not os.path.isabs(LOG_DIR):
+    LOG_DIR = os.path.abspath(os.path.join(BASE_DIR, LOG_DIR))
 LOG_RETENTION_HOURS = int(os.getenv("LOG_RETENTION_HOURS", "48"))
 
 LOG_APP_DIR = os.path.join(LOG_DIR, "app")
+LOG_BOT_DIR = os.path.join(LOG_APP_DIR, "bot")
+LOG_BACKEND_DIR = os.path.join(LOG_APP_DIR, "backend")
 LOG_TUNNEL_DIR = os.path.join(LOG_DIR, "tunnel")
+LOG_CLOUDFLARED_DIR = os.path.join(LOG_TUNNEL_DIR, "cloudflared")
+LOG_FRONTEND_DIR = os.path.join(LOG_DIR, "frontend")
+LOG_VITE_DIR = os.path.join(LOG_FRONTEND_DIR, "vite")
+LOG_AI_DIR = os.path.join(LOG_DIR, "ai")
+LOG_LITELLM_DIR = os.path.join(LOG_AI_DIR, "litellm")
 LOG_RUNTIME_DIR = os.path.join(LOG_DIR, "runtime")
+LOG_PROCESS_DIR = os.path.join(LOG_RUNTIME_DIR, "process")
 
-BOT_LOG_PATH = os.path.join(LOG_APP_DIR, "bot.log")
-BACKEND_LOG_PATH = os.path.join(LOG_APP_DIR, "backend.log")
-CLOUDFLARED_LOG_PATH = os.path.join(LOG_TUNNEL_DIR, "cloudflared.log")
-CLOUDFLARED_STDOUT_PATH = os.path.join(LOG_TUNNEL_DIR, "cloudflared.stdout")
+BOT_LOG_PATH = os.path.join(LOG_BOT_DIR, "bot.log")
+BACKEND_LOG_PATH = os.path.join(LOG_BACKEND_DIR, "backend.log")
+CLOUDFLARED_LOG_PATH = os.path.join(LOG_CLOUDFLARED_DIR, "cloudflared.log")
+CLOUDFLARED_STDOUT_PATH = os.path.join(LOG_CLOUDFLARED_DIR, "cloudflared.stdout")
+FRONTEND_LOG_PATH = os.path.join(LOG_VITE_DIR, "frontend.stdout")
+LITELLM_LOG_PATH = os.path.join(LOG_LITELLM_DIR, "litellm.log")
+DEV_PID_PATH = os.path.join(LOG_PROCESS_DIR, "dev.pids")
 
 # --- OCR 配置 (用于地址截图验证) ---
 # TESSERACT_CMD: Tesseract 执行文件路径。

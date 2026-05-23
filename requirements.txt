@@ -9,3 +9,6 @@ pytesseract
 deep-translator
 langdetect
 openpyxl
+cachetools
+pytest>=7.0
+pytest-asyncio>=0.23.0

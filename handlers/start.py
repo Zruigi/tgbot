@@ -7,25 +7,119 @@
 - Deep Linking 自助解禁：unmute_{group_id} 参数处理
 """
 import logging
+import os
+import re
 import time
-from datetime import datetime, timedelta
+from typing import Dict
+from urllib.parse import urlencode
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, WebAppInfo, ReplyKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 import config
 import web_admin
 import database
+from backend.repositories import merchant_repo
+from cachetools import TTLCache
+from services.i18n import (
+    SUPPORTED_LOCALES,
+    language_label,
+    resolve_user_locale,
+    set_user_locale,
+    tr,
+)
 
 logger = logging.getLogger(__name__)
 
-# 频率限制缓存：{user_id: last_verify_time}
-_unmute_rate_limit = {}
+# 频率限制缓存：{user_id: last_verify_time}，TTL 60秒，上限 1000 条
+_unmute_rate_limit = TTLCache(maxsize=1000, ttl=60)
+
+
+def _main_menu_action_map(locale: str, has_merchant_console: bool, is_admin: bool) -> Dict[str, str]:
+    mapping = {
+        tr(locale, "buttons.language"): "lang_menu",
+        tr(locale, "buttons.contact_admin"): "contact_admin",
+        tr(locale, "buttons.spot_price"): "spot_price",
+        tr(locale, "buttons.futures_price"): "futures_price",
+        tr(locale, "buttons.wallet_monitor"): "wallet_monitor",
+        tr(locale, "buttons.wallet_list"): "wallet_my_list",
+        tr(locale, "buttons.email_settings"): "email_settings",
+        tr(locale, "buttons.back_to_main"): "back_to_start",
+    }
+    if has_merchant_console:
+        mapping[tr(locale, "buttons.merchant_console")] = "merchant_web_otp"
+    else:
+        mapping[tr(locale, "buttons.register_bot")] = "register_merchant"
+    if is_admin:
+        mapping[tr(locale, "buttons.web_admin")] = "admin_web_otp"
+        mapping[tr(locale, "buttons.system_settings")] = "admin_settings"
+    return mapping
+
+
+def build_main_menu_text_pattern() -> str:
+    labels = set()
+    for locale_code in SUPPORTED_LOCALES:
+        direct_keys = {
+            tr(locale_code, "buttons.language"),
+            tr(locale_code, "buttons.contact_admin"),
+            tr(locale_code, "buttons.wallet_list"),
+            tr(locale_code, "buttons.back_to_main"),
+            tr(locale_code, "buttons.web_admin"),
+            tr(locale_code, "buttons.merchant_console"),
+            tr(locale_code, "buttons.system_settings"),
+        }
+        labels.update(direct_keys)
+        labels.update(language_label(code) for code in SUPPORTED_LOCALES)
+    escaped = sorted(re.escape(label) for label in labels if label)
+    return r"^(?:" + "|".join(escaped) + r")$"
 
 
 def _is_admin(user_id: int) -> bool:
     """判断是否为管理员"""
     return user_id in config.ADMIN_TG_IDS
+
+
+def _resolve_frontend_url_for_otp() -> str:
+    """
+    运行时解析 OTP 登录基础 URL。
+    优先级：
+    1) .env 中的 FRONTEND_URL
+    2) .env 中的 WEB_BASE_URL
+    3) 进程内缓存的 config.FRONTEND_URL
+    """
+    env_file = os.path.join(config.BASE_DIR, ".env")
+    latest_frontend = ""
+    latest_web_base = ""
+
+    try:
+        if os.path.exists(env_file):
+            with open(env_file, "r", encoding="utf-8", errors="ignore") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip("'\"").rstrip("/")
+                    if not value:
+                        continue
+                    if key == "FRONTEND_URL":
+                        latest_frontend = value
+                    elif key == "WEB_BASE_URL":
+                        latest_web_base = value
+    except Exception as e:
+        logger.warning(f"读取 .env 域名失败，回退到 config.FRONTEND_URL: {e}")
+
+    return (
+        latest_frontend
+        or latest_web_base
+        or (config.FRONTEND_URL or "").strip().rstrip("/")
+    )
+
+
+def _build_admin_browser_url(frontend_url: str, *, otp: str) -> str:
+    params = {'otp': otp}
+    return f"{frontend_url.rstrip('/')}/admin?{urlencode(params)}"
 
 
 async def _handle_unmute_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, param: str) -> None:
@@ -205,44 +299,157 @@ async def _execute_unmute(bot, user_id: int, group_id: int) -> None:
 
 
 
-def _admin_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
-    """管理员专属菜单（双列排版）— Web后台按钮直接使用 url 跳转"""
-    # 生成 OTP + 一次性加密入口路由，降低固定登录入口暴露与重放风险
-    try:
-        otp = web_admin.generate_otp()
-        url = f"{config.FRONTEND_URL}/?otp={otp}"
-        logger.info(f"Final Login URL Sent to TG: {url}")
-        web_btn = InlineKeyboardButton("🌐 Web 管理后台", url=url)
-    except Exception as e:
-        logger.warning(f"生成 OTP 失败，降级为 callback: {e}")
-        web_btn = InlineKeyboardButton("🌐 Web 管理后台", callback_data="admin_web_otp")
 
+
+async def _build_merchant_entry_urls(owner_tg_user_id: int) -> tuple[str, str]:
+    merchant = await merchant_repo.get_merchant_by_owner(int(owner_tg_user_id))
+    if not merchant:
+        raise ValueError('merchant_not_found')
+
+    frontend_url = _resolve_frontend_url_for_otp()
+    if not frontend_url or '127.0.0.1' in frontend_url or 'localhost' in frontend_url:
+        raise ValueError(f'前端域名不可用: {frontend_url}')
+
+    grant_meta = await web_admin.generate_entry_grant(
+        issued_for=str(owner_tg_user_id),
+        role_hint='merchant_owner',
+        tenant_id=str(merchant.get('tenant_id') or ''),
+        merchant_id=int(merchant.get('id')),
+        entry_intent='merchant_console',
+    )
+    otp = await web_admin.generate_otp(
+        role='merchant_owner',
+        tenant_id=str(merchant.get('tenant_id') or ''),
+        merchant_id=int(merchant.get('id')),
+        issued_for=str(owner_tg_user_id),
+    )
+    miniapp_url = web_admin.build_miniapp_url(
+        entry_intent='merchant_console',
+        grant=grant_meta['grant'],
+        tenant_hint=str(merchant.get('tenant_id') or ''),
+        merchant_id_hint=int(merchant.get('id')),
+    )
+    browser_url = web_admin.build_miniapp_url(
+        entry_intent='merchant_console',
+        grant=grant_meta['grant'],
+        otp=otp,
+        tenant_hint=str(merchant.get('tenant_id') or ''),
+        merchant_id_hint=int(merchant.get('id')),
+    )
+    return miniapp_url, browser_url
+
+
+async def _build_admin_entry_urls(user_id: int) -> tuple[str, str]:
+    frontend_url = _resolve_frontend_url_for_otp()
+    if not frontend_url or '127.0.0.1' in frontend_url or 'localhost' in frontend_url:
+        raise ValueError(f'前端域名不可用: {frontend_url}')
+
+    grant_meta = await web_admin.generate_entry_grant(
+        issued_for=str(user_id),
+        role_hint='platform_admin',
+        entry_intent='admin_console',
+    )
+    otp = await web_admin.generate_otp(
+        role='platform_admin',
+        issued_for=str(user_id),
+    )
+    miniapp_url = web_admin.build_miniapp_url(
+        entry_intent='admin_console',
+        grant=grant_meta['grant'],
+    )
+    browser_url = web_admin.build_miniapp_url(
+        entry_intent='admin_console',
+        grant=grant_meta['grant'],
+        otp=otp,
+    )
+    return miniapp_url, browser_url
+
+
+def _language_keyboard(locale: str) -> InlineKeyboardMarkup:
+    rows = []
+    current = locale
+    for code in SUPPORTED_LOCALES:
+        prefix = "✅ " if code == current else ""
+        rows.append([InlineKeyboardButton(f"{prefix}{language_label(code)}", callback_data=f"lang_set:{code}")])
+    rows.append([InlineKeyboardButton(tr(locale, "buttons.back_to_main"), callback_data="back_to_start")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _language_reply_keyboard(locale: str) -> ReplyKeyboardMarkup:
+    rows = [[language_label(code)] for code in SUPPORTED_LOCALES]
+    rows.append([tr(locale, "buttons.back_to_main")])
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder=tr(locale, "common.language_title"),
+    )
+
+
+def _main_reply_keyboard(locale: str, is_admin: bool, has_merchant_console: bool) -> ReplyKeyboardMarkup:
+    rows = [
+        [tr(locale, "buttons.contact_admin")],
+    ]
+    if is_admin:
+        rows.append([tr(locale, "buttons.web_admin")])
+        rows.append([tr(locale, "buttons.merchant_console")])
+    elif has_merchant_console:
+        rows.append([tr(locale, "buttons.merchant_console")])
+    else:
+        rows.append([tr(locale, "buttons.register_bot")])
+
+    rows.extend([
+        [tr(locale, "buttons.spot_price"), tr(locale, "buttons.futures_price")],
+        [tr(locale, "buttons.wallet_monitor"), tr(locale, "buttons.wallet_list")],
+        [tr(locale, "buttons.email_settings"), tr(locale, "buttons.language")],
+    ])
+    if is_admin:
+        rows.append([tr(locale, "buttons.system_settings")])
+
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder=tr(locale, "start.main_menu", user="", role_tag="", user_id="").split("\n")[-1],
+    )
+
+
+def _admin_keyboard(locale: str, user_id: int = 0) -> InlineKeyboardMarkup:
+    """管理员专属菜单（双列排版）— Web后台入口始终点击后动态生成 OTP 链接"""
     keyboard = [
-        # 首行：Web 后台独占一行（重要入口，url 直接跳转）
-        [web_btn],
-        # 双列行
-        [InlineKeyboardButton("⚙️ 系统设置", callback_data="admin_settings"),
-         InlineKeyboardButton("📈 现货行情", callback_data="spot_price")],
-        [InlineKeyboardButton("📉 合约行情", callback_data="futures_price"),
-         InlineKeyboardButton("👛 监听钱包", callback_data="wallet_monitor")],
-        [InlineKeyboardButton("📋 我的列表", callback_data="wallet_my_list"),
-         InlineKeyboardButton("📧 邮箱设置", callback_data="email_settings")],
+        [InlineKeyboardButton(tr(locale, "buttons.web_admin"), callback_data="admin_web_otp")],
+        [InlineKeyboardButton(tr(locale, "buttons.merchant_console"), callback_data="merchant_web_otp")],
+        [InlineKeyboardButton(tr(locale, "buttons.system_settings"), callback_data="admin_settings"),
+         InlineKeyboardButton(tr(locale, "buttons.spot_price"), callback_data="spot_price")],
+        [InlineKeyboardButton(tr(locale, "buttons.futures_price"), callback_data="futures_price"),
+         InlineKeyboardButton(tr(locale, "buttons.wallet_monitor"), callback_data="wallet_monitor")],
+        [InlineKeyboardButton(tr(locale, "buttons.wallet_list"), callback_data="wallet_my_list"),
+         InlineKeyboardButton(tr(locale, "buttons.email_settings"), callback_data="email_settings")],
+        [InlineKeyboardButton(tr(locale, "buttons.language"), callback_data="lang_menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-def _user_keyboard() -> InlineKeyboardMarkup:
+
+def _user_keyboard(locale: str, has_merchant_console: bool = False) -> InlineKeyboardMarkup:
     """普通用户菜单（双列排版，客服置顶整行）"""
     keyboard = [
-        # 首行：客服独占
-        [InlineKeyboardButton("🎧 联系人工客服", callback_data="contact_admin")],
-        # 双列行
-        [InlineKeyboardButton("📈 现货行情", callback_data="spot_price"),
-         InlineKeyboardButton("📉 合约行情", callback_data="futures_price")],
-        [InlineKeyboardButton("👛 监听钱包", callback_data="wallet_monitor"),
-         InlineKeyboardButton("📋 我的列表", callback_data="wallet_my_list")],
-        [InlineKeyboardButton("📧 邮箱设置", callback_data="email_settings")],
+        [InlineKeyboardButton(tr(locale, "buttons.contact_admin"), callback_data="contact_admin")],
     ]
+    if has_merchant_console:
+        keyboard.append([InlineKeyboardButton(tr(locale, "buttons.merchant_console"), callback_data="merchant_web_otp")])
+    else:
+        keyboard.append([InlineKeyboardButton(tr(locale, "buttons.register_bot"), callback_data="register_merchant")])
+    keyboard.extend([
+        [InlineKeyboardButton(tr(locale, "buttons.spot_price"), callback_data="spot_price"),
+         InlineKeyboardButton(tr(locale, "buttons.futures_price"), callback_data="futures_price")],
+        [InlineKeyboardButton(tr(locale, "buttons.wallet_monitor"), callback_data="wallet_monitor"),
+         InlineKeyboardButton(tr(locale, "buttons.wallet_list"), callback_data="wallet_my_list")],
+        [InlineKeyboardButton(tr(locale, "buttons.email_settings"), callback_data="email_settings")],
+        [InlineKeyboardButton(tr(locale, "buttons.language"), callback_data="lang_menu")],
+    ])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -251,6 +458,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
+    locale = await resolve_user_locale(user.id, getattr(user, "language_code", None))
 
     # 解析 Deep Linking 参数
     args = context.args or []
@@ -259,28 +467,124 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     is_admin = _is_admin(user.id)
-    keyboard = _admin_keyboard(user.id) if is_admin else _user_keyboard()
+    merchant = await merchant_repo.get_merchant_by_owner(user.id)
+    has_merchant_console = merchant is not None
+    keyboard = _admin_keyboard(locale, user.id) if is_admin else _user_keyboard(locale, has_merchant_console)
+    reply_keyboard = _main_reply_keyboard(locale, is_admin, has_merchant_console)
 
-    role_tag = "👑 管理员" if is_admin else "👤 用户"
-    text = (
-        f"你好，{user.mention_html()} {role_tag}\n"
-        f"UserID: <code>{user.id}</code>\n\n"
-        "请选择功能："
-    )
+    role_tag = tr(locale, "start.role.admin") if is_admin else (tr(locale, "start.role.merchant") if has_merchant_console else tr(locale, "start.role.user"))
+    text = tr(locale, "start.main_menu", user=user.mention_html(), role_tag=role_tag, user_id=user.id)
 
     if update.message:
-        await update.message.reply_html(text, reply_markup=keyboard)
+        await update.message.reply_html(text, reply_markup=reply_keyboard)
     elif update.callback_query:
+        chat_id = update.callback_query.message.chat_id if update.callback_query.message else user.id
         try:
             await update.callback_query.edit_message_text(
                 text, reply_markup=keyboard, parse_mode="HTML"
             )
         except Exception:
-            chat_id = update.callback_query.message.chat_id if update.callback_query.message else user.id
-            await context.bot.send_message(
-                chat_id=chat_id, text=text,
-                reply_markup=keyboard, parse_mode="HTML"
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_keyboard,
+            parse_mode="HTML"
+        )
+
+
+async def show_language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, locale: str) -> None:
+    text = (
+        f"{tr(locale, 'common.language_title')}\n\n"
+        f"{tr(locale, 'common.language_current', language=language_label(locale))}"
+    )
+    if update.message:
+        await update.message.reply_text(text, reply_markup=_language_reply_keyboard(locale))
+    elif update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=_language_keyboard(locale))
+        except Exception:
+            pass
+        chat_id = update.callback_query.message.chat_id if update.callback_query.message else update.effective_user.id
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=_language_reply_keyboard(locale))
+
+
+async def main_menu_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+
+    user = update.effective_user
+    locale = await resolve_user_locale(user.id, getattr(user, "language_code", None))
+    is_admin = _is_admin(user.id)
+    merchant = await merchant_repo.get_merchant_by_owner(user.id)
+    has_merchant_console = merchant is not None
+    text = (update.message.text or "").strip()
+
+    for code in SUPPORTED_LOCALES:
+        if text == language_label(code):
+            await set_user_locale(user.id, code)
+            await update.message.reply_text(
+                tr(code, "common.language_saved", language=language_label(code)),
+                reply_markup=_main_reply_keyboard(code, is_admin, has_merchant_console),
             )
+            return
+
+    action = _main_menu_action_map(locale, has_merchant_console, is_admin).get(text)
+    if not action:
+        return
+
+    if action == "lang_menu":
+        await show_language_menu(update, context, locale)
+        return
+    if action == "back_to_start":
+        await start(update, context)
+        return
+    if action == "wallet_my_list":
+        from handlers.wallet_panel import my_wallets_command
+        await my_wallets_command(update, context)
+        return
+    if action == "admin_settings":
+        await update.message.reply_text(tr(locale, "common.admin_settings_web_only"))
+        return
+    if action == "admin_web_otp":
+        if not is_admin:
+            await update.message.reply_text(tr(locale, "common.no_permission"))
+            return
+        try:
+            miniapp_url, browser_url = await _build_admin_entry_urls(user.id)
+            text = tr(locale, "start.admin_portal_text")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(tr(locale, "buttons.open_admin_console"), web_app=WebAppInfo(url=miniapp_url))],
+                [InlineKeyboardButton(tr(locale, "buttons.browser_open"), url=browser_url)],
+                [InlineKeyboardButton(tr(locale, "buttons.back_to_main"), callback_data="back_to_start")],
+            ])
+            await update.message.reply_html(text, reply_markup=kb)
+        except Exception as e:
+            logger.error(f"[main_menu] 生成管理员入口失败: {e}", exc_info=True)
+            await update.message.reply_text(tr(locale, "start.link_unavailable"))
+        return
+    if action == "merchant_web_otp":
+        try:
+            miniapp_url, browser_url = await _build_merchant_entry_urls(user.id)
+            text = tr(locale, "start.merchant_portal_text")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(tr(locale, "buttons.open_merchant_console"), web_app=WebAppInfo(url=miniapp_url))],
+                [InlineKeyboardButton(tr(locale, "buttons.browser_open"), url=browser_url)],
+                [InlineKeyboardButton(tr(locale, "buttons.back_to_main"), callback_data="back_to_start")],
+            ])
+            await update.message.reply_html(text, reply_markup=kb)
+        except ValueError as e:
+            if str(e) == "merchant_not_found":
+                await update.message.reply_text(tr(locale, "start.merchant_not_bound"))
+            else:
+                await update.message.reply_text(tr(locale, "start.link_unavailable"))
+        except Exception as e:
+            logger.error(f"[main_menu] 生成商户入口失败: {e}", exc_info=True)
+            await update.message.reply_text(tr(locale, "start.link_unavailable"))
+        return
+    if action == "contact_admin":
+        await update.message.reply_html(tr(locale, "start.contact_admin_text"))
+        return
 
 
 async def restart_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -309,6 +613,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     user_id = query.from_user.id
     is_admin = _is_admin(user_id)
+    locale = await resolve_user_locale(user_id, getattr(query.from_user, "language_code", None))
 
     # 处理解禁验证回调
     if data.startswith("unmute_verify:"):
@@ -336,63 +641,123 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _execute_unmute(context.bot, user_id, group_id)
         return
 
+    if data == "lang_menu":
+        await show_language_menu(update, context, locale)
+        return
+
+    if data.startswith("lang_set:"):
+        selected_locale = await set_user_locale(user_id, data.split(":", 1)[1])
+        await query.answer(tr(selected_locale, "common.language_saved", language=language_label(selected_locale)))
+        await start(update, context)
+        return
+
     if data == "admin_web_otp":
         if not is_admin:
-            await query.answer("⛔ 无权限", show_alert=True)
+            await query.answer(tr(locale, "common.no_permission"), show_alert=True)
             return
         try:
-            # 使用 FRONTEND_URL（指向 5173 Vite 前端），而非后端 8080
-            frontend_url = config.FRONTEND_URL
-            if not frontend_url or '127.0.0.1' in frontend_url or 'localhost' in frontend_url:
-                await query.answer(
-                    "⚠️ 暂时无法生成登录链接\n请配置 FRONTEND_URL 环境变量指向前端隧道地址",
-                    show_alert=True
-                )
-                return
-            otp = web_admin.generate_otp()
-            if not otp:
-                await query.answer("⚠️ OTP 生成失败，请重试", show_alert=True)
-                return
-            otp_url = f"{frontend_url}/?otp={otp}"
-            logger.info(f"Final Login URL Sent to TG: {otp_url}")
-            if not otp_url or not otp_url.startswith('http'):
-                await query.answer("⚠️ 登录链接异常，请检查 FRONTEND_URL 配置", show_alert=True)
-                return
-            text = (
-                "🚀 <b>Web 管理后台</b>\n\n"
-                "点击下方按钮一键免密登录后台。\n"
-                "⚠️ 此链接 <b>5 分钟内有效</b>，仅限单次使用，请勿转发。"
-            )
+            miniapp_url, browser_url = await _build_admin_entry_urls(user_id)
+            logger.info(f"[admin_web_otp] generated urls user_id=%s miniapp=%s", user_id, miniapp_url)
+            text = tr(locale, "start.admin_portal_text")
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🌐 立即进入管理后台", url=otp_url)],
-                [InlineKeyboardButton("⬅️ 返回主菜单", callback_data="back_to_start")],
+                [InlineKeyboardButton(tr(locale, "buttons.open_admin_console"), web_app=WebAppInfo(url=miniapp_url))],
+                [InlineKeyboardButton(tr(locale, "buttons.browser_open"), url=browser_url)],
+                [InlineKeyboardButton(tr(locale, "buttons.back_to_main"), callback_data="back_to_start")],
             ])
+            sent_ok = False
             try:
                 await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
-            except Exception:
-                await context.bot.send_message(
-                    chat_id=user_id, text=text, reply_markup=kb, parse_mode="HTML"
-                )
+                sent_ok = True
+                logger.info(f"[admin_web_otp] edit_message_text sent user_id={user_id}")
+            except Exception as edit_err:
+                logger.warning(f"[admin_web_otp] edit_message_text failed user_id={user_id}: {edit_err}")
+            if not sent_ok:
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=text,
+                        reply_markup=kb,
+                        parse_mode="HTML"
+                    )
+                    sent_ok = True
+                    logger.info(f"[admin_web_otp] fallback send_message sent user_id={user_id}")
+                except Exception as send_err:
+                    logger.error(f"[admin_web_otp] fallback send_message failed user_id={user_id}: {send_err}")
+                    raise
         except Exception as e:
-            logger.error(f"生成 OTP 链接失败: {e}")
-            await query.answer("⚠️ 暂时无法生成登录链接，请检查后端配置", show_alert=True)
+            logger.error(f"生成 OTP 链接失败: {e}", exc_info=True)
+            await query.answer(tr(locale, "start.link_unavailable"), show_alert=True)
+
+    elif data == "merchant_web_otp":
+        try:
+            miniapp_url, browser_url = await _build_merchant_entry_urls(user_id)
+            logger.info(f"[merchant_web_otp] generated urls user_id=%s miniapp=%s", user_id, miniapp_url)
+            text = tr(locale, "start.merchant_portal_text")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(tr(locale, "buttons.open_merchant_console"), web_app=WebAppInfo(url=miniapp_url))],
+                [InlineKeyboardButton(tr(locale, "buttons.browser_open"), url=browser_url)],
+                [InlineKeyboardButton(tr(locale, "buttons.back_to_main"), callback_data="back_to_start")],
+            ])
+            sent_ok = False
+            try:
+                await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+                sent_ok = True
+                logger.info(f"[merchant_web_otp] edit_message_text sent user_id={user_id}")
+            except Exception as edit_err:
+                logger.warning(f"[merchant_web_otp] edit_message_text failed user_id={user_id}: {edit_err}")
+            if not sent_ok:
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=text, reply_markup=kb, parse_mode="HTML")
+                    logger.info(f"[merchant_web_otp] fallback send_message sent user_id={user_id}")
+                except Exception as send_err:
+                    logger.error(f"[merchant_web_otp] fallback send_message failed user_id={user_id}: {send_err}")
+                    raise
+        except ValueError as e:
+            if str(e) == 'merchant_not_found':
+                await query.answer(tr(locale, "start.merchant_not_bound"), show_alert=True)
+            else:
+                await query.answer(tr(locale, "start.link_unavailable"), show_alert=True)
+            logger.warning(f"[merchant_web_otp] value error user_id={user_id}: {e}")
+        except Exception as e:
+            logger.error(f"生成商户 OTP 链接失败: {e}", exc_info=True)
+            await query.answer(tr(locale, "start.link_unavailable"), show_alert=True)
+
+    elif data == "register_merchant":
+        await start_merchant_onboarding(update, context)
 
     elif data == "contact_admin":
-        await query.edit_message_text(
-            "🎧 <b>人工客服</b>\n\n"
-            "你可以直接在此聊天框发送消息、图片或文件，我会实时转达给客服人员。",
-            parse_mode="HTML"
-        )
+        text = tr(locale, "start.contact_admin_text")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(tr(locale, "buttons.back_to_main"), callback_data="back_to_start")],
+        ])
+        sent_ok = False
+        try:
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            sent_ok = True
+        except Exception as edit_err:
+            logger.warning(f"[contact_admin] edit_message_text failed user_id={user_id}: {edit_err}")
+        if not sent_ok:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+            except Exception as send_err:
+                logger.error(f"[contact_admin] send_message failed user_id={user_id}: {send_err}")
+                await query.answer("⚠️ 暂时无法打开客服入口，请稍后重试", show_alert=True)
+
 
     elif data == "admin_settings":
         if not is_admin:
-            await query.answer("⛔ 无权限", show_alert=True)
+            await query.answer(tr(locale, "common.no_permission"), show_alert=True)
             return
-        await query.answer("系统设置请在 Web 后台操作。", show_alert=True)
+        await query.answer(tr(locale, "common.admin_settings_web_only"), show_alert=True)
 
     elif data == "restart_bot":
         if not is_admin:
-            await query.answer("⛔ 无权限", show_alert=True)
+            await query.answer(tr(locale, "common.no_permission"), show_alert=True)
             return
         await query.edit_message_text("🔄 正在重启 Bot，请稍候…")
         config.RESTART_REQUESTED = True
@@ -402,4 +767,4 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await start(update, context)
 
     else:
-        await query.answer("该功能正在维护中…", show_alert=True)
+        await query.answer(tr(locale, "common.feature_maintaining"), show_alert=True)

@@ -14,6 +14,133 @@ from config import DB_NAME, ADMIN_ID
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_tenant_id(value: Optional[str]) -> str:
+    """统一清洗 tenant_id 输入，避免空白/None 混用。"""
+    return str(value or "").strip()
+
+
+async def _resolve_scope_bot_id(
+    db: aiosqlite.Connection,
+    *,
+    tenant_id: Optional[str] = None,
+    merchant_id: Optional[int] = None,
+) -> Optional[int]:
+    """根据 tenant/merchant scope 解析对应商户 bot_id。"""
+    normalized_tenant = _normalize_tenant_id(tenant_id)
+    if merchant_id is not None:
+        async with db.execute(
+            "SELECT bot_id FROM merchants WHERE id = ? LIMIT 1",
+            (int(merchant_id),),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return int(row[0])
+    if normalized_tenant:
+        async with db.execute(
+            "SELECT bot_id FROM merchants WHERE tenant_id = ? LIMIT 1",
+            (normalized_tenant,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return int(row[0])
+    return None
+
+
+async def _resolve_tenant_id_from_group(
+    db: aiosqlite.Connection,
+    group_id: Optional[int],
+) -> Optional[str]:
+    """由 group_id 反查租户。"""
+    if group_id is None:
+        return None
+    async with db.execute(
+        "SELECT tenant_id FROM tracked_groups WHERE group_id = ? LIMIT 1",
+        (int(group_id),),
+    ) as cursor:
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        tenant_id = _normalize_tenant_id(row[0])
+        return tenant_id or None
+
+
+async def _resolve_tenant_id_for_user(
+    db: aiosqlite.Connection,
+    user_id: Optional[int],
+) -> Optional[str]:
+    """通过用户在各业务表中的痕迹反查 tenant_id。"""
+    if user_id is None:
+        return None
+    uid = int(user_id)
+
+    for sql in (
+        "SELECT tenant_id FROM admin_inbox WHERE from_userid = ? AND tenant_id IS NOT NULL AND tenant_id != '' LIMIT 1",
+        "SELECT tenant_id FROM potential_users WHERE user_id = ? AND tenant_id IS NOT NULL AND tenant_id != '' LIMIT 1",
+        "SELECT tenant_id FROM group_members WHERE user_id = ? AND tenant_id IS NOT NULL AND tenant_id != '' LIMIT 1",
+        "SELECT tenant_id FROM messages WHERE (from_userid = ? OR to_userid = ?) AND tenant_id IS NOT NULL AND tenant_id != '' ORDER BY timestamp DESC LIMIT 1",
+    ):
+        params = (uid, uid) if sql.count("?") == 2 else (uid,)
+        async with db.execute(sql, params) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                tenant_id = _normalize_tenant_id(row[0])
+                if tenant_id:
+                    return tenant_id
+
+    async with db.execute(
+        """
+        SELECT tg.tenant_id
+        FROM group_members gm
+        JOIN tracked_groups tg ON tg.group_id = gm.group_id
+        WHERE gm.user_id = ?
+          AND tg.tenant_id IS NOT NULL
+          AND tg.tenant_id != ''
+        ORDER BY tg.updated_at DESC
+        LIMIT 1
+        """,
+        (uid,),
+    ) as cursor:
+        row = await cursor.fetchone()
+        if row:
+            tenant_id = _normalize_tenant_id(row[0])
+            if tenant_id:
+                return tenant_id
+
+    return None
+
+
+async def _resolve_message_tenant_id(
+    db: aiosqlite.Connection,
+    *,
+    from_userid: int,
+    to_userid: int,
+    tenant_id: Optional[str] = None,
+) -> str:
+    """为消息写入推导 tenant_id，优先显式值，兜底按 bot/user 痕迹推导。"""
+    normalized_tenant = _normalize_tenant_id(tenant_id)
+    if normalized_tenant:
+        return normalized_tenant
+
+    async with db.execute(
+        "SELECT tenant_id FROM merchants WHERE bot_id IN (?, ?) AND tenant_id IS NOT NULL AND tenant_id != '' LIMIT 1",
+        (int(from_userid), int(to_userid)),
+    ) as cursor:
+        row = await cursor.fetchone()
+        if row:
+            merchant_tenant = _normalize_tenant_id(row[0])
+            if merchant_tenant:
+                return merchant_tenant
+
+    for candidate_user_id in (from_userid, to_userid):
+        if int(candidate_user_id) == int(ADMIN_ID):
+            continue
+        tenant_from_user = await _resolve_tenant_id_for_user(db, int(candidate_user_id))
+        if tenant_from_user:
+            return tenant_from_user
+
+    return "default"
+
 async def init_db():
     """初始化数据库表结构并执行必要的迁移"""
     async with aiosqlite.connect(DB_NAME) as db:
@@ -270,6 +397,21 @@ async def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS monitor_counterparty_labels (
+                label_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_userid INTEGER NOT NULL,
+                counterparty TEXT NOT NULL,
+                network TEXT DEFAULT '',
+                label TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(admin_userid, counterparty, network)
+            )
+        ''')
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_monitor_counterparty_label ON monitor_counterparty_labels(admin_userid, counterparty, network)"
+        )
 
         # 13. tracked_groups 表 (群组监听主表)
         await db.execute('''
@@ -281,6 +423,7 @@ async def init_db():
                 first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 delete_on_revoke BOOLEAN DEFAULT 0,
+                revoke_sync_chat_id INTEGER DEFAULT NULL,
                 verify_enabled BOOLEAN DEFAULT 0,
                 verify_type TEXT DEFAULT 'captcha',
                 verify_timeout INTEGER DEFAULT 120,
@@ -378,7 +521,12 @@ async def init_db():
                 quoted_tg_msg_id INTEGER DEFAULT NULL,
                 quoted_text TEXT DEFAULT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                message_ts INTEGER DEFAULT (strftime('%s','now'))
+                message_ts INTEGER DEFAULT (strftime('%s','now')),
+                revoke_checked BOOLEAN DEFAULT 0,
+                is_advertising BOOLEAN DEFAULT 0,
+                ad_score INTEGER DEFAULT 0,
+                ad_confidence TEXT DEFAULT 'low',
+                ad_findings TEXT DEFAULT NULL
             )
         ''')
         
@@ -389,6 +537,21 @@ async def init_db():
             await db.execute("ALTER TABLE group_messages ADD COLUMN message_ts INTEGER DEFAULT NULL")
             await db.execute("UPDATE group_messages SET message_ts = CAST(strftime('%s', timestamp) AS INTEGER)")
             logger.info("✅ 数据库迁移：已为 group_messages 添加 message_ts 字段并初始化数据")
+        if 'revoke_checked' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN revoke_checked BOOLEAN DEFAULT 0")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 revoke_checked 字段")
+        if 'is_advertising' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN is_advertising BOOLEAN DEFAULT 0")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 is_advertising 字段")
+        if 'ad_score' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN ad_score INTEGER DEFAULT 0")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_score 字段")
+        if 'ad_confidence' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN ad_confidence TEXT DEFAULT 'low'")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_confidence 字段")
+        if 'ad_findings' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN ad_findings TEXT DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_findings 字段")
 
         # 检查并添加缺失的列 (group_members 迁移 - 验证字段)
         cursor = await db.execute("PRAGMA table_info(group_members)")
@@ -406,6 +569,7 @@ async def init_db():
         # 为 group_id 和 timestamp 创建索引以优化查询
         await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_query ON group_messages(group_id, timestamp DESC)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_ts ON group_messages(group_id, message_ts DESC)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_ad ON group_messages(group_id, is_advertising, ad_score DESC)")
         await db.execute(
             """
             DELETE FROM group_messages
@@ -481,6 +645,21 @@ async def init_db():
                 if 'message_ts' not in gm_columns:
                     logger.info("迁移 group_messages: 新增 message_ts 列")
                     await db.execute("ALTER TABLE group_messages ADD COLUMN message_ts INTEGER DEFAULT (strftime('%s','now'))")
+                if 'revoke_checked' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 revoke_checked 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN revoke_checked BOOLEAN DEFAULT 0")
+                if 'is_advertising' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 is_advertising 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN is_advertising BOOLEAN DEFAULT 0")
+                if 'ad_score' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 ad_score 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN ad_score INTEGER DEFAULT 0")
+                if 'ad_confidence' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 ad_confidence 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN ad_confidence TEXT DEFAULT 'low'")
+                if 'ad_findings' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 ad_findings 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN ad_findings TEXT DEFAULT NULL")
                 await db.execute("UPDATE group_messages SET message_ts = CAST(strftime('%s', timestamp) AS INTEGER) WHERE message_ts IS NULL OR message_ts = 0")
 
             # 1. 检查 tracked_groups 列
@@ -510,6 +689,9 @@ async def init_db():
                 if 'delete_on_revoke' not in columns:
                     logger.info("迁移 tracked_groups: 新增 delete_on_revoke 列")
                     await db.execute("ALTER TABLE tracked_groups ADD COLUMN delete_on_revoke BOOLEAN DEFAULT 0")
+                if 'revoke_sync_chat_id' not in columns:
+                    logger.info("迁移 tracked_groups: 新增 revoke_sync_chat_id 列")
+                    await db.execute("ALTER TABLE tracked_groups ADD COLUMN revoke_sync_chat_id INTEGER DEFAULT NULL")
 
                 if 'verify_enabled' not in columns:
                     logger.info("迁移 tracked_groups: 新增 verify_enabled 列")
@@ -584,6 +766,13 @@ async def init_db():
                 channel TEXT DEFAULT 'web_ai',
                 user_id INTEGER,
                 sandbox_id TEXT,
+                tenant_id TEXT DEFAULT 'default',
+                merchant_id INTEGER DEFAULT NULL,
+                feature_key TEXT DEFAULT 'general',
+                request_trace_id TEXT DEFAULT NULL,
+                prompt_template_version TEXT DEFAULT NULL,
+                result_status TEXT DEFAULT 'success',
+                endpoint TEXT DEFAULT NULL,
                 model TEXT,
                 prompt_tokens INTEGER DEFAULT 0,
                 completion_tokens INTEGER DEFAULT 0,
@@ -592,6 +781,59 @@ async def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        cursor = await db.execute("PRAGMA table_info(ai_usage_logs)")
+        ai_usage_columns = [row[1] for row in await cursor.fetchall()]
+        if 'tenant_id' not in ai_usage_columns:
+            await db.execute("ALTER TABLE ai_usage_logs ADD COLUMN tenant_id TEXT DEFAULT 'default'")
+            logger.info("✅ 数据库迁移：已为 ai_usage_logs 添加 tenant_id 字段")
+        if 'merchant_id' not in ai_usage_columns:
+            await db.execute("ALTER TABLE ai_usage_logs ADD COLUMN merchant_id INTEGER DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 ai_usage_logs 添加 merchant_id 字段")
+        if 'feature_key' not in ai_usage_columns:
+            await db.execute("ALTER TABLE ai_usage_logs ADD COLUMN feature_key TEXT DEFAULT 'general'")
+            logger.info("✅ 数据库迁移：已为 ai_usage_logs 添加 feature_key 字段")
+        if 'request_trace_id' not in ai_usage_columns:
+            await db.execute("ALTER TABLE ai_usage_logs ADD COLUMN request_trace_id TEXT DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 ai_usage_logs 添加 request_trace_id 字段")
+        if 'prompt_template_version' not in ai_usage_columns:
+            await db.execute("ALTER TABLE ai_usage_logs ADD COLUMN prompt_template_version TEXT DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 ai_usage_logs 添加 prompt_template_version 字段")
+        if 'result_status' not in ai_usage_columns:
+            await db.execute("ALTER TABLE ai_usage_logs ADD COLUMN result_status TEXT DEFAULT 'success'")
+            logger.info("✅ 数据库迁移：已为 ai_usage_logs 添加 result_status 字段")
+        if 'endpoint' not in ai_usage_columns:
+            await db.execute("ALTER TABLE ai_usage_logs ADD COLUMN endpoint TEXT DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 ai_usage_logs 添加 endpoint 字段")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_tenant_created ON ai_usage_logs(tenant_id, created_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_merchant_created ON ai_usage_logs(merchant_id, created_at)")
+
+        # ── 多租户数据隔离迁移：为核心业务表添加 tenant_id ──────────
+        _tenant_migration_tables = [
+            'broadcast_targets',
+            'push_tasks',
+            'tracked_groups',
+            'potential_users',
+            'address_monitors',
+            'monitor_transactions',
+            'group_messages',
+            'group_members',
+            'group_address_hits',
+        ]
+        for _tbl in _tenant_migration_tables:
+            cursor = await db.execute(f"PRAGMA table_info({_tbl})")
+            _cols = [row[1] for row in await cursor.fetchall()]
+            if 'tenant_id' not in _cols:
+                await db.execute(f"ALTER TABLE {_tbl} ADD COLUMN tenant_id TEXT DEFAULT 'default'")
+                logger.info(f"✅ 数据库迁移：已为 {_tbl} 添加 tenant_id 字段")
+            # 创建索引（幂等）
+            await db.execute(f"CREATE INDEX IF NOT EXISTS idx_{_tbl}_tenant ON {_tbl}(tenant_id)")
+        # push_tasks 额外添加 created_by 字段（如果不存在），用于任务归属
+        cursor = await db.execute("PRAGMA table_info(push_tasks)")
+        _pt_cols = [row[1] for row in await cursor.fetchall()]
+        if 'created_by' not in _pt_cols:
+            await db.execute("ALTER TABLE push_tasks ADD COLUMN created_by INTEGER DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 push_tasks 添加 created_by 字段")
 
         # 23. oneapi_keys 表（OneAPI sk 映射）
         await db.execute('''
@@ -606,8 +848,417 @@ async def init_db():
             )
         ''')
 
+        # 24. merchants 表（平台域：商户主档）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS merchants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL UNIQUE,
+                owner_tg_user_id INTEGER NOT NULL,
+                merchant_name TEXT NOT NULL,
+                bot_id INTEGER DEFAULT NULL,
+                bot_username TEXT DEFAULT NULL,
+                status TEXT DEFAULT 'active_free',
+                plan_type TEXT DEFAULT 'free',
+                subscription_status TEXT DEFAULT 'free',
+                subscription_expires_at DATETIME DEFAULT NULL,
+                runtime_version INTEGER DEFAULT 1,
+                config_version INTEGER DEFAULT 1,
+                feature_version INTEGER DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor = await db.execute("PRAGMA table_info(merchants)")
+        merchant_columns = [row[1] for row in await cursor.fetchall()]
+        if 'onboarding_completed' not in merchant_columns:
+            await db.execute("ALTER TABLE merchants ADD COLUMN onboarding_completed INTEGER DEFAULT 0")
+            logger.info("✅ 数据库迁移：已为 merchants 添加 onboarding_completed 字段")
+        if 'onboarding_approved_at' not in merchant_columns:
+            await db.execute("ALTER TABLE merchants ADD COLUMN onboarding_approved_at DATETIME DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 merchants 添加 onboarding_approved_at 字段")
+        if 'onboarding_notified_at' not in merchant_columns:
+            await db.execute("ALTER TABLE merchants ADD COLUMN onboarding_notified_at DATETIME DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 merchants 添加 onboarding_notified_at 字段")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_merchants_owner ON merchants(owner_tg_user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_merchants_status ON merchants(status, plan_type)")
+
+        # 25. plans 表（平台域：套餐定义）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_code TEXT NOT NULL UNIQUE,
+                plan_name TEXT NOT NULL,
+                price_usdt REAL DEFAULT 0,
+                duration_days INTEGER DEFAULT 30,
+                features_json TEXT DEFAULT '{}',
+                status TEXT DEFAULT 'active',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO plans (plan_code, plan_name, price_usdt, duration_days, features_json, status)
+            VALUES
+                ('free', 'Free', 0, 30, '{"base_bot": true, "basic_ai": true, "basic_translate": true, "dual_bot": true, "broadcast": true, "group_chat": true, "subscription_check": true, "shared_ai_translate": false}', 'active'),
+                ('pro', 'Pro', 99, 30, '{"base_bot": true, "basic_ai": true, "basic_translate": true, "dual_bot": true, "broadcast": true, "group_chat": true, "subscription_check": true, "shared_ai_translate": true}', 'active')
+            """
+        )
+
+        # 26. merchant_subscriptions 表（平台域：商户订阅）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS merchant_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                merchant_id INTEGER NOT NULL,
+                plan_code TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                start_at DATETIME DEFAULT NULL,
+                end_at DATETIME DEFAULT NULL,
+                payment_order_id INTEGER DEFAULT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (merchant_id) REFERENCES merchants(id)
+            )
+        ''')
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_merchant_subscriptions_merchant ON merchant_subscriptions(merchant_id, status, end_at)")
+
+        # 27. payment_orders 表（平台域：支付订单）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS payment_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                merchant_id INTEGER NOT NULL,
+                plan_code TEXT NOT NULL,
+                base_amount_usdt REAL NOT NULL DEFAULT 0,
+                amount_offset_usdt REAL NOT NULL DEFAULT 0,
+                amount_usdt REAL NOT NULL,
+                chain_type TEXT DEFAULT 'TRON',
+                payment_address TEXT,
+                payment_qr_image_path TEXT DEFAULT NULL,
+                tx_hash TEXT DEFAULT NULL,
+                status TEXT DEFAULT 'pending',
+                expire_at DATETIME DEFAULT NULL,
+                confirmed_at DATETIME DEFAULT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (merchant_id) REFERENCES merchants(id)
+            )
+        ''')
+        cursor = await db.execute("PRAGMA table_info(payment_orders)")
+        payment_order_columns = [row[1] for row in await cursor.fetchall()]
+        if 'base_amount_usdt' not in payment_order_columns:
+            await db.execute("ALTER TABLE payment_orders ADD COLUMN base_amount_usdt REAL NOT NULL DEFAULT 0")
+            await db.execute("UPDATE payment_orders SET base_amount_usdt = amount_usdt WHERE base_amount_usdt = 0")
+            logger.info("✅ 数据库迁移：已为 payment_orders 添加 base_amount_usdt 字段")
+        if 'amount_offset_usdt' not in payment_order_columns:
+            await db.execute("ALTER TABLE payment_orders ADD COLUMN amount_offset_usdt REAL NOT NULL DEFAULT 0")
+            logger.info("✅ 数据库迁移：已为 payment_orders 添加 amount_offset_usdt 字段")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_payment_orders_merchant ON payment_orders(merchant_id, status, created_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_payment_orders_tx_hash ON payment_orders(tx_hash)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_payment_orders_match_lookup ON payment_orders(chain_type, payment_address, status, amount_usdt, expire_at)")
+
+
+        # 28. platform_payment_configs 表（平台域：收款配置）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS platform_payment_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chain_type TEXT NOT NULL UNIQUE,
+                wallet_address TEXT NOT NULL,
+                wallet_qr_image_path TEXT DEFAULT NULL,
+                instruction_text TEXT DEFAULT '',
+                is_active BOOLEAN DEFAULT 1,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # 29. merchant_features 表（租户功能快照）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS merchant_features (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                merchant_id INTEGER NOT NULL,
+                tenant_id TEXT NOT NULL,
+                feature_key TEXT NOT NULL,
+                enabled BOOLEAN DEFAULT 0,
+                source TEXT DEFAULT 'plan',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tenant_id, feature_key),
+                FOREIGN KEY (merchant_id) REFERENCES merchants(id)
+            )
+        ''')
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_merchant_features_merchant ON merchant_features(merchant_id, tenant_id)")
+
+        # 30. merchant_ai_quota 表（租户 AI 配额）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS merchant_ai_quota (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                merchant_id INTEGER NOT NULL,
+                tenant_id TEXT NOT NULL UNIQUE,
+                daily_quota INTEGER DEFAULT 0,
+                monthly_quota INTEGER DEFAULT 0,
+                used_daily INTEGER DEFAULT 0,
+                used_monthly INTEGER DEFAULT 0,
+                last_reset_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (merchant_id) REFERENCES merchants(id)
+            )
+        ''')
+
+        # 31. tenant_audit_logs 表（租户审计日志）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS tenant_audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                merchant_id INTEGER DEFAULT NULL,
+                operator_role TEXT DEFAULT 'system',
+                operator_id TEXT DEFAULT NULL,
+                action TEXT NOT NULL,
+                resource_type TEXT DEFAULT NULL,
+                resource_id TEXT DEFAULT NULL,
+                payload_json TEXT DEFAULT NULL,
+                trace_id TEXT DEFAULT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (merchant_id) REFERENCES merchants(id)
+            )
+        ''')
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_tenant_audit_logs_tenant_created ON tenant_audit_logs(tenant_id, created_at)")
+
+        # 33. web_login_otps 表（Web OTP 持久化存储，仅保存哈希）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS web_login_otps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                otp_hash TEXT NOT NULL UNIQUE,
+                role TEXT DEFAULT 'platform_admin',
+                tenant_id TEXT DEFAULT '',
+                merchant_id INTEGER DEFAULT NULL,
+                issued_for TEXT DEFAULT NULL,
+                expires_at DATETIME NOT NULL,
+                used_at DATETIME DEFAULT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_web_login_otps_expires ON web_login_otps(expires_at, used_at)")
+
+        # 检查 web_login_otps 表是否有 session_token 字段
+        cursor = await db.execute("PRAGMA table_info(web_login_otps)")
+        web_otp_columns = [row[1] for row in await cursor.fetchall()]
+        if 'session_token' not in web_otp_columns:
+            await db.execute("ALTER TABLE web_login_otps ADD COLUMN session_token TEXT DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 web_login_otps 添加 session_token 字段")
+
+        # 34. web_entry_grants 表（Mini App 入口 grant）
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS web_entry_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                grant_hash TEXT NOT NULL UNIQUE,
+                issued_for TEXT NOT NULL,
+                role_hint TEXT DEFAULT 'platform_admin',
+                tenant_id TEXT DEFAULT '',
+                merchant_id INTEGER DEFAULT NULL,
+                entry_intent TEXT DEFAULT 'menu',
+                ua_fingerprint TEXT DEFAULT '',
+                proof_salt TEXT NOT NULL,
+                expires_at DATETIME NOT NULL,
+                last_rotated_at DATETIME DEFAULT NULL,
+                revoked_at DATETIME DEFAULT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_web_entry_grants_lookup ON web_entry_grants(grant_hash, revoked_at, expires_at)")
+
+        # ── 多租户隔离迁移：为间接隔离表添加 tenant_id ──────────
+        _indirect_tenant_tables = {
+            'admin_inbox': 'idx_admin_inbox_tenant',
+            'messages': 'idx_messages_tenant',
+            'merchant_subscriptions': 'idx_merchant_subscriptions_tenant',
+            'payment_orders': 'idx_payment_orders_tenant',
+        }
+        for _tbl, _idx_name in _indirect_tenant_tables.items():
+            cursor = await db.execute(f"PRAGMA table_info({_tbl})")
+            _cols = [row[1] for row in await cursor.fetchall()]
+            if 'tenant_id' not in _cols:
+                await db.execute(f"ALTER TABLE {_tbl} ADD COLUMN tenant_id TEXT DEFAULT 'default'")
+                logger.info(f"✅ 数据库迁移：已为 {_tbl} 添加 tenant_id 字段")
+            await db.execute(f"CREATE INDEX IF NOT EXISTS {_idx_name} ON {_tbl}(tenant_id)")
+
+        # 验证已有的 tenant_id 索引（确保13张核心表的索引存在）
+        _verify_tenant_index_tables = [
+            'tracked_groups', 'group_messages', 'group_members', 'potential_users',
+            'broadcast_targets', 'push_tasks', 'address_monitors', 'monitor_transactions',
+            'group_address_hits', 'ai_usage_logs', 'merchant_features',
+        ]
+        for _tbl in _verify_tenant_index_tables:
+            await db.execute(f"CREATE INDEX IF NOT EXISTS idx_{_tbl}_tenant ON {_tbl}(tenant_id)")
+
         await db.commit()
 
+
+
+async def save_web_login_otp(
+    otp_hash: str,
+    *,
+    role: str = 'platform_admin',
+    tenant_id: str = '',
+    merchant_id: Optional[int] = None,
+    issued_for: Optional[str] = None,
+    expires_at: str,
+    session_token: Optional[str] = None,
+) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO web_login_otps
+            (otp_hash, role, tenant_id, merchant_id, issued_for, expires_at, used_at, session_token, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, CURRENT_TIMESTAMP)
+            """,
+            (otp_hash, role, tenant_id, merchant_id, issued_for, expires_at, session_token),
+        )
+        await db.commit()
+        return True
+
+
+async def get_web_login_otp(otp_hash: str) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM web_login_otps WHERE otp_hash = ? AND used_at IS NULL",
+            (otp_hash,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def consume_web_login_otp(otp_hash: str) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "UPDATE web_login_otps SET used_at = CURRENT_TIMESTAMP WHERE otp_hash = ? AND used_at IS NULL",
+            (otp_hash,),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def cleanup_expired_web_login_otps() -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "DELETE FROM web_login_otps WHERE expires_at < CURRENT_TIMESTAMP OR used_at IS NOT NULL"
+        )
+        await db.commit()
+        return int(cur.rowcount or 0)
+
+
+async def save_web_entry_grant(
+    grant_hash: str,
+    *,
+    issued_for: str,
+    role_hint: str = 'platform_admin',
+    tenant_id: str = '',
+    merchant_id: Optional[int] = None,
+    entry_intent: str = 'menu',
+    ua_fingerprint: str = '',
+    proof_salt: str,
+    expires_at: str,
+) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO web_entry_grants
+            (
+                grant_hash, issued_for, role_hint, tenant_id, merchant_id,
+                entry_intent, ua_fingerprint, proof_salt, expires_at,
+                revoked_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, CURRENT_TIMESTAMP)
+            """,
+            (
+                grant_hash,
+                str(issued_for or ''),
+                str(role_hint or 'platform_admin'),
+                str(tenant_id or ''),
+                merchant_id,
+                str(entry_intent or 'menu'),
+                str(ua_fingerprint or ''),
+                str(proof_salt or ''),
+                expires_at,
+            ),
+        )
+        await db.commit()
+        return True
+
+
+async def get_web_entry_grant(grant_hash: str) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM web_entry_grants
+            WHERE grant_hash = ?
+              AND revoked_at IS NULL
+            LIMIT 1
+            """,
+            (grant_hash,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def bind_web_entry_grant_proof(grant_hash: str, *, ua_fingerprint: str) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            """
+            UPDATE web_entry_grants
+            SET ua_fingerprint = CASE
+                WHEN COALESCE(ua_fingerprint, '') = '' THEN ?
+                ELSE ua_fingerprint
+            END
+            WHERE grant_hash = ?
+              AND revoked_at IS NULL
+            """,
+            (str(ua_fingerprint or ''), grant_hash),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def touch_web_entry_grant_rotation(grant_hash: str) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            """
+            UPDATE web_entry_grants
+            SET last_rotated_at = CURRENT_TIMESTAMP
+            WHERE grant_hash = ?
+              AND revoked_at IS NULL
+            """,
+            (grant_hash,),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def revoke_web_entry_grant(grant_hash: str) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            """
+            UPDATE web_entry_grants
+            SET revoked_at = CURRENT_TIMESTAMP
+            WHERE grant_hash = ?
+              AND revoked_at IS NULL
+            """,
+            (grant_hash,),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def cleanup_expired_web_entry_grants() -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            """
+            DELETE FROM web_entry_grants
+            WHERE revoked_at IS NOT NULL
+               OR expires_at < CURRENT_TIMESTAMP
+            """
+        )
+        await db.commit()
+        return int(cur.rowcount or 0)
 async def get_admin_setting(key: str, default: Optional[str] = None):
     """获取管理员设置"""
     async with aiosqlite.connect(DB_NAME) as db:
@@ -615,11 +1266,66 @@ async def get_admin_setting(key: str, default: Optional[str] = None):
             row = await cursor.fetchone()
             return row[0] if row else default
 
+
 async def save_admin_setting(key: str, value: str):
     """更新管理员设置"""
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("INSERT OR REPLACE INTO admin_settings (key, value) VALUES (?, ?)", (key, str(value)))
         await db.commit()
+
+
+async def list_ai_custom_skills(enabled_only: bool = False) -> List[Dict[str, Any]]:
+    """列出 AI 助手自定义技能。"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        sql = "SELECT * FROM ai_custom_skills"
+        if enabled_only:
+            sql += " WHERE is_enabled = 1"
+        sql += " ORDER BY updated_at DESC, id DESC"
+        async with db.execute(sql) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def upsert_ai_custom_skill(
+    name: str,
+    description: str = "",
+    prompt_template: str = "",
+    source: str = "custom",
+    is_enabled: bool = True,
+) -> bool:
+    """新增或更新 AI 自定义技能。"""
+    if not (name or "").strip():
+        return False
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT INTO ai_custom_skills (name, description, prompt_template, source, is_enabled, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(name) DO UPDATE SET
+                description=excluded.description,
+                prompt_template=excluded.prompt_template,
+                source=excluded.source,
+                is_enabled=excluded.is_enabled,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (name.strip(), (description or "").strip(), prompt_template or "", (source or "custom").strip(), 1 if is_enabled else 0),
+        )
+        await db.commit()
+        return True
+
+
+async def set_ai_custom_skill_enabled(name: str, is_enabled: bool) -> bool:
+    """启用/停用技能。"""
+    if not (name or "").strip():
+        return False
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "UPDATE ai_custom_skills SET is_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+            (1 if is_enabled else 0, name.strip()),
+        )
+        await db.commit()
+        return cur.rowcount > 0
 
 
 async def save_ai_usage_log(
@@ -841,19 +1547,26 @@ async def save_message(
     original_text: Optional[str] = None,
     admin_userid: Optional[str] = None,
     emoji: Optional[str] = None,
-    trace_id: Optional[str] = None
+    trace_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
 ):
     """统一保存消息，并更新管理员收件箱汇总 (2026 规格：支持多媒体、引用、翻译、实名及头像更新)"""
     import uuid
     if not trace_id:
         trace_id = str(uuid.uuid4())
     async with aiosqlite.connect(DB_NAME) as db:
+        effective_tenant_id = await _resolve_message_tenant_id(
+            db,
+            from_userid=from_userid,
+            to_userid=to_userid,
+            tenant_id=tenant_id,
+        )
         # 1. 存入 messages 主表
         cur = await db.execute(
             """INSERT INTO messages 
-               (trace_id, from_userid, to_userid, content, type, file_id, media_url, is_read, tg_msg_id, auto_translation, translated_text, original_text, admin_userid, quoted_text, quoted_msg_id, quoted_file_id, quoted_type, status) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (trace_id, from_userid, to_userid, content, msg_type, file_id, media_url, 1 if is_read else 0, tg_msg_id, translated_text, translated_text, original_text, admin_userid, quoted_text, quoted_msg_id, quoted_file_id, quoted_type, status)
+               (trace_id, from_userid, to_userid, content, type, file_id, media_url, is_read, tg_msg_id, auto_translation, translated_text, original_text, admin_userid, quoted_text, quoted_msg_id, quoted_file_id, quoted_type, status, tenant_id) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trace_id, from_userid, to_userid, content, msg_type, file_id, media_url, 1 if is_read else 0, tg_msg_id, translated_text, translated_text, original_text, admin_userid, quoted_text, quoted_msg_id, quoted_file_id, quoted_type, status, effective_tenant_id)
         )
         msg_db_id = cur.lastrowid
         
@@ -866,7 +1579,10 @@ async def save_message(
         if to_userid == config.ADMIN_ID:
             # 获取该用户的所有未读消息
             db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT content FROM messages WHERE from_userid = ? AND is_read = 0 AND is_deleted = 0 ORDER BY timestamp ASC", (from_userid,)) as cursor:
+            async with db.execute(
+                "SELECT content FROM messages WHERE from_userid = ? AND is_read = 0 AND is_deleted = 0 AND tenant_id = ? ORDER BY timestamp ASC",
+                (from_userid, effective_tenant_id),
+            ) as cursor:
                 unread_rows = await cursor.fetchall()
                 unread_msgs = [row['content'] for row in unread_rows]
             
@@ -889,8 +1605,8 @@ async def save_message(
                 
             if exists:
                 # 无论是否有 username 传入，都尝试更新
-                update_parts = ["summary = ?", "unread_count = ?", "last_active = CURRENT_TIMESTAMP"]
-                params = [full_summary, len(unread_msgs)]
+                update_parts = ["summary = ?", "unread_count = ?", "last_active = CURRENT_TIMESTAMP", "tenant_id = ?"]
+                params = [full_summary, len(unread_msgs), effective_tenant_id]
                 
                 if username:
                     update_parts.append("from_username = ?")
@@ -907,8 +1623,8 @@ async def save_message(
                 # 新用户入库，必须确保有名字
                 display_name = username or f"User {from_userid}"
                 await db.execute(
-                    "INSERT INTO admin_inbox (from_userid, from_username, summary, unread_count, avatar_file_id) VALUES (?, ?, ?, ?, ?)",
-                    (from_userid, display_name, full_summary, len(unread_msgs), avatar_file_id)
+                    "INSERT INTO admin_inbox (from_userid, from_username, summary, unread_count, avatar_file_id, tenant_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (from_userid, display_name, full_summary, len(unread_msgs), avatar_file_id, effective_tenant_id)
                 )
         await db.commit()
         return msg_db_id
@@ -933,17 +1649,131 @@ async def update_message_status(msg_db_id: Optional[int], status: str, tg_msg_id
             await db.execute("UPDATE messages SET status = ? WHERE msg_id = ?", (status, msg_db_id))
         await db.commit()
 
-async def mark_messages_as_read(from_userid: int):
+async def mark_messages_as_read(from_userid: int, tenant_id: Optional[str] = None):
     """将特定用户发来的消息标记为已读"""
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE messages SET is_read = 1 WHERE from_userid = ?", (from_userid,))
-        await db.execute("UPDATE admin_inbox SET unread_count = 0, summary = '' WHERE from_userid = ?", (from_userid,))
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        if normalized_tenant:
+            await db.execute(
+                "UPDATE messages SET is_read = 1 WHERE from_userid = ? AND tenant_id = ?",
+                (from_userid, normalized_tenant),
+            )
+            await db.execute(
+                "UPDATE admin_inbox SET unread_count = 0, summary = '' WHERE from_userid = ? AND tenant_id = ?",
+                (from_userid, normalized_tenant),
+            )
+        else:
+            await db.execute("UPDATE messages SET is_read = 1 WHERE from_userid = ?", (from_userid,))
+            await db.execute("UPDATE admin_inbox SET unread_count = 0, summary = '' WHERE from_userid = ?", (from_userid,))
         await db.commit()
 
-async def get_inbox_list():
-    """获取来访用户列表 (含自动重建逻辑)"""
+async def get_inbox_list(tenant_id: Optional[str] = None, merchant_id: Optional[int] = None):
+    """获取来访用户列表；tenant scope 下只返回当前商户会话。"""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        if normalized_tenant:
+            counterpart_id = await _resolve_scope_bot_id(db, tenant_id=normalized_tenant, merchant_id=merchant_id)
+            if counterpart_id is None:
+                counterpart_id = ADMIN_ID
+
+            async with db.execute(
+                """
+                SELECT
+                    CASE WHEN from_userid = ? THEN to_userid ELSE from_userid END AS uid,
+                    MAX(timestamp) AS last_active
+                FROM messages
+                WHERE tenant_id = ?
+                  AND ((from_userid = ? AND to_userid != ?) OR (to_userid = ? AND from_userid != ?))
+                  AND is_deleted = 0
+                GROUP BY uid
+                ORDER BY MAX(timestamp) DESC
+                """,
+                (counterpart_id, normalized_tenant, counterpart_id, counterpart_id, counterpart_id, counterpart_id),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+            users: list[dict] = []
+            for row in rows:
+                uid = int(row["uid"])
+                last_active = row["last_active"]
+                async with db.execute(
+                    """
+                    SELECT content
+                    FROM messages
+                    WHERE tenant_id = ?
+                      AND is_deleted = 0
+                      AND ((from_userid = ? AND to_userid = ?) OR (from_userid = ? AND to_userid = ?))
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (normalized_tenant, uid, counterpart_id, counterpart_id, uid),
+                ) as msg_cursor:
+                    latest_row = await msg_cursor.fetchone()
+
+                async with db.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM messages
+                    WHERE tenant_id = ?
+                      AND from_userid = ?
+                      AND to_userid = ?
+                      AND is_read = 0
+                      AND is_deleted = 0
+                    """,
+                    (normalized_tenant, uid, counterpart_id),
+                ) as unread_cursor:
+                    unread_row = await unread_cursor.fetchone()
+
+                display_name = None
+                avatar_file_id = None
+                async with db.execute(
+                    "SELECT from_username, avatar_file_id FROM admin_inbox WHERE from_userid = ? AND tenant_id = ? LIMIT 1",
+                    (uid, normalized_tenant),
+                ) as inbox_cursor:
+                    inbox_row = await inbox_cursor.fetchone()
+                    if inbox_row:
+                        display_name = inbox_row["from_username"]
+                        avatar_file_id = inbox_row["avatar_file_id"]
+
+                if not display_name:
+                    async with db.execute(
+                        "SELECT username, first_name FROM potential_users WHERE user_id = ? AND tenant_id = ? LIMIT 1",
+                        (uid, normalized_tenant),
+                    ) as potential_cursor:
+                        potential_row = await potential_cursor.fetchone()
+                        if potential_row:
+                            display_name = potential_row["username"] or potential_row["first_name"]
+
+                if not display_name:
+                    async with db.execute(
+                        """
+                        SELECT username, first_name, avatar_file_id
+                        FROM group_members
+                        WHERE user_id = ?
+                          AND tenant_id = ?
+                        ORDER BY joined_at DESC
+                        LIMIT 1
+                        """,
+                        (uid, normalized_tenant),
+                    ) as member_cursor:
+                        member_row = await member_cursor.fetchone()
+                        if member_row:
+                            display_name = member_row["username"] or member_row["first_name"]
+                            avatar_file_id = avatar_file_id or member_row["avatar_file_id"]
+
+                users.append({
+                    "from_userid": uid,
+                    "from_username": display_name or f"User {uid}",
+                    "summary": (latest_row["content"] if latest_row and latest_row["content"] else "[媒体消息]"),
+                    "unread_count": int(unread_row[0] if unread_row else 0),
+                    "last_active": last_active,
+                    "tenant_id": normalized_tenant,
+                    "avatar_file_id": avatar_file_id,
+                })
+
+            return users
+
         async with db.execute("SELECT * FROM admin_inbox ORDER BY last_active DESC") as cursor:
             rows = await cursor.fetchall()
             if rows:
@@ -1037,12 +1867,23 @@ async def get_recent_active_count(minutes: int = 5):
             row = await cursor.fetchone()
             return row[0] if row else 0
 
-async def get_chat_history(user_id: int, limit: int = 50, offset: int = 0):
+async def get_chat_history(
+    user_id: int,
+    limit: int = 50,
+    offset: int = 0,
+    tenant_id: Optional[str] = None,
+    merchant_id: Optional[int] = None,
+):
     """获取与特定用户的聊天历史"""
     import config
     admin_id = config.ADMIN_ID
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        counterpart_id = admin_id
+        if normalized_tenant:
+            counterpart_id = await _resolve_scope_bot_id(db, tenant_id=normalized_tenant, merchant_id=merchant_id) or admin_id
+
         query = """
             SELECT m.*, e.emoji 
             FROM messages m
@@ -1053,7 +1894,12 @@ async def get_chat_history(user_id: int, limit: int = 50, offset: int = 0):
             ORDER BY m.timestamp DESC
             LIMIT ? OFFSET ?
         """
-        async with db.execute(query, (user_id, admin_id, admin_id, user_id, limit, offset)) as cursor:
+        params: list[Any] = [user_id, counterpart_id, counterpart_id, user_id]
+        if normalized_tenant:
+            query = query.replace("AND m.is_deleted = 0", "AND m.is_deleted = 0 AND m.tenant_id = ?")
+            params.append(normalized_tenant)
+        params.extend([limit, offset])
+        async with db.execute(query, tuple(params)) as cursor:
             rows = await cursor.fetchall()
             messages = [dict(row) for row in rows]
             messages.reverse() # 前端需要按时间顺序列出（旧到新），所以反转返回
@@ -1503,13 +2349,26 @@ async def update_pending_admin_msg_status(msg_uuid: str, status: str):
         await db.execute("UPDATE pending_admin_messages SET status = ? WHERE msg_uuid = ?", (status, msg_uuid))
         await db.commit()
 
-async def soft_delete_chat(user_id: int):
-    """软删除特定用户的聊天记录"""
+async def soft_delete_chat(user_id: int, tenant_id: Optional[str] = None, merchant_id: Optional[int] = None):
+    """软删除特定用户的聊天记录；tenant scope 下仅删除当前租户会话。"""
     async with aiosqlite.connect(DB_NAME) as db:
-        # 将该用户的消息标记为删除
-        await db.execute("UPDATE messages SET is_deleted = 1 WHERE from_userid = ? OR to_userid = ?", (user_id, user_id))
-        # 同时从 inbox 移除
-        await db.execute("DELETE FROM admin_inbox WHERE from_userid = ?", (user_id,))
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        if normalized_tenant:
+            counterpart_id = await _resolve_scope_bot_id(db, tenant_id=normalized_tenant, merchant_id=merchant_id) or ADMIN_ID
+            await db.execute(
+                """
+                UPDATE messages
+                SET is_deleted = 1
+                WHERE tenant_id = ?
+                  AND ((from_userid = ? AND to_userid = ?) OR (from_userid = ? AND to_userid = ?))
+                """,
+                (normalized_tenant, user_id, counterpart_id, counterpart_id, user_id),
+            )
+        else:
+            # 将该用户的消息标记为删除
+            await db.execute("UPDATE messages SET is_deleted = 1 WHERE from_userid = ? OR to_userid = ?", (user_id, user_id))
+            # 同时从 inbox 移除
+            await db.execute("DELETE FROM admin_inbox WHERE from_userid = ?", (user_id,))
         await db.commit()
 
 
@@ -1548,9 +2407,11 @@ async def delete_pending_admin_msg(msg_uuid: str):
 
 async def upsert_potential_user(user_id: int, username: Optional[str], first_name: Optional[str] = None, last_name: Optional[str] = None, 
                              message_text: Optional[str] = None, keywords: Optional[str] = None, profile_tags: Optional[str] = None,
-                             group_id: Optional[int] = None, group_title: Optional[str] = None):
+                             group_id: Optional[int] = None, group_title: Optional[str] = None,
+                             tenant_id: Optional[str] = None):
     """保存或更新潜在用户信息 (含标签累积逻辑)"""
     async with aiosqlite.connect(DB_NAME) as db:
+        effective_tenant_id = _normalize_tenant_id(tenant_id) or await _resolve_tenant_id_from_group(db, group_id) or 'default'
         # 获取现有记录以进行累积
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT keywords, profile_tags FROM potential_users WHERE user_id = ?", (user_id,)) as cursor:
@@ -1572,8 +2433,8 @@ async def upsert_potential_user(user_id: int, username: Optional[str], first_nam
 
         await db.execute(
             """INSERT INTO potential_users 
-               (user_id, username, first_name, last_name, message_text, keywords, profile_tags, group_id, group_title, captured_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+               (user_id, username, first_name, last_name, message_text, keywords, profile_tags, group_id, group_title, tenant_id, captured_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                ON CONFLICT(user_id) DO UPDATE SET
                username=excluded.username,
                first_name=excluded.first_name,
@@ -1583,30 +2444,65 @@ async def upsert_potential_user(user_id: int, username: Optional[str], first_nam
                profile_tags=?,
                group_id=excluded.group_id,
                group_title=excluded.group_title,
+               tenant_id=excluded.tenant_id,
                captured_at=CURRENT_TIMESTAMP""",
-            (user_id, username, first_name, last_name, message_text, new_kws, new_tags, group_id, group_title, new_kws, new_tags)
+            (user_id, username, first_name, last_name, message_text, new_kws, new_tags, group_id, group_title, effective_tenant_id, new_kws, new_tags)
         )
         await db.commit()
 
 
-async def upsert_tracked_group(group_id: int, title: str):
-    """登记或更新追踪的群组信息 (支持首次发现与更新时间)"""
+async def get_tracked_group_tenant_id(group_id: int) -> Optional[str]:
+    """获取群组当前归属租户"""
     async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT tenant_id FROM tracked_groups WHERE group_id = ?",
+            (group_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            tenant_id = row[0]
+            return str(tenant_id).strip() if tenant_id is not None else None
+
+
+async def upsert_tracked_group(group_id: int, title: str, tenant_id: Optional[str] = None):
+    """登记或更新追踪的群组信息 (支持首次发现与更新时间 + 租户隔离)"""
+    effective_tenant = (tenant_id or '').strip()
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT tenant_id FROM tracked_groups WHERE group_id = ?",
+            (group_id,),
+        ) as cursor:
+            existing = await cursor.fetchone()
+        if existing and str(existing['tenant_id'] or '').strip():
+            effective_tenant = str(existing['tenant_id']).strip()
+        if not effective_tenant:
+            effective_tenant = 'default'
         await db.execute(
-            """INSERT INTO tracked_groups (group_id, group_title, first_seen, updated_at)
-               VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """INSERT INTO tracked_groups (group_id, group_title, tenant_id, first_seen, updated_at)
+               VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                ON CONFLICT(group_id) DO UPDATE SET
                group_title=excluded.group_title,
+               tenant_id=excluded.tenant_id,
                updated_at=CURRENT_TIMESTAMP""",
-            (group_id, title)
+            (group_id, title, effective_tenant)
         )
         await db.commit()
 
 
-async def get_potential_tags():
-    """从 potential_users 表中去重聚合所有标签"""
+async def get_potential_tags(tenant_id: Optional[str] = None):
+    """从 potential_users 表中去重聚合所有标签。"""
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT profile_tags FROM potential_users WHERE profile_tags IS NOT NULL") as cursor:
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        if normalized_tenant:
+            cursor = await db.execute(
+                "SELECT profile_tags FROM potential_users WHERE profile_tags IS NOT NULL AND tenant_id = ?",
+                (normalized_tenant,),
+            )
+        else:
+            cursor = await db.execute("SELECT profile_tags FROM potential_users WHERE profile_tags IS NOT NULL")
+        async with cursor:
             rows = await cursor.fetchall()
             all_tags = set()
             for row in rows:
@@ -1615,20 +2511,27 @@ async def get_potential_tags():
             return sorted(list(all_tags))
 
 
-async def get_tracked_groups_paginated(page: int = 1, size: int = 20):
-    """分页获取群组列表"""
+async def get_tracked_groups_paginated(page: int = 1, size: int = 20, tenant_id: Optional[str] = None):
+    """分页获取群组列表；tenant scope 下自动过滤 tenant_id。"""
     offset = (page - 1) * size
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        # 获取总数
-        async with db.execute("SELECT COUNT(*) FROM tracked_groups") as cursor:
-            total = (await cursor.fetchone())[0]
-            
-        # 获取分页数据
-        async with db.execute(
-            "SELECT * FROM tracked_groups ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-            (size, offset)
-        ) as cursor:
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        if normalized_tenant:
+            async with db.execute("SELECT COUNT(*) FROM tracked_groups WHERE tenant_id = ?", (normalized_tenant,)) as cursor:
+                total = (await cursor.fetchone())[0]
+            cursor = await db.execute(
+                "SELECT * FROM tracked_groups WHERE tenant_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (normalized_tenant, size, offset)
+            )
+        else:
+            async with db.execute("SELECT COUNT(*) FROM tracked_groups") as cursor:
+                total = (await cursor.fetchone())[0]
+            cursor = await db.execute(
+                "SELECT * FROM tracked_groups ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (size, offset)
+            )
+        async with cursor:
             rows = await cursor.fetchall()
             return {"groups": [dict(row) for row in rows], "total": total}
 
@@ -1641,46 +2544,74 @@ async def is_group_listen_enabled(group_id: int) -> bool:
             return bool(row[0]) if row else False
 
 
-async def set_group_listen_status(group_id: int, is_monitored: bool):
-    """开启或关闭群组监听"""
+async def set_group_listen_status(group_id: int, is_monitored: bool, tenant_id: Optional[str] = None):
+    """开启或关闭群组监听；tenant scope 下强制 group_id+tenant_id 联合命中。"""
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE tracked_groups SET is_monitored = ? WHERE group_id = ?",
-            (1 if is_monitored else 0, group_id)
-        )
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        if normalized_tenant:
+            await db.execute(
+                "UPDATE tracked_groups SET is_monitored = ? WHERE group_id = ? AND tenant_id = ?",
+                (1 if is_monitored else 0, group_id, normalized_tenant)
+            )
+        else:
+            await db.execute(
+                "UPDATE tracked_groups SET is_monitored = ? WHERE group_id = ?",
+                (1 if is_monitored else 0, group_id)
+            )
         await db.commit()
 
 
-async def get_tracked_groups_with_stats():
-    """获取所有追踪群组及其详细监测状态"""
+async def get_tracked_groups_with_stats(tenant_id: Optional[str] = None):
+    """获取所有追踪群组及其详细监测状态，支持租户隔离"""
     from datetime import datetime, timedelta
     now = datetime.now()
     online_threshold = now - timedelta(minutes=10)
     
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM tracked_groups ORDER BY updated_at DESC") as cursor:
-            rows = await cursor.fetchall()
-            groups = []
-            for row in rows:
+        if tenant_id is not None:
+            async with db.execute("SELECT * FROM tracked_groups WHERE tenant_id = ? ORDER BY updated_at DESC", (tenant_id,)) as cursor:
+                rows = await cursor.fetchall()
+        else:
+            async with db.execute("SELECT * FROM tracked_groups ORDER BY updated_at DESC") as cursor:
+                rows = await cursor.fetchall()
+        groups = []
+        for row in rows:
+            try:
                 g = dict(row)
                 # 计算在线状态
-                updated_at_dt = datetime.fromisoformat(g['updated_at'].replace(' ', 'T'))
-                g['is_online'] = updated_at_dt > online_threshold
+                updated_at_str = g.get('updated_at', '')
+                if updated_at_str:
+                    try:
+                        updated_at_dt = datetime.fromisoformat(updated_at_str.replace(' ', 'T'))
+                    except (ValueError, AttributeError):
+                        updated_at_dt = now
+                    g['is_online'] = updated_at_dt > online_threshold
+                else:
+                    g['is_online'] = False
                 # 兼容旧字段
                 g['name'] = g['group_title']
                 g['listen_status'] = bool(g['is_monitored'])
                 groups.append(g)
-            return groups
+            except Exception as e:
+                continue
+        return groups
 
 
-async def update_group_custom_keywords(group_id: int, keywords: str):
-    """更新群组自定义关键词"""
+async def update_group_custom_keywords(group_id: int, keywords: str, tenant_id: Optional[str] = None):
+    """更新群组自定义关键词；tenant scope 下强制 group_id+tenant_id 联合命中。"""
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE tracked_groups SET custom_keywords = ? WHERE group_id = ?",
-            (keywords, group_id)
-        )
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        if normalized_tenant:
+            await db.execute(
+                "UPDATE tracked_groups SET custom_keywords = ? WHERE group_id = ? AND tenant_id = ?",
+                (keywords, group_id, normalized_tenant)
+            )
+        else:
+            await db.execute(
+                "UPDATE tracked_groups SET custom_keywords = ? WHERE group_id = ?",
+                (keywords, group_id)
+            )
         await db.commit()
 
 
@@ -1694,13 +2625,99 @@ async def get_group_delete_on_revoke(group_id: int) -> bool:
             return bool(row[0]) if row else False
 
 
-async def set_group_delete_on_revoke(group_id: int, enabled: bool):
-    """设置群组撤回同步删除开关"""
+async def get_group_revoke_sync_chat_id(group_id: int):
+    """获取群组绑定的校对信息群 ID"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT revoke_sync_chat_id FROM tracked_groups WHERE group_id = ?", (group_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+
+
+async def set_group_revoke_sync_chat_id(group_id: int, chat_id: Optional[int]):
+    """为指定群组设置校对信息群 ID"""
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
-            "UPDATE tracked_groups SET delete_on_revoke = ? WHERE group_id = ?",
-            (1 if enabled else 0, group_id)
+            "UPDATE tracked_groups SET revoke_sync_chat_id = ? WHERE group_id = ?",
+            (int(chat_id) if chat_id is not None else None, group_id)
         )
+        await db.commit()
+
+
+async def get_revoke_sync_assigned_groups(chat_id: int) -> list:
+    """获取已分配到某个校对信息群的群组列表"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT group_id, group_title, is_monitored, delete_on_revoke, revoke_sync_chat_id, updated_at
+            FROM tracked_groups
+            WHERE revoke_sync_chat_id = ?
+            ORDER BY updated_at DESC, group_id DESC
+            """,
+            (chat_id,),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+async def save_revoke_sync_group_assignments(chat_id: int, group_ids: list[int]):
+    """批量保存某个校对信息群的群组授权/分配关系"""
+    normalized_ids = sorted({int(gid) for gid in (group_ids or []) if str(gid).strip()})
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT group_id FROM tracked_groups WHERE revoke_sync_chat_id = ?",
+            (chat_id,),
+        ) as cursor:
+            old_group_ids = {int(row["group_id"]) for row in await cursor.fetchall()}
+
+        removed_group_ids = sorted(old_group_ids - set(normalized_ids))
+        await db.execute(
+            "UPDATE tracked_groups SET revoke_sync_chat_id = NULL WHERE revoke_sync_chat_id = ?",
+            (chat_id,),
+        )
+        if removed_group_ids:
+            placeholders = ",".join("?" for _ in removed_group_ids)
+            await db.execute(
+                f"UPDATE tracked_groups SET delete_on_revoke = 0 WHERE group_id IN ({placeholders})",
+                tuple(removed_group_ids),
+            )
+        if normalized_ids:
+            placeholders = ",".join("?" for _ in normalized_ids)
+            await db.execute(
+                f"UPDATE tracked_groups SET revoke_sync_chat_id = ? WHERE group_id IN ({placeholders})",
+                (chat_id, *normalized_ids),
+            )
+        await db.commit()
+
+
+async def reassign_revoke_sync_groups(old_chat_id: Optional[int], new_chat_id: Optional[int]):
+    """将旧校对信息群下的群组授权迁移到新群"""
+    if old_chat_id is None:
+        return
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE tracked_groups SET revoke_sync_chat_id = ? WHERE revoke_sync_chat_id = ?",
+            (int(new_chat_id) if new_chat_id is not None else None, int(old_chat_id)),
+        )
+        await db.commit()
+
+
+async def set_group_delete_on_revoke(group_id: int, enabled: bool, tenant_id: Optional[str] = None):
+    """设置群组撤回同步删除开关；tenant scope 下强制 group_id+tenant_id 联合命中。"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        if normalized_tenant:
+            await db.execute(
+                "UPDATE tracked_groups SET delete_on_revoke = ? WHERE group_id = ? AND tenant_id = ?",
+                (1 if enabled else 0, group_id, normalized_tenant)
+            )
+        else:
+            await db.execute(
+                "UPDATE tracked_groups SET delete_on_revoke = ? WHERE group_id = ?",
+                (1 if enabled else 0, group_id)
+            )
         await db.commit()
 
 
@@ -1711,11 +2728,12 @@ async def get_groups_with_revoke_sync() -> list:
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT group_id FROM tracked_groups WHERE delete_on_revoke = 1 AND is_monitored = 1"
+            "SELECT group_id, revoke_sync_chat_id FROM tracked_groups WHERE delete_on_revoke = 1 AND is_monitored = 1 AND revoke_sync_chat_id IS NOT NULL"
         ) as cursor:
-            groups = [row['group_id'] for row in await cursor.fetchall()]
+            groups = [dict(row) for row in await cursor.fetchall()]
         result = []
-        for gid in groups:
+        for item in groups:
+            gid = item['group_id']
             # 只取 48h 内、tg_msg_id 不为空、且未校对过的消息，最多 200 条
             async with db.execute(
                 "SELECT msg_id, tg_msg_id FROM group_messages "
@@ -1728,7 +2746,11 @@ async def get_groups_with_revoke_sync() -> list:
             ) as cursor:
                 msgs = [dict(row) for row in await cursor.fetchall()]
             if msgs:
-                result.append({'group_id': gid, 'messages': msgs})
+                result.append({
+                    'group_id': gid,
+                    'revoke_sync_chat_id': item.get('revoke_sync_chat_id'),
+                    'messages': msgs,
+                })
         return result
 
 
@@ -1797,44 +2819,105 @@ async def save_group_message(
     quoted_text: Optional[str] = None,
     message_ts: Optional[int] = None,
     avatar_file_id: Optional[str] = None,
+    is_advertising: Optional[bool] = None,
+    ad_score: Optional[int] = None,
+    ad_confidence: Optional[str] = None,
+    ad_findings: Optional[Union[str, List[str]]] = None,
+    tenant_id: Optional[str] = None,
 ):
     """保存全量群组消息记录（按 group_id + tg_msg_id 去重）"""
     ts = int(message_ts) if message_ts else None
+    findings_text: Optional[str] = None
+    if isinstance(ad_findings, str):
+        findings_text = ad_findings
+    elif isinstance(ad_findings, list):
+        try:
+            findings_text = json.dumps(ad_findings, ensure_ascii=False)
+        except Exception:
+            findings_text = None
+
     async with aiosqlite.connect(DB_NAME) as db:
+        effective_tenant_id = _normalize_tenant_id(tenant_id) or await _resolve_tenant_id_from_group(db, group_id) or 'default'
         await db.execute(
-            "INSERT OR IGNORE INTO group_messages (group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, file_id, quoted_tg_msg_id, quoted_text, message_ts, avatar_file_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, file_id, quoted_tg_msg_id, quoted_text, ts, avatar_file_id)
+            """
+            INSERT OR IGNORE INTO group_messages (
+                group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, file_id,
+                quoted_tg_msg_id, quoted_text, message_ts, avatar_file_id,
+                is_advertising, ad_score, ad_confidence, ad_findings, tenant_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, file_id,
+                quoted_tg_msg_id, quoted_text, ts, avatar_file_id,
+                1 if is_advertising else 0,
+                int(ad_score or 0),
+                (ad_confidence or "low"),
+                findings_text,
+                effective_tenant_id,
+            )
         )
         await db.commit()
 
 
-async def get_group_messages(group_id: int, limit: int = 50, offset: int = 0):
-    """获取指定群组的消息历史（按真实发言时间稳定排序），自动补全头像"""
+async def get_group_messages(group_id: int, limit: int = 50, offset: int = 0, tenant_id: Optional[str] = None):
+    """获取指定群组的消息历史；tenant scope 下强制过滤 tenant_id。"""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        if normalized_tenant:
+            query = """
+                SELECT t.*,
+                       COALESCE(t.avatar_file_id, gm.avatar_file_id) AS avatar_file_id
+                FROM (
+                    SELECT *
+                    FROM group_messages
+                    WHERE group_id = ?
+                      AND tenant_id = ?
+                    ORDER BY COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) DESC, tg_msg_id DESC, msg_id DESC
+                    LIMIT ? OFFSET ?
+                ) t
+                LEFT JOIN (
+                    SELECT user_id, avatar_file_id
+                    FROM group_members
+                    WHERE avatar_file_id IS NOT NULL
+                      AND tenant_id = ?
+                    GROUP BY user_id
+                ) gm ON gm.user_id = t.user_id
+                ORDER BY COALESCE(t.message_ts, CAST(strftime('%s', t.timestamp) AS INTEGER)) ASC, t.tg_msg_id ASC, t.msg_id ASC
             """
-            SELECT t.*,
-                   COALESCE(t.avatar_file_id, gm.avatar_file_id) AS avatar_file_id
-            FROM (
-                SELECT *
-                FROM group_messages
-                WHERE group_id = ?
-                ORDER BY COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) DESC, tg_msg_id DESC, msg_id DESC
-                LIMIT ? OFFSET ?
-            ) t
-            LEFT JOIN (
-                SELECT user_id, avatar_file_id
-                FROM group_members
-                WHERE avatar_file_id IS NOT NULL
-                GROUP BY user_id
-            ) gm ON gm.user_id = t.user_id
-            ORDER BY COALESCE(t.message_ts, CAST(strftime('%s', t.timestamp) AS INTEGER)) ASC, t.tg_msg_id ASC, t.msg_id ASC
-            """,
-            (group_id, limit, offset)
-        ) as cursor:
+            params = (group_id, normalized_tenant, limit, offset, normalized_tenant)
+        else:
+            query = """
+                SELECT t.*,
+                       COALESCE(t.avatar_file_id, gm.avatar_file_id) AS avatar_file_id
+                FROM (
+                    SELECT *
+                    FROM group_messages
+                    WHERE group_id = ?
+                    ORDER BY COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) DESC, tg_msg_id DESC, msg_id DESC
+                    LIMIT ? OFFSET ?
+                ) t
+                LEFT JOIN (
+                    SELECT user_id, avatar_file_id
+                    FROM group_members
+                    WHERE avatar_file_id IS NOT NULL
+                    GROUP BY user_id
+                ) gm ON gm.user_id = t.user_id
+                ORDER BY COALESCE(t.message_ts, CAST(strftime('%s', t.timestamp) AS INTEGER)) ASC, t.tg_msg_id ASC, t.msg_id ASC
+            """
+            params = (group_id, limit, offset)
+        async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            results = [dict(row) for row in rows]
+            for item in results:
+                raw_findings = item.get("ad_findings")
+                if isinstance(raw_findings, str) and raw_findings.strip():
+                    try:
+                        item["ad_findings"] = json.loads(raw_findings)
+                    except Exception:
+                        pass
+            return results
 
 
 async def delete_group_message(group_id: int, tg_msg_id: int) -> bool:
@@ -1849,23 +2932,26 @@ async def delete_group_message(group_id: int, tg_msg_id: int) -> bool:
 
 
 async def save_group_member(user_id: int, username: Optional[str], first_name: Optional[str] = None, last_name: Optional[str] = None,
-                           group_id: Optional[int] = None, group_title: Optional[str] = None):
+                           group_id: Optional[int] = None, group_title: Optional[str] = None,
+                           tenant_id: Optional[str] = None):
     """保存群组成员信息（按 group_id + user_id 幂等更新）"""
     if group_id is None:
         return
     async with aiosqlite.connect(DB_NAME) as db:
+        effective_tenant_id = _normalize_tenant_id(tenant_id) or await _resolve_tenant_id_from_group(db, group_id) or 'default'
         await db.execute(
             """INSERT INTO group_members 
-               (user_id, username, first_name, last_name, group_id, group_title, status, joined_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
+               (user_id, username, first_name, last_name, group_id, group_title, tenant_id, status, joined_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
                ON CONFLICT(group_id, user_id) DO UPDATE SET
                username=excluded.username,
                first_name=excluded.first_name,
                last_name=excluded.last_name,
                group_title=excluded.group_title,
+               tenant_id=excluded.tenant_id,
                status='active',
                joined_at=CURRENT_TIMESTAMP""",
-            (user_id, username, first_name, last_name, group_id, group_title)
+            (user_id, username, first_name, last_name, group_id, group_title, effective_tenant_id)
         )
         await db.commit()
 
@@ -1891,12 +2977,17 @@ async def delete_monitor_admin(monitor_id: int) -> bool:
         return cur.rowcount > 0
 
 
-async def get_potential_users(limit: int = 50, offset: int = 0, keyword: Optional[str] = None, tag: Optional[str] = None, group_id: Optional[int] = None, start_time: Optional[str] = None, end_time: Optional[str] = None):
-    """获取潜在用户列表 (支持分页与画像/关键词过滤)"""
+async def get_potential_users(limit: int = 50, offset: int = 0, keyword: Optional[str] = None, tag: Optional[str] = None, group_id: Optional[int] = None, start_time: Optional[str] = None, end_time: Optional[str] = None, tenant_id: Optional[str] = None):
+    """获取潜在用户列表 (支持分页与画像/关键词过滤 + tenant scope)"""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         where_clauses = []
         params = []
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+
+        if normalized_tenant:
+            where_clauses.append("tenant_id = ?")
+            params.append(normalized_tenant)
         
         if keyword:
             where_clauses.append("(keywords LIKE ? OR username LIKE ? OR first_name LIKE ? OR last_name LIKE ?)")
@@ -2072,37 +3163,68 @@ async def get_group_members_live(group_id: int, bot=None):
 
 
 
+async def get_broadcast_target_tenant_id(chat_id: int) -> Optional[str]:
+    """获取广播目标当前归属租户"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT tenant_id FROM broadcast_targets WHERE chat_id = ?",
+            (chat_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            tenant_id = row[0]
+            return str(tenant_id).strip() if tenant_id is not None else None
+
+
 async def upsert_broadcast_target(
     chat_id: int,
     chat_title: str,
     chat_type: str,
     chat_username: Optional[str] = None,
     can_broadcast: bool = True,
+    tenant_id: Optional[str] = None,
 ):
-    """登记/更新广播目标（群组、超级群、频道）"""
+    """登记/更新广播目标（群组、超级群、频道），支持租户隔离"""
+    effective_tenant = (tenant_id or '').strip()
     async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT tenant_id FROM broadcast_targets WHERE chat_id = ?",
+            (chat_id,),
+        ) as cursor:
+            existing = await cursor.fetchone()
+        if existing and str(existing['tenant_id'] or '').strip():
+            effective_tenant = str(existing['tenant_id']).strip()
+        if not effective_tenant:
+            effective_tenant = 'default'
         await db.execute(
             """
-            INSERT INTO broadcast_targets (chat_id, chat_title, chat_type, chat_username, can_broadcast, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO broadcast_targets (chat_id, chat_title, chat_type, chat_username, can_broadcast, tenant_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(chat_id) DO UPDATE SET
                 chat_title=excluded.chat_title,
                 chat_type=excluded.chat_type,
                 chat_username=excluded.chat_username,
                 can_broadcast=excluded.can_broadcast,
+                tenant_id=excluded.tenant_id,
                 updated_at=CURRENT_TIMESTAMP
             """,
-            (chat_id, chat_title, chat_type, chat_username, 1 if can_broadcast else 0),
+            (chat_id, chat_title, chat_type, chat_username, 1 if can_broadcast else 0, effective_tenant),
         )
         await db.commit()
 
 
-async def get_broadcast_targets(chat_types: Optional[List[str]] = None, enabled_only: bool = True):
-    """获取广播目标列表（支持按类型过滤）"""
+async def get_broadcast_targets(chat_types: Optional[List[str]] = None, enabled_only: bool = True, tenant_id: Optional[str] = None):
+    """获取广播目标列表（支持按类型过滤 + 租户隔离）"""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         where_parts = []
         params: List[Any] = []
+
+        if tenant_id is not None:
+            where_parts.append("tenant_id = ?")
+            params.append(tenant_id)
 
         if enabled_only:
             where_parts.append("can_broadcast = 1")
@@ -2163,26 +3285,31 @@ async def upsert_group_address_hit(group_id: int, user_id: int, address: str, ne
         await db.commit()
 
 
-async def create_push_task(task_name: str, content: str, image_file_id: Optional[str], do_translate: bool, target_chat_ids: List[int], start_at: str, interval_hours: int, status: str, next_run_at: str):
-    """创建定时推送任务"""
+async def create_push_task(task_name: str, content: str, image_file_id: Optional[str], do_translate: bool, target_chat_ids: List[int], start_at: str, interval_hours: int, status: str, next_run_at: str, tenant_id: Optional[str] = None, created_by: Optional[int] = None):
+    """创建定时推送任务，支持租户隔离"""
+    effective_tenant = tenant_id or 'default'
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
             """
-            INSERT INTO push_tasks (task_name, content, image_file_id, do_translate, target_chat_ids, start_at, interval_hours, status, next_run_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            INSERT INTO push_tasks (task_name, content, image_file_id, do_translate, target_chat_ids, start_at, interval_hours, status, next_run_at, tenant_id, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """,
-            (task_name, content, image_file_id, 1 if do_translate else 0, json.dumps(target_chat_ids), start_at, interval_hours, status, next_run_at),
+            (task_name, content, image_file_id, 1 if do_translate else 0, json.dumps(target_chat_ids), start_at, interval_hours, status, next_run_at, effective_tenant, created_by),
         )
         await db.commit()
         return cur.lastrowid
 
 
-async def list_push_tasks():
-    """列出推送任务"""
+async def list_push_tasks(tenant_id: Optional[str] = None):
+    """列出推送任务，支持租户隔离"""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM push_tasks ORDER BY created_at DESC") as cursor:
-            rows = await cursor.fetchall()
+        if tenant_id is not None:
+            async with db.execute("SELECT * FROM push_tasks WHERE tenant_id = ? ORDER BY created_at DESC", (tenant_id,)) as cursor:
+                rows = await cursor.fetchall()
+        else:
+            async with db.execute("SELECT * FROM push_tasks ORDER BY created_at DESC") as cursor:
+                rows = await cursor.fetchall()
             result = []
             for row in rows:
                 item = dict(row)
@@ -2267,14 +3394,22 @@ async def update_push_task_run_result(task_id: int, last_run_at: str, next_run_a
 # 入群验证 (Join Verify)
 # ─────────────────────────────────────────────────────────────
 
-async def get_group_verify_config(group_id: int) -> dict:
-    """获取群组入群验证配置"""
+async def get_group_verify_config(group_id: int, tenant_id: Optional[str] = None) -> dict:
+    """获取群组入群验证配置；tenant scope 下强制 group_id+tenant_id 联合命中。"""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT verify_enabled, verify_type, verify_timeout, verify_channel_id, verify_questions, verify_msg_template FROM tracked_groups WHERE group_id = ?",
-            (group_id,)
-        ) as cursor:
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        if normalized_tenant:
+            cursor = await db.execute(
+                "SELECT verify_enabled, verify_type, verify_timeout, verify_channel_id, verify_questions, verify_msg_template FROM tracked_groups WHERE group_id = ? AND tenant_id = ?",
+                (group_id, normalized_tenant)
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT verify_enabled, verify_type, verify_timeout, verify_channel_id, verify_questions, verify_msg_template FROM tracked_groups WHERE group_id = ?",
+                (group_id,)
+            )
+        async with cursor:
             row = await cursor.fetchone()
             if not row:
                 return {"verify_enabled": False, "verify_type": "captcha", "verify_timeout": 120, "verify_channel_id": None, "verify_questions": None, "verify_msg_template": None}
@@ -2287,25 +3422,27 @@ async def get_group_verify_config(group_id: int) -> dict:
                 "verify_msg_template": row["verify_msg_template"],
             }
 
-
-async def save_group_verify_config(group_id: int, config: dict) -> None:
-    """保存群组入群验证配置"""
+async def save_group_verify_config(group_id: int, config: dict, tenant_id: Optional[str] = None) -> None:
+    """保存群组入群验证配置；tenant scope 下强制 group_id+tenant_id 联合命中。"""
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            """UPDATE tracked_groups SET
-                verify_enabled = ?, verify_type = ?, verify_timeout = ?,
-                verify_channel_id = ?, verify_questions = ?, verify_msg_template = ?
-               WHERE group_id = ?""",
-            (
-                1 if config.get("verify_enabled") else 0,
-                config.get("verify_type", "captcha"),
-                config.get("verify_timeout", 120),
-                config.get("verify_channel_id"),
-                json.dumps(config.get("verify_questions", []), ensure_ascii=False) if config.get("verify_questions") else None,
-                config.get("verify_msg_template"),
-                group_id,
-            )
-        )
+        normalized_tenant = _normalize_tenant_id(tenant_id)
+        params = [
+            1 if config.get("verify_enabled") else 0,
+            config.get("verify_type", "captcha"),
+            config.get("verify_timeout", 120),
+            config.get("verify_channel_id"),
+            json.dumps(config.get("verify_questions", []), ensure_ascii=False) if config.get("verify_questions") else None,
+            config.get("verify_msg_template"),
+            group_id,
+        ]
+        sql = """UPDATE tracked_groups SET
+            verify_enabled = ?, verify_type = ?, verify_timeout = ?,
+            verify_channel_id = ?, verify_questions = ?, verify_msg_template = ?
+           WHERE group_id = ?"""
+        if normalized_tenant:
+            sql += " AND tenant_id = ?"
+            params.append(normalized_tenant)
+        await db.execute(sql, tuple(params))
         await db.commit()
 
 
@@ -2979,7 +4116,7 @@ async def get_finance_category_tree() -> List[Dict[str, Any]]:
 async def init_finance_module():
     """初始化财务 ERP 模块"""
     try:
-        from finance_core import init_finance_db, init_default_chart_of_accounts
+        from backend.app.services.finance_core import init_finance_db, init_default_chart_of_accounts
         await init_finance_db()
         await init_default_chart_of_accounts()
         logger.info("✅ 财务 ERP 模块初始化完成")

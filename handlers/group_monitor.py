@@ -13,16 +13,19 @@ from telegram import Update
 from telegram.ext import ContextTypes, MessageHandler, filters
 import config
 import database
+from services.ai_agent.ad_detection import detect_advertising_signals
+from cachetools import TTLCache
 
-# 头像缓存：user_id -> avatar_file_id，避免重复调用 get_chat
-_avatar_cache: dict = {}
+# 头像缓存：user_id -> avatar_file_id，TTL 1小时，上限 2000 条
+_avatar_cache: TTLCache = TTLCache(maxsize=2000, ttl=3600)
 from services.security_shield import ADDR_REGEX
 
 logger = logging.getLogger(__name__)
 
 # --- 2026 规格：群组监听配置缓存 ---
 # 缓存格式：{group_id: {"is_monitored": bool, "custom_keywords": list}}
-_group_config_cache = {}
+# TTL 10分钟，上限 500 条
+_group_config_cache = TTLCache(maxsize=500, ttl=600)
 
 # 默认画像标签引擎配置 (支持正则管道符 |)
 KEYWORD_PROFILE_TAGS = {
@@ -425,6 +428,22 @@ async def track_group_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 if not quoted_text:
                     quoted_text = '[媒体消息]'
 
+            ad_flags = {
+                "is_advertising": False,
+                "ad_score": 0,
+                "ad_confidence": "low",
+                "ad_findings": [],
+            }
+            text_for_ad = (message.text or message.caption or "").strip()
+            if text_for_ad and sender_type in ("user", "channel"):
+                try:
+                    ad_flags = detect_advertising_signals(
+                        text=text_for_ad,
+                        context_type="group_message",
+                    )
+                except Exception as ad_ex:
+                    logger.debug("广告识别失败: %s", ad_ex)
+
             # 获取头像（带缓存，每用户只调一次 get_chat）
             _avatar = None
             if message.from_user:
@@ -451,6 +470,10 @@ async def track_group_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 quoted_text=quoted_text,
                 message_ts=int(message.date.timestamp()) if message.date else None,
                 avatar_file_id=_avatar,
+                is_advertising=bool(ad_flags.get("is_advertising")),
+                ad_score=int(ad_flags.get("ad_score", 0) or 0),
+                ad_confidence=str(ad_flags.get("confidence") or "low"),
+                ad_findings=ad_flags.get("findings") or [],
             )
 
         # 始终把发言人写入 group_members（即使未开启监听，也可用于“成员管理”弹窗展示）
@@ -649,8 +672,8 @@ async def handle_group_left_member(update: Update, context: ContextTypes.DEFAULT
 
 
 # 频道验证冷却缓存：避免对同一用户在短时间内重复调用 get_chat_member
-# 格式：(group_id, user_id) -> timestamp
-_verify_cooldown: dict = {}
+# 格式：(group_id, user_id) -> timestamp，TTL 60秒，上限 5000 条
+_verify_cooldown: TTLCache = TTLCache(maxsize=5000, ttl=60)
 VERIFY_COOLDOWN_SECS = 30  # 30秒内同一用户只检测一次
 
 
@@ -750,7 +773,10 @@ async def _check_channel_verify(
             )
             # 5秒后自动删除提示
             import asyncio
-            asyncio.create_task(_auto_delete_msg(context.bot, group_id, tip_msg.message_id, 5))
+            _bg_tasks = set()
+            t = asyncio.create_task(_auto_delete_msg(context.bot, group_id, tip_msg.message_id, 5))
+            _bg_tasks.add(t)
+            t.add_done_callback(_bg_tasks.discard)
         except Exception as tip_err:
             logger.warning("[频道验证] 发送提示失败: %s", tip_err)
 

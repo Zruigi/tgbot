@@ -45,6 +45,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     user = update.effective_user
     if not user or str(user.id) != str(config.ADMIN_ID):
+        if update.message:
+            await update.message.reply_text("⛔ 仅管理员可使用此命令。")
         return ConversationHandler.END
 
     # 并发读取数据库配置
@@ -249,8 +251,12 @@ async def save_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await admin_panel(update, context)
 
 async def cancel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """退出配置 (安全清理)"""
-    if update.message:
+    """退出配置 (安全清理)，若为 /start 则继续执行对应命令"""
+    cmd = (update.message.text or '').strip().lower() if update.message else ''
+    if cmd.startswith('/start'):
+        from handlers.start import start
+        await start(update, context)
+    elif update.message:
         await update.message.reply_text("已退出配置。")
     elif update.callback_query:
         await update.callback_query.edit_message_text("已退出配置。")
@@ -287,6 +293,9 @@ admin_config_handler = ConversationHandler(
         WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.REPLY, save_token), CommandHandler("skip", save_token)],
         WAITING_SYSTEM_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.REPLY, save_prompt)]
     },
-    fallbacks=[CommandHandler("cancel", cancel_settings)],
+    fallbacks=[
+        CommandHandler("cancel", cancel_settings),
+        CommandHandler("start", cancel_settings),
+    ],
     per_message=False
 )

@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
+DEFAULT_LOG_DIR="/home/ubuntu/tgbot/logs"
+LOG_DIR="${LOG_DIR:-$DEFAULT_LOG_DIR}"
 RETENTION_HOURS="${LOG_RETENTION_HOURS:-48}"
 
 mkdir -p "$LOG_DIR"
@@ -22,14 +23,15 @@ retention_hours = int(sys.argv[2])
 cutoff = datetime.now() - timedelta(hours=retention_hours)
 
 deleted = []
-for path in log_dir.rglob("*.log"):
-    try:
-        mtime = datetime.fromtimestamp(path.stat().st_mtime)
-        if mtime < cutoff:
-            path.unlink(missing_ok=True)
-            deleted.append(path.name)
-    except Exception as exc:
-        print(f"WARN: failed to process {path.name}: {exc}")
+for pattern in ("*.log", "*.stdout", "*.stderr", "*.out"):
+    for path in log_dir.rglob(pattern):
+        try:
+            mtime = datetime.fromtimestamp(path.stat().st_mtime)
+            if mtime < cutoff:
+                path.unlink(missing_ok=True)
+                deleted.append(path.name)
+        except Exception as exc:
+            print(f"WARN: failed to process {path.name}: {exc}")
 
 print(f"Log cleanup complete. retention_hours={retention_hours}, deleted={len(deleted)}")
 if deleted:

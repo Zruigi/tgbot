@@ -37,6 +37,8 @@ const tokenInput = ref('')
 const loading = ref(false)
 const error = ref('')
 
+const resolveHomeRoute = () => '/saas'
+
 onMounted(async () => {
   // OTP 自动登录：从 URL 参数中读取 otp
   const params = new URLSearchParams(window.location.search)
@@ -48,7 +50,7 @@ onMounted(async () => {
       if (auth.isAuthenticated) {
         // 清除 URL 中的 otp 参数，防止刷新重用
         window.history.replaceState({}, '', window.location.pathname)
-        router.push('/chat')
+        router.push(resolveHomeRoute())
         return
       } else {
         error.value = auth.error || 'OTP 已失效，请重新从 Telegram 获取登录链接'
@@ -59,7 +61,7 @@ onMounted(async () => {
   }
   // 已有 token 则直接跳转
   auth.checkToken()
-  if (auth.isAuthenticated) router.push('/chat')
+  if (auth.isAuthenticated) router.push(resolveHomeRoute())
 })
 
 async function handleLogin() {
@@ -67,7 +69,7 @@ async function handleLogin() {
   loading.value = true
   try {
     await auth.login(tokenInput.value)
-    if (auth.isAuthenticated) router.push('/chat')
+    if (auth.isAuthenticated) router.push(resolveHomeRoute())
     else error.value = auth.error || 'Token 错误，请重试'
   } catch {
     error.value = 'Token 错误，请重试'

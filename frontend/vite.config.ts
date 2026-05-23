@@ -14,7 +14,7 @@ export default defineConfig({
     port: 5173,
     host: '0.0.0.0',
     // Allow all hosts including *.trycloudflare.com
-    allowedHosts: 'all',
+    allowedHosts: true,
     hmr: {
       // Cloudflare tunnel: browser must use port 443 (tunnel's public HTTPS port)
       protocol: isCfTunnel ? 'wss' : 'ws',

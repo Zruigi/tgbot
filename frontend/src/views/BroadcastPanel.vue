@@ -1,73 +1,84 @@
 <template>
   <div class="flex h-full overflow-hidden bg-surface">
-    <!-- 左侧：目标选择面板 -->
+    <!-- 左侧：目标选择摘要 -->
     <div class="border-r border-outline-variant/20 flex flex-col bg-surface-container-lowest/80"
-         :class="mobilePanelView==='list'?'w-full md:w-80':'hidden md:flex md:w-80'">
-      <div class="p-5 border-b border-outline-variant/10 space-y-3">
-        <div class="flex items-center justify-between">
-          <h2 class="text-lg font-black flex items-center">
+         :class="mobilePanelView==='list'?'w-full md:w-[360px]':'hidden md:flex md:w-[360px]'">
+      <div class="p-4 md:p-5 border-b border-outline-variant/10 space-y-4">
+        <div class="flex items-center justify-between gap-3">
+          <h2 class="text-base md:text-lg font-black flex items-center min-w-0">
             <span class="material-symbols-outlined mr-2 text-primary">campaign</span>群发目标
           </h2>
-          <span class="bg-primary/10 text-primary text-[10px] font-bold px-2 py-1 rounded-full">
+          <span class="bg-primary/10 text-primary text-[10px] font-bold px-2 py-1 rounded-full shrink-0">
             {{ totalSelected }} 已选
           </span>
         </div>
 
-        <!-- 目标类型选项卡 -->
-        <div class="flex gap-1.5">
-          <button @click="activeTab='users'"
-                  :class="activeTab==='users'?'bg-primary text-white':'bg-surface-container text-slate-600'"
-                  class="flex-1 py-2 text-xs font-bold rounded-lg transition-all">
-            用户
+        <div class="grid grid-cols-3 gap-2">
+          <button @click="openTargetDrawer('users')"
+                  class="rounded-2xl px-3 py-3 text-left transition-all border"
+                  :class="selectedUserIds.length ? 'bg-primary/10 border-primary/25 text-primary' : 'bg-surface-container border-transparent text-slate-600'">
+            <span class="material-symbols-outlined text-lg">person</span>
+            <div class="mt-2 text-[10px] font-black uppercase tracking-widest">联系人</div>
+            <div class="mt-1 text-xs font-bold">{{ selectedUserIds.length }}/{{ users.length }}</div>
           </button>
-          <button @click="activeTab='groups'"
-                  :class="activeTab==='groups'?'bg-primary text-white':'bg-surface-container text-slate-600'"
-                  class="flex-1 py-2 text-xs font-bold rounded-lg transition-all">
-            群/频道
+          <button @click="openTargetDrawer('groups')"
+                  class="rounded-2xl px-3 py-3 text-left transition-all border"
+                  :class="selectedGroupCount ? 'bg-cyan-500/10 border-cyan-500/25 text-cyan-700' : 'bg-surface-container border-transparent text-slate-600'">
+            <span class="material-symbols-outlined text-lg">groups</span>
+            <div class="mt-2 text-[10px] font-black uppercase tracking-widest">群组</div>
+            <div class="mt-1 text-xs font-bold">{{ selectedGroupCount }}/{{ groupTargets.length }}</div>
+          </button>
+          <button @click="openTargetDrawer('channels')"
+                  class="rounded-2xl px-3 py-3 text-left transition-all border"
+                  :class="selectedChannelCount ? 'bg-sky-500/10 border-sky-500/25 text-sky-700' : 'bg-surface-container border-transparent text-slate-600'">
+            <span class="material-symbols-outlined text-lg">campaign</span>
+            <div class="mt-2 text-[10px] font-black uppercase tracking-widest">频道</div>
+            <div class="mt-1 text-xs font-bold">{{ selectedChannelCount }}/{{ channelTargets.length }}</div>
           </button>
         </div>
 
-        <!-- 快捷操作 -->
-        <div class="flex gap-2">
-          <button @click="selectAll" class="flex-1 py-1.5 text-[10px] font-bold uppercase bg-primary/10 text-primary rounded-lg hover:bg-primary/20">全选</button>
-          <button @click="clearAll" class="flex-1 py-1.5 text-[10px] font-bold uppercase bg-slate-100 text-slate-500 rounded-lg">清空</button>
-          <button v-if="activeTab==='groups'" @click="syncTargets" class="flex-1 py-1.5 text-[10px] font-bold uppercase bg-cyan-500/15 text-cyan-700 rounded-lg">同步</button>
+        <div class="flex items-center gap-2">
+          <button @click="syncTargets"
+                  class="flex-1 py-2 rounded-xl bg-emerald-500/10 text-emerald-700 text-[11px] font-bold flex items-center justify-center gap-1.5">
+            <span class="material-symbols-outlined text-sm">sync</span>
+            同步群组/频道
+          </button>
+          <button @click="clearAll"
+                  :disabled="totalSelected === 0"
+                  class="px-4 py-2 rounded-xl bg-slate-100 text-slate-500 text-[11px] font-bold disabled:opacity-40">
+            清空
+          </button>
         </div>
       </div>
 
-      <!-- 目标列表 -->
-      <div class="flex-1 overflow-y-auto no-scrollbar p-2 space-y-1">
-        <div v-if="activeTab==='users'">
-          <div v-for="u in users" :key="u.from_userid"
-               @click="toggleUser(u.from_userid)"
-               class="flex items-center p-3 rounded-xl cursor-pointer border transition-all"
-               :class="selectedUserIds.includes(u.from_userid)?'bg-primary/10 border-primary/25':'border-transparent bg-white/70 hover:bg-white'">
-            <div class="w-10 h-10 rounded-xl mr-3 flex-shrink-0 overflow-hidden flex items-center justify-center bg-surface-container-high text-primary font-bold">
-              <img v-if="u.avatar_file_id && fileUrls[u.avatar_file_id]" :src="fileUrls[u.avatar_file_id]" class="w-10 h-10 object-cover block"/>
-              <span v-else>{{ (u.from_username||'U').charAt(0).toUpperCase() }}</span>
+      <div class="flex-1 min-h-0 overflow-y-auto no-scrollbar p-4 space-y-3">
+        <div class="rounded-2xl border border-outline-variant/10 bg-surface-container-low/70 p-4">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <div class="text-[10px] font-black uppercase tracking-widest text-primary">添选记忆</div>
+              <p class="mt-1 text-xs text-slate-500 leading-relaxed">{{ selectionMemoryHint }}</p>
             </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-xs font-bold truncate">{{ u.from_username||u.username||'用户 '+u.from_userid }}</div>
-              <div class="text-[9px] text-slate-400">ID: {{ u.from_userid }}</div>
-            </div>
-            <span v-if="selectedUserIds.includes(u.from_userid)" class="material-symbols-outlined text-primary text-sm">check_circle</span>
+            <span class="material-symbols-outlined text-primary">checklist</span>
           </div>
         </div>
-        <div v-else>
-          <div v-if="isTargetsLoading" class="py-8 text-center text-xs text-slate-400">加载中...</div>
-          <div v-for="t in targets" :key="t.chat_id"
-               @click="toggleTarget(t.chat_id)"
-               class="flex items-center p-3 rounded-xl cursor-pointer border transition-all"
-               :class="selectedChatIds.includes(t.chat_id)?'bg-primary/10 border-primary/25':'border-transparent bg-white/70 hover:bg-white'">
-            <div class="w-10 h-10 rounded-xl mr-3 flex-shrink-0 flex items-center justify-center bg-surface-container-high text-slate-500">
-              <span class="material-symbols-outlined text-[18px]">{{ t.chat_type==='channel'?'campaign':'groups' }}</span>
-            </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-xs font-bold truncate">{{ t.chat_title||t.chat_id }}</div>
-              <div class="text-[9px] text-slate-400">{{ t.chat_type==='channel'?'频道':'群组' }}</div>
-            </div>
-            <span v-if="selectedChatIds.includes(t.chat_id)" class="material-symbols-outlined text-primary text-sm">check_circle</span>
+
+        <div v-if="selectedPreviewItems.length > 0" class="space-y-2">
+          <div class="text-[10px] font-black uppercase tracking-widest text-slate-400 px-1">已选对象</div>
+          <div class="flex flex-wrap gap-2">
+            <span v-for="item in selectedPreviewItems" :key="item.key"
+                  class="inline-flex max-w-full items-center gap-1.5 rounded-full bg-primary/10 text-primary px-3 py-1.5 text-[11px] font-bold">
+              <span class="material-symbols-outlined text-sm">{{ item.icon }}</span>
+              <span class="truncate max-w-[180px]">{{ item.label }}</span>
+            </span>
+            <span v-if="hiddenSelectedCount > 0"
+                  class="inline-flex items-center rounded-full bg-surface-container text-slate-500 px-3 py-1.5 text-[11px] font-bold">
+              +{{ hiddenSelectedCount }}
+            </span>
           </div>
+        </div>
+
+        <div v-else class="rounded-2xl border border-dashed border-outline-variant/30 p-5 text-center text-xs text-slate-400">
+          暂未选择目标，点击上方联系人、群组或频道开始添加。
         </div>
       </div>
 
@@ -118,10 +129,12 @@
                 <button @click="insertHtmlLink" type="button" class="px-2.5 py-1 text-[11px] font-bold rounded-lg bg-surface-container text-slate-700 hover:bg-primary/10 hover:text-primary transition-all">链接</button>
               </div>
 
-              <div class="bg-white border border-outline-variant/20 rounded-2xl p-4 focus-within:border-primary/40 transition-colors">
+              <div class="border rounded-2xl p-4 focus-within:border-primary/40 transition-colors"
+                   :class="themeStore.isDark ? 'bg-[#0d1828] border-[#2d4668]' : 'bg-white border-outline-variant/20'">
                 <textarea ref="contentTextarea" v-model="composer.content"
                           placeholder="输入广播消息正文...&#10;&#10;支持 HTML 格式：&lt;b&gt;粗体&lt;/b&gt; &lt;i&gt;斜体&lt;/i&gt; &lt;a href='url'&gt;链接&lt;/a&gt;"
-                          class="w-full bg-transparent border-none focus:ring-0 text-sm text-slate-800 placeholder:text-slate-400 min-h-[160px] no-scrollbar resize-none leading-relaxed"></textarea>
+                          class="w-full bg-transparent border-none focus:ring-0 text-sm min-h-[160px] no-scrollbar resize-none leading-relaxed"
+                          :class="themeStore.isDark ? 'text-slate-100 placeholder:text-slate-500' : 'text-slate-800 placeholder:text-slate-400'"></textarea>
               </div>
               <p class="text-[10px] text-slate-400">{{ composer.content.length }} 字符</p>
             </div>
@@ -148,7 +161,8 @@
             <!-- 自定义按钮 -->
             <div class="space-y-2">
               <label class="text-[10px] font-black text-primary uppercase tracking-widest">自定义跳转按钮（可选）</label>
-              <div class="bg-white border border-outline-variant/20 rounded-2xl p-4 space-y-3">
+              <div class="border rounded-2xl p-4 space-y-3"
+                   :class="themeStore.isDark ? 'bg-[#0d1828] border-[#2d4668]' : 'bg-white border-outline-variant/20'">
                 <div v-for="(btn, idx) in composer.buttons" :key="idx"
                      class="flex items-center gap-2 p-2 bg-surface-container rounded-xl">
                   <span class="material-symbols-outlined text-slate-400 text-sm">link</span>
@@ -167,12 +181,13 @@
             </div>
 
             <!-- 选项开关 -->
-            <div class="flex items-center gap-6 bg-white/90 border border-outline-variant/15 p-4 rounded-2xl">
+            <div class="flex items-center gap-6 border p-4 rounded-2xl"
+                 :class="themeStore.isDark ? 'bg-[#0d1828]/90 border-[#2d4668]' : 'bg-white/90 border-outline-variant/15'">
               <div class="flex items-center gap-3 cursor-pointer" @click="composer.doTranslate=!composer.doTranslate">
                 <div class="w-10 h-6 rounded-full relative transition-all" :class="composer.doTranslate?'bg-primary':'bg-slate-300'">
                   <div class="absolute top-1 w-4 h-4 bg-white rounded-full transition-all" :class="composer.doTranslate?'left-5':'left-1'"></div>
                 </div>
-                <span class="text-xs font-semibold text-slate-700">自动翻译</span>
+                <span class="text-xs font-semibold" :class="themeStore.isDark ? 'text-slate-200' : 'text-slate-700'">自动翻译</span>
               </div>
             </div>
           </div>
@@ -181,18 +196,20 @@
         <!-- 实时预览区域 -->
         <div class="overflow-y-auto no-scrollbar p-4 md:p-6 bg-surface-container-lowest/50">
           <div class="max-w-md mx-auto">
-            <div class="bg-white rounded-2xl shadow-lg border border-outline-variant/10 overflow-hidden">
+            <div class="rounded-2xl shadow-lg border overflow-hidden"
+                 :class="themeStore.isDark ? 'bg-[#0d1828] border-[#2d4668]' : 'bg-white border-outline-variant/10'">
               <!-- 消息头部 -->
-              <div class="px-4 py-3 bg-surface-container-lowest border-b border-outline-variant/10 flex items-center gap-2">
+              <div class="px-4 py-3 border-b flex items-center gap-2"
+                   :class="themeStore.isDark ? 'bg-[#09111d] border-[#2d4668]' : 'bg-surface-container-lowest border-outline-variant/10'">
                 <span class="material-symbols-outlined text-primary text-sm">campaign</span>
-                <span class="text-xs font-bold text-slate-600">消息预览</span>
+                <span class="text-xs font-bold" :class="themeStore.isDark ? 'text-slate-300' : 'text-slate-600'">消息预览</span>
               </div>
               <!-- 消息内容 -->
               <div class="p-4 space-y-3">
                 <div v-if="selectedImagePreview" class="rounded-xl overflow-hidden">
                   <img :src="selectedImagePreview" class="w-full object-contain max-h-64"/>
                 </div>
-                <div v-if="composer.content" class="text-sm text-slate-800 whitespace-pre-wrap leading-relaxed" v-html="formatPreview(composer.content)"></div>
+                <div v-if="composer.content" class="text-sm whitespace-pre-wrap leading-relaxed" :class="themeStore.isDark ? 'text-slate-100' : 'text-slate-800'" v-html="formatPreview(composer.content)"></div>
                 <div v-else class="text-sm text-slate-300 italic">暂无内容</div>
                 <div v-if="composer.buttons.length > 0" class="pt-2 border-t border-outline-variant/10 space-y-1.5">
                   <div v-for="(row, rIdx) in buttonRows" :key="rIdx" class="flex gap-1.5">
@@ -203,8 +220,9 @@
                   </div>
                 </div>
               </div>
-              <div class="px-4 py-2 bg-surface-container-lowest border-t border-outline-variant/10 flex items-center justify-between">
-                <span class="text-[10px] text-slate-400">目标: {{ totalSelected }} 个</span>
+              <div class="px-4 py-2 border-t flex items-center justify-between"
+                   :class="themeStore.isDark ? 'bg-[#09111d] border-[#2d4668]' : 'bg-surface-container-lowest border-outline-variant/10'">
+                <span class="text-[10px] text-slate-400">目标: 用户 {{ selectedUserIds.length }} / 群频道 {{ selectedChatIds.length }}</span>
                 <span class="text-[10px] text-slate-400">{{ new Date().toLocaleString('zh-CN') }}</span>
               </div>
             </div>
@@ -219,7 +237,7 @@
                 class="w-full py-3.5 bg-primary text-white rounded-2xl font-black shadow-lg shadow-primary/20 hover:brightness-105 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2">
           <span v-if="!isSending" class="material-symbols-outlined">send</span>
           <span v-else class="material-symbols-outlined animate-spin">refresh</span>
-          <span>{{ isSending?'发送中...':'发送到 '+totalSelected+' 个目标' }}</span>
+          <span>{{ isSending ? '发送中...' : sendButtonText }}</span>
         </button>
       </div>
     </div>
@@ -304,14 +322,104 @@
         </div>
       </div>
     </transition>
+
+    <transition name="fade">
+      <div v-if="mobileTargetDrawerOpen" class="fixed inset-0 z-[90] bg-black/50 backdrop-blur-sm" @click="closeTargetDrawer">
+        <div class="absolute inset-x-0 bottom-0 md:inset-x-auto md:right-6 md:top-6 md:bottom-6 md:w-[420px] rounded-t-[28px] md:rounded-[28px] bg-surface-container-lowest shadow-2xl border border-outline-variant/10 overflow-hidden max-h-[82vh] md:max-h-none"
+             @click.stop>
+          <div class="px-5 pt-3 pb-4 border-b border-outline-variant/10 bg-surface-container-lowest/95">
+            <div class="w-12 h-1.5 rounded-full bg-slate-300 mx-auto mb-4"></div>
+            <div class="flex items-center justify-between">
+              <div>
+                <div class="text-lg font-black text-slate-800">选择群发对象</div>
+                <p class="text-[11px] text-slate-400 mt-1">联系人、群组、频道可跨选项添选，已勾选对象会持续保留。</p>
+              </div>
+              <button @click="closeTargetDrawer" class="w-10 h-10 rounded-full flex items-center justify-center bg-surface-container text-slate-500">
+                <span class="material-symbols-outlined">close</span>
+              </button>
+            </div>
+
+            <div class="mt-4 grid grid-cols-3 gap-2">
+              <button @click="mobileTargetDrawerTab='users'"
+                      :class="mobileTargetDrawerTab==='users' ? 'bg-primary text-white shadow-lg shadow-primary/20' : 'bg-surface-container text-slate-600'"
+                      class="rounded-2xl px-3 py-3 text-left transition-all">
+                <div class="text-[10px] font-black uppercase tracking-widest">联系人</div>
+                <div class="mt-1 text-xs font-bold">{{ selectedUserIds.length }}/{{ users.length }}</div>
+              </button>
+              <button @click="mobileTargetDrawerTab='groups'"
+                      :class="mobileTargetDrawerTab==='groups' ? 'bg-cyan-600 text-white shadow-lg shadow-cyan-600/20' : 'bg-surface-container text-slate-600'"
+                      class="rounded-2xl px-4 py-3 text-left transition-all">
+                <div class="text-[10px] font-black uppercase tracking-widest">群组</div>
+                <div class="mt-1 text-xs font-bold">{{ selectedGroupCount }}/{{ groupTargets.length }} 已选</div>
+              </button>
+              <button @click="mobileTargetDrawerTab='channels'"
+                      :class="mobileTargetDrawerTab==='channels' ? 'bg-sky-600 text-white shadow-lg shadow-sky-600/20' : 'bg-surface-container text-slate-600'"
+                      class="rounded-2xl px-4 py-3 text-left transition-all">
+                <div class="text-[10px] font-black uppercase tracking-widest">频道</div>
+                <div class="mt-1 text-xs font-bold">{{ selectedChannelCount }}/{{ channelTargets.length }} 已选</div>
+              </button>
+            </div>
+
+            <div class="mt-3 grid grid-cols-3 gap-2">
+              <button @click="selectAllCurrentDrawerTab"
+                      class="py-2 rounded-xl bg-primary/10 text-primary text-[10px] font-bold uppercase">
+                全选
+              </button>
+              <button @click="clearCurrentDrawerTab"
+                      class="py-2 rounded-xl bg-slate-100 text-slate-500 text-[10px] font-bold uppercase">
+                清空
+              </button>
+              <button @click="syncTargets"
+                      class="py-2 rounded-xl bg-emerald-500/10 text-emerald-700 text-[10px] font-bold uppercase">
+                同步
+              </button>
+            </div>
+          </div>
+
+          <div class="overflow-y-auto no-scrollbar px-3 py-3 space-y-2 max-h-[calc(82vh-230px)] md:max-h-[calc(100vh-270px)]">
+            <div v-if="isCurrentDrawerLoading" class="py-10 text-center text-xs text-slate-400">加载中...</div>
+            <div v-else-if="currentDrawerItems.length === 0" class="py-10 text-center text-xs text-slate-400">
+              当前暂无{{ currentDrawerLabel }}目标
+            </div>
+            <button v-for="item in currentDrawerItems" :key="item.key"
+                    @click="toggleDrawerItem(item)"
+                    class="w-full flex items-center p-3 rounded-2xl border transition-all text-left"
+                    :class="item.selected ? 'bg-primary/10 border-primary/25' : 'border-transparent bg-white/70'">
+              <div class="w-11 h-11 rounded-2xl mr-3 flex-shrink-0 overflow-hidden flex items-center justify-center bg-surface-container-high text-slate-500">
+                <img v-if="item.avatarFileId && fileUrls[item.avatarFileId]" :src="fileUrls[item.avatarFileId]" class="w-11 h-11 object-cover block"/>
+                <span v-else class="material-symbols-outlined text-[18px]">{{ item.icon }}</span>
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-bold truncate text-slate-800">{{ item.title }}</div>
+                <div class="mt-1 text-[11px] text-slate-400">
+                  {{ item.subtitle }}
+                </div>
+              </div>
+              <span class="material-symbols-outlined text-primary text-lg">
+                {{ item.selected ? 'check_circle' : 'radio_button_unchecked' }}
+              </span>
+            </button>
+          </div>
+
+          <div class="px-4 py-4 border-t border-outline-variant/10 bg-surface-container-lowest">
+            <button @click="closeTargetDrawer"
+                    class="w-full py-3.5 rounded-2xl bg-primary text-white font-black shadow-lg shadow-primary/20">
+              完成选择（{{ totalSelected }}）
+            </button>
+          </div>
+        </div>
+      </div>
+    </transition>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useFileStore } from '@/stores/fileStore'
+import { useThemeStore } from '@/stores/theme'
 
 const fileStore = useFileStore()
+const themeStore = useThemeStore()
 const fileUrls = computed(() => fileStore.fileUrls)
 
 const getToken = () => {
@@ -351,9 +459,55 @@ const authH = () => {
   return headers
 }
 
+function escapeHtmlText(value: string): string {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+function escapeHtmlAttr(value: string): string {
+  return escapeHtmlText(value)
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function normalizeTelegramUrl(value: string): string {
+  const raw = String(value || '').trim()
+  if (/^https?:\/\//i.test(raw)) return raw
+  if (/^@[A-Za-z0-9_]{5,32}$/.test(raw)) return `https://t.me/${raw.slice(1)}`
+  if (/^[A-Za-z0-9_]{5,32}$/.test(raw)) return `https://t.me/${raw}`
+  return ''
+}
+
+function prepareButtonsForSubmit(): { text: string, url: string }[] {
+  const result: { text: string, url: string }[] = []
+  for (const button of composer.buttons) {
+    const text = String(button.text || '').trim()
+    const rawUrl = String(button.url || '').trim()
+    if (!text && !rawUrl) continue
+    if (!text || !rawUrl) throw new Error('请完整填写按钮文字和链接')
+    const normalizedUrl = normalizeTelegramUrl(rawUrl)
+    if (!normalizedUrl) throw new Error('按钮链接必须是 http(s) 地址或 Telegram 用户名')
+    result.push({ text, url: normalizedUrl })
+  }
+  return result.slice(0, 6)
+}
+
+async function parseJsonResponse(res: Response): Promise<any> {
+  const text = await res.text()
+  if (!text) return {}
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error(`服务器返回了非 JSON 响应（HTTP ${res.status}），请检查接口路由`)
+  }
+}
+
 // 移动端面板状态
 const mobilePanelView = ref<'list'|'detail'>('list')
-const activeTab = ref<'users'|'groups'>('users')
+const mobileTargetDrawerOpen = ref(false)
+const mobileTargetDrawerTab = ref<'users'|'groups'|'channels'>('users')
 
 // 数据
 const users = ref<any[]>([])
@@ -396,6 +550,8 @@ const reportText = computed(() => {
     `📢 群发报告`,
     `━━━━━━━━━━━━━━━━`,
     `📊 总计: ${broadcastResult.total} 个目标`,
+    `👤 用户: ${broadcastResult.selectedUsers.length} 个`,
+    `👥 群/频道: ${broadcastResult.selectedChats.length} 个`,
     `✅ 成功: ${broadcastResult.success} 个`,
     `❌ 失败: ${broadcastResult.failed} 个`,
     `━━━━━━━━━━━━━━━━`,
@@ -422,9 +578,71 @@ const reportText = computed(() => {
 
 // 计算属性
 const totalSelected = computed(() => selectedUserIds.value.length + selectedChatIds.value.length)
+const groupTargets = computed(() => targets.value.filter((t: any) => t.chat_type !== 'channel'))
+const channelTargets = computed(() => targets.value.filter((t: any) => t.chat_type === 'channel'))
+const selectedGroupCount = computed(() => groupTargets.value.filter((t: any) => selectedChatIds.value.includes(Number(t.chat_id))).length)
+const selectedChannelCount = computed(() => channelTargets.value.filter((t: any) => selectedChatIds.value.includes(Number(t.chat_id))).length)
+const currentDrawerLabel = computed(() => {
+  if (mobileTargetDrawerTab.value === 'users') return '联系人'
+  if (mobileTargetDrawerTab.value === 'groups') return '群组'
+  return '频道'
+})
+const currentDrawerItems = computed(() => {
+  if (mobileTargetDrawerTab.value === 'users') {
+    return users.value.map((u: any) => ({
+      kind: 'user' as const,
+      key: `user-${u.from_userid}`,
+      id: Number(u.from_userid),
+      title: u.from_username || u.username || `用户 ${u.from_userid}`,
+      subtitle: `联系人 · ID ${u.from_userid}`,
+      icon: 'person',
+      avatarFileId: u.avatar_file_id,
+      selected: selectedUserIds.value.includes(Number(u.from_userid)),
+    }))
+  }
+
+  const source = mobileTargetDrawerTab.value === 'groups' ? groupTargets.value : channelTargets.value
+  return source.map((t: any) => ({
+    kind: 'chat' as const,
+    key: `chat-${t.chat_id}`,
+    id: Number(t.chat_id),
+    title: t.chat_title || String(t.chat_id),
+    subtitle: `${t.chat_type === 'channel' ? '频道' : '群组'} · ID ${t.chat_id}`,
+    icon: t.chat_type === 'channel' ? 'campaign' : 'groups',
+    selected: selectedChatIds.value.includes(Number(t.chat_id)),
+  }))
+})
+const isCurrentDrawerLoading = computed(() => mobileTargetDrawerTab.value !== 'users' && isTargetsLoading.value)
+const selectionMemoryHint = computed(() => {
+  if (totalSelected.value === 0) return '从联系人、群组、频道里分别添选目标，切换选项不会清空之前的勾选。'
+  return `已暂存联系人 ${selectedUserIds.value.length}、群组 ${selectedGroupCount.value}、频道 ${selectedChannelCount.value}。`
+})
+const selectedPreviewItems = computed(() => {
+  const userItems = users.value
+    .filter((u: any) => selectedUserIds.value.includes(Number(u.from_userid)))
+    .map((u: any) => ({
+      key: `user-${u.from_userid}`,
+      icon: 'person',
+      label: u.from_username || u.username || `用户 ${u.from_userid}`,
+    }))
+  const chatItems = targets.value
+    .filter((t: any) => selectedChatIds.value.includes(Number(t.chat_id)))
+    .map((t: any) => ({
+      key: `chat-${t.chat_id}`,
+      icon: t.chat_type === 'channel' ? 'campaign' : 'groups',
+      label: t.chat_title || String(t.chat_id),
+    }))
+  return [...userItems, ...chatItems].slice(0, 8)
+})
+const hiddenSelectedCount = computed(() => Math.max(totalSelected.value - selectedPreviewItems.value.length, 0))
 
 const canSend = computed(() => {
   return totalSelected.value > 0 && (composer.content.trim() || selectedImage.value)
+})
+
+const sendButtonText = computed(() => {
+  if (totalSelected.value === 0) return '请选择发送目标'
+  return `发送给 ${selectedUserIds.value.length} 个用户 + ${selectedChatIds.value.length} 个群/频道`
 })
 
 // 按钮按行分组（每行最多 2 个）
@@ -440,6 +658,10 @@ const buttonRows = computed(() => {
 onMounted(async () => {
   await ensureCsrfToken()
   await Promise.all([loadUsers(), loadTargets()])
+})
+
+onBeforeUnmount(() => {
+  resetBroadcastSession()
 })
 
 // 加载用户列表
@@ -472,20 +694,57 @@ async function syncTargets() {
 }
 
 // 选择操作
-function selectAll() {
-  if (activeTab.value === 'users') {
-    selectedUserIds.value = users.value.map((u: any) => u.from_userid)
-  } else {
-    selectedChatIds.value = targets.value.map((t: any) => t.chat_id)
-  }
+function selectAllUsers() {
+  selectedUserIds.value = users.value.map((u: any) => Number(u.from_userid))
+}
+
+function selectAllTargets() {
+  selectedChatIds.value = targets.value.map((t: any) => Number(t.chat_id))
+}
+
+function clearSelectedUsers() {
+  selectedUserIds.value = []
+}
+
+function clearSelectedTargets() {
+  selectedChatIds.value = []
 }
 
 function clearAll() {
-  if (activeTab.value === 'users') {
-    selectedUserIds.value = []
-  } else {
-    selectedChatIds.value = []
+  clearSelectedUsers()
+  clearSelectedTargets()
+}
+
+function openTargetDrawer(tab: 'users' | 'groups' | 'channels') {
+  mobileTargetDrawerTab.value = tab
+  mobileTargetDrawerOpen.value = true
+}
+
+function closeTargetDrawer() {
+  mobileTargetDrawerOpen.value = false
+}
+
+function selectAllCurrentDrawerTab() {
+  if (mobileTargetDrawerTab.value === 'users') {
+    const nextUserIds = users.value.map((u: any) => Number(u.from_userid))
+    selectedUserIds.value = Array.from(new Set([...selectedUserIds.value, ...nextUserIds]))
+    return
   }
+
+  const source = mobileTargetDrawerTab.value === 'groups' ? groupTargets.value : channelTargets.value
+  const nextIds = source.map((t: any) => Number(t.chat_id))
+  selectedChatIds.value = Array.from(new Set([...selectedChatIds.value, ...nextIds]))
+}
+
+function clearCurrentDrawerTab() {
+  if (mobileTargetDrawerTab.value === 'users') {
+    selectedUserIds.value = []
+    return
+  }
+
+  const source = mobileTargetDrawerTab.value === 'groups' ? groupTargets.value : channelTargets.value
+  const currentIds = new Set(source.map((t: any) => Number(t.chat_id)))
+  selectedChatIds.value = selectedChatIds.value.filter((id) => !currentIds.has(id))
 }
 
 function toggleUser(id: number) {
@@ -498,6 +757,11 @@ function toggleTarget(id: number) {
   const i = selectedChatIds.value.indexOf(id)
   if (i >= 0) selectedChatIds.value.splice(i, 1)
   else selectedChatIds.value.push(id)
+}
+
+function toggleDrawerItem(item: { kind: 'user' | 'chat', id: number }) {
+  if (item.kind === 'user') toggleUser(item.id)
+  else toggleTarget(item.id)
 }
 
 // HTML 快捷格式工具
@@ -533,8 +797,13 @@ function insertHtmlLink() {
   const text = selected || '点击查看'
   const url = window.prompt('请输入链接 URL（例如 https://example.com）', 'https://')
   if (!url) return
+  const normalizedUrl = normalizeTelegramUrl(url)
+  if (!normalizedUrl) {
+    alert('链接必须是 http(s) 地址或 Telegram 用户名')
+    return
+  }
 
-  const insertText = `<a href="${url}">${text}</a>`
+  const insertText = `<a href="${escapeHtmlAttr(normalizedUrl)}">${escapeHtmlText(text)}</a>`
   composer.content = `${composer.content.slice(0, start)}${insertText}${composer.content.slice(end)}`
 
   requestAnimationFrame(() => {
@@ -561,6 +830,28 @@ function clearImage() {
   selectedImage.value = null
   selectedImagePreview.value = ''
   if (imageInput.value) imageInput.value.value = ''
+}
+
+function resetBroadcastSession() {
+  selectedUserIds.value = []
+  selectedChatIds.value = []
+  mobilePanelView.value = 'list'
+  mobileTargetDrawerOpen.value = false
+  mobileTargetDrawerTab.value = 'users'
+  composer.content = ''
+  composer.doTranslate = false
+  composer.buttons = []
+  showResultModal.value = false
+  copied.value = false
+  broadcastResult.total = 0
+  broadcastResult.success = 0
+  broadcastResult.failed = 0
+  broadcastResult.failedItems = []
+  broadcastResult.content = ''
+  broadcastResult.buttons = []
+  broadcastResult.selectedUsers = []
+  broadcastResult.selectedChats = []
+  clearImage()
 }
 
 // 按钮管理
@@ -591,14 +882,15 @@ async function submitBroadcast() {
     formData.append('do_translate', String(composer.doTranslate))
     formData.append('user_ids', JSON.stringify(selectedUserIds.value))
     formData.append('chat_ids', JSON.stringify(selectedChatIds.value))
-    if (composer.buttons.length > 0) {
-      formData.append('buttons', JSON.stringify(composer.buttons))
+    const submitButtons = prepareButtonsForSubmit()
+    if (submitButtons.length > 0) {
+      formData.append('buttons', JSON.stringify(submitButtons))
     }
     if (selectedImage.value) {
       formData.append('image', selectedImage.value)
     }
 
-    const res = await fetch('/api/broadcast/send', {
+    const res = await fetch('/api/broadcast/unified', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${getToken()}`,
@@ -607,11 +899,14 @@ async function submitBroadcast() {
       body: formData
     })
 
-    const data = await res.json()
+    const data = await parseJsonResponse(res)
     if (res.status === 403) {
       csrfToken = ''
       await ensureCsrfToken()
-      throw new Error('认证已刷新，请重试发送')
+      throw new Error(data.message || '认证已刷新，请重试发送')
+    }
+    if (!res.ok) {
+      throw new Error(data.message || `发送接口返回 HTTP ${res.status}`)
     }
 
     if (data.status === 'ok') {
@@ -621,7 +916,7 @@ async function submitBroadcast() {
       broadcastResult.failed = data.summary.failed
       broadcastResult.failedItems = data.summary.failed_items || data.failed_items || []
       broadcastResult.content = composer.content
-      broadcastResult.buttons = [...composer.buttons]
+      broadcastResult.buttons = [...submitButtons]
       broadcastResult.selectedUsers = [...selectedUserIds.value]
       broadcastResult.selectedChats = [...selectedChatIds.value]
       showResultModal.value = true
@@ -631,12 +926,14 @@ async function submitBroadcast() {
       composer.buttons = []
       selectedUserIds.value = []
       selectedChatIds.value = []
+      mobileTargetDrawerOpen.value = false
+      mobileTargetDrawerTab.value = 'users'
       clearImage()
     } else {
       alert('发送失败: ' + (data.message || '未知错误'))
     }
   } catch (e: any) {
-    alert('网络错误: ' + e.message)
+    alert('发送失败: ' + (e?.message || '网络错误'))
   } finally {
     isSending.value = false
   }
@@ -663,3 +960,21 @@ async function copyReport() {
   }
 }
 </script>
+
+<style scoped>
+.broadcast-list-items {
+  position: relative;
+  z-index: 1;
+}
+
+.broadcast-list-lock {
+  box-shadow: 0 1px 0 rgba(57, 87, 126, 0.28);
+}
+
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+</style>

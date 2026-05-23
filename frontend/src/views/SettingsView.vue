@@ -1,224 +1,480 @@
 <template>
-  <div class="settings-root">
-    <div class="topbar-row">
-      <h2>系统设置</h2>
-    </div>
+  <div class="uc-page bg-surface settings-page">
+    <header class="uc-header">
+      <div class="uc-header-wrap">
+        <div>
+          <h2 class="uc-title">
+            <span class="material-symbols-outlined text-primary">{{ isAiFocusMode ? 'smart_toy' : 'settings' }}</span>
+            {{ isAiFocusMode ? 'AI 设置' : '系统设置' }}
+          </h2>
+          <p class="uc-subtitle">{{ headerSubtitle }}</p>
+        </div>
+        <div class="uc-actions">
+          <button class="uc-btn uc-btn-primary" @click="saveSettings" :disabled="saving">
+            {{ saving ? '保存中...' : '保存配置' }}
+          </button>
+        </div>
+      </div>
+    </header>
 
-    <div ref="canvasRef" class="settings-canvas">
-      <div class="settings-container">
-        <!-- LLM API Configuration -->
-        <div class="card settings-card">
-          <div class="card-header">
-            <h3>AI 翻译引擎配置</h3>
-            <p class="subtitle">配置自动翻译所使用的大模型 API</p>
-          </div>
+    <main ref="canvasRef" class="uc-main">
+      <div class="uc-main-wrap settings-wrap">
+        <section ref="aiEngineSectionRef" class="uc-card" :class="{ 'ai-focus-card': focusedSection === 'ai' }">
+          <h3 class="uc-card-title">AI 翻译引擎配置</h3>
+          <p class="uc-card-subtitle">配置自动翻译所使用的大模型 API</p>
 
-          <div class="settings-group">
-            <div class="field">
-              <label>API 模式</label>
-              <div class="radio-group">
-                <label class="radio-item" :class="{ active: config.llm_api_mode === 'rented' }">
+          <div class="settings-stack">
+            <div class="uc-field">
+              <span class="uc-label">API 模式</span>
+              <div class="mode-grid">
+                <label class="mode-item" :class="{ active: config.llm_api_mode === 'rented' }">
                   <input type="radio" v-model="config.llm_api_mode" value="rented" />
-                  <div class="radio-content">
-                    <span class="title">🚀 租用 API (一键适配)</span>
-                    <span class="desc">使用系统预置的优化线路，无需自行配置密钥</span>
+                  <div>
+                    <div class="mode-title">租用 API</div>
+                    <div class="mode-desc">系统预置节点，开箱可用</div>
                   </div>
                 </label>
-                <label class="radio-item" :class="{ active: config.llm_api_mode === 'own' }">
+                <label class="mode-item" :class="{ active: config.llm_api_mode === 'own' }">
                   <input type="radio" v-model="config.llm_api_mode" value="own" />
-                  <div class="radio-content">
-                    <span class="title">🔑 自有 API</span>
-                    <span class="desc">填入您私人的 API Key，确保数据完全私有</span>
+                  <div>
+                    <div class="mode-title">自有 API</div>
+                    <div class="mode-desc">使用私有密钥与专属模型线路</div>
                   </div>
                 </label>
               </div>
             </div>
 
-            <div v-if="config.llm_api_mode === 'own'" class="own-api-fields">
-              <div class="field">
-                <label>API 厂商 / 模型系列</label>
-                <select v-model="config.llm_model_type" class="input">
-                  <option value="openai">OpenAI / 兼容接口</option>
-                  <option value="deepseek">DeepSeek</option>
-                  <option value="gemini">Google Gemini</option>
-                </select>
+            <div v-if="config.llm_api_mode === 'own'" class="sub-panel">
+              <div class="uc-grid uc-grid-cols-2">
+                <label class="uc-field">
+                  <span class="uc-label">API 厂商 / 模型系列</span>
+                  <select v-model="config.llm_model_type" class="uc-input">
+                    <option value="openai">OpenAI / 兼容接口</option>
+                    <option value="deepseek">DeepSeek</option>
+                    <option value="gemini">Google Gemini</option>
+                  </select>
+                </label>
+
+                <label class="uc-field">
+                  <span class="uc-label">模型名称</span>
+                  <input v-model="config.llm_model" class="uc-input" placeholder="gpt-4.1-mini / gemini-2.5-flash" />
+                </label>
               </div>
 
-              <div class="field">
-                <label>API Base URL</label>
-                <input v-model="config.llm_base_url" class="input" placeholder="https://api.openai.com/v1" />
-              </div>
+              <label class="uc-field">
+                <span class="uc-label">API Base URL</span>
+                <input v-model="config.llm_base_url" class="uc-input" placeholder="https://api.openai.com/v1" />
+              </label>
 
-              <div class="field">
-                <label>API Key</label>
-                <input v-model="config.llm_api_key" type="password" class="input" placeholder="sk-xxxxxxxxxxxxxxxx" />
-                <p class="hint">填入后将加密存储。留空表示不修改现有密钥。</p>
-              </div>
-
-              <div class="field">
-                <label>模型名称 (Model Name)</label>
-                <input v-model="config.llm_model" class="input" placeholder="gpt-3.5-turbo" />
-              </div>
+              <label class="uc-field">
+                <span class="uc-label">API Key</span>
+                <input v-model="config.llm_api_key" type="password" class="uc-input" placeholder="sk-xxxxxxxxxxxxxxxx" />
+                <p class="helper-text">留空表示不修改当前密钥。</p>
+              </label>
             </div>
 
-            <div class="vertex-oneclick-box">
-              <h4>Vertex 一键自动配置（推荐）</h4>
-              <p class="desc">输入 Vertex Key 与 OneAPI 地址，系统自动生成可直接使用的中转 URL + SK + 模型配置。</p>
+            <div class="sub-panel accent-panel">
+              <h4 class="sub-title">Vertex 一键自动配置（推荐）</h4>
+              <p class="helper-text">输入 Vertex Key 与 OneAPI 地址后，自动生成可直接使用的中转配置。</p>
 
-              <div class="debug-grid">
-                <div class="field">
-                  <label>Vertex API Key</label>
-                  <input v-model="vertexQuickForm.vertex_api_key" type="password" class="input" placeholder="AIza..." />
-                </div>
+              <div class="uc-grid uc-grid-cols-3">
+                <label class="uc-field">
+                  <span class="uc-label">Vertex API Key</span>
+                  <input v-model="vertexQuickForm.vertex_api_key" type="password" class="uc-input" placeholder="AIza..." />
+                </label>
 
-                <div class="field">
-                  <label>OneAPI Base URL</label>
-                  <input v-model="vertexQuickForm.oneapi_base_url" class="input" placeholder="https://oneapi.example.com" />
-                </div>
+                <label class="uc-field">
+                  <span class="uc-label">OneAPI Base URL</span>
+                  <input v-model="vertexQuickForm.oneapi_base_url" class="uc-input" placeholder="https://oneapi.example.com" />
+                </label>
 
-                <div class="field">
-                  <label>Gemini 模型</label>
-                  <select v-model="vertexQuickForm.model" class="input">
+                <label class="uc-field">
+                  <span class="uc-label">Gemini 模型</span>
+                  <select v-model="vertexQuickForm.model" class="uc-input">
                     <option v-for="m in quickGeminiModels" :key="m" :value="m">{{ m }}</option>
                   </select>
-                </div>
+                </label>
               </div>
 
-              <div class="field">
-                <label>中转 SK（可选，不填则自动生成）</label>
-                <input v-model="vertexQuickForm.relay_api_key" class="input" placeholder="sk-your-own-relay-key" />
-              </div>
+              <label class="uc-field">
+                <span class="uc-label">中转 SK（可选）</span>
+                <input v-model="vertexQuickForm.relay_api_key" class="uc-input" placeholder="sk-your-own-relay-key" />
+              </label>
 
-              <div class="debug-actions">
-                <button class="btn btn-primary" @click="oneClickVertexSetup" :disabled="quickSetting">
+              <div class="uc-actions">
+                <button class="uc-btn uc-btn-primary" @click="oneClickVertexSetup" :disabled="quickSetting">
                   {{ quickSetting ? '配置中...' : '一键自动配置' }}
                 </button>
               </div>
 
-              <div v-if="quickResult" class="quick-result-box">
-                <div class="field">
-                  <label>中转 URL</label>
-                  <pre class="debug-meta">{{ quickResult.oneapi_base_url }}</pre>
-                </div>
-                <div class="field">
-                  <label>模型 ID</label>
-                  <pre class="debug-meta">{{ quickResult.model }}</pre>
-                </div>
-                <div class="field">
-                  <label>中转 API (chat/completions)</label>
-                  <pre class="debug-meta">{{ quickResult.model_infer_url }}</pre>
-                </div>
-                <div class="field">
-                  <label>中转 SK</label>
-                  <pre class="debug-meta">{{ quickResult.relay_api_key }}</pre>
-                </div>
+              <div v-if="quickResult" class="quick-result-grid">
+                <label class="uc-field">
+                  <span class="uc-label">中转 URL</span>
+                  <pre class="debug-block">{{ quickResult.oneapi_base_url }}</pre>
+                </label>
+                <label class="uc-field">
+                  <span class="uc-label">模型 ID</span>
+                  <pre class="debug-block">{{ quickResult.model }}</pre>
+                </label>
+                <label class="uc-field">
+                  <span class="uc-label">调用地址</span>
+                  <pre class="debug-block">{{ quickResult.model_infer_url }}</pre>
+                </label>
+                <label class="uc-field">
+                  <span class="uc-label">中转 SK</span>
+                  <pre class="debug-block">{{ quickResult.relay_api_key }}</pre>
+                </label>
               </div>
             </div>
 
-            <div v-if="config.llm_api_mode === 'rented'" class="rented-api-info">
-              <div class="info-box">
-                <span class="info-icon">✨</span>
-                <p>当前处于租用模式。系统将自动适配最佳节点，为您提供稳定的翻译服务。您无需承担配置和维护成本。</p>
+            <div class="sub-panel lock-panel">
+              <h4 class="sub-title">模型锁定</h4>
+              <p class="helper-text">开启后，后端将强制使用 `gemini-3.1-pro-preview`，忽略请求里传入的其它模型。</p>
+              <div class="model-lock-row">
+                <div>
+                  <div class="toggle-title">当前状态：{{ config.llm_model_lock_enabled ? '已锁定' : '未锁定' }}</div>
+                  <div class="helper-text">锁定模型：{{ config.llm_model_lock_target || MODEL_LOCK_TARGET }}</div>
+                </div>
+                <button class="uc-btn" :class="config.llm_model_lock_enabled ? 'uc-btn-danger' : 'uc-btn-primary'" @click="toggleModelLock" :disabled="modelLockSaving">
+                  {{ modelLockSaving ? '处理中...' : (config.llm_model_lock_enabled ? '解除锁定' : '锁定为 gemini-3.1-pro-preview') }}
+                </button>
               </div>
             </div>
-          </div>
-        </div>
 
-        <!-- Global Translation Toggle -->
-        <div class="card settings-card">
-          <div class="settings-group">
-            <div class="field flex-row">
-              <div class="field-info">
-                <label>全局自动翻译</label>
-                <p class="desc">开启后，客服私聊中的外语消息将自动翻译为中文</p>
-              </div>
-              <div class="switch-container">
-                <input type="checkbox" v-model="config.global_auto_translate" id="auto-trans" class="switch" />
-                <label for="auto-trans"></label>
-              </div>
+            <div v-if="config.llm_api_mode === 'rented'" class="sub-panel info-panel">
+              当前为租用模式，系统自动选择稳定节点并托管更新，无需手动维护 API 参数。
             </div>
           </div>
-        </div>
+        </section>
 
-        <!-- AI Debug Panel -->
-        <div class="card settings-card debug-card">
-          <div class="card-header">
-            <h3>AI 调试面板</h3>
-            <p class="subtitle">用于快速验证 `/api/openai/models` 与 `/api/openai/exec` 接口</p>
+        <section class="uc-card">
+          <h3 class="uc-card-title">翻译策略</h3>
+          <p class="uc-card-subtitle">全局开关控制客服私聊消息自动翻译</p>
+          <div class="toggle-row">
+            <div>
+              <div class="toggle-title">全局自动翻译</div>
+              <div class="helper-text">开启后，客服私聊中的外语消息将自动翻译为中文。</div>
+            </div>
+            <div class="toggle-switch">
+              <input type="checkbox" v-model="config.global_auto_translate" id="auto-trans" class="switch" />
+              <label for="auto-trans"></label>
+            </div>
           </div>
+        </section>
 
-          <div class="settings-group">
-            <div class="debug-grid">
-              <div class="field">
-                <label>可用模型</label>
-                <select v-model="debugForm.model" class="input" :disabled="debugLoadingModels || debugExecuting">
-                  <option value="">自动选择（使用当前配置模型）</option>
+        <section ref="aiSkillsSectionRef" class="uc-card" :class="{ 'ai-focus-card': focusedSection === 'skills' }">
+          <h3 class="uc-card-title">AI Skills 管理</h3>
+          <p class="uc-card-subtitle">仅管理项目隔离后的 Skills，避免读取服务器全局目录</p>
+
+          <div class="settings-stack">
+            <div class="uc-actions">
+              <button class="uc-btn uc-btn-ghost" @click="loadAiSkills" :disabled="skillsLoading || skillsSaving || skillsImporting">
+                {{ skillsLoading ? '刷新中...' : '刷新列表' }}
+              </button>
+              <button class="uc-btn uc-btn-primary" @click="importBuiltinSkills" :disabled="skillsImporting || skillsLoading">
+                {{ skillsImporting ? '导入中...' : '导入本地 Skills' }}
+              </button>
+              <button class="uc-btn uc-btn-ghost" @click="openSkillDrawer" :disabled="skillsLoading || skillsImporting">
+                查看 Skills
+              </button>
+            </div>
+            <p class="helper-text">默认仅扫描项目内 `skills/`。可通过 `AI_SKILL_LOCAL_DIRS` 指定项目内子目录。</p>
+
+            <div class="sub-panel">
+              <div class="uc-grid uc-grid-cols-2">
+                <label class="uc-field">
+                  <span class="uc-label">Skill 名称</span>
+                  <input v-model="skillForm.name" class="uc-input" placeholder="例如: group_ad_review" />
+                </label>
+                <label class="uc-field">
+                  <span class="uc-label">描述</span>
+                  <input v-model="skillForm.description" class="uc-input" placeholder="一句话描述这个技能用途" />
+                </label>
+              </div>
+              <label class="uc-field">
+                <span class="uc-label">Prompt 模板</span>
+                <textarea v-model="skillForm.prompt_template" class="uc-input debug-textarea" placeholder="该技能的提示词模板"></textarea>
+              </label>
+              <div class="uc-actions">
+                <button class="uc-btn uc-btn-primary" @click="saveAiSkill" :disabled="skillsSaving">
+                  {{ skillsSaving ? '保存中...' : '保存 Skill' }}
+                </button>
+              </div>
+            </div>
+
+            <div class="helper-text">当前自定义 Skill：{{ aiSkills.length }} 个（列表在抽屉中查看）</div>
+          </div>
+        </section>
+
+        <section class="uc-card">
+          <h3 class="uc-card-title">外观与主题</h3>
+          <p class="uc-card-subtitle">自定义背景图、暗黑模式与定时切换</p>
+
+          <div class="settings-stack">
+            <div class="uc-field">
+              <span class="uc-label">全局背景图</span>
+              <p class="helper-text">应用到整个后台页面。建议选择浅色或深色背景，以匹配当前主题模式。</p>
+              <div class="upload-row">
+                <input ref="bgInputRef" type="file" accept="image/*" class="hidden-input" @change="handleBgUpload" />
+                <button type="button" class="uc-btn uc-btn-ghost" @click="bgInputRef?.click()">选择图片</button>
+                <button
+                  v-if="themeStore.settings.customBackground"
+                  type="button"
+                  class="uc-btn uc-btn-danger"
+                  @click="resetBackground"
+                >
+                  重置背景
+                </button>
+                <span v-if="themeStore.settings.customBackground" class="bg-ready">已设置</span>
+              </div>
+            </div>
+
+            <div class="uc-field">
+              <span class="uc-label">聊天背景图</span>
+              <p class="helper-text">仅应用在会话列表里的消息区域，不影响其它模块页面。</p>
+              <div class="upload-row">
+                <input ref="chatBgInputRef" type="file" accept="image/*" class="hidden-input" @change="handleChatBgUpload" />
+                <button type="button" class="uc-btn uc-btn-ghost" @click="chatBgInputRef?.click()">选择图片</button>
+                <button
+                  v-if="themeStore.settings.chatBackground"
+                  type="button"
+                  class="uc-btn uc-btn-danger"
+                  @click="resetChatBackground"
+                >
+                  重置背景
+                </button>
+                <span v-if="themeStore.settings.chatBackground" class="bg-ready">已设置</span>
+              </div>
+            </div>
+
+            <label class="uc-field">
+              <span class="uc-label">暗黑模式</span>
+              <select v-model="themeForm.darkMode" class="uc-input" @change="onDarkModeChange">
+                <option value="auto">跟随系统</option>
+                <option value="light">始终浅色</option>
+                <option value="dark">始终深色</option>
+                <option value="schedule">定时切换</option>
+              </select>
+              <p class="helper-text">
+                {{ themeForm.darkMode === 'auto' ? '自动跟随设备系统主题。' : '' }}
+                {{ themeForm.darkMode === 'light' ? '保持浅色主题。' : '' }}
+                {{ themeForm.darkMode === 'dark' ? '保持深色主题。' : '' }}
+                {{ themeForm.darkMode === 'schedule' ? '按设定时段自动切换。' : '' }}
+              </p>
+            </label>
+
+            <div v-if="themeForm.darkMode === 'schedule'" class="sub-panel">
+              <div class="uc-grid uc-grid-cols-2">
+                <label class="uc-field">
+                  <span class="uc-label">开启时间</span>
+                  <input v-model="themeForm.scheduleStart" type="time" class="uc-input" @change="onScheduleTimeChange" />
+                </label>
+                <label class="uc-field">
+                  <span class="uc-label">关闭时间</span>
+                  <input v-model="themeForm.scheduleEnd" type="time" class="uc-input" @change="onScheduleTimeChange" />
+                </label>
+              </div>
+              <p class="helper-text">支持跨夜设定，例如 20:00 ~ 07:00。</p>
+            </div>
+          </div>
+        </section>
+
+        <section ref="aiDebugSectionRef" class="uc-card" :class="{ 'ai-focus-card': focusedSection === 'debug' }">
+          <h3 class="uc-card-title">AI 调试面板</h3>
+          <p class="uc-card-subtitle">快速验证 `/api/openai/models` 与 `/api/openai/exec` 调用链路</p>
+
+          <div class="settings-stack">
+            <div class="uc-grid uc-grid-cols-3">
+              <label class="uc-field">
+                <span class="uc-label">可用模型</span>
+                <select v-model="debugForm.model" class="uc-input" :disabled="debugLoadingModels || debugExecuting">
+                  <option value="">自动选择（当前配置）</option>
                   <option v-for="m in debugModels" :key="m" :value="m">{{ m }}</option>
                 </select>
-              </div>
+              </label>
 
-              <div class="field">
-                <label>Sandbox ID</label>
-                <input v-model="debugForm.sandbox_id" class="input" placeholder="sbx_manual_debug" />
-              </div>
+              <label class="uc-field">
+                <span class="uc-label">Sandbox ID</span>
+                <input v-model="debugForm.sandbox_id" class="uc-input" placeholder="sbx_settings_debug" />
+              </label>
 
-              <div class="field">
-                <label>User ID（可选）</label>
-                <input v-model="debugForm.user_id" class="input" placeholder="900000001" />
-              </div>
+              <label class="uc-field">
+                <span class="uc-label">User ID（可选）</span>
+                <input v-model="debugForm.user_id" class="uc-input" placeholder="900000001" />
+              </label>
             </div>
 
-            <div class="field">
-              <label>测试输入</label>
+            <label class="uc-field">
+              <span class="uc-label">测试输入</span>
               <textarea
                 v-model="debugForm.input"
-                class="input debug-textarea"
+                class="uc-input debug-textarea"
                 placeholder="输入你要测试的 prompt，例如：请返回一行 JSON，包含 ok=true"
               ></textarea>
-            </div>
+            </label>
 
-            <div class="debug-actions">
-              <button class="btn btn-ghost" @click="loadDebugModels" :disabled="debugLoadingModels || debugExecuting">
+            <div class="uc-actions">
+              <button class="uc-btn uc-btn-ghost" @click="loadDebugModels" :disabled="debugLoadingModels || debugExecuting">
                 {{ debugLoadingModels ? '刷新中...' : '刷新模型列表' }}
               </button>
-              <button class="btn btn-primary" @click="runDebugExec" :disabled="debugExecuting">
+              <button class="uc-btn uc-btn-primary" @click="runDebugExec" :disabled="debugExecuting">
                 {{ debugExecuting ? '执行中...' : '执行 Exec 测试' }}
               </button>
             </div>
 
             <div v-if="debugError" class="debug-error">{{ debugError }}</div>
 
-            <div class="debug-result-wrap">
-              <div class="field">
-                <label>返回文本</label>
-                <pre class="debug-result">{{ debugResult || '（尚无结果）' }}</pre>
+            <div class="debug-result-grid">
+              <label class="uc-field">
+                <span class="uc-label">返回文本</span>
+                <pre class="debug-block">{{ debugResult || '（尚无结果）' }}</pre>
+              </label>
+              <label class="uc-field">
+                <span class="uc-label">响应元数据</span>
+                <pre class="debug-block">{{ debugMetaText }}</pre>
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="actions-foot">
+          <button class="uc-btn uc-btn-primary" @click="saveSettings" :disabled="saving">
+            {{ saving ? '保存中...' : '保存配置' }}
+          </button>
+        </section>
+      </div>
+    </main>
+
+    <transition name="fade">
+      <div v-if="showSkillsDrawer" class="drawer-overlay" @click.self="closeSkillDrawer">
+        <aside class="skills-drawer">
+          <div class="drawer-head">
+            <div>
+              <h3 class="uc-card-title">Skills 列表</h3>
+              <p class="helper-text">抽屉展示，避免挤占设置页空间</p>
+            </div>
+            <button class="uc-btn uc-btn-ghost" @click="closeSkillDrawer">关闭</button>
+          </div>
+
+          <div class="drawer-tabs">
+            <button class="drawer-tab" :class="{ active: skillDrawerTab === 'custom' }" @click="skillDrawerTab='custom'">
+              自定义 ({{ aiSkills.length }})
+            </button>
+            <button class="drawer-tab" :class="{ active: skillDrawerTab === 'builtin' }" @click="skillDrawerTab='builtin'">
+              本地扫描 ({{ builtinSkills.length }})
+            </button>
+          </div>
+
+          <div class="skills-list">
+            <div v-if="skillsLoading" class="helper-text">加载中...</div>
+            <div v-else-if="activeSkillRows.length === 0" class="helper-text">
+              {{ skillDrawerTab === 'custom' ? '暂无自定义 Skill' : '暂无本地扫描 Skill' }}
+            </div>
+            <div v-else class="skills-table">
+              <div class="skills-row skills-head">
+                <span>名称</span>
+                <span>来源</span>
+                <span>状态</span>
+                <span>操作</span>
               </div>
-              <div class="field">
-                <label>响应元数据</label>
-                <pre class="debug-meta">{{ debugMetaText }}</pre>
+              <div v-for="s in activeSkillRows" :key="s.id || s.name" class="skills-row">
+                <div class="skills-name">
+                  <div class="font-bold text-sm">{{ s.name }}</div>
+                  <div class="text-[11px] text-slate-400 truncate">{{ s.description || '无描述' }}</div>
+                </div>
+                <span class="text-xs">{{ s.source || 'custom' }}</span>
+                <span class="text-xs" :class="skillEnabled(s) ? 'text-emerald-600' : 'text-slate-400'">
+                  {{ skillEnabled(s) ? '启用中' : '已停用' }}
+                </span>
+                <div class="skills-actions">
+                  <button class="uc-btn uc-btn-ghost" @click="fillSkillForm(s); closeSkillDrawer()">编辑</button>
+                  <button v-if="skillDrawerTab === 'custom'" class="uc-btn" :class="skillEnabled(s) ? 'uc-btn-danger' : 'uc-btn-primary'" @click="toggleSkill(s)">
+                    {{ skillEnabled(s) ? '停用' : '启用' }}
+                  </button>
+                  <button v-else class="uc-btn uc-btn-primary" @click="fillSkillForm(s); closeSkillDrawer()">用作模板</button>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-
-        <div class="actions-row">
-          <button class="btn btn-primary" @click="saveSettings" :disabled="saving">
-            {{ saving ? '保存中...' : '保存配置' }}
-          </button>
-        </div>
-
-        <div class="canvas-bottom-limit" aria-hidden="true"></div>
+        </aside>
       </div>
-    </div>
+    </transition>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, reactive, computed } from 'vue'
-import { api } from '@/api'
+import { configApi, sharedApi } from '@/api'
+import { useThemeStore } from '@/stores/theme'
+import { useAuthStore } from '@/stores/auth'
+
+const auth = useAuthStore()
+const isMerchant = computed(() => auth.sessionContext.role === 'merchant_owner')
+const isAiFocusMode = ref(true)
+const focusedSection = ref<string | null>(null)
+const headerSubtitle = computed(() => isAiFocusMode.value ? '配置和调试 AI 模型' : '系统全局配置')
 
 const saving = ref(false)
 const canvasRef = ref<HTMLElement | null>(null)
+
+const themeStore = useThemeStore()
+const themeForm = reactive({
+  darkMode: themeStore.settings.darkMode,
+  scheduleStart: themeStore.settings.scheduleStart,
+  scheduleEnd: themeStore.settings.scheduleEnd,
+})
+const bgInputRef = ref<HTMLInputElement | null>(null)
+const chatBgInputRef = ref<HTMLInputElement | null>(null)
+
+function onDarkModeChange() {
+  themeStore.setDarkMode(themeForm.darkMode)
+}
+
+function onScheduleTimeChange() {
+  themeStore.setSchedule(themeForm.scheduleStart, themeForm.scheduleEnd)
+}
+
+function readImageAsDataUrl(e: Event, onDone: (base64: string) => void) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+
+  if (file.size > 5 * 1024 * 1024) {
+    alert('图片大小不能超过 5MB')
+    input.value = ''
+    return
+  }
+
+  const reader = new FileReader()
+  reader.onload = () => {
+    const base64 = reader.result as string
+    onDone(base64)
+    input.value = ''
+  }
+  reader.readAsDataURL(file)
+}
+
+function handleBgUpload(e: Event) {
+  readImageAsDataUrl(e, (base64) => {
+    themeStore.setCustomBackground(base64)
+  })
+}
+
+function resetBackground() {
+  themeStore.setCustomBackground(null)
+  if (bgInputRef.value) bgInputRef.value.value = ''
+}
+
+function handleChatBgUpload(e: Event) {
+  readImageAsDataUrl(e, (base64) => {
+    themeStore.setChatBackground(base64)
+  })
+}
+
+function resetChatBackground() {
+  themeStore.setChatBackground(null)
+  if (chatBgInputRef.value) chatBgInputRef.value.value = ''
+}
 
 const config = reactive({
   llm_api_mode: 'rented',
@@ -226,24 +482,55 @@ const config = reactive({
   llm_base_url: '',
   llm_api_key: '',
   llm_model: '',
-  global_auto_translate: false
+  llm_model_lock_enabled: false,
+  llm_model_lock_target: 'gemini-3.1-pro-preview',
+  global_auto_translate: false,
 })
 
+type AiSkill = {
+  id?: number
+  name: string
+  description?: string
+  prompt_template?: string
+  source?: string
+  is_enabled?: boolean | number
+  updated_at?: string
+}
+
+const aiSkills = ref<AiSkill[]>([])
+const builtinSkills = ref<AiSkill[]>([])
+const skillsLoading = ref(false)
+const skillsSaving = ref(false)
+const skillsImporting = ref(false)
+const showSkillsDrawer = ref(false)
+const skillDrawerTab = ref<'custom' | 'builtin'>('custom')
+const skillForm = reactive<AiSkill>({
+  name: '',
+  description: '',
+  prompt_template: '',
+  source: 'custom',
+  is_enabled: true,
+})
+
+const activeSkillRows = computed(() => (skillDrawerTab.value === 'custom' ? aiSkills.value : builtinSkills.value))
+
+const MODEL_LOCK_TARGET = 'gemini-3.1-pro-preview'
 const vertexQuickForm = reactive({
   vertex_api_key: '',
   oneapi_base_url: '',
   relay_api_key: '',
-  model: 'gemini-2.5-flash-lite'
+  model: 'gemini-2.5-flash-lite',
 })
 
 const quickGeminiModels = ref<string[]>([
+  'gemini-3.1-pro-preview',
   'gemini-2.5-pro',
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite',
   'gemini-1.5-pro',
-  'gemini-1.5-flash'
+  'gemini-1.5-flash',
 ])
 const quickSetting = ref(false)
 const quickResult = ref<null | {
@@ -254,6 +541,7 @@ const quickResult = ref<null | {
   relay_api_key_masked: string
   model: string
 }>(null)
+const modelLockSaving = ref(false)
 
 const debugLoadingModels = ref(false)
 const debugExecuting = ref(false)
@@ -266,7 +554,7 @@ const debugForm = reactive({
   model: '',
   input: '请返回一句简短的中文，说明当前模型调用链路正常。',
   sandbox_id: 'sbx_settings_debug',
-  user_id: ''
+  user_id: '',
 })
 
 const debugMetaText = computed(() => {
@@ -275,10 +563,12 @@ const debugMetaText = computed(() => {
 })
 
 onMounted(async () => {
-  const res = await api.getConfig()
+  const res = await configApi.getConfig()
   if (res.status === 'ok') {
     Object.assign(config, res.data)
-    config.global_auto_translate = res.data.global_auto_translate === 'true'
+    config.global_auto_translate = res.data.global_auto_translate === 'true' || res.data.global_auto_translate === true
+    config.llm_model_lock_enabled = res.data.llm_model_lock_enabled === 'true' || res.data.llm_model_lock_enabled === true
+    config.llm_model_lock_target = String(res.data.llm_model_lock_target || MODEL_LOCK_TARGET).trim() || MODEL_LOCK_TARGET
     if (typeof res.data.llm_model === 'string' && res.data.llm_model.trim()) {
       debugForm.model = res.data.llm_model.trim()
       vertexQuickForm.model = res.data.llm_model.trim()
@@ -286,9 +576,13 @@ onMounted(async () => {
     if (Array.isArray(res.data.gemini_model_options) && res.data.gemini_model_options.length) {
       quickGeminiModels.value = res.data.gemini_model_options.map((x: any) => String(x)).filter(Boolean)
     }
+    if (config.llm_model_lock_enabled) {
+      applyModelLockToForms()
+    }
   }
 
   await loadDebugModels()
+  await loadAiSkills()
   document.addEventListener('focusin', handleFocusIn)
 })
 
@@ -314,7 +608,7 @@ async function loadDebugModels() {
   debugLoadingModels.value = true
   debugError.value = ''
   try {
-    const res = await api.getOpenaiModels()
+    const res = await sharedApi.getOpenaiModels()
     const items = Array.isArray(res?.data) ? res.data : []
     debugModels.value = items.map((m: any) => String(m?.id || '')).filter(Boolean)
     if (!debugForm.model && debugModels.value.length) {
@@ -354,7 +648,7 @@ async function runDebugExec() {
       payload.user_id = parsedUserId
     }
 
-    const res = await api.execOpenai(payload)
+    const res = await sharedApi.execOpenai(payload)
     if (res?.error?.message) {
       debugError.value = String(res.error.message)
       debugMeta.value = res
@@ -366,7 +660,7 @@ async function runDebugExec() {
       model: res?.model,
       sandbox_id: res?.sandbox_id,
       usage: res?.usage || null,
-      status: res?.status || 'ok'
+      status: res?.status || 'ok',
     }
   } catch (e) {
     debugError.value = 'Exec 调用失败，请检查网络或后端日志'
@@ -375,12 +669,138 @@ async function runDebugExec() {
   }
 }
 
+function skillEnabled(s: AiSkill): boolean {
+  return s.is_enabled === true || Number(s.is_enabled) === 1
+}
+
+function fillSkillForm(s: AiSkill) {
+  skillForm.name = String(s.name || '')
+  skillForm.description = String(s.description || '')
+  skillForm.prompt_template = String(s.prompt_template || '')
+  skillForm.source = String(s.source || 'custom')
+  skillForm.is_enabled = skillEnabled(s)
+}
+
+async function loadAiSkills() {
+  skillsLoading.value = true
+  try {
+    const res = await sharedApi.getAiSkills(false)
+    if (res?.status === 'ok') {
+      const rows = Array.isArray(res.data) ? res.data : []
+      aiSkills.value = rows.filter((x: AiSkill) => String(x.source || '').toLowerCase() !== 'builtin_fs')
+    } else {
+      alert('加载 Skill 列表失败: ' + String(res?.message || '未知错误'))
+    }
+  } catch (e) {
+    alert('加载 Skill 列表失败，请检查网络或后端日志')
+  } finally {
+    skillsLoading.value = false
+  }
+}
+
+async function loadDiscoveredSkills() {
+  try {
+    const res = await sharedApi.getDiscoveredAiSkills()
+    if (res?.status === 'ok') {
+      const rows = Array.isArray(res.data) ? res.data : []
+      builtinSkills.value = rows.map((x: any) => ({
+        name: String(x.name || ''),
+        description: String(x.description || ''),
+        source: String(x.source || 'builtin_scan'),
+        is_enabled: false,
+      }))
+    } else {
+      builtinSkills.value = []
+    }
+  } catch (e) {
+    builtinSkills.value = []
+  }
+}
+
+async function saveAiSkill() {
+  const name = String(skillForm.name || '').trim()
+  if (!name) {
+    alert('请先输入 Skill 名称')
+    return
+  }
+  skillsSaving.value = true
+  try {
+    const res = await sharedApi.upsertAiSkill({
+      name,
+      description: String(skillForm.description || '').trim(),
+      prompt_template: String(skillForm.prompt_template || ''),
+      source: String(skillForm.source || 'custom'),
+      is_enabled: skillForm.is_enabled !== false,
+    })
+    if (res?.status === 'ok') {
+      await loadAiSkills()
+      alert('Skill 已保存')
+    } else {
+      alert('保存 Skill 失败: ' + String(res?.message || '未知错误'))
+    }
+  } catch (e) {
+    alert('保存 Skill 失败，请检查网络或后端日志')
+  } finally {
+    skillsSaving.value = false
+  }
+}
+
+async function toggleSkill(s: AiSkill) {
+  const enabled = !skillEnabled(s)
+  try {
+    const res = await sharedApi.toggleAiSkill(String(s.name || ''), enabled)
+    if (res?.status === 'ok') {
+      await loadAiSkills()
+    } else {
+      alert('更新 Skill 状态失败: ' + String(res?.message || '未知错误'))
+    }
+  } catch (e) {
+    alert('更新 Skill 状态失败，请检查网络或后端日志')
+  }
+}
+
+async function importBuiltinSkills() {
+  skillsImporting.value = true
+  try {
+    const res = await sharedApi.importBuiltinAiSkills()
+    if (res?.status === 'ok') {
+      await Promise.all([loadAiSkills(), loadDiscoveredSkills()])
+      alert(res?.message || '内置 Skills 导入完成')
+    } else {
+      alert('导入失败: ' + String(res?.message || '未知错误'))
+    }
+  } catch (e) {
+    alert('导入失败，请检查网络或后端日志')
+  } finally {
+    skillsImporting.value = false
+  }
+}
+
+async function openSkillDrawer() {
+  showSkillsDrawer.value = true
+  skillDrawerTab.value = 'custom'
+  await Promise.all([loadAiSkills(), loadDiscoveredSkills()])
+}
+
+function closeSkillDrawer() {
+  showSkillsDrawer.value = false
+}
+
 async function saveSettings() {
   saving.value = true
   try {
-    const res = await api.saveConfig({
+    const lockTarget = String(config.llm_model_lock_target || MODEL_LOCK_TARGET).trim() || MODEL_LOCK_TARGET
+    const payload: Record<string, any> = {
       ...config,
-      global_auto_translate: config.global_auto_translate ? 'true' : 'false'
+      llm_model_lock_enabled: config.llm_model_lock_enabled ? 'true' : 'false',
+      llm_model_lock_target: lockTarget,
+      global_auto_translate: config.global_auto_translate ? 'true' : 'false',
+    }
+    if (config.llm_model_lock_enabled) {
+      payload.llm_model = lockTarget
+    }
+    const res = await configApi.saveConfig({
+      ...payload,
     })
     if (res.status === 'ok') {
       alert('配置已成功保存')
@@ -406,7 +826,7 @@ async function oneClickVertexSetup() {
       model: vertexQuickForm.model.trim(),
     }
 
-    const res = await api.setupVertexOneClick(payload)
+    const res = await configApi.setupVertexOneClick(payload)
     if (res?.status !== 'ok') {
       alert('一键配置失败: ' + String(res?.message || '未知错误'))
       return
@@ -427,6 +847,9 @@ async function oneClickVertexSetup() {
     config.llm_base_url = quickResult.value.oneapi_base_url
     config.llm_model = quickResult.value.model
     debugForm.model = quickResult.value.model
+    if (config.llm_model_lock_enabled) {
+      applyModelLockToForms()
+    }
 
     const successText = [
       '✅ Vertex 一键配置完成',
@@ -442,308 +865,185 @@ async function oneClickVertexSetup() {
     quickSetting.value = false
   }
 }
+
+function applyModelLockToForms() {
+  const lockTarget = String(config.llm_model_lock_target || MODEL_LOCK_TARGET).trim() || MODEL_LOCK_TARGET
+  config.llm_model_lock_target = lockTarget
+  config.llm_model = lockTarget
+  debugForm.model = lockTarget
+  vertexQuickForm.model = lockTarget
+}
+
+async function toggleModelLock() {
+  modelLockSaving.value = true
+  try {
+    const nextEnabled = !config.llm_model_lock_enabled
+    const lockTarget = String(config.llm_model_lock_target || MODEL_LOCK_TARGET).trim() || MODEL_LOCK_TARGET
+    const payload: Record<string, any> = {
+      llm_model_lock_enabled: nextEnabled ? 'true' : 'false',
+      llm_model_lock_target: lockTarget,
+    }
+    if (nextEnabled) {
+      payload.llm_model = lockTarget
+    }
+
+    const res = await configApi.saveConfig(payload)
+    if (res?.status !== 'ok') {
+      alert('模型锁定更新失败: ' + String(res?.message || '未知错误'))
+      return
+    }
+
+    config.llm_model_lock_enabled = nextEnabled
+    if (nextEnabled) {
+      applyModelLockToForms()
+      alert(`已锁定模型为 ${lockTarget}`)
+    } else {
+      alert('已解除模型锁定')
+    }
+  } catch (e) {
+    alert('模型锁定请求失败，请检查后端日志')
+  } finally {
+    modelLockSaving.value = false
+  }
+}
 </script>
 
 <style scoped>
-.settings-root {
-  height: 100%;
-  min-height: 0;
+.settings-wrap {
+  max-width: 1120px;
+}
+
+.settings-stack {
+  margin-top: 12px;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  gap: 12px;
 }
 
-.settings-canvas {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  -webkit-overflow-scrolling: touch;
-  touch-action: pan-y;
-  overscroll-behavior-y: contain;
-  padding: 20px;
-  padding-bottom: calc(88px + env(safe-area-inset-bottom) + var(--kb-offset, 0px));
+.mode-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
 }
 
-.settings-container {
-  max-width: 800px;
-  margin: 0 auto;
+.mode-item {
+  border: 1px solid rgb(148 163 184 / 0.24);
+  border-radius: 13px;
+  background: rgb(248 250 252 / 0.7);
+  padding: 12px;
   display: flex;
-  flex-direction: column;
-  gap: 20px;
-}
-
-.canvas-bottom-limit {
-  height: 8px;
-}
-
-.settings-card {
-  padding: 24px;
-}
-
-.card-header {
-  margin-bottom: 24px;
-  border-bottom: 1px solid var(--border-muted);
-  padding-bottom: 16px;
-}
-
-.card-header h3 {
-  font-size: 18px;
-  font-weight: 600;
-  margin: 0 0 4px 0;
-}
-
-.subtitle {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-
-.settings-group {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-}
-
-.field {
-  display: flex;
-  flex-direction: column;
   gap: 8px;
+  align-items: flex-start;
+  cursor: pointer;
+  transition: all 0.18s ease;
 }
 
-.flex-row {
-  flex-direction: row;
+.mode-item:hover {
+  border-color: rgb(36 161 222 / 0.45);
+}
+
+.mode-item.active {
+  border-color: rgb(36 161 222 / 0.62);
+  box-shadow: 0 0 0 3px rgb(36 161 222 / 0.12);
+}
+
+.dark .mode-item {
+  border-color: rgb(73 106 148 / 0.28);
+  background: rgb(8 17 31 / 0.68);
+}
+
+.mode-title {
+  font-size: 13px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.mode-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.dark .mode-title {
+  color: #dbeafe;
+}
+
+.dark .mode-desc {
+  color: #adc3e0;
+}
+
+.sub-panel {
+  border: 1px solid rgb(148 163 184 / 0.22);
+  border-radius: 14px;
+  background: rgb(248 250 252 / 0.72);
+  padding: 12px;
+}
+
+.dark .sub-panel {
+  border-color: rgb(73 106 148 / 0.28);
+  background: rgb(8 17 31 / 0.7);
+}
+
+.accent-panel {
+  border-color: rgb(36 161 222 / 0.35);
+}
+
+.info-panel {
+  font-size: 13px;
+  color: #334155;
+}
+
+.dark .info-panel {
+  color: #dbeafe;
+}
+
+.sub-title {
+  font-size: 15px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.dark .sub-title {
+  color: #e2e8f0;
+}
+
+.lock-panel {
+  border-color: rgb(14 165 233 / 0.3);
+}
+
+.model-lock-row {
+  display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
 }
 
-.field label {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.field .desc {
+.helper-text {
   font-size: 12px;
-  color: var(--text-secondary);
-  margin: 2px 0 0 0;
+  color: #64748b;
 }
 
-.radio-group {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin-top: 4px;
+.dark .helper-text {
+  color: #adc3e0;
 }
 
-.radio-item {
-  position: relative;
-  padding: 16px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition: all 0.2s;
+.toggle-row {
+  margin-top: 10px;
   display: flex;
-  gap: 12px;
-  align-items: flex-start;
-}
-
-.radio-item:hover {
-  border-color: var(--accent);
-  background: var(--bg-hover);
-}
-
-.radio-item.active {
-  border-color: var(--accent);
-  background: rgba(88, 166, 255, 0.05);
-  box-shadow: 0 0 0 1px var(--accent);
-}
-
-.radio-item input {
-  margin-top: 3px;
-}
-
-.radio-content {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.radio-content .title {
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.radio-content .desc {
-  font-size: 12px;
-  color: var(--text-secondary);
-  line-height: 1.4;
-}
-
-.own-api-fields {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  padding: 20px;
-  background: var(--bg-elevated);
-  border-radius: var(--radius-md);
-  margin-top: 8px;
-  border: 1px solid var(--border-muted);
-}
-
-.rented-api-info {
-  padding: 20px;
-  background: var(--bg-elevated);
-  border-radius: var(--radius-md);
-  margin-top: 8px;
-  border: 1px dashed var(--accent);
-}
-
-.info-box {
-  display: flex;
-  gap: 12px;
   align-items: center;
-}
-
-.info-icon {
-  font-size: 24px;
-}
-
-.info-box p {
-  font-size: 13px;
-  line-height: 1.5;
-  color: var(--text-secondary);
-  margin: 0;
-}
-
-.hint {
-  font-size: 11px;
-  color: var(--text-muted);
-  margin: 4px 0 0 0;
-}
-
-.actions-row {
-  display: flex;
-  justify-content: flex-end;
-  padding: 20px 0;
-}
-
-.debug-card {
-  border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--border));
-  background: linear-gradient(180deg, color-mix(in srgb, var(--bg-elevated) 84%, var(--accent) 16%), var(--bg-card));
-}
-
-.debug-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  justify-content: space-between;
   gap: 12px;
 }
 
-.debug-textarea {
-  min-height: 96px;
-  resize: vertical;
+.toggle-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: #0f172a;
 }
 
-.debug-actions {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.debug-error {
-  border: 1px solid color-mix(in srgb, #ff5f56 45%, var(--border));
-  background: color-mix(in srgb, #ff5f56 12%, var(--bg-elevated));
-  color: #ffb4af;
-  padding: 10px 12px;
-  border-radius: 10px;
-  font-size: 12px;
-  line-height: 1.4;
-}
-
-.debug-result-wrap {
-  display: grid;
-  grid-template-columns: 1.2fr 1fr;
-  gap: 12px;
-}
-
-.debug-result,
-.debug-meta {
-  margin: 0;
-  padding: 14px;
-  border-radius: 10px;
-  border: 1px solid var(--border-muted);
-  background: color-mix(in srgb, var(--bg-elevated) 90%, #000 10%);
-  color: var(--text-primary);
-  max-height: 280px;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.debug-meta {
-  white-space: pre;
-}
-
-.quick-result-box {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-
-.vertex-oneclick-box {
-  margin-top: 14px;
-  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
-  border-radius: var(--radius-md);
-  padding: 16px;
-  background: color-mix(in srgb, var(--bg-elevated) 86%, var(--accent) 14%);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.vertex-oneclick-box h4 {
-  margin: 0;
-  font-size: 15px;
-}
-
-@media (max-width: 768px) {
-  .settings-canvas {
-    padding: 12px;
-    padding-bottom: calc(124px + env(safe-area-inset-bottom) + var(--kb-offset, 0px));
-  }
-
-  .canvas-bottom-limit {
-    height: calc(40px + env(safe-area-inset-bottom));
-  }
-
-  .settings-card {
-    padding: 16px;
-  }
-
-  .radio-group {
-    grid-template-columns: 1fr;
-  }
-
-  .flex-row {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 12px;
-  }
-
-  .actions-row {
-    justify-content: stretch;
-  }
-
-  .actions-row .btn {
-    width: 100%;
-    justify-content: center;
-  }
-
-  .debug-grid,
-  .debug-result-wrap {
-    grid-template-columns: 1fr;
-  }
+.dark .toggle-title {
+  color: #e2e8f0;
 }
 
 .switch {
@@ -753,31 +1053,259 @@ async function oneClickVertexSetup() {
 .switch + label {
   display: block;
   width: 44px;
-  height: 22px;
-  background: var(--border);
-  border-radius: 22px;
+  height: 24px;
+  border-radius: 99px;
+  background: rgb(148 163 184 / 0.5);
   position: relative;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.2s ease;
 }
 
 .switch + label::after {
   content: '';
   position: absolute;
-  left: 2px;
-  top: 2px;
   width: 18px;
   height: 18px;
-  background: white;
+  top: 3px;
+  left: 3px;
   border-radius: 50%;
-  transition: all 0.2s;
+  background: #fff;
+  transition: all 0.2s ease;
 }
 
 .switch:checked + label {
-  background: var(--success);
+  background: #24a1de;
 }
 
 .switch:checked + label::after {
-  left: 24px;
+  left: 23px;
+}
+
+.upload-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.bg-ready {
+  font-size: 12px;
+  font-weight: 700;
+  color: rgb(6 95 70);
+}
+
+.dark .bg-ready {
+  color: rgb(110 231 183);
+}
+
+.hidden-input {
+  display: none;
+}
+
+.debug-textarea {
+  min-height: 102px;
+  resize: vertical;
+}
+
+.debug-error {
+  border-radius: 12px;
+  border: 1px solid rgb(239 68 68 / 0.35);
+  background: rgb(254 226 226 / 0.86);
+  color: #b91c1c;
+  padding: 10px 12px;
+  font-size: 12px;
+}
+
+.dark .debug-error {
+  border-color: rgb(248 113 113 / 0.32);
+  background: rgb(127 29 29 / 0.4);
+  color: #fecaca;
+}
+
+.debug-result-grid,
+.quick-result-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.skills-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.skills-table {
+  border: 1px solid rgb(148 163 184 / 0.24);
+  border-radius: 12px;
+  overflow: hidden;
+  background: rgb(248 250 252 / 0.72);
+}
+
+.dark .skills-table {
+  border-color: rgb(73 106 148 / 0.32);
+  background: rgb(8 17 31 / 0.66);
+}
+
+.skills-row {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgb(148 163 184 / 0.14);
+}
+
+.skills-row:last-child {
+  border-bottom: none;
+}
+
+.skills-head {
+  background: rgb(241 245 249 / 0.9);
+  font-size: 12px;
+  font-weight: 800;
+  color: #475569;
+}
+
+.dark .skills-head {
+  background: rgb(15 23 42 / 0.8);
+  color: #cbd5e1;
+}
+
+.skills-name {
+  min-width: 0;
+}
+
+.skills-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.drawer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: rgb(2 6 23 / 0.48);
+  display: flex;
+  justify-content: flex-end;
+}
+
+.skills-drawer {
+  width: min(760px, 94vw);
+  height: 100%;
+  background: rgb(248 250 252);
+  border-left: 1px solid rgb(148 163 184 / 0.24);
+  box-shadow: -12px 0 30px rgb(2 6 23 / 0.18);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dark .skills-drawer {
+  background: rgb(2 12 24);
+  border-left-color: rgb(73 106 148 / 0.35);
+}
+
+.drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.drawer-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.drawer-tab {
+  border: 1px solid rgb(148 163 184 / 0.26);
+  background: rgb(241 245 249 / 0.75);
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 10px;
+  border-radius: 10px;
+  transition: all 0.16s ease;
+}
+
+.drawer-tab.active {
+  border-color: rgb(36 161 222 / 0.55);
+  background: rgb(36 161 222 / 0.13);
+  color: #0369a1;
+}
+
+.dark .drawer-tab {
+  border-color: rgb(73 106 148 / 0.32);
+  background: rgb(15 23 42 / 0.65);
+  color: #cbd5e1;
+}
+
+.dark .drawer-tab.active {
+  border-color: rgb(56 189 248 / 0.55);
+  background: rgb(14 116 144 / 0.22);
+  color: #7dd3fc;
+}
+
+.debug-block {
+  margin: 0;
+  border: 1px solid rgb(148 163 184 / 0.24);
+  border-radius: 11px;
+  background: rgb(248 250 252 / 0.8);
+  color: #0f172a;
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.dark .debug-block {
+  border-color: rgb(73 106 148 / 0.3);
+  background: rgb(6 14 26 / 0.8);
+  color: #dbeafe;
+}
+
+.actions-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 2px;
+}
+
+@media (max-width: 768px) {
+  .mode-grid,
+  .debug-result-grid,
+  .quick-result-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .skills-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .skills-drawer {
+    width: 100vw;
+    padding: 12px;
+  }
+
+  .toggle-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .model-lock-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .actions-foot .uc-btn {
+    width: 100%;
+  }
 }
 </style>

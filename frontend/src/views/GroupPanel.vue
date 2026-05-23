@@ -3,26 +3,38 @@
     <!-- 群组列表侧栏 -->
     <div class="border-r border-outline-variant/20 flex flex-col bg-surface-container-lowest/80" :class="mobilePanelView==='list'?'w-full md:w-80':'hidden md:flex md:w-80'">
       <div class="p-5 border-b border-outline-variant/10 space-y-3">
-        <div class="flex items-center justify-between">
+        <div class="flex items-center justify-between gap-2">
           <h2 class="text-lg font-black flex items-center"><span class="material-symbols-outlined mr-2 text-primary">groups</span>群组管理</h2>
-          <!-- 频道引导关注看板 -->
-          <div v-if="verifyGrowthSummary" class="mt-3 grid grid-cols-2 gap-2">
-            <button @click="openVerifiedUsersModal('today')" class="flex items-center gap-2 px-3 py-2 bg-primary/8 rounded-xl border border-primary/15 cursor-pointer hover:bg-primary/12 transition-colors active:scale-95">
-              <span class="material-symbols-outlined text-primary text-base">today</span>
-              <div>
-                <div class="text-base font-black text-primary leading-none">{{ verifyGrowthSummary.today }}</div>
-                <div class="text-[9px] text-slate-400 mt-0.5">今日引导关注</div>
-              </div>
+          <div class="flex items-center gap-2 flex-shrink-0">
+            <button
+              @click="openRevokeSyncBindingModal"
+              class="revoke-sync-entry-btn w-8 h-8 rounded-lg text-[10px] font-bold transition-all flex items-center justify-center relative"
+              :class="revokeSyncChatInfo?.chat_id
+                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200/70 dark:bg-emerald-500/12 dark:text-emerald-300 dark:border-emerald-400/20'
+                : 'bg-amber-50 text-amber-700 border border-amber-200/70 dark:bg-amber-500/12 dark:text-amber-300 dark:border-amber-400/20'"
+              :title="revokeSyncChatInfo?.chat_id ? `当前绑定：${revokeSyncChatInfo.title || revokeSyncChatInfo.chat_id}` : '绑定校对信息群'"
+            >
+              <span class="material-symbols-outlined text-[14px]">{{ revokeSyncChatInfo?.chat_id ? 'hub' : 'link' }}</span>
+              <span v-if="revokeSyncChatInfo?.chat_id" class="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
             </button>
-            <button @click="openVerifiedUsersModal('all')" class="flex items-center gap-2 px-3 py-2 bg-emerald-50 rounded-xl border border-emerald-200/60 cursor-pointer hover:bg-emerald-100/50 transition-colors active:scale-95">
-              <span class="material-symbols-outlined text-emerald-600 text-base">verified</span>
-              <div>
-                <div class="text-base font-black text-emerald-600 leading-none">{{ verifyGrowthSummary.total }}</div>
-                <div class="text-[9px] text-slate-400 mt-0.5">总引导数</div>
-              </div>
-            </button>
+            <button @click="loadGroups" class="w-9 h-9 rounded-xl bg-surface-container text-primary flex items-center justify-center"><span class="material-symbols-outlined text-[18px]">refresh</span></button>
           </div>
-          <button @click="loadGroups" class="w-9 h-9 rounded-xl bg-surface-container text-primary flex items-center justify-center"><span class="material-symbols-outlined text-[18px]">refresh</span></button>
+        </div>
+        <div v-if="verifyGrowthSummary" class="grid grid-cols-2 gap-2">
+          <button @click="openVerifiedUsersModal('today')" class="flex items-center gap-2 px-3 py-2 bg-primary/10 rounded-xl border border-primary/15 cursor-pointer hover:bg-primary/10 transition-colors active:scale-95">
+            <span class="material-symbols-outlined text-primary text-base">today</span>
+            <div>
+              <div class="text-base font-black text-primary leading-none">{{ verifyGrowthSummary.today }}</div>
+              <div class="text-[9px] text-slate-400 mt-0.5">今日引导关注</div>
+            </div>
+          </button>
+          <button @click="openVerifiedUsersModal('all')" class="flex items-center gap-2 px-3 py-2 bg-emerald-50 rounded-xl border border-emerald-200/60 cursor-pointer hover:bg-emerald-100/50 transition-colors active:scale-95">
+            <span class="material-symbols-outlined text-emerald-600 text-base">verified</span>
+            <div>
+              <div class="text-base font-black text-emerald-600 leading-none">{{ verifyGrowthSummary.total }}</div>
+              <div class="text-[9px] text-slate-400 mt-0.5">总引导数</div>
+            </div>
+          </button>
         </div>
         <!-- 全局消息搜索框 -->
         <div class="relative">
@@ -138,7 +150,17 @@
                  :class="msg.is_outgoing ? 'bg-primary text-white rounded-tr-sm' : 'bg-white text-slate-800 rounded-tl-sm'">
               <!-- 发送者名字 -->
               <div v-if="!msg.is_outgoing" class="text-[10px] font-black text-primary mb-1">
-                {{ msg.username ? '@'+msg.username : (msg.first_name || ('UID '+msg.user_id)) }}
+                <a :href="tgUserProfileHref(msg.user_id, msg.username)"
+                   class="hover:underline"
+                   @click.stop.prevent="openTgUserProfile(msg.user_id, msg.username)">{{ tgUserLinkLabel(msg.user_id, msg.username, msg.first_name) }}</a>
+                <span
+                  v-if="getAdBadgeText(msg)"
+                  class="ml-1.5 px-1.5 py-0.5 rounded-md text-[9px] font-black align-middle"
+                  :class="getAdBadgeClass(msg)"
+                  :title="getAdBadgeTitle(msg)"
+                >
+                  {{ getAdBadgeText(msg) }}
+                </span>
               </div>
               <!-- 引用块：蓝色渐变 + 点击跳转 -->
               <div v-if="msg.quoted_tg_msg_id"
@@ -171,7 +193,7 @@
                     <span class="material-symbols-outlined text-2xl">sentiment_satisfied</span>
                   </button>
                 </template>
-                <a v-else-if="fileUrls[msg.file_id]" :href="fileUrls[msg.file_id]" target="_blank" class="text-xs font-bold text-primary underline">下载文件</a>
+                <a v-else-if="fileUrls[msg.file_id]" :href="fileUrls[msg.file_id]" class="text-xs font-bold text-primary underline" @click.prevent="openUrl(fileUrls[msg.file_id])">下载文件</a>
                 <button v-if="!['photo','animation','video','voice','audio','sticker'].includes(msg.msg_type||'') && !fileUrls[msg.file_id]" @click="fileStore.autoLoadFile(msg.file_id)" class="text-xs font-bold underline text-primary">加载媒体</button>
               </div>
               <!-- 正文 -->
@@ -202,7 +224,7 @@
 
         <div v-if="groupMobileActionMsg" class="md:hidden absolute inset-0 z-40 bg-black/35" @click="closeGroupMobileActionMenu"></div>
         <div v-if="groupMobileActionMsg" class="md:hidden absolute left-4 right-4 bottom-6 z-50 rounded-2xl border border-outline-variant/30 bg-surface-container-highest shadow-2xl overflow-hidden">
-          <button @click="handleGroupMobileQuote" class="w-full flex items-center gap-3 px-4 py-4 text-sm font-bold text-left hover:bg-primary/8">
+          <button @click="handleGroupMobileQuote" class="w-full flex items-center gap-3 px-4 py-4 text-sm font-bold text-left hover:bg-primary/10">
             <span class="material-symbols-outlined text-primary">reply</span>
             引用回复
           </button>
@@ -231,10 +253,12 @@
         >
           <span class="material-symbols-outlined text-slate-600 dark:text-slate-200 text-[22px]">expand_circle_down</span>
         </div>
-        <div v-if="groupRoomReplyingTo" class="mx-4 mb-0 px-4 py-2.5 bg-primary/8 border border-primary/20 border-b-0 rounded-t-2xl flex items-center gap-3">
+        <div v-if="groupRoomReplyingTo" class="mx-4 mb-0 px-4 py-2.5 bg-primary/10 border border-primary/20 border-b-0 rounded-t-2xl flex items-center gap-3">
           <span class="material-symbols-outlined text-primary text-sm">reply</span>
           <div class="flex-1 min-w-0">
-            <span class="text-[10px] font-black text-primary">@{{ groupRoomReplyingTo.username || groupRoomReplyingTo.first_name || ('UID '+groupRoomReplyingTo.user_id) }}</span>
+            <a :href="tgUserProfileHref(groupRoomReplyingTo.user_id, groupRoomReplyingTo.username)"
+               class="text-[10px] font-black text-primary hover:underline"
+               @click.stop.prevent="openTgUserProfile(groupRoomReplyingTo.user_id, groupRoomReplyingTo.username)">{{ tgUserLinkLabel(groupRoomReplyingTo.user_id, groupRoomReplyingTo.username, groupRoomReplyingTo.first_name) }}</a>
             <span class="text-xs text-slate-500 ml-2 truncate">{{ groupRoomReplyingTo.content }}</span>
           </div>
           <button @click="groupRoomReplyingTo=null" class="w-6 h-6 flex items-center justify-center rounded-lg hover:bg-primary/20 transition-all"><span class="material-symbols-outlined text-slate-400 text-sm">close</span></button>
@@ -280,7 +304,7 @@
               <button @click="batchAction('mute')" :disabled="selectedMemberIds.length===0" class="px-2.5 py-1.5 text-[10px] font-bold rounded-lg bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-40 active:scale-95 transition-all"><span class="material-symbols-outlined text-[12px] align-middle">volume_off</span> 禁言</button>
               <button @click="batchAction('unmute')" :disabled="selectedMemberIds.length===0" class="px-2.5 py-1.5 text-[10px] font-bold rounded-lg bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-40 active:scale-95 transition-all"><span class="material-symbols-outlined text-[12px] align-middle">volume_up</span> 解禁</button>
               <button @click="batchAction('promote')" :disabled="selectedMemberIds.length===0" class="px-2.5 py-1.5 text-[10px] font-bold rounded-lg bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-40 active:scale-95 transition-all"><span class="material-symbols-outlined text-[12px] align-middle">shield_person</span> 设管</button>
-              <button @click="batchAction('demote')" :disabled="selectedMemberIds.length===0" class="px-2.5 py-1.5 text-[10px] font-bold rounded-lg bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-40 active:scale-95 transition-all"><span class="material-symbols-outlined text-[12px] align-middle">shield_person_off</span> 撤管</button>
+              <button @click="batchAction('demote')" :disabled="selectedMemberIds.length===0" class="px-2.5 py-1.5 text-[10px] font-bold rounded-lg bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-40 active:scale-95 transition-all"><span class="material-symbols-outlined text-[12px] align-middle">remove_moderator</span> 撤管</button>
               <button @click="batchAction('kick')" :disabled="selectedMemberIds.length===0" class="px-2.5 py-1.5 text-[10px] font-bold rounded-lg bg-rose-50 text-rose-500 hover:bg-rose-100 disabled:opacity-40 active:scale-95 transition-all"><span class="material-symbols-outlined text-[12px] align-middle">person_remove</span> 移除</button>
             </div>
           </div>
@@ -303,12 +327,12 @@
           <div v-else class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-1.5">
             <div v-for="m in filteredGroupMembers" :key="m.user_id"
                  class="relative flex items-center gap-3 px-3 py-2.5 rounded-2xl border border-transparent transition-all group cursor-pointer"
-                 :class="selectedMemberIds.includes(m.user_id)?'bg-primary/6 border-primary/15':'hover:bg-slate-50 hover:border-slate-200/60'"
+                 :class="selectedMemberIds.includes(m.user_id)?'bg-primary/5 border-primary/15':'hover:bg-slate-50 hover:border-slate-200/60'"
                  @click="toggleMemberSelect(m.user_id)">
               <div class="w-4 h-4 rounded-full border-2 flex-shrink-0 flex items-center justify-center transition-all" :class="selectedMemberIds.includes(m.user_id)?'border-primary bg-primary':'border-slate-300'">
                 <span v-if="selectedMemberIds.includes(m.user_id)" class="material-symbols-outlined text-white text-[10px]">check</span>
               </div>
-              <div class="w-9 h-9 rounded-xl flex-shrink-0 overflow-hidden bg-primary/8 flex items-center justify-center text-primary font-black text-sm">
+              <div class="w-9 h-9 rounded-xl flex-shrink-0 overflow-hidden bg-primary/10 flex items-center justify-center text-primary font-black text-sm">
                 <img v-if="m.avatar_file_id && fileUrls[m.avatar_file_id]" :src="fileUrls[m.avatar_file_id]" class="w-full h-full object-cover"/>
                 <span v-else>{{ (m.first_name||m.username||'U').charAt(0).toUpperCase() }}</span>
               </div>
@@ -317,7 +341,9 @@
                   <span class="text-sm font-bold text-slate-800 truncate">{{ m.first_name||m.username||'Unknown' }}</span>
                   <span v-if="['admin','administrator','creator'].includes((m.status||'').toLowerCase())" class="px-1.5 py-0.5 bg-slate-100 text-slate-500 text-[9px] font-black rounded-md flex-shrink-0">管理</span>
                 </div>
-                <div class="text-[10px] text-slate-400 truncate">@{{ m.username||('UID '+m.user_id) }}</div>
+                <div class="text-[10px] text-slate-400 truncate">
+                  <a :href="tgUserProfileHref(m.user_id, m.username)" class="hover:underline text-primary" @click.stop.prevent="openTgUserProfile(m.user_id, m.username)">{{ tgUserLinkLabel(m.user_id, m.username, m.first_name) }}</a>
+                </div>
               </div>
               <div class="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all bg-white/90 rounded-xl px-1 py-0.5 shadow-sm" @click.stop>
                 <button @click="memberAction(m,'mute')" class="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-amber-50 hover:text-amber-500 text-slate-400 transition-all" title="禁言"><span class="material-symbols-outlined text-[15px]">volume_off</span></button>
@@ -356,10 +382,19 @@
             <div v-for="m in groupMessages" :key="m.msg_id" :id="m.tg_msg_id?('group-msg-'+m.tg_msg_id):undefined"
                  class="p-4 bg-surface-container-lowest rounded-2xl border border-outline-variant/5 shadow-sm hover:shadow-md transition-all">
               <div class="flex items-center justify-between mb-2">
-                <div class="flex items-center space-x-2">
-                  <span class="text-xs font-black text-primary">@{{ m.username }}</span>
-                  <span class="text-[9px] text-slate-300 font-medium">ID: {{ m.user_id }}</span>
+                <div class="flex items-center space-x-2 min-w-0">
+                  <a :href="tgUserProfileHref(m.user_id, m.username)"
+                     class="text-xs font-black text-primary hover:underline truncate"
+                     @click.stop.prevent="openTgUserProfile(m.user_id, m.username)">{{ tgUserLinkLabel(m.user_id, m.username, m.first_name) }}</a>
                   <span v-if="m.sender_type" class="text-[9px] px-2 py-0.5 rounded-full bg-surface-container-high text-slate-500">{{ m.sender_type }}</span>
+                  <span
+                    v-if="getAdBadgeText(m)"
+                    class="text-[9px] px-2 py-0.5 rounded-full font-black"
+                    :class="getAdBadgeClass(m)"
+                    :title="getAdBadgeTitle(m)"
+                  >
+                    {{ getAdBadgeText(m) }}
+                  </span>
                 </div>
                 <span class="text-[9px] text-slate-400">{{ formatTime(m.message_ts||m.timestamp) }}</span>
               </div>
@@ -387,7 +422,7 @@
                   <video v-if="fileUrls[m.file_id] && isVideoSticker(fileUrls[m.file_id])" :src="fileUrls[m.file_id]" autoplay loop muted playsinline controls class="w-24 h-24 object-contain rounded-lg"></video>
                   <img v-else-if="fileUrls[m.file_id]" :src="fileUrls[m.file_id]" class="w-24 h-24 object-contain rounded-lg"/>
                 </template>
-                <a v-else-if="fileUrls[m.file_id]" :href="fileUrls[m.file_id]" target="_blank" class="text-xs font-bold text-primary underline">下载文件</a>
+                <a v-else-if="fileUrls[m.file_id]" :href="fileUrls[m.file_id]" class="text-xs font-bold text-primary underline" @click.prevent="openUrl(fileUrls[m.file_id])">下载文件</a>
                 <button v-if="!fileUrls[m.file_id]" @click="fileStore.autoLoadFile(m.file_id)" class="text-xs font-bold underline text-primary">加载媒体</button>
               </div>
               <div class="text-sm text-on-surface leading-relaxed whitespace-pre-wrap">{{ m.content }}</div>
@@ -474,7 +509,7 @@
                           class="w-full px-3 py-2 bg-slate-50 rounded-xl border text-sm resize-none focus:ring-2 focus:ring-primary/20 focus:border-primary/30"></textarea>
               </div>
               <!-- 统计展示 -->
-              <div v-if="verifyStats" class="p-3 bg-gradient-to-r from-primary/8 to-primary/4 rounded-2xl border border-primary/15">
+              <div v-if="verifyStats" class="p-3 bg-gradient-to-r from-primary/10 to-primary/5 rounded-2xl border border-primary/15">
                 <div class="text-[10px] font-black text-primary uppercase tracking-wider mb-2">当前群验证统计</div>
                 <div class="flex items-center gap-4">
                   <div class="flex-1">
@@ -560,7 +595,9 @@
                   <div class="flex items-center gap-2">
                     <span class="text-sm font-bold text-slate-800 truncate">{{ user.first_name || user.username || 'Unknown' }}</span>
                   </div>
-                  <div class="text-[10px] text-slate-400 truncate">@{{ user.username || ('UID ' + user.user_id) }}</div>
+                  <div class="text-[10px] text-slate-400 truncate">
+                    <a :href="tgUserProfileHref(user.user_id, user.username)" class="hover:underline text-primary" @click.stop.prevent="openTgUserProfile(user.user_id, user.username)">{{ tgUserLinkLabel(user.user_id, user.username, user.first_name) }}</a>
+                  </div>
                   <div v-if="user.group_title" class="text-[10px] text-primary mt-0.5">📍 {{ user.group_title }}</div>
                 </div>
                 <!-- 验证时间 -->
@@ -630,7 +667,9 @@
                       <div class="flex items-center gap-2">
                         <span class="text-sm font-bold text-slate-800 truncate">{{ user.first_name || user.username || 'Unknown' }}</span>
                       </div>
-                      <div class="text-[10px] text-slate-400 truncate">@{{ user.username || ('UID ' + user.user_id) }}</div>
+                      <div class="text-[10px] text-slate-400 truncate">
+                      <a :href="tgUserProfileHref(user.user_id, user.username)" class="hover:underline text-primary" @click.stop.prevent="openTgUserProfile(user.user_id, user.username)">{{ tgUserLinkLabel(user.user_id, user.username, user.first_name) }}</a>
+                    </div>
                     </div>
                   </button>
                 </div>
@@ -659,6 +698,217 @@
     </div>
   </transition>
 
+  <!-- 校对信息群绑定弹窗 -->
+  <transition name="fade">
+    <div v-if="showRevokeSyncBindingModal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div
+        class="revoke-sync-modal w-full max-w-3xl rounded-3xl shadow-2xl flex flex-col max-h-[92vh] animate-in zoom-in-95 overflow-hidden"
+        :class="themeStore.isDark
+          ? 'bg-[#09111d] border border-[#2d4668]'
+          : 'bg-surface-container-lowest border border-outline-variant/10'"
+      >
+        <div
+          class="revoke-sync-modal-head px-6 py-5 border-b flex items-center justify-between"
+          :class="themeStore.isDark
+            ? 'border-[#2d4668] bg-[linear-gradient(135deg,rgba(36,161,222,0.18)_0%,rgba(36,161,222,0.06)_38%,rgba(9,17,29,0.92)_100%)]'
+            : 'border-outline-variant/10 bg-gradient-to-r from-primary/10 via-primary/5 to-transparent'"
+        >
+          <div class="flex items-center gap-3">
+            <span class="material-symbols-outlined" :class="themeStore.isDark ? 'text-amber-300' : 'text-amber-600'">hub</span>
+            <div>
+              <h3 class="text-base font-black" :class="themeStore.isDark ? 'text-slate-100' : 'text-slate-900'">校对群绑定与授权</h3>
+              <p class="text-[11px] mt-0.5" :class="themeStore.isDark ? 'text-slate-400' : 'text-slate-500'">绑定校对信息群后，可直接选择哪些群可以使用它，并为群聊分配校对群。</p>
+            </div>
+          </div>
+          <button
+            @click="showRevokeSyncBindingModal=false"
+            class="w-8 h-8 flex items-center justify-center rounded-xl transition-colors"
+            :class="themeStore.isDark ? 'hover:bg-[#13253d]' : 'hover:bg-surface-container'"
+          >
+            <span class="material-symbols-outlined" :class="themeStore.isDark ? 'text-slate-300' : 'text-slate-400'">close</span>
+          </button>
+        </div>
+        <div class="flex-1 overflow-y-auto p-5 grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-5">
+          <div class="space-y-4">
+            <div class="revoke-sync-panel rounded-2xl border p-4"
+                 :class="revokeSyncChatInfo?.chat_id
+                   ? (themeStore.isDark ? 'bg-emerald-500/10 border-emerald-400/20' : 'bg-emerald-50 border-emerald-200/70')
+                   : (themeStore.isDark ? 'bg-[#102034] border-[#2d4668]' : 'bg-surface-container border-outline-variant/10')">
+              <div class="text-xs font-black uppercase tracking-wider"
+                   :class="revokeSyncChatInfo?.chat_id ? (themeStore.isDark ? 'text-emerald-300' : 'text-emerald-700') : (themeStore.isDark ? 'text-slate-400' : 'text-slate-500')">
+                {{ revokeSyncChatInfo?.chat_id ? '当前已绑定' : '当前未绑定' }}
+              </div>
+              <div class="mt-2 text-sm font-bold break-all" :class="themeStore.isDark ? 'text-slate-100' : 'text-slate-800'">
+                {{ revokeSyncChatInfo?.chat_id ? (revokeSyncChatInfo.title || revokeSyncChatInfo.chat_id) : '暂无校对信息群' }}
+              </div>
+              <div class="mt-1 text-[11px] break-all" :class="themeStore.isDark ? 'text-slate-400' : 'text-slate-500'" v-if="revokeSyncChatInfo?.chat_id">
+                ID: {{ revokeSyncChatInfo.chat_id }}<span v-if="revokeSyncChatInfo.username" class="ml-1">· @{{ revokeSyncChatInfo.username }}</span><span v-if="revokeSyncChatInfo.type" class="ml-1">· {{ revokeSyncChatInfo.type }}</span>
+              </div>
+              <div v-if="revokeSyncChatInfo?.chat_id" class="mt-3 flex flex-wrap gap-2">
+                <span class="px-2 py-1 rounded-lg text-[10px] font-bold"
+                      :class="themeStore.isDark ? 'bg-emerald-500/15 text-emerald-300' : 'bg-emerald-100 text-emerald-700'">已授权 {{ revokeSyncAssignedGroupIds.length }} 个群</span>
+                <span v-if="selectedGroupRoomId && revokeSyncAssignedGroupIds.includes(selectedGroupRoomId)" class="px-2 py-1 rounded-lg text-[10px] font-bold"
+                      :class="themeStore.isDark ? 'bg-primary/20 text-sky-300' : 'bg-primary/10 text-primary'">当前群已分配</span>
+              </div>
+            </div>
+            <div class="space-y-2">
+              <label class="text-[10px] font-black uppercase tracking-wider" :class="themeStore.isDark ? 'text-slate-400' : 'text-slate-400'">群组 / 频道标识</label>
+              <input
+                v-model="revokeSyncBindingInput"
+                type="text"
+                placeholder="-1001234567890 或 @channel_username"
+                class="revoke-sync-input w-full px-3 py-2 rounded-xl border text-sm focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500/30"
+                :class="themeStore.isDark ? 'bg-[#0b1525] border-[#2d4668] text-slate-100 placeholder:text-slate-500' : 'bg-surface-container border-outline-variant/10 text-slate-800'"
+                @keyup.enter="saveRevokeSyncChatBinding"
+              />
+              <p class="text-[11px] leading-relaxed" :class="themeStore.isDark ? 'text-slate-400' : 'text-slate-500'">
+                绑定前请先把机器人加入该群/频道，并确保机器人能发送消息和删除自己转发的暂存消息。
+              </p>
+            </div>
+            <div v-if="selectedGroupRoomId && revokeSyncChatInfo?.chat_id"
+                 class="revoke-sync-panel rounded-2xl border p-4"
+                 :class="themeStore.isDark ? 'border-primary/20 bg-primary/10' : 'border-primary/15 bg-primary/5'">
+              <div class="text-[10px] font-black text-primary uppercase tracking-wider">当前选中群快捷操作</div>
+              <div class="mt-1 text-sm font-bold" :class="themeStore.isDark ? 'text-slate-100' : 'text-slate-800'">{{ selectedGroupRoomTitle || selectedGroupRoomId }}</div>
+              <div class="mt-3 flex gap-2">
+                <button
+                  @click="assignCurrentGroupToRevokeSync"
+                  class="flex-1 py-2 rounded-xl text-sm font-black transition-all"
+                  :class="revokeSyncAssignedGroupIds.includes(selectedGroupRoomId)
+                    ? (themeStore.isDark ? 'bg-[#17304a] text-slate-500 cursor-not-allowed' : 'bg-surface-container text-slate-400 cursor-not-allowed')
+                    : 'bg-primary text-white hover:brightness-105'"
+                  :disabled="revokeSyncSavingAssignments || revokeSyncAssignedGroupIds.includes(selectedGroupRoomId)"
+                >
+                  分配给当前群
+                </button>
+                <button
+                  @click="removeCurrentGroupFromRevokeSync"
+                  class="flex-1 py-2 rounded-xl text-sm font-black transition-all"
+                  :class="revokeSyncAssignedGroupIds.includes(selectedGroupRoomId)
+                    ? (themeStore.isDark ? 'bg-rose-500/14 text-rose-300 hover:bg-rose-500/18' : 'bg-rose-50 text-rose-600 hover:bg-rose-100')
+                    : (themeStore.isDark ? 'bg-[#17304a] text-slate-500 cursor-not-allowed' : 'bg-surface-container text-slate-400 cursor-not-allowed')"
+                  :disabled="revokeSyncSavingAssignments || !revokeSyncAssignedGroupIds.includes(selectedGroupRoomId)"
+                >
+                  移出当前群
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div
+            class="revoke-sync-assign-panel min-w-0 rounded-2xl border p-4 flex flex-col"
+            :class="themeStore.isDark ? 'border-[#2d4668] bg-[#122034]' : 'border-outline-variant/10 bg-surface-container/80'"
+          >
+            <div class="flex items-center justify-between gap-3 flex-wrap">
+              <div>
+                <div class="text-sm font-black" :class="themeStore.isDark ? 'text-slate-100' : 'text-slate-800'">授权哪些群使用当前校对群</div>
+                <div class="text-[11px] mt-0.5" :class="themeStore.isDark ? 'text-slate-400' : 'text-slate-500'">勾选后会把当前绑定的校对群分配给这些群。只对已授权群生效。</div>
+              </div>
+              <span
+                class="text-[11px] font-bold px-2.5 py-1 rounded-full border"
+                :class="themeStore.isDark ? 'bg-[#0b1525] border-[#2d4668] text-slate-300' : 'bg-surface-container-lowest border-outline-variant/10 text-slate-500'"
+              >{{ revokeSyncAssignedGroupIds.length }} / {{ groupStore.groups.length }}</span>
+            </div>
+            <div class="mt-4 flex items-center gap-2">
+              <input
+                v-model="revokeSyncAssignmentSearchQuery"
+                type="text"
+                placeholder="搜索群组名称或 ID"
+                class="revoke-sync-input flex-1 px-3 py-2 rounded-xl border text-sm focus:ring-2 focus:ring-primary/20"
+                :class="themeStore.isDark ? 'bg-[#0b1525] border-[#2d4668] text-slate-100 placeholder:text-slate-500' : 'bg-surface-container-lowest border-outline-variant/10 text-slate-800'"
+              />
+              <button
+                @click="toggleAssignAllFiltered"
+                class="px-3 py-2 rounded-xl text-xs font-black"
+                :class="themeStore.isDark ? 'bg-[#17304a] text-slate-300 hover:bg-[#214161]' : 'bg-surface-container text-slate-600 hover:bg-surface-container-high'"
+              >切换当前筛选</button>
+            </div>
+            <div class="mt-4 flex-1 overflow-y-auto no-scrollbar space-y-2 pr-1 min-h-[260px] revoke-sync-scroll">
+              <div v-if="filteredRevokeSyncAssignableGroups.length === 0" class="py-12 text-center text-sm" :class="themeStore.isDark ? 'text-slate-400' : 'text-slate-400'">
+                没有匹配的群组
+              </div>
+              <button
+                v-for="g in filteredRevokeSyncAssignableGroups"
+                :key="'sync-bind-' + g.group_id"
+                @click="toggleRevokeSyncGroupAssignment(g.group_id)"
+                class="revoke-sync-group-item w-full text-left px-4 py-3 rounded-2xl border transition-all flex items-center gap-3"
+                :class="revokeSyncAssignedGroupIds.includes(g.group_id)
+                  ? (themeStore.isDark ? 'bg-emerald-500/10 border-emerald-400/20' : 'bg-emerald-50 border-emerald-200/70')
+                  : (themeStore.isDark ? 'bg-[#0b1525] border-[#2d4668] hover:border-primary/30 hover:bg-[#11263f]' : 'bg-surface-container-lowest border-outline-variant/10 hover:border-primary/25 hover:bg-primary/5')"
+              >
+                <div class="w-5 h-5 rounded-md border flex items-center justify-center flex-shrink-0"
+                     :class="revokeSyncAssignedGroupIds.includes(g.group_id)
+                       ? 'bg-emerald-500 border-emerald-500 text-white'
+                       : (themeStore.isDark ? 'border-[#4f6b92] text-transparent' : 'border-slate-300 text-transparent')">
+                  <span class="material-symbols-outlined text-[12px]">check</span>
+                </div>
+                <div class="min-w-0 flex-1">
+                  <div class="text-sm font-bold truncate" :class="themeStore.isDark ? 'text-slate-100' : 'text-slate-800'">{{ g.group_title || g.group_id }}</div>
+                  <div class="text-[10px] mt-0.5" :class="themeStore.isDark ? 'text-slate-400' : 'text-slate-500'">
+                    ID: {{ g.group_id }}
+                    <span class="ml-1" :class="g.is_monitored ? 'text-emerald-600' : 'text-slate-400'">· {{ g.is_monitored ? '监听中' : '未监听' }}</span>
+                    <span v-if="g.delete_on_revoke" class="ml-1 text-amber-600">· 已开启校对</span>
+                  </div>
+                </div>
+                <span class="text-[10px] font-black px-2 py-1 rounded-lg flex-shrink-0"
+                      :class="revokeSyncAssignedGroupIds.includes(g.group_id)
+                        ? (themeStore.isDark ? 'bg-emerald-500/15 text-emerald-300' : 'bg-emerald-100 text-emerald-700')
+                        : (themeStore.isDark ? 'bg-[#17304a] text-slate-400' : 'bg-surface-container text-slate-500')">
+                  {{ revokeSyncAssignedGroupIds.includes(g.group_id) ? '已授权' : '未授权' }}
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+        <div
+          class="revoke-sync-footer px-5 py-4 border-t flex gap-2"
+          :class="themeStore.isDark ? 'border-[#2d4668] bg-[#08111d]' : 'border-outline-variant/10 bg-surface-container-lowest/90'"
+        >
+          <button
+            v-if="revokeSyncChatInfo?.chat_id"
+            @click="unbindRevokeSyncChat"
+            :disabled="revokeSyncChatLoading"
+            class="px-4 py-2 bg-rose-50 text-rose-600 text-sm font-black rounded-xl dark:bg-rose-500/12 dark:text-rose-300 disabled:opacity-50"
+          >
+            解绑
+          </button>
+          <button
+            v-if="revokeSyncChatInfo?.chat_id"
+            @click="saveRevokeSyncAssignments"
+            :disabled="revokeSyncSavingAssignments"
+            class="px-4 py-2 bg-primary text-white text-sm font-black rounded-xl shadow-lg shadow-primary/20 disabled:opacity-50"
+          >
+            {{ revokeSyncSavingAssignments ? '保存中...' : '保存授权' }}
+          </button>
+          <button
+            @click="showRevokeSyncBindingModal=false"
+            class="flex-1 py-2 text-sm font-black rounded-xl"
+            :class="themeStore.isDark ? 'bg-[#17304a] text-slate-300' : 'bg-surface-container text-slate-600'"
+          >关闭</button>
+          <button
+            @click="saveRevokeSyncChatBinding"
+            :disabled="revokeSyncChatLoading || !revokeSyncBindingInput.trim()"
+            class="flex-1 py-2 bg-amber-500 text-white text-sm font-black rounded-xl shadow-lg shadow-amber-500/20 disabled:opacity-50"
+          >
+            {{ revokeSyncChatLoading ? '绑定中...' : (revokeSyncChatInfo?.chat_id ? '重新绑定' : '立即绑定') }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </transition>
+
+  <transition name="fade">
+    <div v-if="revokeSyncToast" class="revoke-sync-toast fixed right-5 bottom-5 z-[140] max-w-sm rounded-2xl border px-4 py-3 shadow-2xl backdrop-blur-sm"
+         :class="revokeSyncToast.type === 'success'
+           ? (themeStore.isDark ? 'bg-emerald-500/14 border-emerald-400/20 text-emerald-200' : 'bg-emerald-50/95 border-emerald-200 text-emerald-700')
+           : (themeStore.isDark ? 'bg-rose-500/14 border-rose-400/20 text-rose-200' : 'bg-rose-50/95 border-rose-200 text-rose-600')">
+      <div class="flex items-start gap-2">
+        <span class="material-symbols-outlined text-[18px] mt-0.5">{{ revokeSyncToast.type === 'success' ? 'check_circle' : 'error' }}</span>
+        <div class="text-sm font-bold leading-relaxed">{{ revokeSyncToast.message }}</div>
+      </div>
+    </div>
+  </transition>
+
   <!-- 禁言时长选择弹窗 -->
   <transition name="fade">
     <div v-if="showMuteModal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
@@ -670,7 +920,10 @@
         <div class="p-5 space-y-4">
           <div v-if="muteTargetUser" class="p-3 bg-amber-50 rounded-xl border border-amber-200/60">
             <div class="text-sm font-black text-amber-900">{{ muteTargetUser.first_name || muteTargetUser.username || 'Unknown' }}</div>
-            <div class="text-[10px] text-amber-700 mt-0.5">@{{ muteTargetUser.username || ('UID ' + muteTargetUser.user_id) }}</div>
+            <a v-if="muteTargetUser.user_id"
+               :href="tgUserProfileHref(muteTargetUser.user_id, muteTargetUser.username)"
+               class="text-[10px] text-amber-700 mt-0.5 hover:underline block"
+               @click.stop.prevent="openTgUserProfile(muteTargetUser.user_id, muteTargetUser.username)">{{ tgUserLinkLabel(muteTargetUser.user_id, muteTargetUser.username, muteTargetUser.first_name) }}</a>
             <div class="text-[10px] text-amber-600 mt-1">📍 {{ muteTargetUser.group_title || ('群组 ' + muteTargetUser.group_id) }}</div>
           </div>
           <div>
@@ -700,6 +953,9 @@ import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useGroupStore } from '@/stores/group'
 import { useWsStore } from '@/stores/ws'
 import { useFileStore } from '@/stores/fileStore'
+import { useThemeStore } from '@/stores/theme'
+import { openExternalLink } from '@/lib/telegram'
+import { openTgUserProfile, tgUserProfileHref, tgUserLinkLabel } from '@/utils/tgUserLink'
 
 const emit = defineEmits<{ chat: [userId: number, name: string] }>()
 const msgListRef = ref<HTMLElement|null>(null)
@@ -751,6 +1007,7 @@ async function handleBallClick() {
 const groupStore = useGroupStore()
 const wsStore = useWsStore()
 const fileStore = useFileStore()
+const themeStore = useThemeStore()
 const fileUrls = computed(() => fileStore.fileUrls)
 
 const token = () => localStorage.getItem('admin_token') || ''
@@ -769,6 +1026,7 @@ const showGroupMembersModal = ref(false)
 const showVerifyConfigModal = ref(false)
 const showGroupMessagesModal = ref(false)
 const showGroupReplyModal = ref(false)
+const showRevokeSyncBindingModal = ref(false)
 const isVerifiedUsersModalOpen = ref(false)
 const verifiedUsersPeriod = ref<'today'|'all'>('all')
 const verifiedUsersTab = ref<'verified'|'unverified'>('verified')
@@ -810,20 +1068,51 @@ const memberVisibleCount = ref(MEMBER_PAGE_SIZE)
 // ---- Revoke Sync 状态 ----
 const selectedGroupRevokeSync = ref(false)
 const revokeSyncLoading = ref(false)
+const revokeSyncChatLoading = ref(false)
+const revokeSyncSavingAssignments = ref(false)
+const revokeSyncChatInfo = ref<any | null>(null)
+const revokeSyncBindingInput = ref('')
+const revokeSyncAssignedGroupIds = ref<number[]>([])
+const revokeSyncAssignmentSearchQuery = ref('')
+const revokeSyncToast = ref<{ type: 'success' | 'error', message: string } | null>(null)
+let revokeSyncToastTimer: ReturnType<typeof setTimeout> | null = null
 const groupLongPressTimer = ref<ReturnType<typeof setTimeout> | null>(null)
 const groupMobileActionMsg = ref<any | null>(null)
 
+function showRevokeSyncToast(message: string, type: 'success' | 'error' = 'success') {
+  revokeSyncToast.value = { message, type }
+  if (revokeSyncToastTimer) clearTimeout(revokeSyncToastTimer)
+  revokeSyncToastTimer = setTimeout(() => {
+    revokeSyncToast.value = null
+    revokeSyncToastTimer = null
+  }, 2600)
+}
+
 async function toggleRevokeSync() {
   if (!selectedGroupRoomId.value || revokeSyncLoading.value) return
+  const newVal = !selectedGroupRevokeSync.value
+  if (newVal && !revokeSyncChatInfo.value?.chat_id) {
+    showRevokeSyncBindingModal.value = true
+    showRevokeSyncToast('请先绑定校对信息群，再开启校对功能。', 'error')
+    return
+  }
   revokeSyncLoading.value = true
   try {
-    const newVal = !selectedGroupRevokeSync.value
     const res = await fetch('/api/group_listen/revoke_sync', {
       method: 'POST', headers: authH(),
       body: JSON.stringify({ group_id: selectedGroupRoomId.value, enabled: newVal })
     })
     const d = await res.json()
-    if (d.status === 'ok') selectedGroupRevokeSync.value = newVal
+    if (d.status === 'ok') {
+      selectedGroupRevokeSync.value = newVal
+      if (newVal && d.revoke_sync_chat_id && !revokeSyncAssignedGroupIds.value.includes(Number(selectedGroupRoomId.value))) {
+        revokeSyncAssignedGroupIds.value = [...revokeSyncAssignedGroupIds.value, Number(selectedGroupRoomId.value)]
+      }
+      showRevokeSyncToast(newVal ? '已开启该群的校对功能' : '已关闭该群的校对功能', 'success')
+    } else {
+      if (d.message) showRevokeSyncToast(d.message, 'error')
+      if (newVal && /绑定/.test(String(d.message || ''))) showRevokeSyncBindingModal.value = true
+    }
   } finally { revokeSyncLoading.value = false }
 }
 
@@ -833,8 +1122,159 @@ async function loadRevokeSync() {
     const res = await fetch(`/api/group_listen/list`, { headers: authH() })
     const d = await res.json()
     const g = (d.groups || d.data || []).find((x: any) => x.group_id === selectedGroupRoomId.value)
-    if (g) selectedGroupRevokeSync.value = !!g.delete_on_revoke
+    selectedGroupRevokeSync.value = !!g?.delete_on_revoke
   } catch {}
+}
+
+function openRevokeSyncBindingModal() {
+  revokeSyncBindingInput.value = revokeSyncChatInfo.value?.username
+    ? `@${revokeSyncChatInfo.value.username}`
+    : String(revokeSyncChatInfo.value?.chat_id || '')
+  showRevokeSyncBindingModal.value = true
+  loadRevokeSyncChatInfo()
+}
+
+async function loadRevokeSyncChatInfo() {
+  try {
+    const res = await fetch('/api/group_listen/sync_chat_info', { headers: authH() })
+    const d = await res.json()
+    revokeSyncChatInfo.value = d.status === 'ok' ? (d.data || null) : null
+    revokeSyncAssignedGroupIds.value = Array.isArray(revokeSyncChatInfo.value?.assigned_groups)
+      ? revokeSyncChatInfo.value.assigned_groups.map((g: any) => Number(g.group_id)).filter((id: number) => Number.isFinite(id))
+      : []
+  } catch {
+    revokeSyncChatInfo.value = null
+    revokeSyncAssignedGroupIds.value = []
+  }
+}
+
+async function saveRevokeSyncChatBinding() {
+  const chatId = revokeSyncBindingInput.value.trim()
+  if (!chatId || revokeSyncChatLoading.value) return
+  revokeSyncChatLoading.value = true
+  try {
+    const res = await fetch('/api/group_listen/create_sync_chat', {
+      method: 'POST',
+      headers: authH(),
+      body: JSON.stringify({ chat_id: chatId }),
+    })
+    const d = await res.json()
+    if (d.status === 'ok') {
+      await loadRevokeSyncChatInfo()
+      revokeSyncBindingInput.value = revokeSyncChatInfo.value?.username
+        ? `@${revokeSyncChatInfo.value.username}`
+        : String(revokeSyncChatInfo.value?.chat_id || '')
+      showRevokeSyncToast(d.message || '校对信息群绑定成功', 'success')
+    } else if (d.message) {
+      showRevokeSyncToast(d.message, 'error')
+    }
+  } catch {
+    showRevokeSyncToast('绑定校对信息群失败，请稍后重试。', 'error')
+  } finally {
+    revokeSyncChatLoading.value = false
+  }
+}
+
+async function unbindRevokeSyncChat() {
+  if (revokeSyncChatLoading.value) return
+  if (!window.confirm('解绑后，已开启的校对任务将无法继续执行。确认解绑？')) return
+  revokeSyncChatLoading.value = true
+  try {
+    const res = await fetch('/api/group_listen/create_sync_chat', {
+      method: 'POST',
+      headers: authH(),
+      body: JSON.stringify({ unbind: true }),
+    })
+    const d = await res.json()
+    if (d.status === 'ok') {
+      revokeSyncChatInfo.value = null
+      revokeSyncAssignedGroupIds.value = []
+      revokeSyncBindingInput.value = ''
+      selectedGroupRevokeSync.value = false
+      showRevokeSyncToast(d.message || '已解绑校对信息群', 'success')
+    } else if (d.message) {
+      showRevokeSyncToast(d.message, 'error')
+    }
+  } catch {
+    showRevokeSyncToast('解绑校对信息群失败，请稍后重试。', 'error')
+  } finally {
+    revokeSyncChatLoading.value = false
+  }
+}
+
+const filteredRevokeSyncAssignableGroups = computed(() => {
+  const q = revokeSyncAssignmentSearchQuery.value.trim().toLowerCase()
+  if (!q) return groupStore.groups
+  return groupStore.groups.filter((g: any) =>
+    String(g.group_id).includes(q) || String(g.group_title || '').toLowerCase().includes(q)
+  )
+})
+
+function toggleRevokeSyncGroupAssignment(groupId: number) {
+  if (!revokeSyncChatInfo.value?.chat_id) {
+    showRevokeSyncToast('请先绑定校对信息群。', 'error')
+    return
+  }
+  const current = new Set(revokeSyncAssignedGroupIds.value)
+  if (current.has(groupId)) current.delete(groupId)
+  else current.add(groupId)
+  revokeSyncAssignedGroupIds.value = [...current]
+}
+
+function toggleAssignAllFiltered() {
+  if (!revokeSyncChatInfo.value?.chat_id) {
+    showRevokeSyncToast('请先绑定校对信息群。', 'error')
+    return
+  }
+  const visibleIds = filteredRevokeSyncAssignableGroups.value.map((g: any) => Number(g.group_id))
+  const selected = new Set(revokeSyncAssignedGroupIds.value)
+  const allSelected = visibleIds.length > 0 && visibleIds.every((id: number) => selected.has(id))
+  for (const id of visibleIds) {
+    if (allSelected) selected.delete(id)
+    else selected.add(id)
+  }
+  revokeSyncAssignedGroupIds.value = [...selected]
+}
+
+async function saveRevokeSyncAssignments() {
+  if (!revokeSyncChatInfo.value?.chat_id || revokeSyncSavingAssignments.value) return
+  revokeSyncSavingAssignments.value = true
+  try {
+    const res = await fetch('/api/group_listen/sync_chat_assignments', {
+      method: 'POST',
+      headers: authH(),
+      body: JSON.stringify({
+        chat_id: revokeSyncChatInfo.value.chat_id,
+        group_ids: revokeSyncAssignedGroupIds.value,
+      }),
+    })
+    const d = await res.json()
+    if (d.status === 'ok') {
+      revokeSyncAssignedGroupIds.value = Array.isArray(d.data?.assigned_group_ids) ? d.data.assigned_group_ids.map((id: any) => Number(id)) : revokeSyncAssignedGroupIds.value
+      await loadRevokeSyncChatInfo()
+      await loadGroups()
+      if (selectedGroupRoomId.value) await loadRevokeSync()
+      showRevokeSyncToast(d.message || '校对群授权已保存', 'success')
+    } else {
+      showRevokeSyncToast(d.message || '保存授权失败', 'error')
+    }
+  } catch {
+    showRevokeSyncToast('保存校对群授权失败，请稍后重试。', 'error')
+  } finally {
+    revokeSyncSavingAssignments.value = false
+  }
+}
+
+function assignCurrentGroupToRevokeSync() {
+  if (!selectedGroupRoomId.value) return
+  if (!revokeSyncAssignedGroupIds.value.includes(Number(selectedGroupRoomId.value))) {
+    revokeSyncAssignedGroupIds.value = [...revokeSyncAssignedGroupIds.value, Number(selectedGroupRoomId.value)]
+  }
+}
+
+function removeCurrentGroupFromRevokeSync() {
+  if (!selectedGroupRoomId.value) return
+  revokeSyncAssignedGroupIds.value = revokeSyncAssignedGroupIds.value.filter((id) => id !== Number(selectedGroupRoomId.value))
 }
 
 // ---- 全局搜索状态 ----
@@ -898,10 +1338,15 @@ const filteredGroupMembers = computed(() => {
 onMounted(() => {
   loadGroups()
   loadVerifyGrowthSummary()
+  loadRevokeSyncChatInfo()
 })
 onUnmounted(() => {
   memberObserver?.disconnect()
   clearGroupLongPressTimer()
+  if (revokeSyncToastTimer) {
+    clearTimeout(revokeSyncToastTimer)
+    revokeSyncToastTimer = null
+  }
 })
 
 watch(showGroupMembersModal, (v) => {
@@ -934,7 +1379,7 @@ watch(() => wsStore.lastEvent, (evt) => {
   } else if (evt.type === 'group_revoke_sync_update') {
     // 同步 revoke 开关状态
     const { group_id, enabled } = evt.data
-    if (group_id) {
+    if (group_id && selectedGroupRoomId.value === group_id) {
       selectedGroupRevokeSync.value = enabled
     }
   }
@@ -1539,10 +1984,40 @@ async function confirmMute() {
 
 // ---- utils ----
 function hideSearchResultsDelayed() { setTimeout(() => { showSearchResults.value = false }, 200) }
-function openUrl(url: string) { window.open(url, '_blank') }
+function openUrl(url: string) { openExternalLink(url) }
 
 function isVideoSticker(url: string): boolean {
   return url.endsWith('.webm') || url.includes('.webm?')
+}
+
+function getAdScore(msg: any): number {
+  const v = Number(msg?.ad_score ?? 0)
+  return Number.isFinite(v) ? v : 0
+}
+
+function getAdBadgeText(msg: any): string {
+  const score = getAdScore(msg)
+  const flagged = !!msg?.is_advertising
+  if (score >= 60) return `广告 ${score}`
+  if (flagged || score >= 40) return `疑似广告 ${score}`
+  if (score >= 25) return `推广倾向 ${score}`
+  return ''
+}
+
+function getAdBadgeClass(msg: any): string {
+  const score = getAdScore(msg)
+  if (score >= 60) return 'bg-rose-100 text-rose-600'
+  if (score >= 40 || !!msg?.is_advertising) return 'bg-amber-100 text-amber-700'
+  return 'bg-slate-100 text-slate-600'
+}
+
+function getAdBadgeTitle(msg: any): string {
+  const findings = Array.isArray(msg?.ad_findings)
+    ? msg.ad_findings.filter((x: any) => typeof x === 'string')
+    : []
+  const score = getAdScore(msg)
+  if (!findings.length) return `广告评分: ${score}`
+  return `广告评分: ${score}\n` + findings.join('\n')
 }
 
 function formatTime(ts: any): string {
@@ -1561,6 +2036,75 @@ function formatDateTime(ts: any): string {
 </script>
 
 <style scoped>
+.revoke-sync-entry-btn {
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+}
+
+:global(html.dark) .revoke-sync-entry-btn {
+  background: rgba(15, 30, 52, 0.94) !important;
+  color: #8fdcff !important;
+  border-color: rgba(73, 106, 148, 0.32) !important;
+  box-shadow: 0 12px 26px rgba(2, 6, 23, 0.34);
+}
+
+:global(html.dark) .revoke-sync-modal {
+  background:
+    linear-gradient(180deg, rgba(9, 18, 31, 0.98) 0%, rgba(7, 13, 24, 0.98) 100%) !important;
+  border-color: rgba(73, 106, 148, 0.24) !important;
+  box-shadow: 0 30px 60px rgba(2, 6, 23, 0.62);
+}
+
+:global(html.dark) .revoke-sync-modal-head {
+  background:
+    linear-gradient(135deg, rgba(36, 161, 222, 0.16) 0%, rgba(36, 161, 222, 0.06) 38%, rgba(6, 13, 24, 0.08) 100%) !important;
+}
+
+:global(html.dark) .revoke-sync-panel {
+  background: rgba(11, 22, 38, 0.88) !important;
+  border-color: rgba(73, 106, 148, 0.22) !important;
+}
+
+:global(html.dark) .revoke-sync-assign-panel {
+  background: rgba(10, 18, 32, 0.88) !important;
+  border-color: rgba(73, 106, 148, 0.22) !important;
+}
+
+:global(html.dark) .revoke-sync-input {
+  background: rgba(7, 13, 24, 0.92) !important;
+  border-color: rgba(73, 106, 148, 0.24) !important;
+  color: #edf4ff !important;
+}
+
+:global(html.dark) .revoke-sync-input::placeholder {
+  color: rgba(161, 183, 213, 0.72) !important;
+}
+
+:global(html.dark) .revoke-sync-group-item {
+  background: rgba(10, 18, 32, 0.9) !important;
+  border-color: rgba(73, 106, 148, 0.18) !important;
+}
+
+:global(html.dark) .revoke-sync-group-item:hover {
+  background: rgba(17, 39, 63, 0.92) !important;
+  border-color: rgba(36, 161, 222, 0.26) !important;
+}
+
+:global(html.dark) .revoke-sync-footer {
+  background: rgba(7, 13, 24, 0.94) !important;
+}
+
+:global(html.dark) .revoke-sync-toast {
+  box-shadow: 0 24px 48px rgba(2, 6, 23, 0.52);
+}
+
+:global(html.dark) .revoke-sync-scroll::-webkit-scrollbar-thumb {
+  background: rgba(79, 107, 146, 0.68);
+}
+
+:global(html.dark) .revoke-sync-scroll::-webkit-scrollbar-track {
+  background: rgba(11, 21, 37, 0.42);
+}
+
 .mobile-longpress-target {
   -webkit-touch-callout: none;
   -webkit-user-select: none;
@@ -1602,10 +2146,15 @@ function formatDateTime(ts: any): string {
   will-change: opacity, transform;
   transform: translateZ(0);
   z-index: 30;
-  /* 深色模式 */
-  @media (prefers-color-scheme: dark) {
-    background: rgba(30, 41, 59, 0.80);
-  }
+}
+
+:global(html.dark) .scroll-ball,
+:global(body.dark) .scroll-ball {
+  background: rgba(6, 13, 24, 0.84);
+  box-shadow:
+    0 0 0 1px rgba(73, 106, 148, 0.24),
+    0 8px 30px rgba(2, 6, 23, 0.34),
+    0 1px 6px rgba(4, 14, 29, 0.22);
 }
 
 .scroll-ball:active {
@@ -1613,4 +2162,3 @@ function formatDateTime(ts: any): string {
   transform: translateZ(0) scale(0.92);
 }
 </style>
-

@@ -13,7 +13,9 @@
       >
         <div class="avatar">{{ initials(u.from_username) }}</div>
         <div class="user-info">
-          <div class="user-name truncate">{{ u.from_username || `User ${u.from_userid}` }}</div>
+          <a class="user-name truncate block hover:underline"
+             :href="tgUserProfileHref(u.from_userid, u.username || u.from_username)"
+             @click.stop.prevent="openTgUserProfile(u.from_userid, u.username || u.from_username)">{{ tgUserLinkLabel(u.from_userid, u.username || u.from_username, u.first_name) }}</a>
           <div class="user-summary truncate">{{ u.summary || '...' }}</div>
         </div>
         <span v-if="u.unread_count > 0" class="unread-dot">{{ u.unread_count }}</span>
@@ -24,7 +26,11 @@
       <div v-if="!store.selectedUserId" class="no-selection">← 选择一个会话</div>
       <template v-else>
         <div class="msg-topbar">
-          <strong>{{ currentUser?.from_username || `User ${store.selectedUserId}` }}</strong>
+          <a v-if="store.selectedUserId"
+             class="font-bold hover:underline"
+             :href="tgUserProfileHref(store.selectedUserId, currentUser?.username || currentUser?.from_username)"
+             @click.stop.prevent="openTgUserProfile(store.selectedUserId, currentUser?.username || currentUser?.from_username)">{{ tgUserLinkLabel(store.selectedUserId, currentUser?.username || currentUser?.from_username, currentUser?.first_name) }}</a>
+          <strong v-else>—</strong>
           <button class="btn btn-ghost btn-sm" @click="markRead">标记已读</button>
         </div>
         <div class="msg-list" ref="msgListEl">
@@ -53,12 +59,23 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { useChatStore } from '@/stores/chat'
+import { openTgUserProfile, tgUserProfileHref, tgUserLinkLabel } from '@/utils/tgUserLink'
 
 const store = useChatStore()
 const draft = ref('')
 const msgListEl = ref<HTMLElement | null>(null)
 
-onMounted(() => store.fetchUsers())
+onMounted(async () => {
+  await store.fetchUsers()
+  // 确保响应式更新已生效
+  await nextTick()
+  console.log('ChatView mounted - users count:', store.users.length)
+})
+
+// 监听用户列表变化
+watch(() => store.users.length, (newLen) => {
+  console.log('Users array length changed:', newLen)
+}, { immediate: true })
 
 watch(() => store.messages, () => nextTick(scrollBottom))
 

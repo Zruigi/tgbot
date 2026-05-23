@@ -18,6 +18,9 @@ import logging
 import random
 from html import escape
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, ChatMemberUpdated
+
+# 后台任务引用集合：防止 fire-and-forget 任务被 GC 回收
+_bg_tasks: set = set()
 from telegram.ext import ContextTypes, MessageHandler, filters, CallbackQueryHandler, ChatMemberHandler
 from telegram.error import TelegramError
 import database
@@ -183,7 +186,8 @@ async def _timeout_kick_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         tip = await context.bot.send_message(
             chat_id=group_id, text="\u23f0 验证超时，已移出未验证用户。"
         )
-        asyncio.create_task(_auto_delete(context.bot, group_id, tip.message_id, 8))
+        t = asyncio.create_task(_auto_delete(context.bot, group_id, tip.message_id, 8))
+        _bg_tasks.add(t); t.add_done_callback(_bg_tasks.discard)
     except Exception:
         pass
 
@@ -199,9 +203,10 @@ def _schedule_timeout_kick(
     """
     if not context.job_queue:
         logger.warning("[验证] job_queue 不可用，回退到 asyncio.create_task")
-        asyncio.create_task(
+        t = asyncio.create_task(
             _legacy_timeout_kick(context.bot, group_id, user_id, session_id, bot_msg_id, timeout)
         )
+        _bg_tasks.add(t); t.add_done_callback(_bg_tasks.discard)
         return
 
     job_name = f"verify_timeout_{group_id}_{user_id}"
@@ -243,7 +248,8 @@ async def _legacy_timeout_kick(
     await _kick_user(bot, group_id, user_id)
     try:
         tip = await bot.send_message(chat_id=group_id, text="\u23f0 验证超时，已移出未验证用户。")
-        asyncio.create_task(_auto_delete(bot, group_id, tip.message_id, 8))
+        t = asyncio.create_task(_auto_delete(bot, group_id, tip.message_id, 8))
+        _bg_tasks.add(t); t.add_done_callback(_bg_tasks.discard)
     except Exception:
         pass
 
@@ -298,7 +304,8 @@ async def _on_verify_success(
             text=f"\u2705 {mention} \u9a8c\u8bc1\u901a\u8fc7\uff0c\u6b22\u8fce\u52a0\u5165\uff01",
             parse_mode='HTML',
         )
-        asyncio.create_task(_auto_delete(bot, group_id, confirm.message_id, 3))
+        t = asyncio.create_task(_auto_delete(bot, group_id, confirm.message_id, 3))
+        _bg_tasks.add(t); t.add_done_callback(_bg_tasks.discard)
     except Exception as e:
         logger.warning("[验证] 发送确认提示失败: %s", e)
 
@@ -573,7 +580,8 @@ async def handle_verify_callback(update: Update, context: ContextTypes.DEFAULT_T
                     text=f"\u274c {mention} \u7b54\u9898\u9519\u8bef\uff0c\u5df2\u79fb\u51fa\u7fa4\u7ec4\u3002",
                     parse_mode='HTML',
                 )
-                asyncio.create_task(_auto_delete(context.bot, group_id, tip.message_id, 10))
+                t = asyncio.create_task(_auto_delete(context.bot, group_id, tip.message_id, 10))
+                _bg_tasks.add(t); t.add_done_callback(_bg_tasks.discard)
             except Exception:
                 pass
 

@@ -41,14 +41,25 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const res = await fetch('/api/users', { headers: authH(), keepalive: true })
       const d = await res.json()
+      console.log('Users API Response:', d)
       if (d.status === 'ok') {
-        users.value = d.data || []
+        // 强制触发 Vue 响应式更新 - 使用扩展运算符创建新数组
+        const newData = d.data || []
+        console.log(`Setting users: ${newData.length} items`, newData)
+        users.value = [...newData]
+        console.log(`Users updated: ${users.value.length}`)
         for (const u of users.value) {
           if (u.avatar_file_id && !fileUrls[u.avatar_file_id]) {
             autoLoadFile(u.avatar_file_id)
           }
         }
+      } else {
+        console.error('Failed to fetch users:', d)
+        users.value = []
       }
+    } catch (err) {
+      console.error('Error fetching users:', err)
+      users.value = []
     } finally {
       isLoading.value = false
     }
@@ -93,11 +104,23 @@ export const useChatStore = defineStore('chat', () => {
       if (d.url) {
         fileUrls[fileId] = d.url
       } else {
+        // ★ 不立即标记为永久失败 —— 允许后续重试（5秒自动重试一次）
+        setTimeout(() => { delete fileErrors[fileId]; }, 5000)
         fileErrors[fileId] = true
       }
     } catch {
+      // ★ 同上：允许重试而非永久标记
+      setTimeout(() => { delete fileErrors[fileId]; }, 5000)
       fileErrors[fileId] = true
     }
+  }
+
+  /** ★ 手动强制重新加载文件（清除缓存后重新请求） */
+  async function forceReloadFile(fileId: string) {
+    if (!fileId) return
+    delete fileUrls[fileId]
+    delete fileErrors[fileId]
+    await autoLoadFile(fileId)
   }
 
   async function loadFile(fileId: string) {
@@ -123,6 +146,7 @@ export const useChatStore = defineStore('chat', () => {
     loadFile,
     autoLoadFile,
     autoLoadMedia,
-    getSelectedUserAvatar
+    getSelectedUserAvatar,
+    forceReloadFile
   }
 })

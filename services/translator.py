@@ -227,23 +227,59 @@ async def translate_text_advanced(text: str, system_prompt: str, user_prompt: st
         logger.info(f"Using Rented API Mode: {current_model}")
     else:
         # 自有模式：优先从数据库读取用户配置
+        llm_model_type = (await database.get_admin_setting("llm_model_type", "openai") or "openai").strip().lower()
         current_model = await database.get_admin_setting("llm_model", config.LLM_MODEL_NAME)
         api_url = await database.get_admin_setting("llm_base_url", config.LLM_BASE_URL)
-        
-        api_key = None
-        # 先尝试获取用户自定义的通用 Key
-        custom_key = await SecretManager.get_config("LLM_API_KEY", default=None)
-        if custom_key:
-            api_key = custom_key
-        else:
-            # 回退到具体的 API Key 类型
-            if 'deepseek' in current_model.lower():
-                api_key = await SecretManager.get_config("DEEPSEEK_API_KEY", default=config.DEEPSEEK_API_KEY)
-            elif 'gemini' in current_model.lower():
-                api_key = await SecretManager.get_config("GEMINI_API_KEY", default=config.GEMINI_API_KEY)
+
+        # 兼容：模型为空时按模型类型给出默认值，避免落到无关模型
+        if not current_model:
+            if llm_model_type == "deepseek":
+                current_model = "deepseek-chat"
+            elif llm_model_type == "gemini":
+                current_model = "gemini-2.5-flash-lite"
             else:
-                api_key = await SecretManager.get_config("LLM_API_KEY", default=config.LLM_API_KEY)
-    
+                current_model = config.LLM_MODEL_NAME
+
+        async def _legacy_admin_key(*keys: str):
+            """兼容旧版保存在 admin_settings 的密钥字段。"""
+            for k in keys:
+                v = await database.get_admin_setting(k, "")
+                if v and str(v).strip():
+                    return str(v).strip()
+            return ""
+
+        api_key = None
+
+        # 先按模型类型取专用 Key（避免通用 key 抢占 DeepSeek/Gemini）
+        if llm_model_type == "deepseek" or "deepseek" in current_model.lower():
+            api_key = (
+                await SecretManager.get_config("DEEPSEEK_API_KEY", default=None)
+                or await _legacy_admin_key("llm_api_key_deepseek")
+                or config.DEEPSEEK_API_KEY
+                or await SecretManager.get_config("LLM_API_KEY", default=None)
+                or await _legacy_admin_key("llm_api_key")
+                or config.LLM_API_KEY
+            )
+        elif llm_model_type == "gemini" or "gemini" in current_model.lower():
+            api_key = (
+                await SecretManager.get_config("GEMINI_API_KEY", default=None)
+                or await _legacy_admin_key("llm_api_key_gemini")
+                or config.GEMINI_API_KEY
+                or await SecretManager.get_config("LLM_API_KEY", default=None)
+                or await _legacy_admin_key("llm_api_key")
+                or config.LLM_API_KEY
+            )
+        else:
+            api_key = (
+                await SecretManager.get_config("LLM_API_KEY", default=None)
+                or await _legacy_admin_key("llm_api_key")
+                or config.LLM_API_KEY
+            )
+
+        # DeepSeek 常见默认地址兜底
+        if (llm_model_type == "deepseek" or "deepseek" in current_model.lower()) and not (api_url or "").strip():
+            api_url = "https://api.deepseek.com/v1"
+
     if not api_key:
         raise ValueError("Missing valid API Key for 2026 models")
 

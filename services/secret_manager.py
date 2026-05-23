@@ -71,5 +71,30 @@ class SecretManager:
             return False
 
     @classmethod
+    async def delete_config(cls, key: str, tenant_id: str = 'default') -> bool:
+        """
+        删除配置
+        """
+        try:
+            cache_key = f"{tenant_id}:{key}"
+            
+            # 删除缓存
+            if cache_key in cls._cache:
+                del cls._cache[cache_key]
+            
+            # 删除数据库记录
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute(
+                    "DELETE FROM tenant_configs WHERE tenant_id = ? AND config_key = ?",
+                    (tenant_id, key)
+                )
+                await db.commit()
+            
+            return True
+        except Exception as e:
+            logger.error(f"[SecretManager] 删除配置 {key} 失败: {e}")
+            return False
+
+    @classmethod
     def invalidate_cache(cls):
         cls._cache = {}
