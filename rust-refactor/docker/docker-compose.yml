@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  # PostgreSQL 主数据库
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: tgbot-postgres
+    environment:
+      POSTGRES_USER: tgbot
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: tgbot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tgbot"]
+      interval: 10s
+      timeout: 5s
+
+  # Redis 缓存和消息队列
+  redis:
+    image: redis:7-alpine
+    container_name: tgbot-redis
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+
+  # PaddleOCR 服务
+  paddleocr:
+    build: 
+      context: ./paddleocr
+      dockerfile: Dockerfile
+    container_name: tgbot-paddleocr
+    ports:
+      - "8001:8000"
+    environment:
+      - FLASK_ENV=production
+    volumes:
+      - paddle_data:/root/.paddleocr
+
+  # LiteLLM AI网关
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: tgbot-litellm
+    ports:
+      - "4000:4000"
+    environment:
+      - DATABASE_URL=postgres://tgbot:changeme@postgres:5432/tgbot
+      - LITELLM_MASTER_KEY=sk-local
+      - STORE_MODEL_IN_DB=FALSE
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+    command: --config /app/config.yaml --port 4000 --host 0.0.0.0
+
+  # 主API服务
+  api:
+    build:
+      context: ..
+      dockerfile: rust-refactor/docker/Dockerfile
+    container_name: tgbot-api
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://tgbot:changeme@postgres:5432/tgbot
+      - REDIS_URL=redis://redis:6379
+      - PADDLEOCR_URL=http://paddleocr:8000
+      - LITELLM_BASE_URL=http://litellm:4000/v1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../:/app
+
+volumes:
+  postgres_data:
+  redis_data:
+  paddle_data:
+
