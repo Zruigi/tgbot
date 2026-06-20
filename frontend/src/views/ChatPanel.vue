@@ -328,9 +328,21 @@ const normalizedUsers = computed(() =>
   }))
 )
 
+// Agent Assistant contact - fixed entry
+const agentAssistantContact = {
+  from_userid: -99999,
+  from_username: 'Agent助手',
+  username: 'agent_assistant',
+  is_ai_assistant: true,
+  avatar_file_id: null,
+  unread_count: 0,
+  last_msg_time: Date.now(),
+  is_system_contact: true
+};
+
 const filteredUsers = computed(() => {
   const q = searchQuery.value.trim().toLowerCase()
-  if (!q) return normalizedUsers.value
+  if (!q) return [agentAssistantContact, ...normalizedUsers.value]
   return normalizedUsers.value.filter((u: any) => {
     const uid = String(u.from_userid || '')
     const uname = String(u.from_username || '').toLowerCase()
@@ -559,6 +571,12 @@ function upsertMessagesFromLatest(fresh: any[]) {
 
 
 async function selectUser(u: any) {
+  // Handle Agent Assistant
+  if (u.is_ai_assistant || u.from_userid === -99999) {
+    chatStore.selectedUserId = -99999
+    chatStore.selectedUserName = 'Agent 助手'
+    return
+  }
   chatStore.selectedUserId = u.from_userid
   chatStore.selectedUserName = u.from_username || u.username || 'ID:' + u.from_userid
   chatStore.messages = []
