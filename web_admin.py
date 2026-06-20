@@ -2162,11 +2162,78 @@ async def api_ai_chat_bridge(request):
             quota_check = {'allowed': True}
 
         try:
-            from backend.app.services.ai_service import get_ai_service
-            reply = await get_ai_service().chat(user_id=user_id, message=input_text, model=model)
+            # --- 真实 AI Agent（替换原来的 stub） ---
+            import aiohttp
+            from services.ai_agent.core import AIAgent
+            from services.ai_agent.schema import AgentContext, AgentRole
+
+            # 构建 LLM 调用函数（通过 LiteLLM 代理）
+            _llm_api_key = config.LLM_API_KEY or 'sk-vertex-1300'
+            _llm_base_url = config.LLM_BASE_URL or 'http://127.0.0.1:4000/v1'
+
+            # 将用户传入的 model 名映射到 LiteLLM 注册名
+            _model_map = {
+                'gemini-2.5-flash-lite': 'gemini-flash',
+                'gemini-2.5-pro': 'gemini-opus',
+                'gemini-2.5-pro-preview': 'gemini-3.1-pro-preview',
+                'gpt-4': 'gpt-4',
+                'gpt-3.5-turbo': 'gpt-3.5-turbo',
+            }
+
+            async def _llm_call_fn(messages, model='', tools=None):
+                resolved_model = _model_map.get(model, 'gemini-flash')
+                url = f'{_llm_base_url}/chat/completions'
+                payload = {
+                    'model': resolved_model,
+                    'messages': messages,
+                    'max_tokens': 2048,
+                    'temperature': 0.7,
+                }
+                # Only add tools if non-empty (DeepSeek doesn't support empty tools array)
+                if tools:
+                    payload['tools'] = tools
+                headers = {
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {_llm_api_key}',
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                        result = await resp.json()
+                choices = result.get('choices', [])
+                if choices:
+                    text = choices[0].get('message', {}).get('content', '')
+                else:
+                    text = result.get('error', {}).get('message', '[LLM] 调用失败')
+                usage = result.get('usage', {})
+                return text, usage
+
+            # 确定角色：管理员用 ASSISTANT，普通用户用 ASSISTANT（目前不限制）
+            is_admin = str(user_id) in [str(a) for a in config.ADMIN_TG_IDS]
+            agent_role = AgentRole.ASSISTANT
+
+            # 构建 Agent 上下文
+            agent_ctx = AgentContext(
+                user_id=user_id,
+                channel='web_ai_chat',
+                conversation_history=[],
+                active_role=agent_role,
+                metadata={
+                    'tenant_id': tenant_id,
+                    'is_admin': is_admin,
+                },
+            )
+
+            # 创建并运行 Agent
+            agent = AIAgent(llm_call_fn=_llm_call_fn)
+            agent_response = await agent.process_message(
+                user_message=input_text,
+                ctx=agent_ctx,
+                model=model,
+            )
+            reply = agent_response.text if agent_response else '[AI] 处理失败，请稍后重试'
         except Exception as ai_err:
-            logger.error(f"AI 服务调用失败: {ai_err}")
-            reply = f"[AI] 收到您的消息: {input_text}"
+            logger.error(f"AI 服务调用失败: {ai_err}", exc_info=True)
+            reply = f'[AI] 处理异常: {ai_err}'[:500]
 
         try:
             from backend.repositories.ai_usage_repo import save_ai_usage_log

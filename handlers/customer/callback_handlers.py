@@ -52,10 +52,10 @@ async def handle_do_quick_reply(context, query, target_user_id: int, choice: str
         from .customer_service import safe_send_message, format_admin_tag
         
         # 获取管理员信息
-        admin_info = await database.get_admin_info(config.ADMIN_ID)
+        admin_info = await database.get_admin_info(admin_id)
         admin_display_name = admin_tg_name
         admin_worker_no = admin_info['worker_no'] if admin_info else "CS001"
-        admin_tag = format_admin_tag(config.ADMIN_ID, admin_display_name, admin_worker_no)
+        admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
         
         # 发送消息
         sent_msg = await safe_send_message(
@@ -68,7 +68,7 @@ async def handle_do_quick_reply(context, query, target_user_id: int, choice: str
         # 存入数据库
         if sent_msg:
             await database.save_message(
-                from_userid=config.ADMIN_ID,
+                from_userid=admin_id,
                 to_userid=target_user_id,
                 content=reply_text,
                 status='sent',
@@ -140,7 +140,7 @@ async def handle_quick_send_confirm(context, query, target_user_id: int, msg_uui
             """SELECT * FROM pending_admin_messages 
                WHERE admin_id = ? AND status = 'pending' AND timestamp <= ? 
                ORDER BY timestamp ASC""",
-            (config.ADMIN_ID, current_ts)
+            (admin_id, current_ts)
         ) as cursor:
             pending_batch = await cursor.fetchall()
     
@@ -157,10 +157,10 @@ async def handle_quick_send_confirm(context, query, target_user_id: int, msg_uui
             msg_type = pending['msg_type']
             file_id = pending['file_id']
             
-            admin_info = await database.get_admin_info(config.ADMIN_ID)
+            admin_info = await database.get_admin_info(admin_id)
             admin_display_name = admin_tg_name
             admin_worker_no = admin_info['worker_no'] if admin_info else "CS001"
-            admin_tag = format_admin_tag(config.ADMIN_ID, admin_display_name, admin_worker_no)
+            admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
             
             sent_msg = None
             if msg_type == 'text':
@@ -206,7 +206,7 @@ async def handle_quick_send_confirm(context, query, target_user_id: int, msg_uui
             
             if sent_msg:
                 await database.save_message(
-                    from_userid=config.ADMIN_ID, 
+                    from_userid=admin_id, 
                     to_userid=target_user_id,
                     content=reply_text or f"[{msg_type}]", 
                     msg_type=msg_type,

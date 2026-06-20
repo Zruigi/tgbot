@@ -261,7 +261,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not user: return
     admin_id = user.id
     
-    if str(admin_id) != str(config.ADMIN_ID):
+    if int(admin_id) not in config.ADMIN_TG_IDS:
         await query.answer("权限不足", show_alert=True)
         return
     
@@ -736,7 +736,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = user.id
     
     # 忽略来自管理员的消息 (管理员由 handle_admin_reply 处理)
-    if str(user_id) == str(config.ADMIN_ID):
+    if int(user_id) in config.ADMIN_TG_IDS:
         return
         
     original_text = user_message.text or user_message.caption or ""
@@ -892,7 +892,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """处理回复消息（仅限指定的 ADMIN_ID 对转发消息的回复）"""
+    """处理回复消息（仅限指定的管理员 对转发消息的回复）"""
     user = update.effective_user
     user_message = update.message
     if not user or not user_message:
@@ -900,8 +900,8 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     user_id = user.id
     
-    # 权限检查：仅限指定的 ADMIN_ID
-    if str(user_id) != str(config.ADMIN_ID):
+    # 权限检查：仅限指定的管理员
+    if int(user_id) not in config.ADMIN_TG_IDS:
         return
 
     # 检查是否是回复某条消息
@@ -1077,7 +1077,7 @@ async def handle_admin_non_reply(update: Update, context: ContextTypes.DEFAULT_T
     if not effective_user: return
 
     # 权限检查
-    if str(effective_user.id) != str(config.ADMIN_ID):
+    if int(effective_user.id) not in config.ADMIN_TG_IDS:
         return
 
     msg_text = user_message.text or user_message.caption or ""
@@ -1218,7 +1218,7 @@ async def select_other_user_callback(update: Update, context: ContextTypes.DEFAU
         return
     
     user = query.from_user
-    if not user or str(user.id) != str(config.ADMIN_ID):
+    if not user or int(user.id) not in config.ADMIN_TG_IDS:
         await query.answer("❌ 仅管理员可使用此功能", show_alert=True)
         return
     
@@ -1349,7 +1349,7 @@ async def user_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
         
     user = query.from_user
-    if not user or str(user.id) != str(config.ADMIN_ID):
+    if not user or int(user.id) not in config.ADMIN_TG_IDS:
         await query.answer("❌ 仅管理员可使用此功能", show_alert=True)
         return
     
@@ -1390,7 +1390,7 @@ async def confirm_send_to_callback(update: Update, context: ContextTypes.DEFAULT
         return
         
     user = query.from_user
-    if not user or str(user.id) != str(config.ADMIN_ID):
+    if not user or int(user.id) not in config.ADMIN_TG_IDS:
         await query.answer("❌ 仅管理员可使用此功能", show_alert=True)
         return
     
@@ -1536,7 +1536,7 @@ async def admin_reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = effective_user.id
     
     # 权限检查
-    if str(user_id) != str(config.ADMIN_ID):
+    if int(user_id) not in config.ADMIN_TG_IDS:
         return
 
     if not context.args or len(context.args) < 2:
