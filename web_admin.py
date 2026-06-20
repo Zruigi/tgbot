@@ -26,6 +26,7 @@ from urllib.parse import urlencode, quote, parse_qsl
 from html import escape
 from typing import Optional, Dict, Any
 from backend.repositories import merchant_repo
+from backend.app.api.ai import api_detect_advertising
 from services.secret_manager import SecretManager
 
 # OTP 一次性登录凭证存储: {otp: {token, expire_at, role, tenant_id, merchant_id, issued_for}}
@@ -3927,7 +3928,7 @@ async def start_web_server(bot):
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/api/users', api_get_users)
     app.router.add_post("/api/ai/chat", api_ai_chat_bridge)
-    app.router.add_post("/api/ai/detect_ad", backend.app.api.ai.api_detect_advertising)
+    app.router.add_post("/api/ai/detect_ad", api_detect_advertising)
     app.router.add_post('/api/messages/{user_id}/ai', api_ai_chat_bridge)
     app.router.add_get('/api/messages/{user_id}', api_get_messages)
     app.router.add_post('/api/messages/{user_id}', api_send_message)
