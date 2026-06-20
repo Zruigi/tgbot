@@ -312,10 +312,10 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             # 执行常规发送逻辑
             # 2026 规格：注入身份标签
             # 强制优先使用本次交互获取的 admin_tg_name，而不是数据库旧值
-            admin_info = await database.get_admin_info(config.ADMIN_ID)
+            admin_info = await database.get_admin_info(admin_id)
             admin_display_name = admin_tg_name # 直接使用刚才从 User 对象提取的实名
             admin_worker_no = admin_info['worker_no'] if admin_info else "CS001"
-            admin_tag = format_admin_tag(config.ADMIN_ID, admin_display_name, admin_worker_no)
+            admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
 
             sent_msg = await safe_send_message(
                 context=context,
@@ -326,7 +326,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             # 存入数据库
             if sent_msg:
                 await database.save_message(
-                    from_userid=config.ADMIN_ID,
+                    from_userid=admin_id,
                     to_userid=target_user_id,
                     content=reply_text,
                     status='sent',
@@ -386,7 +386,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             async with db.execute(
                 "SELECT * FROM pending_admin_messages WHERE admin_id = ? AND status = 'pending' AND timestamp <= ? ORDER BY timestamp ASC",
-                (config.ADMIN_ID, current_ts)
+                (admin_id, current_ts)
             ) as cursor:
                 pending_batch = await cursor.fetchall()
 
@@ -405,10 +405,10 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 
                 logger.info(f"⚖️ [Batch-Send] Admin confirming UUID:{p_uuid} in batch to {target_user_id}")
                 
-                admin_info = await database.get_admin_info(config.ADMIN_ID)
+                admin_info = await database.get_admin_info(admin_id)
                 admin_display_name = admin_tg_name
                 admin_worker_no = admin_info['worker_no'] if admin_info else "CS001"
-                admin_tag = format_admin_tag(config.ADMIN_ID, admin_display_name, admin_worker_no)
+                admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
 
                 sent_msg = None
                 if msg_type == 'text':
@@ -446,7 +446,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 
                 if sent_msg:
                     await database.save_message(
-                        from_userid=config.ADMIN_ID, to_userid=target_user_id,
+                        from_userid=admin_id, to_userid=target_user_id,
                         content=reply_text or f"[{msg_type}]", msg_type=msg_type,
                         file_id=file_id, status='sent', tg_msg_id=sent_msg.message_id
                     )
@@ -525,10 +525,10 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.answer("No other users", show_alert=True)
                 return
             
-            admin_info = await database.get_admin_info(config.ADMIN_ID)
+            admin_info = await database.get_admin_info(admin_id)
             admin_display_name = admin_tg_name
             admin_worker_no = admin_info['worker_no'] if admin_info else "CS001"
-            admin_tag = format_admin_tag(config.ADMIN_ID, admin_display_name, admin_worker_no)
+            admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
             
             success_count = 0
             failed_count = 0
@@ -573,7 +573,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     failed_count += 1
             
             await database.save_message(
-                from_userid=config.ADMIN_ID,
+                from_userid=admin_id,
                 to_userid=0,
                 content=f"[Batch] {content}",
                 msg_type=msg_type,
@@ -827,7 +827,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         await database.save_message(
             from_userid=user_id,
-            to_userid=config.ADMIN_ID,
+            to_userid=admin_id,
             content=original_text,
             msg_type=msg_type,
             file_id=file_id,
@@ -856,7 +856,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         sent_msg = await safe_send_message(
             context=context,
-            chat_id=config.ADMIN_ID,
+            chat_id=admin_id,
             text=admin_text,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -871,7 +871,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             try:
                 media_msg = await safe_send_media(
-                    context, config.ADMIN_ID, msg_type,
+                    context, admin_id, msg_type,
                     file_id=file_id if not processed_path else None,
                     local_path=processed_path, thumb_path=thumb_path,
                     caption=(
@@ -978,7 +978,7 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 发送给用户
         # 2026 规格：在消息头部注入管理员身份标签与工号信息
         # 优化文案：移除硬编码的“管理员回复”，改为更专业的引导文案
-        admin_tag = format_admin_tag(config.ADMIN_ID, admin_display_name, admin_worker_no)
+        admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
         
         sent_msg = None
         reply_to_id = original_tg_msg_id
@@ -1116,7 +1116,7 @@ async def handle_admin_non_reply(update: Update, context: ContextTypes.DEFAULT_T
     # 持久化存储待处理消息 (防丢失/跨重启)
     await database.save_pending_admin_msg(
         msg_uuid=msg_uuid,
-        admin_id=config.ADMIN_ID,
+        admin_id=admin_id,
         content=msg_text,
         msg_type=msg_type,
         file_id=file_id or ""
@@ -1132,7 +1132,7 @@ async def handle_admin_non_reply(update: Update, context: ContextTypes.DEFAULT_T
     
     # 统计该管理员当前所有待处理的消息数
     async with database.aiosqlite.connect(database.DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM pending_admin_messages WHERE admin_id = ? AND status = 'pending'", (config.ADMIN_ID,)) as cursor:
+        async with db.execute("SELECT COUNT(*) FROM pending_admin_messages WHERE admin_id = ? AND status = 'pending'", (admin_id,)) as cursor:
             row = await cursor.fetchone()
             total_pending = row[0] if row else 0
 
@@ -1553,7 +1553,7 @@ async def admin_reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # 存入数据库
         msg_db_id = await database.save_message(
-            from_userid=config.ADMIN_ID,
+            from_userid=admin_id,
             to_userid=target_user_id,
             content=reply_text,
             msg_type='text',
