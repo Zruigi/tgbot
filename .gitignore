@@ -66,3 +66,32 @@ static/dist/
 saas-rust/target/
 .claude/worktrees/
 *.sqlite3
+
+# IDE worktrees & agents
+.agents/
+.arts/
+.claude/
+.claude.json
+skills-lock.json
+litellm_config.yaml
+
+# Cursor/Lingma worktrees
+.cursor/
+.lingma/
+
+# Rust build artifacts
+saas-rust/target/
+
+# Python cache (reinforce)
+__pycache__/
+*.pyc
+
+# Node (reinforce)
+node_modules/
+
+# Environment & secrets (reinforce)
+.env
+.env.bak.*
+google-key.json
+*.pem
+*.key
