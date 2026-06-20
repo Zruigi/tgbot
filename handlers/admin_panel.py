@@ -44,7 +44,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         
     user = update.effective_user
-    if not user or str(user.id) != str(config.ADMIN_ID):
+    if not user or int(user.id) not in config.ADMIN_TG_IDS:
         if update.message:
             await update.message.reply_text("⛔ 仅管理员可使用此命令。")
         return ConversationHandler.END
@@ -265,7 +265,7 @@ async def cancel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sync_potential_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sync_potential 指令：管理员立即同步潜在用户数据"""
     user = update.effective_user
-    if not user or str(user.id) != str(config.ADMIN_ID):
+    if not user or int(user.id) not in config.ADMIN_TG_IDS:
         return
         
     msg = await update.message.reply_text("🔄 正在触发云端同步...")
