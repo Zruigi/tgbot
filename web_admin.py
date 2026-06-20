@@ -3926,8 +3926,8 @@ async def start_web_server(bot):
 
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/api/users', api_get_users)
-    app.router.add_post('/api/ai/chat', api_ai_chat_bridge)
-    app.router.add_post('/api/ai/chat/{user_id}', api_ai_chat_bridge)
+    app.router.add_post("/api/ai/chat", api_ai_chat_bridge)
+    app.router.add_post("/api/ai/detect_ad", backend.app.api.ai.api_detect_advertising)
     app.router.add_post('/api/messages/{user_id}/ai', api_ai_chat_bridge)
     app.router.add_get('/api/messages/{user_id}', api_get_messages)
     app.router.add_post('/api/messages/{user_id}', api_send_message)

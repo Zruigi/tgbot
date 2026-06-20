@@ -1,0 +1,111 @@
+/**
+ * TGBot Advertisement CRUD Node
+ */
+const https = require("https");
+
+module.exports = {
+  displayName: "TGBot Ad Management",
+  name: "TgbotAdCrud",
+  group: ["transform"],
+  version: 1,
+  description: "Advertisement register, query, delete operations",
+  defaults: { name: "TGBot Ad Management", color: "#00cc66" },
+  inputs: ["main"],
+  outputs: ["main"],
+  credentials: [{ name: "tgbotApi", required: true }],
+  properties: [
+    {
+      displayName: "Operation",
+      name: "operation",
+      type: "options",
+      options: [
+        { name: "Register (Create)", value: "create" },
+        { name: "Query (Read)", value: "read" },
+        { name: "Delete", value: "delete" },
+        { name: "List All", value: "list" },
+      ],
+      default: "create",
+    },
+    {
+      displayName: "Ad ID",
+      name: "adId",
+      type: "string",
+      default: "",
+      placeholder: "Advertisement ID (for read/delete)",
+    },
+    {
+      displayName: "Content",
+      name: "content",
+      type: "string",
+      typeOptions: { rows: 3 },
+      default: "",
+      placeholder: "Ad content to register",
+    },
+    {
+      displayName: "Score",
+      name: "score",
+      type: "number",
+      default: 0,
+    },
+    {
+      displayName: "Source",
+      name: "source",
+      type: "string",
+      default: "manual",
+    },
+  ],
+  async execute(this) {
+    const items = this.getInputData();
+    const creds = await this.getCredentials("tgbotApi");
+    const { baseUrl, apiKey } = creds;
+    
+    for (let i = 0; i < items.length; i++) {
+      const operation = this.getNodeParameter("operation", i);
+      const adId = this.getNodeParameter("adId", i);
+      const content = this.getNodeParameter("content", i);
+      const score = this.getNodeParameter("score", i);
+      const source = this.getNodeParameter("source", i);
+      
+      let url = baseUrl + "/api/advertisements";
+      let method = "POST";
+      let body = { content, score, source };
+      
+      if (operation === "read" && adId) {
+        url = baseUrl + "/api/advertisements/" + adId;
+        method = "GET";
+        body = null;
+      } else if (operation === "delete" && adId) {
+        url = baseUrl + "/api/advertisements/" + adId;
+        method = "DELETE";
+        body = null;
+      } else if (operation === "list") {
+        url = baseUrl + "/api/advertisements?status=pending";
+        method = "GET";
+        body = null;
+      }
+      
+      const response = await this.makeRequest({
+        url: url, method: method, body: body,
+        headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
+      });
+      
+      items[i].json = { success: true, operation, data: response };
+    }
+    return [items];
+  },
+  makeRequest(options) {
+    return new Promise((resolve, reject) => {
+      const url = new URL(options.url);
+      const req = https.request({
+        hostname: url.hostname, port: 443, path: url.pathname, method: options.method, headers: options.headers,
+      }, (res) => {
+        let data = "";
+        res.on("data", c => data += c);
+        res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve({}); } });
+      });
+      req.on("error", reject);
+      if (options.body) req.write(JSON.stringify(options.body));
+      req.end();
+    });
+  },
+};

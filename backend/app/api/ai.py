@@ -145,3 +145,28 @@ async def api_get_ai_usage(request: web.Request) -> web.Response:
     except Exception as e:
         logger.error(f"获取使用统计失败：{e}")
         return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+# =============================================================================
+# n8n Integration API - Advertisement Detection
+# =============================================================================
+
+async def api_detect_advertising(request: web.Request) -> web.Response:
+    """广告检测接口 - 供 n8n 节点调用"""
+    try:
+        data = await request.json()
+        text = data.get("text", "")
+        context_type = data.get("context_type", "group_message")
+        
+        if not text:
+            return web.json_response({"error": "text is required"}, status=400)
+        
+        # 调用现有的广告检测逻辑
+        from services.ai_agent.ad_detection import detect_advertising_signals
+        result = detect_advertising_signals(text, context_type)
+        
+        return web.json_response(result)
+        
+    except Exception as e:
+        logger.error(f"Ad detection error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
