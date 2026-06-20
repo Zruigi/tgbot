@@ -7,7 +7,6 @@
 """
 import logging
 import asyncio
-import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 import config
@@ -45,7 +44,9 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         
     user = update.effective_user
-    if not user or str(user.id) != str(config.ADMIN_ID):
+    if not user or int(user.id) not in config.ADMIN_TG_IDS:
+        if update.message:
+            await update.message.reply_text("⛔ 仅管理员可使用此命令。")
         return ConversationHandler.END
 
     # 并发读取数据库配置
@@ -76,8 +77,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📝 翻译提示词", callback_data="adm:prompt")],
         [InlineKeyboardButton("🔄 刷新潜在用户", callback_data="adm:sync_potential")],
         [InlineKeyboardButton(f"{'🛡️' if ocr_enabled else '🔓'} OCR 强核验开关", callback_data="adm:ocr_toggle")],
-        [InlineKeyboardButton("🧹 清理缓存", callback_data="adm:clear_cache"), InlineKeyboardButton("🔙 返回", callback_data="back_to_start")],
-        [InlineKeyboardButton("🌐 打开 Web 管理端", callback_data="adm:open_web")]
+        [InlineKeyboardButton("🧹 清理缓存", callback_data="adm:clear_cache"), InlineKeyboardButton("🔙 返回", callback_data="back_to_start")]
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -188,30 +188,6 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await database.save_admin_setting("ocr_force_enabled", str(not curr).lower())
         return await admin_panel(update, context)
         
-    elif data == "adm:open_web":
-        from web_admin import generate_otp
-        server_url = os.getenv("SERVER_URL", f"http://{os.getenv('SERVER_IP', '43.135.141.154')}")
-        otp = generate_otp(config.WEB_ADMIN_TOKEN, ttl_seconds=300)
-        web_url = f"{server_url}/?otp={otp}"
-        await query.answer()
-        sent = await query.message.reply_text(
-            f"🌐 <b>Web 管理端一次性登录链接</b>\n\n"
-            f"🔐 此链接 <b>5分钟内有效</b>，使用一次后立即失效：\n"
-            f"<a href=\"{web_url}\">点击登录管理后台</a>\n\n"
-            f"⏱ 有效期：5分钟 | ♻️ 一次性：用后即毁",
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-        # 5分钟后自动删除这条消息
-        async def _auto_delete():
-            await asyncio.sleep(300)
-            try:
-                await sent.delete()
-            except Exception:
-                pass
-        asyncio.create_task(_auto_delete())
-        return None
-
     elif data == "adm:clear_cache":
         if context.user_data is not None:
             context.user_data.clear()
@@ -275,8 +251,12 @@ async def save_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await admin_panel(update, context)
 
 async def cancel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """退出配置 (安全清理)"""
-    if update.message:
+    """退出配置 (安全清理)，若为 /start 则继续执行对应命令"""
+    cmd = (update.message.text or '').strip().lower() if update.message else ''
+    if cmd.startswith('/start'):
+        from handlers.start import start
+        await start(update, context)
+    elif update.message:
         await update.message.reply_text("已退出配置。")
     elif update.callback_query:
         await update.callback_query.edit_message_text("已退出配置。")
@@ -285,7 +265,7 @@ async def cancel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sync_potential_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sync_potential 指令：管理员立即同步潜在用户数据"""
     user = update.effective_user
-    if not user or str(user.id) != str(config.ADMIN_ID):
+    if not user or int(user.id) not in config.ADMIN_TG_IDS:
         return
         
     msg = await update.message.reply_text("🔄 正在触发云端同步...")
@@ -313,6 +293,9 @@ admin_config_handler = ConversationHandler(
         WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.REPLY, save_token), CommandHandler("skip", save_token)],
         WAITING_SYSTEM_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.REPLY, save_prompt)]
     },
-    fallbacks=[CommandHandler("cancel", cancel_settings)],
+    fallbacks=[
+        CommandHandler("cancel", cancel_settings),
+        CommandHandler("start", cancel_settings),
+    ],
     per_message=False
 )

@@ -1,0 +1,53 @@
+{
+  "name": "n8n-nodes-tgbot",
+  "version": "1.0.0",
+  "description": "Custom n8n nodes for tgbot AI Agent integration",
+  "keywords": ["n8n", "telegram", "ai", "advertisement", "bot"],
+  "main": "index.js",
+  "n8n": {
+    "nodes": [
+      {
+        "name": "Tgbot AI Agent",
+        "key": "tgbotAiAgent",
+        "displayName": "TGBot AI Agent",
+        "icon": "file:../static/img/tgbot-icon.png",
+        "group": ["ai"],
+        "version": 1,
+        "description": "AI Agent for tgbot with function calling"
+      },
+      {
+        "name": "Tgbot Advertisement Detect",
+        "key": "tgbotAdDetect",
+        "displayName": "TGBot Ad Detection",
+        "group": ["transform"],
+        "version": 1,
+        "description": "Detect advertisement in text"
+      },
+      {
+        "name": "Tgbot Advertisement CRUD",
+        "key": "tgbotAdCrud",
+        "displayName": "TGBot Ad Management",
+        "group": ["transform"],
+        "version": 1,
+        "description": "Advertisement register, query, delete operations"
+      },
+      {
+        "name": "Tgbot Broadcast",
+        "key": "tgbotBroadcast",
+        "displayName": "TGBot Broadcast",
+        "group": ["communication"],
+        "version": 1,
+        "description": "Broadcast message to users or groups"
+      },
+      {
+        "name": "Tgbot Channel Post",
+        "key": "tgbotChannelPost",
+        "displayName": "TGBot Channel Post",
+        "group": ["communication"],
+        "version": 1,
+        "description": "Post message to Telegram channel"
+      }
+    ]
+  },
+  "dependencies": {}
+}

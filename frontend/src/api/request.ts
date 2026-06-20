@@ -1,0 +1,82 @@
+/**
+ * HTTP 请求工具
+ * 供所有 API client 使用
+ */
+import { useAuthStore } from '@/stores/auth'
+
+const TOKEN_KEY = 'adm_s'
+
+function getToken(): string {
+  const raw = sessionStorage.getItem(TOKEN_KEY)
+  if (raw) {
+    try {
+      return decodeURIComponent(atob(raw))
+    } catch {
+      return ''
+    }
+  }
+  return localStorage.getItem('admin_token') || ''
+}
+
+function getSessionContextHeaders() {
+  return {}
+}
+
+let csrfToken = ''
+const refreshCsrf = async () => {
+  try {
+    const res = await fetch('/api/csrf-token', {
+      headers: { 'Authorization': `Bearer ${getToken()}`, ...getSessionContextHeaders() }
+    })
+    const data = await res.json()
+    if (data.status === 'ok') csrfToken = data.token
+  } catch (e) {
+    console.error('Failed to refresh CSRF token', e)
+  }
+}
+
+export const request = async (method: string, url: string, body?: any) => {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', ...getSessionContextHeaders() }
+  const token = getToken()
+  if (token) headers['Authorization'] = `Bearer ${token}`
+
+  if (['POST', 'DELETE', 'PATCH', 'PUT'].includes(method.toUpperCase()) && !csrfToken) {
+    await refreshCsrf()
+  }
+  if (csrfToken) headers['X-CSRF-Token'] = csrfToken
+
+  const isExecCall = url.includes('/exec') || url.includes('/chat/completions')
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), isExecCall ? 35000 : 15000)
+
+  try {
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      keepalive: true,
+      signal: controller.signal,
+    })
+    clearTimeout(timer)
+
+    if (res.status === 403) {
+      await refreshCsrf()
+      headers['X-CSRF-Token'] = csrfToken
+      const retryRes = await fetch(url, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        keepalive: true,
+        signal: AbortSignal.timeout(15000),
+      })
+      return retryRes.json()
+    }
+
+    return res.json()
+  } catch (e: any) {
+    if (e.name === 'AbortError') {
+      throw new Error(isExecCall ? 'LLM 调用超时 (>35s)，可能是 API Key 无效或模型不可达' : '请求超时，请检查网络连接')
+    }
+    throw e
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "lib": ["ESNext", "DOM"],
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] }
+  },
+  "include": ["src/**/*"],
+  "exclude": [
+    "src/store",
+    "src/router",
+    "src/views/AppLayout.vue",
+    "src/views/LoginView.vue",
+    "src/views/ChatView.vue",
+    "src/views/MonitorView.vue",
+    "src/views/BroadcastView.vue",
+    "src/views/GroupView.vue"
+  ]
+}

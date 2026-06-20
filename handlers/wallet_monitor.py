@@ -5,16 +5,33 @@
 import logging
 import httpx
 import asyncio
+import re
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 import config
 import database
+from services.i18n import SUPPORTED_LOCALES, tr
 
 logger = logging.getLogger(__name__)
 
 # 定义状态
 WAITING_ADDRESS = 1
+
+
+def build_wallet_monitor_menu_text_pattern() -> str:
+    labels = {tr(locale, "buttons.wallet_monitor") for locale in SUPPORTED_LOCALES}
+    return r"^(?:" + "|".join(sorted(re.escape(item) for item in labels if item)) + r")$"
+
+
+async def start_wallet_monitor_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_html(
+            "👛 <b>USDT 钱包监听</b>\n\n"
+            "请输入您要查询和监听的 USDT 地址：\n"
+            "支持 <code>TRC20</code> (T开头) 或 <code>BSC</code> (0x开头)"
+        )
+    return WAITING_ADDRESS
 
 async def start_wallet_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """开始钱包监听流程"""
@@ -116,15 +133,30 @@ async def handle_address_input(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 async def cancel_wallet_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """取消监听流程"""
-    await update.message.reply_text("已取消设置。")
+    """取消监听流程，若为 /start 或 /admin 则继续执行对应命令"""
+    cmd = (update.message.text or '').strip().lower() if update.message else ''
+    if cmd.startswith('/start'):
+        from handlers.start import start
+        await start(update, context)
+    elif cmd.startswith('/admin'):
+        from handlers.admin_panel import admin_panel
+        await admin_panel(update, context)
+    else:
+        await update.message.reply_text("已取消设置。")
     return ConversationHandler.END
 
 wallet_monitor_handler = ConversationHandler(
-    entry_points=[CallbackQueryHandler(start_wallet_monitor, pattern="^wallet_monitor$")],
+    entry_points=[
+        CallbackQueryHandler(start_wallet_monitor, pattern="^wallet_monitor$"),
+        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND & filters.Regex(build_wallet_monitor_menu_text_pattern()), start_wallet_monitor_from_text),
+    ],
     states={
-        WAITING_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address_input)]
+        WAITING_ADDRESS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_address_input)]
     },
-    fallbacks=[CommandHandler("cancel", cancel_wallet_monitor)],
+    fallbacks=[
+        CommandHandler("cancel", cancel_wallet_monitor),
+        CommandHandler("start", cancel_wallet_monitor),
+        CommandHandler("admin", cancel_wallet_monitor),
+    ],
     per_message=False
 )

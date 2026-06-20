@@ -16,6 +16,13 @@ from telegram.ext import ContextTypes, ConversationHandler, CommandHandler, Mess
 from telegram.error import RetryAfter, TimedOut, NetworkError
 import config
 import database
+from handlers.customer import (
+    extract_target_user_info,
+    classify_message_content,
+    extract_quoted_message_info,
+    prepare_translation_feedback,
+    build_admin_feedback,
+)
 from services import translator
 from langdetect import detect, LangDetectException
 from services.security_shield import contains_address
@@ -24,8 +31,7 @@ from services.media_processor import MediaProcessor
 
 logger = logging.getLogger(__name__)
 
-# 定义地址验证状态
-WAITING_ADDRESS_PIC = 99
+# 待补发消息过期时间（分钟）
 PENDING_SEND_EXPIRE_MINUTES = 30
 
 # 初始化媒体处理器 (单例模式)
@@ -201,7 +207,7 @@ async def safe_send_message(context, chat_id, text, parse_mode="HTML", max_retri
             raise
     raise Exception("超过最大重试次数")
 
-async def safe_send_photo(context, chat_id, photo, caption=None, parse_mode="HTML", max_retries=3, reply_to_message_id=None):
+async def safe_send_photo(context, chat_id, photo, caption=None, parse_mode="HTML", max_retries=3, reply_to_message_id=None, reply_markup=None):
     """带重试机制的安全发送图片函数"""
     import web_admin
     bot = context.bot if context else web_admin._bot_instance
@@ -216,6 +222,7 @@ async def safe_send_photo(context, chat_id, photo, caption=None, parse_mode="HTM
                 caption=caption,
                 parse_mode=parse_mode,
                 reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup,
                 read_timeout=30,
                 write_timeout=30,
                 connect_timeout=30
@@ -229,7 +236,8 @@ async def safe_send_photo(context, chat_id, photo, caption=None, parse_mode="HTM
                         chat_id=chat_id,
                         photo=photo,
                         caption=caption,
-                        parse_mode=parse_mode
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup
                     )
                 except Exception as e2:
                     logger.error(f"去掉引用发送图片依然失败: {e2}")
@@ -253,7 +261,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not user: return
     admin_id = user.id
     
-    if str(admin_id) != str(config.ADMIN_ID):
+    if int(admin_id) not in config.ADMIN_TG_IDS:
         await query.answer("权限不足", show_alert=True)
         return
     
@@ -304,10 +312,10 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             # 执行常规发送逻辑
             # 2026 规格：注入身份标签
             # 强制优先使用本次交互获取的 admin_tg_name，而不是数据库旧值
-            admin_info = await database.get_admin_info(config.ADMIN_ID)
+            admin_info = await database.get_admin_info(admin_id)
             admin_display_name = admin_tg_name # 直接使用刚才从 User 对象提取的实名
             admin_worker_no = admin_info['worker_no'] if admin_info else "CS001"
-            admin_tag = format_admin_tag(config.ADMIN_ID, admin_display_name, admin_worker_no)
+            admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
 
             sent_msg = await safe_send_message(
                 context=context,
@@ -318,7 +326,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             # 存入数据库
             if sent_msg:
                 await database.save_message(
-                    from_userid=config.ADMIN_ID,
+                    from_userid=admin_id,
                     to_userid=target_user_id,
                     content=reply_text,
                     status='sent',
@@ -378,7 +386,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             async with db.execute(
                 "SELECT * FROM pending_admin_messages WHERE admin_id = ? AND status = 'pending' AND timestamp <= ? ORDER BY timestamp ASC",
-                (config.ADMIN_ID, current_ts)
+                (admin_id, current_ts)
             ) as cursor:
                 pending_batch = await cursor.fetchall()
 
@@ -397,10 +405,10 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 
                 logger.info(f"⚖️ [Batch-Send] Admin confirming UUID:{p_uuid} in batch to {target_user_id}")
                 
-                admin_info = await database.get_admin_info(config.ADMIN_ID)
+                admin_info = await database.get_admin_info(admin_id)
                 admin_display_name = admin_tg_name
                 admin_worker_no = admin_info['worker_no'] if admin_info else "CS001"
-                admin_tag = format_admin_tag(config.ADMIN_ID, admin_display_name, admin_worker_no)
+                admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
 
                 sent_msg = None
                 if msg_type == 'text':
@@ -438,7 +446,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 
                 if sent_msg:
                     await database.save_message(
-                        from_userid=config.ADMIN_ID, to_userid=target_user_id,
+                        from_userid=admin_id, to_userid=target_user_id,
                         content=reply_text or f"[{msg_type}]", msg_type=msg_type,
                         file_id=file_id, status='sent', tg_msg_id=sent_msg.message_id
                     )
@@ -473,7 +481,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             last_msg = chat_history[0]
             msg_content = last_msg.get('content', '')
-            msg_type = last_msg.get('type', 'text')
+            msg_type = last_msg.get('msg_type', 'text')
             file_id = last_msg.get('file_id')
             
             all_users = await database.get_inbox_list()
@@ -517,10 +525,10 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.answer("No other users", show_alert=True)
                 return
             
-            admin_info = await database.get_admin_info(config.ADMIN_ID)
+            admin_info = await database.get_admin_info(admin_id)
             admin_display_name = admin_tg_name
             admin_worker_no = admin_info['worker_no'] if admin_info else "CS001"
-            admin_tag = format_admin_tag(config.ADMIN_ID, admin_display_name, admin_worker_no)
+            admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
             
             success_count = 0
             failed_count = 0
@@ -540,7 +548,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                         
                         caption_text = admin_tag
                         if content:
-                            caption_text += f"\n{escape(final_send_content)}"
+                            caption_text += f"\n{escape(content)}"
                         
                         if msg_type in ['sticker', 'video_note']:
                             await safe_send_media(
@@ -565,7 +573,7 @@ async def cs_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     failed_count += 1
             
             await database.save_message(
-                from_userid=config.ADMIN_ID,
+                from_userid=admin_id,
                 to_userid=0,
                 content=f"[Batch] {content}",
                 msg_type=msg_type,
@@ -728,7 +736,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = user.id
     
     # 忽略来自管理员的消息 (管理员由 handle_admin_reply 处理)
-    if str(user_id) == str(config.ADMIN_ID):
+    if int(user_id) in config.ADMIN_TG_IDS:
         return
         
     original_text = user_message.text or user_message.caption or ""
@@ -819,7 +827,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         await database.save_message(
             from_userid=user_id,
-            to_userid=config.ADMIN_ID,
+            to_userid=admin_id,
             content=original_text,
             msg_type=msg_type,
             file_id=file_id,
@@ -848,7 +856,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         sent_msg = await safe_send_message(
             context=context,
-            chat_id=config.ADMIN_ID,
+            chat_id=admin_id,
             text=admin_text,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -863,7 +871,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             try:
                 media_msg = await safe_send_media(
-                    context, config.ADMIN_ID, msg_type,
+                    context, admin_id, msg_type,
                     file_id=file_id if not processed_path else None,
                     local_path=processed_path, thumb_path=thumb_path,
                     caption=(
@@ -884,7 +892,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """处理回复消息（仅限指定的 ADMIN_ID 对转发消息的回复）"""
+    """处理回复消息（仅限指定的管理员 对转发消息的回复）"""
     user = update.effective_user
     user_message = update.message
     if not user or not user_message:
@@ -892,8 +900,8 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     user_id = user.id
     
-    # 权限检查：仅限指定的 ADMIN_ID
-    if str(user_id) != str(config.ADMIN_ID):
+    # 权限检查：仅限指定的管理员
+    if int(user_id) not in config.ADMIN_TG_IDS:
         return
 
     # 检查是否是回复某条消息
@@ -901,9 +909,7 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not reply_to_message:
         return
 
-    # 1. 核心：从数据库映射表中获取目标用户 ID
-    target_user_id = await database.get_user_id_by_admin_msg(reply_to_message.message_id)
-    original_tg_msg_id = await database.get_original_msg_id_by_admin_msg(reply_to_message.message_id)
+    target_user_id, original_tg_msg_id = await extract_target_user_info(reply_to_message)
 
     # 提取管理员实时 TG 姓名/用户名并同步数据库并直接用于回复
     admin_tg_name = user.first_name or user.username or "Administrator"
@@ -918,96 +924,28 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     original_text_input = user_message.text or user_message.caption or ""
-    
-    # --- 安全校验与自动翻译 (2026 Spec: 回复必翻译) ---
-    global_translate = str(await database.get_admin_setting("global_auto_translate", "false") or "false").lower() == "true"
-    
+
     # 2026 修复：强制对管理员回复执行翻译 (即便全局开关关闭，只要是回复客户，也应优先翻译)
-    # 此处逻辑：如果 verified_text 仍为中文，且目标用户不是中文环境，强制触发翻译
     is_passed, verified_text, _, _, _ = await process_security_check(
-        update, context, original_text_input, 
+        update, context, original_text_input,
         is_admin=True, target_id=target_user_id,
-        do_translate=True # 强制开启翻译流程，内部会判断 target_lang
+        do_translate=True  # 强制开启翻译流程，内部会判断 target_lang
     )
     if not is_passed:
         return
 
-    # 管理员回复内容处理
-    msg_type = 'text'
-    file_id: Optional[str] = None
-    content = ""
-
-    if user_message.text:
-        content = verified_text
-    elif user_message.photo:
-        msg_type = 'photo'
-        file_id = user_message.photo[-1].file_id
-        content = verified_text or "[图片]"
-    elif user_message.sticker:
-        msg_type = 'sticker'
-        file_id = user_message.sticker.file_id
-        content = f"[表情包: {user_message.sticker.emoji or ''}]"
-    elif user_message.animation:
-        msg_type = 'animation'
-        file_id = user_message.animation.file_id
-        content = verified_text or "[动图]"
-    elif user_message.video:
-        msg_type = 'video'
-        file_id = user_message.video.file_id
-        content = verified_text or "[视频]"
-    elif user_message.video_note:
-        msg_type = 'video_note'
-        file_id = user_message.video_note.file_id
-        content = "[视频消息]"
-    elif user_message.voice:
-        msg_type = 'voice'
-        file_id = user_message.voice.file_id
-        content = verified_text or "[语音]"
-    elif user_message.audio:
-        msg_type = 'audio'
-        file_id = user_message.audio.file_id
-        content = verified_text or "[音频]"
-    elif user_message.document:
-        msg_type = 'document'
-        file_id = user_message.document.file_id
-        content = verified_text or f"[文件: {user_message.document.file_name}]"
-    else:
-        msg_type = 'other'
-        content = "[不支持的媒体类型]"
+    msg_type, content, file_id = classify_message_content(user_message, verified_text)
 
     trace_id = str(uuid.uuid4())
     
     try:
-        # 提取被引用消息摘要
-        quoted_text = None
-        quoted_file_id = None
-        quoted_type = 'text'
-        quoted_display_text = None
-
-        if reply_to_message.text or reply_to_message.caption:
-            full_text = str(reply_to_message.text or reply_to_message.caption)
-            if "原文：" in full_text:
-                quoted_text = full_text.split("原文：", 1)[1].split("----------------", 1)[0].strip()
-            elif "内容：" in full_text:
-                quoted_text = full_text.split("内容：", 1)[1].strip()
-            else:
-                quoted_text = full_text.strip()
-            quoted_display_text = (quoted_text[:47] + "...") if quoted_text and len(quoted_text) > 50 else quoted_text
-
-        if reply_to_message.photo:
-            quoted_type, quoted_file_id = 'photo', reply_to_message.photo[-1].file_id
-        elif reply_to_message.sticker:
-            quoted_type, quoted_file_id = 'sticker', reply_to_message.sticker.file_id
-        elif reply_to_message.document:
-            quoted_type, quoted_file_id = 'document', reply_to_message.document.file_id
-        elif reply_to_message.video:
-            quoted_type, quoted_file_id = 'video', reply_to_message.video.file_id
+        quoted_info = extract_quoted_message_info(reply_to_message)
+        quoted_display_text = quoted_info['display_text']
+        quoted_type = quoted_info['type']
+        quoted_file_id = quoted_info['file_id']
 
         final_send_content = verified_text
-        # 判定是否真的执行了翻译逻辑 (内容发生了变化)
-        is_translated = (verified_text.strip() != original_text_input.strip())
-        translated_text = verified_text if is_translated else None
-        original_text = original_text_input if is_translated else None
+        translated_text, original_text = prepare_translation_feedback(original_text_input, verified_text)
 
         # 2026 规格：获取当前处理管理员的详细信息
         admin_info = await database.get_admin_info(user_id)
@@ -1040,7 +978,7 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 发送给用户
         # 2026 规格：在消息头部注入管理员身份标签与工号信息
         # 优化文案：移除硬编码的“管理员回复”，改为更专业的引导文案
-        admin_tag = format_admin_tag(config.ADMIN_ID, admin_display_name, admin_worker_no)
+        admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
         
         sent_msg = None
         reply_to_id = original_tg_msg_id
@@ -1111,21 +1049,15 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 获取目标用户信息以显示在回执中
         target_identity = format_user_identity(target_user_id)
 
-        # 标准化回执（简洁版）
-        if translated_text:
-            admin_feedback = (
-                f"发送成功\n"
-                f"{target_identity}\n"
-                f"原文: {escape(str(original_text))}\n"
-                f"译文: {escape(str(translated_text))}"
-            )
-        else:
-            admin_feedback = (
-                f"发送成功 [{msg_type}]\n"
-                f"{target_identity}\n"
-                f"内容: {escape(str(verified_text or content))}"
-            )
-        
+        admin_feedback = build_admin_feedback(
+            target_identity,
+            msg_type,
+            verified_text,
+            content,
+            translated_text,
+            original_text,
+        )
+
         await user_message.reply_text(admin_feedback, parse_mode="HTML")
         logger.info(f"[TraceID: {trace_id}] 管理员回复用户 {target_user_id} 成功")
 
@@ -1145,7 +1077,7 @@ async def handle_admin_non_reply(update: Update, context: ContextTypes.DEFAULT_T
     if not effective_user: return
 
     # 权限检查
-    if str(effective_user.id) != str(config.ADMIN_ID):
+    if int(effective_user.id) not in config.ADMIN_TG_IDS:
         return
 
     msg_text = user_message.text or user_message.caption or ""
@@ -1184,7 +1116,7 @@ async def handle_admin_non_reply(update: Update, context: ContextTypes.DEFAULT_T
     # 持久化存储待处理消息 (防丢失/跨重启)
     await database.save_pending_admin_msg(
         msg_uuid=msg_uuid,
-        admin_id=config.ADMIN_ID,
+        admin_id=admin_id,
         content=msg_text,
         msg_type=msg_type,
         file_id=file_id or ""
@@ -1200,7 +1132,7 @@ async def handle_admin_non_reply(update: Update, context: ContextTypes.DEFAULT_T
     
     # 统计该管理员当前所有待处理的消息数
     async with database.aiosqlite.connect(database.DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM pending_admin_messages WHERE admin_id = ? AND status = 'pending'", (config.ADMIN_ID,)) as cursor:
+        async with db.execute("SELECT COUNT(*) FROM pending_admin_messages WHERE admin_id = ? AND status = 'pending'", (admin_id,)) as cursor:
             row = await cursor.fetchone()
             total_pending = row[0] if row else 0
 
@@ -1286,7 +1218,7 @@ async def select_other_user_callback(update: Update, context: ContextTypes.DEFAU
         return
     
     user = query.from_user
-    if not user or str(user.id) != str(config.ADMIN_ID):
+    if not user or int(user.id) not in config.ADMIN_TG_IDS:
         await query.answer("❌ 仅管理员可使用此功能", show_alert=True)
         return
     
@@ -1417,7 +1349,7 @@ async def user_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
         
     user = query.from_user
-    if not user or str(user.id) != str(config.ADMIN_ID):
+    if not user or int(user.id) not in config.ADMIN_TG_IDS:
         await query.answer("❌ 仅管理员可使用此功能", show_alert=True)
         return
     
@@ -1458,7 +1390,7 @@ async def confirm_send_to_callback(update: Update, context: ContextTypes.DEFAULT
         return
         
     user = query.from_user
-    if not user or str(user.id) != str(config.ADMIN_ID):
+    if not user or int(user.id) not in config.ADMIN_TG_IDS:
         await query.answer("❌ 仅管理员可使用此功能", show_alert=True)
         return
     
@@ -1604,7 +1536,7 @@ async def admin_reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = effective_user.id
     
     # 权限检查
-    if str(user_id) != str(config.ADMIN_ID):
+    if int(user_id) not in config.ADMIN_TG_IDS:
         return
 
     if not context.args or len(context.args) < 2:
@@ -1621,7 +1553,7 @@ async def admin_reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # 存入数据库
         msg_db_id = await database.save_message(
-            from_userid=config.ADMIN_ID,
+            from_userid=admin_id,
             to_userid=target_user_id,
             content=reply_text,
             msg_type='text',

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 内置 Web 管理端，提供管理员来访用户界面
 """
@@ -9,7 +9,10 @@ import os
 import json
 import logging
 import io
+import hashlib
+import base64
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import database
 import config
 import weakref
@@ -18,24 +21,393 @@ import aiosqlite
 import time
 import secrets
 import string
+import hmac
+from urllib.parse import urlencode, quote, parse_qsl
 from html import escape
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
+from backend.repositories import merchant_repo
+from backend.app.api.ai import api_detect_advertising
+from services.secret_manager import SecretManager
 
-# OTP 一次性登录凭证存储: {otp: {token, expire_at}}
+# OTP 一次性登录凭证存储: {otp: {token, expire_at, role, tenant_id, merchant_id, issued_for}}
 _otp_store: Dict[str, dict] = {}
 
-def generate_otp(token: str, ttl_seconds: int = 300) -> str:
-    """生成一次性登录凭证（8位字母数字，5分钟有效）"""
-    # 清理过期 OTP
+# CSRF Token 存储 {csrf_token: expire_timestamp}
+_csrf_token_store: Dict[str, float] = {}
+
+ENTRY_GRANT_TTL_SECONDS = 30 * 86400
+ENTRY_PROOF_COOKIE = 'entry_proof'
+LAST_SCOPE_COOKIE = 'miniapp_scope'
+MINIAPP_REOPEN_STATUS = 'reopen_in_telegram_required'
+
+
+def _env_flag_enabled(name: str, default: str = '') -> bool:
+    value = str(os.getenv(name, default) or '').strip().lower()
+    return value in {'1', 'true', 'yes', 'on'}
+
+
+def _allow_local_auth_bypass(request: web.Request) -> bool:
+    """Only allow local unauthenticated API bypass when explicitly enabled for development."""
+    if not _env_flag_enabled('ALLOW_LOCAL_API_BYPASS'):
+        return False
+    real_ip = request.headers.get('X-Real-IP', '')
+    forwarded_for = request.headers.get('X-Forwarded-For', '')
+    return not real_ip and not forwarded_for and request.remote in {'127.0.0.1', '::1'}
+
+
+def _frontend_dist_dir() -> str:
+    """Return the built frontend directory. Vite production output is static/dist."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base_dir, 'static', 'dist'),
+        os.path.join(base_dir, 'frontend', 'dist'),
+    ]
+    for candidate in candidates:
+        if os.path.exists(os.path.join(candidate, 'index.html')):
+            return candidate
+    return candidates[0]
+
+
+def _saas_backend_url() -> str:
+    return str(os.getenv('SAAS_BACKEND_URL') or '').strip().rstrip('/')
+
+
+def _saas_proxy_enabled() -> bool:
+    return bool(_saas_backend_url())
+
+
+def _is_saas_proxy_path(path: str) -> bool:
+    return (
+        path == '/api/session/context'
+        or path.startswith('/api/platform/')
+        or path == '/api/platform'
+        or path.startswith('/api/merchant/')
+        or path == '/api/merchant'
+    )
+
+
+def _build_session_token_payload(
+    *,
+    role: str = 'platform_admin',
+    tenant_id: str = '',
+    merchant_id: Optional[int] = None,
+    issued_for: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        'role': str(role or 'platform_admin'),
+        'actor_role': str(role or 'platform_admin'),
+        'tenant_id': str(tenant_id or ''),
+        'merchant_id': int(merchant_id) if merchant_id is not None else None,
+        'issued_for': str(issued_for or ''),
+        'iat': int(time.time()),
+    }
+
+
+def _get_session_signing_secret() -> str:
+    return hashlib.sha256(str(config.WEB_ADMIN_TOKEN).encode('utf-8')).hexdigest()
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip('=')
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = '=' * (-len(data) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode())
+
+
+def _issue_token(
+    *,
+    role: str = 'platform_admin',
+    tenant_id: str = '',
+    merchant_id: Optional[int] = None,
+    issued_for: Optional[str] = None,
+) -> str:
+    import hmac
+
+    payload = _build_session_token_payload(
+        role=role,
+        tenant_id=tenant_id,
+        merchant_id=merchant_id,
+        issued_for=issued_for,
+    )
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    payload_b64 = _b64url_encode(payload_json)
+    sig = hmac.new(
+        _get_session_signing_secret().encode('utf-8'),
+        payload_b64.encode('utf-8'),
+        hashlib.sha256,
+    ).hexdigest()
+    return f'{payload_b64}.{sig}'
+
+
+def _verify_session_token(token: str) -> Optional[Dict[str, Any]]:
+    import hmac
+
+    try:
+        payload_b64, sig = str(token or '').split('.', 1)
+    except ValueError:
+        return None
+
+    expected_sig = hmac.new(
+        _get_session_signing_secret().encode('utf-8'),
+        payload_b64.encode('utf-8'),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(sig, expected_sig):
+        return None
+
+    try:
+        payload = json.loads(_b64url_decode(payload_b64).decode('utf-8'))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _extract_session_context_from_request(request) -> Dict[str, Any]:
+    auth_header = request.headers.get('Authorization') or ''
+    cookie_token = request.cookies.get('admin_token') or ''
+    raw_token = ''
+    if auth_header.startswith('Bearer '):
+        raw_token = auth_header.split(' ', 1)[1].strip()
+    elif cookie_token:
+        raw_token = cookie_token.strip()
+
+    payload = _verify_session_token(raw_token)
+    if payload:
+        payload['authenticated'] = True
+        return payload
+
+    # Token 验证失败时的安全回退: 不再默认返回 platform_admin
+    # 使用 authenticated=False 明确标记未认证状态
+    if raw_token and raw_token == config.WEB_ADMIN_TOKEN:
+        # 兼容旧版直接使用 BOT_TOKEN 的情况
+        result = _build_session_token_payload(role='platform_admin')
+        result['authenticated'] = True
+        return result
+
+    # 未提供有效 Token，返回未认证状态（需要登录）
+    return {
+        'role': 'platform_admin',
+        'tenant_id': '',
+        'merchant_id': None,
+        'issued_for': '',
+        'iat': 0,
+        'authenticated': False,  # 关键: 明确标记为未认证
+    }
+
+
+def generate_csrf_token() -> str:
+    now = time.time()
+    expired = [k for k, v in _csrf_token_store.items() if v < now]
+    for k in expired:
+        _csrf_token_store.pop(k, None)
+    csrf_token = secrets.token_urlsafe(32)
+    _csrf_token_store[csrf_token] = now + 86400
+    return csrf_token
+
+
+async def generate_otp(
+    *,
+    role: str = 'platform_admin',
+    tenant_id: str = '',
+    merchant_id: Optional[int] = None,
+    issued_for: Optional[str] = None,
+    ttl_seconds: int = 300,
+) -> str:
     now = time.time()
     expired = [k for k, v in _otp_store.items() if v['expire_at'] < now]
     for k in expired:
         del _otp_store[k]
-    # 生成新 OTP
+
     alphabet = string.ascii_letters + string.digits
     otp = ''.join(secrets.choice(alphabet) for _ in range(12))
-    _otp_store[otp] = {'token': token, 'expire_at': now + ttl_seconds}
+    session_token = _issue_token(
+        role=role,
+        tenant_id=tenant_id,
+        merchant_id=merchant_id,
+        issued_for=issued_for,
+    )
+    _otp_store[otp] = {
+        'token': session_token,
+        'expire_at': now + ttl_seconds,
+        'role': role,
+        'tenant_id': tenant_id,
+        'merchant_id': merchant_id,
+        'issued_for': issued_for,
+    }
+
+    # 持久化到数据库，确保重启后 OTP 仍然有效
+    otp_hash = hashlib.sha256(otp.encode()).hexdigest()
+    expires_at = datetime.fromtimestamp(now + ttl_seconds).isoformat()
+    try:
+        await database.save_web_login_otp(
+            otp_hash,
+            role=role,
+            tenant_id=tenant_id,
+            merchant_id=merchant_id,
+            issued_for=issued_for,
+            expires_at=expires_at,
+            session_token=session_token,
+        )
+    except Exception as e:
+        logger.warning(f"保存 OTP 到数据库失败: {e}")
+
     return otp
+
+
+def _normalize_entry_intent(value: Optional[str]) -> str:
+    intent = str(value or 'menu').strip().lower()
+    if intent not in {'menu', 'admin_console', 'merchant_console', 'support'}:
+        return 'menu'
+    return intent
+
+
+def _normalize_role_hint(value: Optional[str]) -> str:
+    role = str(value or 'platform_admin').strip().lower()
+    if role not in {'platform_admin', 'merchant_owner'}:
+        return 'platform_admin'
+    return role
+
+
+def _hash_grant(grant: str) -> str:
+    return hashlib.sha256(str(grant or '').encode('utf-8')).hexdigest()
+
+
+def _cookie_secure(request: Optional[web.Request] = None) -> bool:
+    if request is not None:
+        proto = str(request.headers.get('X-Forwarded-Proto') or request.scheme or '').strip().lower()
+        return proto == 'https'
+    return str(config.FRONTEND_URL or '').startswith('https://')
+
+
+def _extract_user_agent(request: Optional[web.Request], client_context: Optional[Dict[str, Any]] = None) -> str:
+    if client_context and client_context.get('user_agent'):
+        return str(client_context.get('user_agent') or '')
+    if request is not None:
+        return str(request.headers.get('User-Agent') or '')
+    return ''
+
+
+def _ua_fingerprint(user_agent: str) -> str:
+    return hashlib.sha256(str(user_agent or '').encode('utf-8')).hexdigest()[:32]
+
+
+async def generate_entry_grant(
+    *,
+    issued_for: str,
+    role_hint: str = 'platform_admin',
+    tenant_id: str = '',
+    merchant_id: Optional[int] = None,
+    entry_intent: str = 'menu',
+    ua_fingerprint: str = '',
+    ttl_seconds: int = ENTRY_GRANT_TTL_SECONDS,
+) -> Dict[str, Any]:
+    grant = secrets.token_urlsafe(32)
+    grant_hash = _hash_grant(grant)
+    expires_at = datetime.fromtimestamp(time.time() + ttl_seconds).isoformat()
+    proof_salt = secrets.token_urlsafe(24)
+    await database.save_web_entry_grant(
+        grant_hash,
+        issued_for=str(issued_for or ''),
+        role_hint=_normalize_role_hint(role_hint),
+        tenant_id=str(tenant_id or ''),
+        merchant_id=int(merchant_id) if merchant_id is not None else None,
+        entry_intent=_normalize_entry_intent(entry_intent),
+        ua_fingerprint=str(ua_fingerprint or ''),
+        proof_salt=proof_salt,
+        expires_at=expires_at,
+    )
+    return {
+        'grant': grant,
+        'grant_hash': grant_hash,
+        'expires_at': expires_at,
+    }
+
+
+async def _resolve_entry_grant(grant: str) -> Optional[Dict[str, Any]]:
+    grant_hash = _hash_grant(grant)
+    row = await database.get_web_entry_grant(grant_hash)
+    if not row:
+        return None
+    try:
+        expires_at = datetime.fromisoformat(str(row.get('expires_at') or ''))
+    except Exception:
+        return None
+    if expires_at <= datetime.now():
+        return None
+    row['grant_hash'] = grant_hash
+    return row
+
+
+def _issue_entry_proof_cookie_value(grant_row: Dict[str, Any], ua_fingerprint: str) -> str:
+    payload = {
+        'grant_hash': str(grant_row.get('grant_hash') or ''),
+        'issued_for': str(grant_row.get('issued_for') or ''),
+        'ua_fingerprint': str(ua_fingerprint or ''),
+        'iat': int(time.time()),
+    }
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(',', ':')).encode('utf-8'))
+    proof_secret = f"{_get_session_signing_secret()}:{grant_row.get('proof_salt') or ''}"
+    sig = hmac.new(
+        proof_secret.encode('utf-8'),
+        payload_b64.encode('utf-8'),
+        hashlib.sha256,
+    ).hexdigest()
+    return f'{payload_b64}.{sig}'
+
+
+def _verify_entry_proof_cookie_value(value: str, grant_row: Dict[str, Any], ua_fingerprint: str) -> bool:
+    try:
+        payload_b64, sig = str(value or '').split('.', 1)
+    except ValueError:
+        return False
+
+    proof_secret = f"{_get_session_signing_secret()}:{grant_row.get('proof_salt') or ''}"
+    expected_sig = hmac.new(
+        proof_secret.encode('utf-8'),
+        payload_b64.encode('utf-8'),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(sig, expected_sig):
+        return False
+
+    try:
+        payload = json.loads(_b64url_decode(payload_b64).decode('utf-8'))
+    except Exception:
+        return False
+
+    return (
+        isinstance(payload, dict)
+        and str(payload.get('grant_hash') or '') == str(grant_row.get('grant_hash') or '')
+        and str(payload.get('issued_for') or '') == str(grant_row.get('issued_for') or '')
+        and str(payload.get('ua_fingerprint') or '') == str(ua_fingerprint or '')
+    )
+
+
+def build_miniapp_url(
+    *,
+    entry_intent: str = 'menu',
+    grant: Optional[str] = None,
+    otp: Optional[str] = None,
+    tenant_hint: Optional[str] = None,
+    merchant_id_hint: Optional[int] = None,
+) -> str:
+    frontend_url = (config.FRONTEND_URL or '').strip().rstrip('/')
+    if not frontend_url:
+        raise ValueError('frontend_url_unavailable')
+    params = {'entry': _normalize_entry_intent(entry_intent)}
+    if grant:
+        params['grant'] = str(grant)
+    if otp:
+        params['otp'] = str(otp)
+    if tenant_hint:
+        params['tenant'] = str(tenant_hint)
+    if merchant_id_hint is not None:
+        params['merchant_id'] = str(int(merchant_id_hint))
+    return f"{frontend_url}/miniapp?{urlencode(params, quote_via=quote)}"
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +426,16 @@ _push_scheduler_task = None
 _push_scheduler_started = False
 
 # 标签缓存与过期时间
-_tags_cache = {"data": [], "expire_at": 0}
-# 成员头像 file_id 缓存（避免频繁打 Telegram API）
-_member_avatar_cache: Dict[int, Dict[str, object]] = {}
+_tags_cache: Dict[str, Dict[str, Any]] = {}
+# 成员头像 file_id 缓存（避免频繁打 Telegram API），TTL 10分钟，上限 2000 条
+from cachetools import TTLCache as _TTLCache
+_member_avatar_cache: _TTLCache = _TTLCache(maxsize=2000, ttl=600)
+
+# 图片上传大小限制：10MB
+_MAX_UPLOAD_SIZE = 10 * 1024 * 1024
+
+# 后台任务引用集合：防止 fire-and-forget 任务被 GC 回收
+_web_bg_tasks: set = set()
 
 def set_bot_instance(bot):
     global _bot_instance
@@ -106,14 +485,13 @@ async def notify_web_clients(event_type: str, data: Optional[Dict] = None):
 
 
 async def _fetch_member_avatar_file_id(user_id: int) -> Optional[str]:
-    """Get member avatar file_id with cache."""
+    """Get member avatar file_id with TTLCache."""
     if not _bot_instance or not user_id:
         return None
 
-    now_ts = time.time()
     cached = _member_avatar_cache.get(int(user_id))
-    if cached and float(cached.get('expire_at', 0)) > now_ts:
-        return cached.get('file_id')
+    if cached is not None:
+        return cached
 
     file_id = None
     try:
@@ -131,10 +509,7 @@ async def _fetch_member_avatar_file_id(user_id: int) -> Optional[str]:
         except Exception:
             file_id = None
 
-    _member_avatar_cache[int(user_id)] = {
-        'file_id': file_id,
-        'expire_at': now_ts + (600 if file_id else 60),
-    }
+    _member_avatar_cache[int(user_id)] = file_id
     return file_id
 
 
@@ -165,22 +540,92 @@ async def _sync_broadcast_targets_from_bot() -> dict:
     return {"scanned": scanned, "updated": updated}
 
 
-async def _send_broadcast_to_chats(chat_ids, content, image_file=None, do_translate=False, retries=1):
+def _dedupe_int_values(values) -> list[int]:
+    """Return a stable, deduplicated list of integer ids from mixed frontend input."""
+    result: list[int] = []
+    seen = set()
+    for value in values or []:
+        raw = str(value).strip()
+        if not raw:
+            continue
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if parsed not in seen:
+            seen.add(parsed)
+            result.append(parsed)
+    return result
+
+
+def _build_broadcast_reply_markup(buttons):
+    """Build Telegram inline keyboard rows from frontend broadcast button specs."""
+    def normalize_button_url(raw_url: str) -> str:
+        raw_url = str(raw_url or '').strip()
+        if re.match(r'^https?://', raw_url, flags=re.IGNORECASE):
+            return raw_url
+        if re.match(r'^@[A-Za-z0-9_]{5,32}$', raw_url):
+            return f"https://t.me/{raw_url[1:]}"
+        if re.match(r'^[A-Za-z0-9_]{5,32}$', raw_url):
+            return f"https://t.me/{raw_url}"
+        raise ValueError('按钮链接必须以 http://、https:// 或 Telegram 用户名开头')
+
+    cleaned = []
+    for button in buttons or []:
+        if not isinstance(button, dict):
+            continue
+        text = str(button.get('text') or '').strip()
+        raw_url = str(button.get('url') or '').strip()
+        if not text and not raw_url:
+            continue
+        if not text or not raw_url:
+            raise ValueError('按钮文字和链接不能为空')
+        url = normalize_button_url(raw_url)
+        cleaned.append({'text': text[:64], 'url': url})
+        if len(cleaned) >= 6:
+            break
+
+    if not cleaned:
+        return None
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = []
+    for i in range(0, len(cleaned), 2):
+        rows.append([
+            InlineKeyboardButton(item['text'], url=item['url'])
+            for item in cleaned[i:i + 2]
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_broadcast_to_chats(
+    chat_ids,
+    content,
+    image_file=None,
+    do_translate=False,
+    retries=1,
+    reply_markup=None,
+    prechecked_text=None,
+):
     """面向群/频道执行广播，返回成功失败汇总"""
     if not _bot_instance:
         return {"total": 0, "success": 0, "failed": 0, "success_ids": [], "failed_items": []}
 
-    from services.security_center import security_check_flow
-    is_passed, verified_text, error_msg, _, _ = await security_check_flow(
-        content or '', image_bytes=image_file, do_translate=do_translate
-    )
-    if not is_passed:
-        raise ValueError(error_msg or '安全校验失败')
+    if prechecked_text is None:
+        from services.security_center import security_check_flow
+        is_passed, verified_text, error_msg, _, _ = await security_check_flow(
+            content or '', image_bytes=image_file, do_translate=do_translate
+        )
+        if not is_passed:
+            raise ValueError(error_msg or '安全校验失败')
+    else:
+        verified_text = prechecked_text
 
     success_ids = []
     failed_items = []
+    normalized_chat_ids = _dedupe_int_values(chat_ids)
 
-    for chat_id in list(dict.fromkeys([int(x) for x in chat_ids if str(x).strip()])):
+    for chat_id in normalized_chat_ids:
         attempt = 0
         sent_ok = False
         last_err = None
@@ -188,11 +633,25 @@ async def _send_broadcast_to_chats(chat_ids, content, image_file=None, do_transl
             attempt += 1
             try:
                 if image_file:
-                    bio = io.BytesIO(image_file)
-                    bio.name = 'broadcast.jpg'
-                    await _bot_instance.send_photo(chat_id=chat_id, photo=bio, caption=verified_text or None)
+                    # 复用同一个 BytesIO，每次 seek 回开头，避免 N 份内存拷贝
+                    if attempt == 1:
+                        bio = io.BytesIO(image_file)
+                        bio.name = 'broadcast.jpg'
+                    bio.seek(0)
+                    await _bot_instance.send_photo(
+                        chat_id=chat_id,
+                        photo=bio,
+                        caption=verified_text or None,
+                        parse_mode="HTML" if verified_text else None,
+                        reply_markup=reply_markup,
+                    )
                 else:
-                    await _bot_instance.send_message(chat_id=chat_id, text=verified_text)
+                    await _bot_instance.send_message(
+                        chat_id=chat_id,
+                        text=verified_text,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup,
+                    )
                 sent_ok = True
                 success_ids.append(chat_id)
             except Exception as ex:
@@ -204,7 +663,7 @@ async def _send_broadcast_to_chats(chat_ids, content, image_file=None, do_transl
             failed_items.append({"chat_id": chat_id, "reason": last_err or 'unknown'})
 
     return {
-        "total": len(list(dict.fromkeys([int(x) for x in chat_ids if str(x).strip()]))),
+        "total": len(normalized_chat_ids),
         "success": len(success_ids),
         "failed": len(failed_items),
         "success_ids": success_ids,
@@ -260,34 +719,403 @@ async def _run_push_scheduler_loop():
 async def auth_middleware(request, handler):
     """
     2026 规格：Bearer Token 校验中间件。
+    同时将 session context 注入到 request['session'] 中供后端 API 使用。
     """
-    # 1. 静态资源与首页、登录接口免登
-    if request.path in ['/', '/ws', '/api/login'] or request.path.startswith('/api/file/'):
+    public_paths = {
+        '/',
+        '/miniapp',
+        '/favicon.ico',
+        '/healthz',
+        '/ws',
+        '/api/login',
+        '/api/login/otp',
+        '/api/login/tma',
+        '/api/health',
+        '/api/csrf-token',
+        '/api/session/context',
+        '/api/miniapp/bootstrap',
+        '/api/miniapp/context',
+        '/api/miniapp/logout_revoke',
+    }
+    session_management_paths = {'/api/session/context'}
+    is_spa_document_path = (
+        request.method in {'GET', 'HEAD'}
+        and not request.path.startswith((
+            '/api',
+            '/assets/',
+            '/static/',
+            '/ws',
+            '/v1/',
+            '/miniapp',
+        ))
+    )
+    if request.path in public_paths or request.path.startswith('/api/file/') or request.path.startswith('/static/') or request.path.startswith('/assets/'):
         return await handler(request)
-        
-    # 2. 检查 Token（Header 或 Cookie）
-    auth_header = request.headers.get('Authorization', '')
-    cookie_token = request.cookies.get('admin_token', '')
-    
-    token = None
-    if auth_header.startswith('Bearer '):
-        token = auth_header[7:]
-    elif cookie_token:
-        token = cookie_token
-        
-    # 3. 校验 Token
-    if token == config.WEB_ADMIN_TOKEN:
+    if is_spa_document_path:
+        return await handler(request)
+    if _saas_proxy_enabled() and _is_saas_proxy_path(request.path):
         return await handler(request)
 
-    # 4. 真实来源是外网但经 nginx 转发后 remote 变为 127.0.0.1
-    # 通过 X-Real-IP 判断，只有真实来源是 127.0.0.1 才免登（本机直接访问）
-    real_ip = request.headers.get('X-Real-IP', '')
-    if not real_ip and request.remote == '127.0.0.1':
-        # 没有 X-Real-IP 说明是本机直接访问（非 nginx 代理），免登
+    auth_header = request.headers.get('Authorization', '')
+    cookie_token = request.cookies.get('admin_token', '')
+
+    token = None
+    if auth_header.startswith('Bearer '):
+        token = auth_header.split(' ', 1)[1]
+    elif cookie_token:
+        token = cookie_token
+
+    session_ctx = _extract_session_context_from_request(request)
+
+    # 将 session context 注入 request 供后端 API 使用
+    request['session'] = session_ctx
+
+    # 商户不应访问平台共享后台接口；平台管理员也不应在此入口切换为商户视角。
+    if request.path in session_management_paths and session_ctx.get('authenticated', False):
+        if request.method != 'GET':
+            return web.json_response({"status": "error", "message": "session_context_switch_disabled"}, status=403)
+
+    merchant_blocked_prefixes = (
+        '/api/users',
+        '/api/messages',
+        '/api/broadcast',
+        '/api/push_tasks',
+        '/api/monitors',
+        '/api/potential_users',
+        '/api/group_listen',
+        '/api/groups',
+        '/api/group_members',
+        '/api/group_messages',
+        '/api/config',
+        '/api/openai',
+        '/v1/',
+    )
+    if session_ctx.get('authenticated', False) and session_ctx.get('role') == 'merchant_owner':
+        if any(request.path.startswith(prefix) for prefix in merchant_blocked_prefixes):
+            return web.json_response({"status": "error", "message": "merchant_console_forbidden"}, status=403)
+
+    if not session_ctx.get('authenticated', False):
+        if token != config.WEB_ADMIN_TOKEN:
+            if _allow_local_auth_bypass(request):
+                return await handler(request)
+            real_ip = request.headers.get('X-Real-IP', '')
+            logger.warning(f"拒绝未授权访问: {request.path} 来自 {request.remote} real={real_ip}")
+            return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
+
+    if _verify_session_token(token or '') is not None or token == config.WEB_ADMIN_TOKEN:
         return await handler(request)
-        
+
+    if _allow_local_auth_bypass(request):
+        return await handler(request)
+
+    real_ip = request.headers.get('X-Real-IP', '')
     logger.warning(f"拒绝未授权访问: {request.path} 来自 {request.remote} real={real_ip}")
     return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
+
+
+def _request_scope_context(request) -> Dict[str, Any]:
+    session = request.get('session') or {}
+    role = str(session.get('role') or '').strip()
+    return {
+        'authenticated': bool(session.get('authenticated', False)),
+        'role': role,
+        'tenant_id': str(session.get('tenant_id') or '').strip(),
+        'merchant_id': int(session.get('merchant_id')) if session.get('merchant_id') is not None else None,
+        'is_merchant': role == 'merchant_owner' and bool(str(session.get('tenant_id') or '').strip()),
+    }
+
+
+async def _resolve_business_window() -> Dict[str, Any]:
+    timezone_name = str(await database.get_admin_setting('miniapp_timezone', 'Asia/Shanghai') or 'Asia/Shanghai').strip() or 'Asia/Shanghai'
+    start = str(await database.get_admin_setting('miniapp_business_start', '09:00') or '09:00').strip() or '09:00'
+    end = str(await database.get_admin_setting('miniapp_business_end', '22:00') or '22:00').strip() or '22:00'
+
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        timezone_name = 'Asia/Shanghai'
+        tz = ZoneInfo(timezone_name)
+
+    now_local = datetime.now(tz)
+    current_minutes = now_local.hour * 60 + now_local.minute
+
+    def _parse_minutes(raw: str, fallback: int) -> int:
+        try:
+            hour, minute = str(raw).split(':', 1)
+            return int(hour) * 60 + int(minute)
+        except Exception:
+            return fallback
+
+    start_minutes = _parse_minutes(start, 9 * 60)
+    end_minutes = _parse_minutes(end, 22 * 60)
+    if end_minutes < start_minutes:
+        in_window = current_minutes >= start_minutes or current_minutes < end_minutes
+    else:
+        in_window = start_minutes <= current_minutes < end_minutes
+
+    return {
+        'timezone': timezone_name,
+        'start': start,
+        'end': end,
+        'active': bool(in_window),
+        'now': now_local.isoformat(),
+    }
+
+
+async def _authenticate_tma_init_data(
+    init_data: str,
+    *,
+    grant_row: Optional[Dict[str, Any]] = None,
+    tenant_hint: str = '',
+    merchant_id_hint: Optional[int] = None,
+) -> Dict[str, Any]:
+    init_data = str(init_data or '').strip()
+    if not init_data:
+        return {'ok': False, 'message': 'init_data 不能为空'}
+
+    bot_token_for_verify = await _resolve_tma_verification_token(
+        grant_row=grant_row,
+        tenant_hint=tenant_hint,
+        merchant_id_hint=merchant_id_hint,
+    )
+    if not bot_token_for_verify:
+        return {'ok': False, 'message': '服务端未配置 Bot Token', 'status_code': 500}
+    pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+
+    received_hash = pairs.pop('hash', '')
+    if not received_hash:
+        return {'ok': False, 'message': 'init_data 缺少 hash'}
+
+    sorted_pairs = sorted(pairs.items())
+    check_string = '\n'.join(f'{k}={v}' for k, v in sorted_pairs)
+    secret_key = hmac.new(
+        b"WebAppData",
+        bot_token_for_verify.encode(),
+        hashlib.sha256,
+    ).digest()
+    computed_hash = hmac.new(
+        secret_key,
+        check_string.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    if computed_hash != received_hash:
+        logger.warning("TMA initData HMAC 验证失败: hash mismatch")
+        return {'ok': False, 'message': 'init_data 验证失败', 'status_code': 401}
+
+    user_json = pairs.get('user', '')
+    if not user_json:
+        return {'ok': False, 'message': 'init_data 缺少 user'}
+
+    user_info = json.loads(user_json)
+    tg_user_id = int(user_info.get('id', 0))
+    if not tg_user_id:
+        return {'ok': False, 'message': '无效的 user id'}
+
+    expected_merchant = None
+    effective_merchant_id = _safe_int((grant_row or {}).get('merchant_id')) or merchant_id_hint
+    if effective_merchant_id is not None:
+        expected_merchant = await merchant_repo.get_merchant_by_id(int(effective_merchant_id))
+
+    merchant = await merchant_repo.get_merchant_by_owner(tg_user_id)
+    if expected_merchant and int(expected_merchant.get('owner_tg_user_id') or 0) == tg_user_id:
+        merchant = expected_merchant
+    is_platform_admin = tg_user_id in config.ADMIN_TG_IDS
+    return {
+        'ok': True,
+        'tg_user_id': tg_user_id,
+        'merchant': merchant,
+        'is_platform_admin': is_platform_admin,
+        'user': user_info,
+        'start_param': str(pairs.get('start_param') or ''),
+        'verified_tenant_id': str((grant_row or {}).get('tenant_id') or tenant_hint or ''),
+        'verified_merchant_id': effective_merchant_id,
+    }
+
+
+async def _consume_otp_session(otp: str) -> Dict[str, Any]:
+    otp = str(otp or '').strip()
+    if not otp:
+        return {'ok': False, 'reason': 'missing'}
+
+    now = time.time()
+    otp_data = _otp_store.get(otp)
+    if otp_data and otp_data['expire_at'] > now:
+        _otp_store.pop(otp, None)
+        payload = _verify_session_token(otp_data['token']) or {}
+        return {
+            'ok': True,
+            'token': otp_data['token'],
+            'session': {
+                'role': payload.get('role', otp_data.get('role', 'platform_admin')),
+                'tenant_id': payload.get('tenant_id', otp_data.get('tenant_id', '')),
+                'merchant_id': payload.get('merchant_id', otp_data.get('merchant_id')),
+                'issued_for': payload.get('issued_for', otp_data.get('issued_for', '')),
+                'actor_role': payload.get('role', otp_data.get('role', 'platform_admin')),
+            },
+            'source': 'otp',
+        }
+
+    _otp_store.pop(otp, None)
+    otp_hash = hashlib.sha256(otp.encode()).hexdigest()
+    db_otp = await database.get_web_login_otp(otp_hash)
+    if db_otp:
+        try:
+            expires_at = datetime.fromisoformat(db_otp['expires_at'])
+        except Exception:
+            expires_at = datetime.min
+        if expires_at > datetime.now():
+            session_token = db_otp.get('session_token')
+            if session_token:
+                payload = _verify_session_token(session_token)
+                if not payload:
+                    return {'ok': False, 'reason': 'session_expired'}
+                await database.consume_web_login_otp(otp_hash)
+                return {
+                    'ok': True,
+                    'token': session_token,
+                    'session': {
+                        'role': payload.get('role', 'platform_admin'),
+                        'tenant_id': payload.get('tenant_id', ''),
+                        'merchant_id': payload.get('merchant_id'),
+                        'issued_for': payload.get('issued_for', db_otp.get('issued_for', '')),
+                        'actor_role': payload.get('role', 'platform_admin'),
+                    },
+                    'source': 'otp',
+                }
+        return {'ok': False, 'reason': 'expired'}
+
+    return {'ok': False, 'reason': 'invalid'}
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == '':
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _extract_request_auth_hints(
+    data: Optional[Dict[str, Any]] = None,
+    client_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload = data or {}
+    ctx = client_context or {}
+    tenant_hint = str(payload.get('tenant_hint') or '').strip()
+    merchant_id_hint = _safe_int(payload.get('merchant_id_hint'))
+    grant = str(payload.get('grant') or '').strip()
+
+    raw_search = str(ctx.get('search') or '').strip()
+    if raw_search.startswith('?'):
+        raw_search = raw_search[1:]
+    if raw_search:
+        for key, value in parse_qsl(raw_search, keep_blank_values=True):
+            if key == 'tenant' and not tenant_hint:
+                tenant_hint = str(value or '').strip()
+            elif key == 'merchant_id' and merchant_id_hint is None:
+                merchant_id_hint = _safe_int(value)
+            elif key == 'grant' and not grant:
+                grant = str(value or '').strip()
+
+    return {
+        'tenant_hint': tenant_hint,
+        'merchant_id_hint': merchant_id_hint,
+        'grant': grant,
+    }
+
+
+async def _resolve_tma_verification_token(
+    *,
+    grant_row: Optional[Dict[str, Any]] = None,
+    tenant_hint: str = '',
+    merchant_id_hint: Optional[int] = None,
+) -> str:
+    effective_tenant_id = str((grant_row or {}).get('tenant_id') or tenant_hint or '').strip()
+    effective_merchant_id = _safe_int((grant_row or {}).get('merchant_id')) or merchant_id_hint
+
+    if not effective_tenant_id and effective_merchant_id is not None:
+        merchant = await merchant_repo.get_merchant_by_id(int(effective_merchant_id))
+        if merchant:
+            effective_tenant_id = str(merchant.get('tenant_id') or '').strip()
+
+    if effective_tenant_id:
+        merchant_bot_token = str(
+            await SecretManager.get_config('TELEGRAM_BOT_TOKEN', tenant_id=effective_tenant_id, default='')
+            or ''
+        ).strip()
+        if merchant_bot_token:
+            return merchant_bot_token
+
+    return str(config.BOT_TOKEN or '').strip()
+
+
+def _resolve_identity_scope(
+    *,
+    entry_intent: str,
+    is_platform_admin: bool,
+    merchant: Optional[Dict[str, Any]],
+    last_scope: str = '',
+) -> Dict[str, Any]:
+    entry_intent = _normalize_entry_intent(entry_intent)
+    last_scope = _normalize_role_hint(last_scope or 'platform_admin')
+    has_merchant = merchant is not None
+
+    if entry_intent == 'merchant_console':
+        if has_merchant:
+            return {'role': 'merchant_owner', 'reason': 'merchant_console_entry'}
+        if is_platform_admin:
+            return {'role': 'platform_admin', 'reason': 'merchant_entry_fallback_platform'}
+
+    if entry_intent == 'admin_console':
+        if is_platform_admin:
+            return {'role': 'platform_admin', 'reason': 'admin_console_entry'}
+        if has_merchant:
+            return {'role': 'merchant_owner', 'reason': 'admin_entry_fallback_merchant'}
+
+    if is_platform_admin and has_merchant:
+        return {'role': last_scope or 'platform_admin', 'reason': 'dual_identity_last_scope'}
+    if is_platform_admin:
+        return {'role': 'platform_admin', 'reason': 'platform_identity'}
+    if has_merchant:
+        return {'role': 'merchant_owner', 'reason': 'merchant_identity'}
+    return {'role': 'unregistered', 'reason': 'unregistered'}
+
+
+def _build_landing_payload(role: str, *, entry_intent: str, business_window: Dict[str, Any]) -> Dict[str, Any]:
+    active = bool(business_window.get('active'))
+    mode = 'normal' if active else 'after_hours'
+
+    if role == 'unregistered':
+        return {'route': '/onboarding', 'mode': 'register', 'reason': 'unregistered'}
+    if role == 'merchant_owner':
+        return {'route': '/saas', 'mode': mode, 'reason': f'{entry_intent}_merchant'}
+    if entry_intent == 'admin_console':
+        return {'route': '/saas', 'mode': mode, 'reason': 'platform_admin_console'}
+    if entry_intent == 'merchant_console':
+        return {'route': '/saas', 'mode': mode, 'reason': 'platform_merchant_console'}
+    if entry_intent == 'support':
+        return {'route': '/chat', 'mode': mode, 'reason': 'support_entry'}
+    return {'route': '/saas', 'mode': mode, 'reason': f'{entry_intent}_platform_beta'}
+
+
+def _identity_label(role: str) -> str:
+    if role == 'platform_admin':
+        return '平台管理员'
+    if role == 'merchant_owner':
+        return '商户管理员'
+    return '未注册用户'
+
+
+def _session_from_grant_row(grant_row: Dict[str, Any]) -> Dict[str, Any]:
+    role = _normalize_role_hint(grant_row.get('role_hint'))
+    return {
+        'role': role,
+        'tenant_id': str(grant_row.get('tenant_id') or ''),
+        'merchant_id': int(grant_row.get('merchant_id')) if grant_row.get('merchant_id') is not None else None,
+        'issued_for': str(grant_row.get('issued_for') or ''),
+        'actor_role': role,
+    }
 
 
 async def api_login(request):
@@ -296,76 +1124,510 @@ async def api_login(request):
         data = await request.json()
         token = (data.get('token') or '').strip()
         if token == config.WEB_ADMIN_TOKEN:
-            return web.json_response({"status": "ok"})
+            session_token = _issue_token(role='platform_admin')
+            return web.json_response({
+                "status": "ok",
+                "token": session_token,
+                "session": {
+                    "role": "platform_admin",
+                    "tenant_id": "",
+                    "merchant_id": None,
+                },
+            })
         return web.json_response({"status": "error", "message": "Token 错误"}, status=401)
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=400)
 
 
-async def index_handler(request):
-    """返回管理员前端页面 (支持 OTP 一次性免登 + Token 直链)"""
-    html_path = os.path.join(os.path.dirname(__file__), 'admin_new.html')
+async def api_login_otp(request):
+    """OTP 登录接口"""
+    try:
+        data = await request.json()
+        otp = (data.get('otp') or '').strip()
+        if not otp:
+            return web.json_response({"status": "error", "message": "otp 不能为空"}, status=400)
+        otp_result = await _consume_otp_session(otp)
+        if otp_result.get('ok'):
+            return web.json_response({
+                "status": "ok",
+                "token": otp_result.get('token'),
+                "session": {
+                    "role": otp_result['session'].get('role', 'platform_admin'),
+                    "tenant_id": otp_result['session'].get('tenant_id', ''),
+                    "merchant_id": otp_result['session'].get('merchant_id'),
+                    "actor_role": otp_result['session'].get('actor_role', otp_result['session'].get('role', 'platform_admin')),
+                },
+            })
 
-    def inject_token(html, token):
-        auto_login = f"""
-    <script>
-    localStorage.setItem('admin_token', '{token}');
-    document.cookie = 'admin_token={token};max-age=604800;path=/';
-    // 立即显示app，跳过DOMContentLoaded验证
-    window.__TOKEN_INJECTED__ = '{token}';
-    </script>"""
-        return html.replace('</head>', auto_login + '\n</head>')
+        return web.json_response({"status": "error", "message": "OTP 无效或已过期"}, status=401)
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=400)
 
-    # 优先处理 OTP 一次性凭证
-    otp = request.query.get('otp')
-    if otp:
-        now = time.time()
-        otp_data = _otp_store.get(otp)
-        if otp_data and otp_data['expire_at'] > now:
-            real_token = otp_data['token']
-            del _otp_store[otp]  # 立即销毁，一次性
-            logger.info("OTP 登录成功，凭证已销毁")
-            try:
-                with open(html_path, 'r', encoding='utf-8') as f:
-                    html = f.read()
-                return web.Response(text=inject_token(html, real_token), content_type='text/html',
-                    headers={'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache'})
-            except Exception as e:
-                return web.Response(text=f"Error: {e}", status=500)
-        else:
-            return web.Response(
-                text="<h1 style='font-family:sans-serif;text-align:center;margin-top:20%;color:#e74c3c'>登录链接已失效或已使用，请重新获取</h1>",
-                content_type='text/html', status=403
+
+async def api_get_csrf_token(request):
+    try:
+        return web.json_response({"status": "ok", "token": generate_csrf_token()})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def api_login_tma(request):
+    """Telegram Mini App initData 认证接口
+    
+    验证 Telegram 传递的 initData HMAC 签名，
+    签名有效则信任其中的 user 信息，自动签发 session token。
+    """
+    try:
+        data = await request.json()
+        init_data = (data.get('init_data') or '').strip()
+        client_context = data.get('client_context') if isinstance(data.get('client_context'), dict) else {}
+        hints = _extract_request_auth_hints(data, client_context)
+        grant_row = await _resolve_entry_grant(hints['grant']) if hints.get('grant') else None
+        auth_result = await _authenticate_tma_init_data(
+            init_data,
+            grant_row=grant_row,
+            tenant_hint=hints.get('tenant_hint') or '',
+            merchant_id_hint=hints.get('merchant_id_hint'),
+        )
+        if not auth_result.get('ok'):
+            return web.json_response(
+                {"status": "error", "message": auth_result.get('message') or 'init_data 验证失败'},
+                status=int(auth_result.get('status_code') or 400),
             )
 
-    # 兼容旧版 ?token= 直链
-    token = request.query.get('token')
-    if token == config.WEB_ADMIN_TOKEN:
-        try:
-            with open(html_path, 'r', encoding='utf-8') as f:
-                html = f.read()
-            return web.Response(text=inject_token(html, token), content_type='text/html',
-                    headers={'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache'})
-        except Exception as e:
-            return web.Response(text=f"Error: {e}", status=500)
+        merchant = auth_result.get('merchant')
+        is_platform_admin = bool(auth_result.get('is_platform_admin'))
+        user_info = auth_result.get('user') or {}
+        tg_user_id = int(auth_result.get('tg_user_id') or 0)
+        scope = _resolve_identity_scope(
+            entry_intent='menu',
+            is_platform_admin=is_platform_admin,
+            merchant=merchant,
+            last_scope='platform_admin',
+        )
+        role = scope.get('role') or 'unregistered'
 
-    # 普通访问，返回带登录界面的页面
-    try:
-        with open(html_path, 'r', encoding='utf-8') as f:
-            return web.Response(text=f.read(), content_type='text/html',
-                headers={'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache'})
+        if role == 'merchant_owner' and merchant:
+            tenant_id = str(merchant.get('tenant_id') or '')
+            merchant_id = int(merchant.get('id') or 0)
+        elif role == 'platform_admin':
+            tenant_id = ''
+            merchant_id = None
+        else:
+            return web.json_response({
+                "status": "ok",
+                "token": None,
+                "session": {
+                    "role": "unregistered",
+                    "tenant_id": "",
+                    "merchant_id": None,
+                    "actor_role": "unregistered",
+                },
+                "user": user_info,
+            })
+
+        session_token = _issue_token(
+            role=role,
+            tenant_id=tenant_id,
+            merchant_id=merchant_id,
+            issued_for=str(tg_user_id),
+        )
+
+        return web.json_response({
+            "status": "ok",
+            "token": session_token,
+            "session": {
+                "role": role,
+                "tenant_id": tenant_id,
+                "merchant_id": merchant_id,
+                "actor_role": role,
+            },
+            "user": user_info,
+        })
+
     except Exception as e:
-        logger.error(f"加载 admin_new.html 失败: {e}")
-        old_path = os.path.join(os.path.dirname(__file__), 'admin.html')
-        if os.path.exists(old_path):
-            with open(old_path, 'r', encoding='utf-8') as f:
-                return web.Response(text=f.read(), content_type='text/html')
-        return web.Response(text=f"Error loading admin UI: {e}", status=500)
+        logger.error(f'api_login_tma error: {e}', exc_info=True)
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+def _set_bootstrap_cookies(
+    response: web.StreamResponse,
+    *,
+    request: web.Request,
+    role: str,
+    proof_value: Optional[str] = None,
+) -> None:
+    secure = _cookie_secure(request)
+    response.set_cookie(
+        LAST_SCOPE_COOKIE,
+        value=str(role or 'platform_admin'),
+        max_age=ENTRY_GRANT_TTL_SECONDS,
+        path='/',
+        samesite='Strict',
+        secure=secure,
+    )
+    if proof_value:
+        response.set_cookie(
+            ENTRY_PROOF_COOKIE,
+            value=proof_value,
+            max_age=ENTRY_GRANT_TTL_SECONDS,
+            path='/',
+            httponly=True,
+            samesite='Strict',
+            secure=secure,
+        )
+
+
+async def api_miniapp_bootstrap(request):
+    try:
+        data = await request.json()
+        init_data = str(data.get('init_data') or '').strip()
+        otp = str(data.get('otp') or '').strip()
+        grant = str(data.get('grant') or '').strip()
+        entry_intent = _normalize_entry_intent(data.get('entry_intent'))
+        client_context = data.get('client_context') if isinstance(data.get('client_context'), dict) else {}
+        auth_hints = _extract_request_auth_hints(data, client_context)
+        user_agent = _extract_user_agent(request, client_context)
+        ua_fp = _ua_fingerprint(user_agent)
+        last_scope = str(request.cookies.get(LAST_SCOPE_COOKIE) or 'platform_admin').strip()
+
+        resolved_grant = grant or str(auth_hints.get('grant') or '').strip()
+        grant_row = await _resolve_entry_grant(resolved_grant) if resolved_grant else None
+        business_window = await _resolve_business_window()
+
+        token = None
+        session = None
+        renewal = {'rotated': False, 'source': 'none', 'grant_expires_at': grant_row.get('expires_at') if grant_row else None}
+        proof_value = None
+
+        if init_data:
+            auth_result = await _authenticate_tma_init_data(
+                init_data,
+                grant_row=grant_row,
+                tenant_hint=auth_hints.get('tenant_hint') or '',
+                merchant_id_hint=auth_hints.get('merchant_id_hint'),
+            )
+            if auth_result.get('ok'):
+                merchant = auth_result.get('merchant')
+                scope = _resolve_identity_scope(
+                    entry_intent=entry_intent,
+                    is_platform_admin=bool(auth_result.get('is_platform_admin')),
+                    merchant=merchant,
+                    last_scope=last_scope,
+                )
+                role = scope.get('role') or 'unregistered'
+                if role == 'unregistered':
+                    landing = _build_landing_payload(role, entry_intent=entry_intent, business_window=business_window)
+                    return web.json_response({
+                        'status': 'ok',
+                        'token': None,
+                        'session': {
+                            'role': 'unregistered',
+                            'tenant_id': '',
+                            'merchant_id': None,
+                            'actor_role': 'unregistered',
+                        },
+                        'landing': landing,
+                        'renewal': renewal,
+                        'ui_context': {
+                            'business_window': business_window,
+                            'entry_intent': entry_intent,
+                            'identity_label': _identity_label('unregistered'),
+                        },
+                        'user': auth_result.get('user'),
+                    })
+
+                merchant_id = None
+                tenant_id = ''
+                if role == 'merchant_owner' and merchant:
+                    merchant_id = int(merchant.get('id') or 0)
+                    tenant_id = str(merchant.get('tenant_id') or '')
+                token = _issue_token(
+                    role=role,
+                    tenant_id=tenant_id,
+                    merchant_id=merchant_id,
+                    issued_for=str(auth_result.get('tg_user_id') or ''),
+                )
+                session = {
+                    'role': role,
+                    'tenant_id': tenant_id,
+                    'merchant_id': merchant_id,
+                    'actor_role': role,
+                }
+                renewal = {'rotated': bool(grant_row), 'source': 'init_data', 'grant_expires_at': grant_row.get('expires_at') if grant_row else None}
+                if grant_row and str(grant_row.get('issued_for') or '') == str(auth_result.get('tg_user_id') or ''):
+                    await database.bind_web_entry_grant_proof(grant_row['grant_hash'], ua_fingerprint=ua_fp)
+                    grant_row = await _resolve_entry_grant(grant)
+                    if grant_row:
+                        proof_value = _issue_entry_proof_cookie_value(grant_row, ua_fp)
+
+        if not token and otp:
+            otp_result = await _consume_otp_session(otp)
+            if otp_result.get('ok'):
+                token = otp_result.get('token')
+                session = {
+                    'role': otp_result['session'].get('role', 'platform_admin'),
+                    'tenant_id': otp_result['session'].get('tenant_id', ''),
+                    'merchant_id': otp_result['session'].get('merchant_id'),
+                    'actor_role': otp_result['session'].get('actor_role', otp_result['session'].get('role', 'platform_admin')),
+                }
+                renewal = {'rotated': False, 'source': 'otp', 'grant_expires_at': grant_row.get('expires_at') if grant_row else None}
+                if grant_row and str(grant_row.get('issued_for') or '') == str(otp_result['session'].get('issued_for') or ''):
+                    await database.bind_web_entry_grant_proof(grant_row['grant_hash'], ua_fingerprint=ua_fp)
+                    grant_row = await _resolve_entry_grant(grant)
+                    if grant_row:
+                        proof_value = _issue_entry_proof_cookie_value(grant_row, ua_fp)
+
+        if not token and grant_row:
+            proof_cookie = str(request.cookies.get(ENTRY_PROOF_COOKIE) or '').strip()
+            if proof_cookie and _verify_entry_proof_cookie_value(proof_cookie, grant_row, ua_fp):
+                await database.touch_web_entry_grant_rotation(grant_row['grant_hash'])
+                session = _session_from_grant_row(grant_row)
+                token = _issue_token(
+                    role=session['role'],
+                    tenant_id=session['tenant_id'],
+                    merchant_id=session['merchant_id'],
+                    issued_for=str(grant_row.get('issued_for') or ''),
+                )
+                renewal = {'rotated': True, 'source': 'grant_proof', 'grant_expires_at': grant_row.get('expires_at')}
+                proof_value = _issue_entry_proof_cookie_value(grant_row, ua_fp)
+            else:
+                return web.json_response({
+                    'status': MINIAPP_REOPEN_STATUS,
+                    'message': '请返回 Telegram 重新打开 Mini App',
+                    'reason': 'grant_requires_proof',
+                    'landing': {'route': '/chat', 'mode': 'reopen', 'reason': 'grant_requires_proof'},
+                    'renewal': {'rotated': False, 'source': 'grant_rejected', 'grant_expires_at': grant_row.get('expires_at')},
+                    'ui_context': {
+                        'business_window': business_window,
+                        'entry_intent': entry_intent,
+                        'identity_label': '需要返回 Telegram',
+                    },
+                }, status=401)
+
+        if not token or not session:
+            return web.json_response({
+                'status': MINIAPP_REOPEN_STATUS,
+                'message': '登录状态已失效，请返回 Telegram 重新打开',
+                'reason': 'bootstrap_auth_failed',
+                'landing': {'route': '/chat', 'mode': 'reopen', 'reason': 'bootstrap_auth_failed'},
+                'renewal': renewal,
+                'ui_context': {
+                    'business_window': business_window,
+                    'entry_intent': entry_intent,
+                    'identity_label': '需要返回 Telegram',
+                },
+            }, status=401)
+
+        landing = _build_landing_payload(session['role'], entry_intent=entry_intent, business_window=business_window)
+        response = web.json_response({
+            'status': 'ok',
+            'token': token,
+            'session': session,
+            'landing': landing,
+            'renewal': renewal,
+            'ui_context': {
+                'business_window': business_window,
+                'entry_intent': entry_intent,
+                'identity_label': _identity_label(session['role']),
+            },
+        })
+        _set_bootstrap_cookies(response, request=request, role=session['role'], proof_value=proof_value)
+        return response
+    except Exception as e:
+        logger.error('api_miniapp_bootstrap error: %s', e, exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_miniapp_context(request):
+    try:
+        session = _extract_session_context_from_request(request)
+        business_window = await _resolve_business_window()
+        return web.json_response({
+            'status': 'ok',
+            'data': {
+                'session': session,
+                'business_window': business_window,
+                'identity_label': _identity_label(str(session.get('role') or 'platform_admin')),
+            },
+        })
+    except Exception as e:
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_miniapp_logout_revoke(request):
+    try:
+        data = await request.json()
+        grant = str(data.get('grant') or '').strip()
+        if grant:
+            await database.revoke_web_entry_grant(_hash_grant(grant))
+        response = web.json_response({'status': 'ok'})
+        response.del_cookie(ENTRY_PROOF_COOKIE, path='/')
+        response.del_cookie(LAST_SCOPE_COOKIE, path='/')
+        return response
+    except Exception as e:
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_get_session_context(request):
+    try:
+        session = _extract_session_context_from_request(request)
+        return web.json_response({"status": "ok", "data": session})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def api_health(request):
+    """Small production readiness endpoint for tunnel and Mini App smoke checks."""
+    dist_dir = _frontend_dist_dir()
+    index_path = os.path.join(dist_dir, 'index.html')
+    assets_dir = os.path.join(dist_dir, 'assets')
+    index_exists = os.path.exists(index_path)
+    assets_exists = os.path.isdir(assets_dir)
+    status = 'ok' if index_exists and assets_exists else 'degraded'
+    payload = {
+        'status': status,
+        'service': 'tgbot',
+        'time': datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),
+        'frontend': {
+            'dist': os.path.relpath(dist_dir, os.path.dirname(os.path.abspath(__file__))),
+            'index': index_exists,
+            'assets': assets_exists,
+        },
+        'miniapp': {
+            'path': '/miniapp',
+            'requires_telegram_init_data': True,
+        },
+    }
+    return web.json_response(payload, status=200 if status == 'ok' else 503)
+
+
+async def api_update_session_context(request):
+    try:
+        current = _extract_session_context_from_request(request)
+
+        # 安全校验: 未认证用户不能切换角色
+        if not current.get('authenticated', True):
+            return web.json_response({
+                "status": "error",
+                "message": "未认证用户禁止切换角色",
+            }, status=401)
+
+        # 会话上下文只允许读取，不允许在生产入口动态切换角色/租户。
+        # 目标架构要求：
+        # 1. 平台管理员固定平台域
+        # 2. 商户通过自己的 OTP/session 进入自己的 tenant 域
+        # 3. 禁止管理员代入商户视角，禁止商户切回平台视角
+        return web.json_response({
+            "status": "error",
+            "message": "session_context_switch_disabled",
+        }, status=403)
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def index_handler(request):
+    """返回前端 SPA 页面，OTP 登录由前端自行调用 /api/login/otp。"""
+    dist_index = os.path.join(_frontend_dist_dir(), 'index.html')
+
+    try:
+        with open(dist_index, 'r', encoding='utf-8') as f:
+            return web.Response(
+                text=f.read(),
+                content_type='text/html',
+                headers={'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache'}
+            )
+    except Exception as e:
+        logger.error(f"加载前端 index.html 失败: {e}")
+        return web.Response(text=f"Error loading frontend UI: {e}", status=500)
+
+
+async def favicon_handler(request):
+    return web.Response(status=204)
+
+
+async def saas_proxy_handler(request):
+    """Forward SaaS API traffic to the Rust/Supabase backend when SAAS_BACKEND_URL is configured."""
+    target_base = _saas_backend_url()
+    if not target_base:
+        return web.json_response({"status": "error", "message": "saas_backend_not_configured"}, status=503)
+
+    target_url = f"{target_base}{request.path}"
+    if request.rel_url.query_string:
+        target_url = f"{target_url}?{request.rel_url.query_string}"
+
+    hop_by_hop = {
+        'connection',
+        'content-length',
+        'host',
+        'keep-alive',
+        'proxy-authenticate',
+        'proxy-authorization',
+        'te',
+        'trailer',
+        'transfer-encoding',
+        'upgrade',
+    }
+    trusted_header_names = {
+        'x-saas-internal-secret',
+        'x-user-id',
+        'x-user-role',
+        'x-tenant-id',
+        'x-merchant-id',
+    }
+    proxy_headers = {}
+    for name, value in request.headers.items():
+        lower = name.lower()
+        if lower in hop_by_hop or lower in trusted_header_names or lower == 'cookie':
+            continue
+        proxy_headers[name] = value
+
+    internal_secret = str(os.getenv('INTERNAL_SAAS_SECRET') or '').strip()
+    session = _extract_session_context_from_request(request)
+    if internal_secret and session.get('authenticated', False):
+        proxy_headers.update({
+            'x-saas-internal-secret': internal_secret,
+            'x-user-role': str(session.get('role') or ''),
+            'x-user-id': str(session.get('issued_for') or ''),
+            'x-tenant-id': str(session.get('tenant_id') or ''),
+            'x-merchant-id': str(session.get('merchant_id') or ''),
+        })
+
+    body = await request.read()
+    timeout = aiohttp.ClientTimeout(total=float(os.getenv('SAAS_PROXY_TIMEOUT', '20')))
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as client:
+            async with client.request(
+                request.method,
+                target_url,
+                headers=proxy_headers,
+                data=body if body else None,
+                allow_redirects=False,
+            ) as upstream:
+                response_body = await upstream.read()
+                response_headers = {}
+                for name, value in upstream.headers.items():
+                    lower = name.lower()
+                    if lower in hop_by_hop or lower in {'content-encoding', 'content-length'}:
+                        continue
+                    response_headers[name] = value
+                return web.Response(body=response_body, status=upstream.status, headers=response_headers)
+    except Exception as e:
+        logger.warning(f"SaaS Rust backend proxy failed: {e}")
+        return web.json_response(
+            {"status": "error", "message": "saas_backend_unavailable", "detail": str(e)},
+            status=502,
+        )
+
 
 async def api_get_users(request):
     """获取来访用户列表"""
     try:
-        users = await database.get_inbox_list()
+        scope = _request_scope_context(request)
+        users = await database.get_inbox_list(
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+            merchant_id=scope['merchant_id'] if scope['is_merchant'] else None,
+        )
         return web.json_response({"status": "ok", "data": users})
     except Exception as e:
         logger.error(f"api_get_users 错误: {e}")
@@ -374,12 +1636,19 @@ async def api_get_users(request):
 async def api_get_messages(request):
     """获取与某用户的聊天历史"""
     try:
+        scope = _request_scope_context(request)
         user_id = int(request.match_info['user_id'])
         page = int(request.query.get('page', 1))
         limit = 50
         offset = (page - 1) * limit
         
-        messages = await database.get_chat_history(user_id, limit, offset)
+        messages = await database.get_chat_history(
+            user_id,
+            limit,
+            offset,
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+            merchant_id=scope['merchant_id'] if scope['is_merchant'] else None,
+        )
         return web.json_response({"status": "ok", "data": messages})
     except Exception as e:
         logger.error(f"api_get_messages 错误: {e}")
@@ -399,6 +1668,7 @@ async def _execute_web_send_task(
     reply_to_msg_id: Optional[int],
     ocr_tag: str,
     security_check_duration: float,
+    reply_markup=None,
 ) -> None:
     """Web 端单条消息异步投递（单发与群发共用）。"""
     import io
@@ -421,7 +1691,7 @@ async def _execute_web_send_task(
             photo_stream.name = "upload.jpg"
             caption_text = admin_tag
             if final_send_content:
-                caption_text += f"\n{escape(final_send_content)}"
+                caption_text += f"\n{final_send_content}"
             sent_msg = await safe_send_photo(
                 context=None,
                 chat_id=user_id,
@@ -429,14 +1699,16 @@ async def _execute_web_send_task(
                 caption=caption_text,
                 parse_mode="HTML",
                 reply_to_message_id=reply_to_msg_id,
+                reply_markup=reply_markup,
             )
         else:
             sent_msg = await safe_send_message(
                 context=None,
                 chat_id=user_id,
-                text=f"{admin_tag}\n{escape(final_send_content)}",
+                text=f"{admin_tag}\n{final_send_content}",
                 parse_mode="HTML",
                 reply_to_message_id=reply_to_msg_id,
+                reply_markup=reply_markup,
             )
         tg_send_duration = (time.time() - tg_send_start) * 1000
         if sent_msg:
@@ -502,6 +1774,7 @@ async def _execute_web_send_task(
 async def api_send_message(request):
     """通过管理员面板向用户发送消息 (支持图文合并)"""
     try:
+        scope = _request_scope_context(request)
         user_id = int(request.match_info['user_id'])
         
         raw_input_text = ""
@@ -527,6 +1800,8 @@ async def api_send_message(request):
                     val = await part.text()
                     do_translate = (val.lower() == 'true')
                 elif part.name == 'image': image_file = await part.read()
+                if image_file and len(image_file) > _MAX_UPLOAD_SIZE:
+                    return web.json_response({"status": "error", "message": f"图片大小超过限制 ({_MAX_UPLOAD_SIZE // 1024 // 1024}MB)"}, status=400)
                     
         if not raw_input_text and not image_file:
             return web.json_response({"status": "error", "message": "内容或图片不能为空"}, status=400)
@@ -605,16 +1880,18 @@ async def api_send_message(request):
             status='sending',
             translated_text=final_send_content if is_actually_translated else None,
             original_text=raw_input_text if is_actually_translated else None,
-            admin_userid=str(config.ADMIN_ID)
+            admin_userid=str(config.ADMIN_ID),
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
         )
         
-        asyncio.create_task(
+        t = asyncio.create_task(
             _execute_web_send_task(
                 user_id, msg_db_id, raw_input_text, final_send_content, image_file,
                 is_actually_translated, quoted_text, quoted_type, quoted_file_id,
                 reply_to_msg_id, ocr_tag, security_check_duration,
             )
         )
+        _web_bg_tasks.add(t); t.add_done_callback(_web_bg_tasks.discard)
         return web.json_response({"status": "ok"})
     except Exception as e:
         logger.error(f"api_send_message 错误: {e}")
@@ -624,6 +1901,7 @@ async def api_send_message(request):
 async def api_broadcast_message(request):
     """向多名用户一键发送相同内容"""
     try:
+        scope = _request_scope_context(request)
         raw_input_text = ""; image_file = None; do_translate = False; user_ids = []
         if request.content_type == "application/json":
             data = await request.json()
@@ -636,6 +1914,8 @@ async def api_broadcast_message(request):
                 if part.name == "content": raw_input_text = await part.text()
                 elif part.name == "do_translate": do_translate = (await part.text()).lower() == "true"
                 elif part.name == "image": image_file = await part.read()
+                if image_file and len(image_file) > _MAX_UPLOAD_SIZE:
+                    return web.json_response({"status": "error", "message": f"图片大小超过限制 ({_MAX_UPLOAD_SIZE // 1024 // 1024}MB)"}, status=400)
                 elif part.name == "user_ids": user_ids = json.loads(await part.text())
 
         if not user_ids or (not raw_input_text and not image_file):
@@ -652,13 +1932,343 @@ async def api_broadcast_message(request):
             msg_db_id = await database.save_message(
                 from_userid=config.ADMIN_ID, to_userid=int(uid), content=verified_text,
                 msg_type="photo" if image_file else "text", is_read=True, username="Admin",
-                status="sending", admin_userid=str(config.ADMIN_ID)
+                status="sending", admin_userid=str(config.ADMIN_ID),
+                tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
             )
             count += 1
-            asyncio.create_task(_execute_web_send_task(int(uid), msg_db_id, raw_input_text, verified_text, image_file, False, None, "text", None, None, ocr_tag, 0))
+            t = asyncio.create_task(_execute_web_send_task(int(uid), msg_db_id, raw_input_text, verified_text, image_file, False, None, "text", None, None, ocr_tag, 0))
+            _web_bg_tasks.add(t); t.add_done_callback(_web_bg_tasks.discard)
         return web.json_response({"status": "ok", "count": count})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def api_broadcast_unified(request):
+    """统一群发入口：同时支持用户、群组、频道、图片和内联按钮。"""
+    try:
+        scope = _request_scope_context(request)
+        content = ''
+        do_translate = False
+        user_ids = []
+        chat_ids = []
+        buttons = []
+        retry_count = 1
+        image_file = None
+
+        if request.content_type == 'application/json':
+            data = await request.json()
+            content = str(data.get('content') or '').strip()
+            do_translate = bool(data.get('do_translate', False))
+            user_ids = data.get('user_ids') or []
+            chat_ids = data.get('chat_ids') or []
+            buttons = data.get('buttons') or []
+            retry_count = int(data.get('retry_count') or 1)
+        else:
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name == 'content':
+                    content = (await part.text()).strip()
+                elif part.name == 'do_translate':
+                    do_translate = (await part.text()).lower() == 'true'
+                elif part.name == 'user_ids':
+                    user_ids = json.loads(await part.text() or '[]')
+                elif part.name == 'chat_ids':
+                    chat_ids = json.loads(await part.text() or '[]')
+                elif part.name == 'buttons':
+                    buttons = json.loads(await part.text() or '[]')
+                elif part.name == 'retry_count':
+                    retry_count = int((await part.text()) or 1)
+                elif part.name == 'image':
+                    image_file = await part.read()
+                    if image_file and len(image_file) > _MAX_UPLOAD_SIZE:
+                        return web.json_response(
+                            {"status": "error", "message": f"图片大小超过限制 ({_MAX_UPLOAD_SIZE // 1024 // 1024}MB)"},
+                            status=400,
+                        )
+
+        user_ids = _dedupe_int_values(user_ids)
+        chat_ids = _dedupe_int_values(chat_ids)
+        if not user_ids and not chat_ids:
+            return web.json_response({"status": "error", "message": "请选择发送目标"}, status=400)
+        if not content and not image_file:
+            return web.json_response({"status": "error", "message": "请输入群发内容或选择图片"}, status=400)
+
+        reply_markup = _build_broadcast_reply_markup(buttons)
+
+        from services.security_center import security_check_flow
+        is_passed, verified_text, error_msg, _, ocr_tag = await security_check_flow(
+            content,
+            image_bytes=image_file,
+            do_translate=do_translate,
+        )
+        if not is_passed:
+            return web.json_response({"status": "error", "message": error_msg or "安全校验失败"}, status=403)
+
+        user_success_ids = []
+        failed_items = []
+        translated = bool(do_translate and verified_text != content)
+
+        for uid in user_ids:
+            try:
+                msg_db_id = await database.save_message(
+                    from_userid=config.ADMIN_ID,
+                    to_userid=uid,
+                    content=verified_text or '[图片]',
+                    msg_type="photo" if image_file else "text",
+                    is_read=True,
+                    username="Admin",
+                    status="sending",
+                    admin_userid=str(config.ADMIN_ID),
+                    tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+                )
+                task = asyncio.create_task(
+                    _execute_web_send_task(
+                        uid,
+                        msg_db_id,
+                        content,
+                        verified_text,
+                        image_file,
+                        translated,
+                        None,
+                        "text",
+                        None,
+                        None,
+                        ocr_tag,
+                        0,
+                        reply_markup=reply_markup,
+                    )
+                )
+                _web_bg_tasks.add(task)
+                task.add_done_callback(_web_bg_tasks.discard)
+                user_success_ids.append(uid)
+            except Exception as ex:
+                failed_items.append({"user_id": uid, "reason": str(ex)})
+
+        chat_summary = {
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "success_ids": [],
+            "failed_items": [],
+        }
+        if chat_ids:
+            chat_summary = await _send_broadcast_to_chats(
+                chat_ids=chat_ids,
+                content=content,
+                image_file=image_file,
+                do_translate=do_translate,
+                retries=max(retry_count, 0),
+                reply_markup=reply_markup,
+                prechecked_text=verified_text,
+            )
+            failed_items.extend(chat_summary.get('failed_items', []))
+
+        summary = {
+            "total": len(user_ids) + int(chat_summary.get('total') or 0),
+            "success": len(user_success_ids) + int(chat_summary.get('success') or 0),
+            "failed": len(failed_items),
+            "success_user_ids": user_success_ids,
+            "success_chat_ids": chat_summary.get('success_ids', []),
+            "failed_items": failed_items,
+        }
+        await notify_web_clients('broadcast_chat_result', summary)
+        return web.json_response({"status": "ok", "summary": summary, "failed_items": failed_items})
+    except ValueError as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=400)
+    except Exception as e:
+        logger.error(f"api_broadcast_unified 错误: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+async def _resolve_ai_pipeline_mode(tenant_id: str) -> str:
+    tenant_key = f"ai_pipeline_mode:{tenant_id}" if tenant_id else ''
+    mode = None
+    if tenant_key:
+        mode = await database.get_admin_setting(tenant_key, None)
+    if not mode:
+        mode = await database.get_admin_setting('ai_pipeline_mode', 'legacy')
+    mode = str(mode or 'legacy').strip()
+    return mode if mode == 'legacy' else 'legacy'
+
+
+async def api_get_ai_pipeline_mode(request):
+    try:
+        scope = _request_scope_context(request)
+        tenant_id = str(request.rel_url.query.get('tenant_id') or scope['tenant_id'] or '').strip()
+        if not tenant_id and scope['role'] != 'platform_admin':
+            return web.json_response({'status': 'error', 'message': 'tenant_id required'}, status=400)
+        mode = await _resolve_ai_pipeline_mode(tenant_id or 'platform')
+        return web.json_response({
+            'status': 'ok',
+            'data': {
+                'tenantId': tenant_id or 'platform',
+                'mode': mode,
+                'modes': ['legacy'],
+            },
+        })
+    except Exception as e:
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_set_ai_pipeline_mode(request):
+    try:
+        scope = _request_scope_context(request)
+        if scope['role'] not in {'platform_admin'}:
+            return web.json_response({'status': 'error', 'message': 'platform_admin_required'}, status=403)
+
+        data = await request.json()
+        tenant_id = str(data.get('tenantId') or data.get('tenant_id') or 'platform').strip() or 'platform'
+        mode = str(data.get('mode') or '').strip()
+        if mode != 'legacy':
+            return web.json_response({'status': 'error', 'message': 'invalid pipeline mode'}, status=400)
+
+        key = 'ai_pipeline_mode' if tenant_id == 'platform' else f'ai_pipeline_mode:{tenant_id}'
+        await database.save_admin_setting(key, mode)
+        return web.json_response({'status': 'ok', 'data': {'tenantId': tenant_id, 'mode': mode}})
+    except Exception as e:
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_ai_chat_bridge(request):
+    """Legacy AI chat endpoint."""
+    try:
+        data = await request.json()
+        raw_user_id = request.match_info.get('user_id') or data.get('userId') or data.get('user_id')
+        user_id = int(raw_user_id)
+        input_text = str(data.get('content') or data.get('input') or data.get('message') or '').strip()
+        model = str(data.get('model') or 'gemini-2.5-flash-lite')
+        feature_key = str(data.get('feature_key') or 'general')
+        idempotency_key = str(data.get('idempotencyKey') or data.get('idempotency_key') or '').strip()
+        scope = _request_scope_context(request)
+        tenant_id = scope['tenant_id'] or 'platform'
+
+        if not input_text:
+            return web.json_response({'status': 'error', 'message': '输入不能为空'}, status=400)
+
+        mode = await _resolve_ai_pipeline_mode(tenant_id)
+
+        try:
+            from backend.app.services.quota_service import get_quota_service
+            quota_check = await get_quota_service().check_available(tenant_id, amount=1)
+            if not quota_check.get('allowed'):
+                return web.json_response(
+                    {'status': 'error', 'message': 'AI 配额不足', 'reason': quota_check.get('reason')},
+                    status=403,
+                )
+        except Exception:
+            quota_check = {'allowed': True}
+
+        try:
+            # --- 真实 AI Agent（替换原来的 stub） ---
+            import aiohttp
+            from services.ai_agent.core import AIAgent
+            from services.ai_agent.schema import AgentContext, AgentRole
+
+            # 构建 LLM 调用函数（通过 LiteLLM 代理）
+            _llm_api_key = config.LLM_API_KEY or 'sk-vertex-1300'
+            _llm_base_url = config.LLM_BASE_URL or 'http://127.0.0.1:4000/v1'
+
+            # 将用户传入的 model 名映射到 LiteLLM 注册名
+            _model_map = {
+                'gemini-2.5-flash-lite': 'gemini-flash',
+                'gemini-2.5-pro': 'gemini-opus',
+                'gemini-2.5-pro-preview': 'gemini-3.1-pro-preview',
+                'gpt-4': 'gpt-4',
+                'gpt-3.5-turbo': 'gpt-3.5-turbo',
+            }
+
+            async def _llm_call_fn(messages, model='', tools=None):
+                resolved_model = _model_map.get(model, 'gemini-flash')
+                url = f'{_llm_base_url}/chat/completions'
+                payload = {
+                    'model': resolved_model,
+                    'messages': messages,
+                    'max_tokens': 2048,
+                    'temperature': 0.7,
+                }
+                # Only add tools if non-empty (DeepSeek doesn't support empty tools array)
+                if tools:
+                    payload['tools'] = tools
+                headers = {
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {_llm_api_key}',
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                        result = await resp.json()
+                choices = result.get('choices', [])
+                if choices:
+                    text = choices[0].get('message', {}).get('content', '')
+                else:
+                    text = result.get('error', {}).get('message', '[LLM] 调用失败')
+                usage = result.get('usage', {})
+                return text, usage
+
+            # 确定角色：管理员用 ASSISTANT，普通用户用 ASSISTANT（目前不限制）
+            is_admin = str(user_id) in [str(a) for a in config.ADMIN_TG_IDS]
+            agent_role = AgentRole.ASSISTANT
+
+            # 构建 Agent 上下文
+            agent_ctx = AgentContext(
+                user_id=user_id,
+                channel='web_ai_chat',
+                conversation_history=[],
+                active_role=agent_role,
+                metadata={
+                    'tenant_id': tenant_id,
+                    'is_admin': is_admin,
+                },
+            )
+
+            # 创建并运行 Agent
+            agent = AIAgent(llm_call_fn=_llm_call_fn)
+            agent_response = await agent.process_message(
+                user_message=input_text,
+                ctx=agent_ctx,
+                model=model,
+            )
+            reply = agent_response.text if agent_response else '[AI] 处理失败，请稍后重试'
+        except Exception as ai_err:
+            logger.error(f"AI 服务调用失败: {ai_err}", exc_info=True)
+            reply = f'[AI] 处理异常: {ai_err}'[:500]
+
+        try:
+            from backend.repositories.ai_usage_repo import save_ai_usage_log
+            from backend.app.services.quota_service import get_quota_service
+            total_tokens = (len(input_text) + len(reply)) // 4
+            await save_ai_usage_log(
+                channel='web_chat',
+                user_id=user_id,
+                sandbox_id=f'sbx_{user_id}',
+                tenant_id=tenant_id,
+                merchant_id=scope['merchant_id'],
+                feature_key=feature_key,
+                result_status='success',
+                endpoint='chat',
+                model=model,
+                prompt_tokens=len(input_text) // 4,
+                completion_tokens=len(reply) // 4,
+                tokens_used=total_tokens,
+                cost=0.0001,
+            )
+            await get_quota_service().record_usage(tenant_id, amount=1)
+        except Exception:
+            pass
+
+        return web.json_response({
+            'status': 'ok',
+            'reply': reply,
+            'data': {'reply': reply},
+            'pipelineMode': mode,
+        })
+    except ValueError:
+        return web.json_response({'status': 'error', 'message': '用户 ID 无效'}, status=400)
+    except Exception as e:
+        logger.error(f"AI 聊天失败：{e}")
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
 
 
 async def api_get_broadcast_targets(request):
@@ -714,6 +2324,8 @@ async def api_broadcast_to_chats(request):
                     retry_count = int((await part.text()) or 1)
                 elif part.name == 'image':
                     image_file = await part.read()
+                    if image_file and len(image_file) > _MAX_UPLOAD_SIZE:
+                        return web.json_response({"status": "error", "message": f"图片大小超过限制 ({_MAX_UPLOAD_SIZE // 1024 // 1024}MB)"}, status=400)
 
         if not chat_ids or (not content and not image_file):
             return web.json_response({"status": "error", "message": "参数不完整"}, status=400)
@@ -1433,7 +3045,7 @@ async def api_sync_potential_users(request):
         stats = await _sync_potential_users_from_group_messages(limit=limit)
 
         global _tags_cache
-        _tags_cache = {"data": [], "expire_at": 0}
+        _tags_cache = {}
 
         await notify_web_clients("potential_sync", {"stats": stats})
 
@@ -1451,6 +3063,7 @@ async def api_sync_potential_users(request):
 async def api_get_potential_users(request):
     """获取潜在用户列表 (支持分页与画像/关键词过滤)"""
     try:
+        scope = _request_scope_context(request)
         limit = min(int(request.query.get('limit', 50)), 500)
         offset = int(request.query.get('offset', 0))
         keyword = request.query.get('keyword')
@@ -1458,7 +3071,14 @@ async def api_get_potential_users(request):
         group_id = request.query.get('group_id')
         if group_id: group_id = int(group_id)
         
-        result = await database.get_potential_users(limit=limit, offset=offset, keyword=keyword, tag=tag, group_id=group_id)
+        result = await database.get_potential_users(
+            limit=limit,
+            offset=offset,
+            keyword=keyword,
+            tag=tag,
+            group_id=group_id,
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+        )
         return web.json_response({"status": "ok", "data": result['users'], "total": result['total']})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -1468,11 +3088,17 @@ async def api_get_potential_tags(request):
     """获取所有潜在用户画像标签 (60s 缓存)"""
     global _tags_cache
     try:
+        scope = _request_scope_context(request)
         now = time.time()
-        if now > _tags_cache["expire_at"]:
-            tags = await database.get_potential_tags()
-            _tags_cache = {"data": tags, "expire_at": now + 60}
-        return web.json_response({"status": "ok", "data": _tags_cache["data"], "total": len(_tags_cache["data"])})
+        cache_key = scope['tenant_id'] if scope['is_merchant'] else '__global__'
+        cache_entry = _tags_cache.get(cache_key) or {"data": [], "expire_at": 0}
+        if now > cache_entry["expire_at"]:
+            tags = await database.get_potential_tags(
+                tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+            )
+            cache_entry = {"data": tags, "expire_at": now + 60}
+            _tags_cache[cache_key] = cache_entry
+        return web.json_response({"status": "ok", "data": cache_entry["data"], "total": len(cache_entry["data"])})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
@@ -1480,8 +3106,13 @@ async def api_get_potential_tags(request):
 async def api_list_groups(request):
     """获取所有追踪的群组列表 (分页 2026 规格，含实时状态)"""
     try:
+        scope = _request_scope_context(request)
         page = int(request.query.get('page', 1)); size = int(request.query.get('size', 20))
-        result = await database.get_tracked_groups_paginated(page, size)
+        result = await database.get_tracked_groups_paginated(
+            page,
+            size,
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+        )
         
         # 增加实时状态标记
         from datetime import datetime, timedelta
@@ -1520,9 +3151,14 @@ async def api_get_monitor_stats(request):
 async def api_toggle_group_listen(request):
     """切换群组监听状态"""
     try:
+        scope = _request_scope_context(request)
         data = await request.json()
         group_id = int(data.get('group_id')); listen_status = bool(data.get('listen_status'))
-        await database.set_group_listen_status(group_id, listen_status)
+        await database.set_group_listen_status(
+            group_id,
+            listen_status,
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+        )
         from handlers.group_monitor import clear_group_cache
         clear_group_cache(group_id)
         await notify_web_clients("group_listen_update", {"group_id": group_id, "new_status": listen_status})
@@ -1534,10 +3170,15 @@ async def api_toggle_group_listen(request):
 async def api_toggle_group_revoke_sync(request):
     """切换群组信息校对（撤回同步删除）开关"""
     try:
+        scope = _request_scope_context(request)
         data = await request.json()
         group_id = int(data.get('group_id'))
         enabled = bool(data.get('enabled'))
-        await database.set_group_delete_on_revoke(group_id, enabled)
+        await database.set_group_delete_on_revoke(
+            group_id,
+            enabled,
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+        )
         await notify_web_clients("group_revoke_sync_update", {"group_id": group_id, "enabled": enabled})
         return web.json_response({"status": "ok", "enabled": enabled})
     except Exception as e:
@@ -1606,8 +3247,12 @@ async def api_promote_potential_user(request):
 async def api_mark_read(request):
     """标记已读"""
     try:
+        scope = _request_scope_context(request)
         user_id = int(request.match_info['user_id'])
-        await database.mark_messages_as_read(user_id)
+        await database.mark_messages_as_read(
+            user_id,
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+        )
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -1615,8 +3260,13 @@ async def api_mark_read(request):
 async def api_delete_chat(request):
     """软删除会话"""
     try:
+        scope = _request_scope_context(request)
         user_id = int(request.match_info['user_id'])
-        await database.soft_delete_chat(user_id)
+        await database.soft_delete_chat(
+            user_id,
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+            merchant_id=scope['merchant_id'] if scope['is_merchant'] else None,
+        )
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -1648,8 +3298,11 @@ async def api_upload_image(request):
         user_id = int(request.match_info['user_id']); reader = await request.multipart(); field = await reader.next()
         if not field: return web.json_response({"status": "error"}, status=400)
         file_data = await field.read()
+        if len(file_data) > _MAX_UPLOAD_SIZE:
+            return web.json_response({"status": "error", "message": f"图片大小超过限制 ({_MAX_UPLOAD_SIZE // 1024 // 1024}MB)"}, status=400)
         msg_db_id = await database.save_message(from_userid=config.ADMIN_ID, to_userid=user_id, content="[图片]", msg_type='photo', is_read=True, username="Admin", status='sending')
-        asyncio.create_task(_execute_web_send_task(user_id, msg_db_id, "[图片]", "[图片]", file_data, False, None, "text", None, None, "", 0))
+        t = asyncio.create_task(_execute_web_send_task(user_id, msg_db_id, "[图片]", "[图片]", file_data, False, None, "text", None, None, "", 0))
+        _web_bg_tasks.add(t); t.add_done_callback(_web_bg_tasks.discard)
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -2074,10 +3727,16 @@ async def api_demote_group_admin(request):
 async def api_get_group_messages(request):
     """2026 规格：获取群组消息历史 (用于爬取展示)"""
     try:
+        scope = _request_scope_context(request)
         group_id = request.query.get('group_id')
         limit = int(request.query.get('limit', 50))
         offset = int(request.query.get('offset', 0))
-        messages = await database.get_group_messages(int(group_id), limit, offset)
+        messages = await database.get_group_messages(
+            int(group_id),
+            limit,
+            offset,
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+        )
         return web.json_response({"status": "ok", "messages": messages})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -2211,9 +3870,11 @@ async def api_delete_group_message(request):
 async def api_update_group_config(request):
     """旧版群组配置更新 (兼容)"""
     try:
+        scope = _request_scope_context(request)
         data = await request.json(); group_id = int(data.get('group_id')); is_monitored = bool(data.get('is_monitored')); custom_keywords = data.get('custom_keywords', '')
-        await database.set_group_listen_status(group_id, is_monitored)
-        await database.update_group_custom_keywords(group_id, custom_keywords)
+        tenant_id = scope['tenant_id'] if scope['is_merchant'] else None
+        await database.set_group_listen_status(group_id, is_monitored, tenant_id=tenant_id)
+        await database.update_group_custom_keywords(group_id, custom_keywords, tenant_id=tenant_id)
         from handlers.group_monitor import clear_group_cache
         clear_group_cache(group_id)
         return web.json_response({"status": "ok"})
@@ -2224,10 +3885,14 @@ async def api_update_group_config(request):
 async def api_get_group_verify_config(request):
     """获取群组入群验证配置"""
     try:
+        scope = _request_scope_context(request)
         group_id = int(request.rel_url.query.get('group_id', 0))
         if not group_id:
             return web.json_response({"status": "error", "message": "group_id 不能为空"}, status=400)
-        cfg = await database.get_group_verify_config(group_id)
+        cfg = await database.get_group_verify_config(
+            group_id,
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+        )
         return web.json_response({"status": "ok", "config": cfg})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -2236,11 +3901,16 @@ async def api_get_group_verify_config(request):
 async def api_save_group_verify_config(request):
     """保存群组入群验证配置"""
     try:
+        scope = _request_scope_context(request)
         data = await request.json()
         group_id = int(data.get('group_id', 0))
         if not group_id:
             return web.json_response({"status": "error", "message": "group_id 不能为空"}, status=400)
-        await database.save_group_verify_config(group_id, data)
+        await database.save_group_verify_config(
+            group_id,
+            data,
+            tenant_id=scope['tenant_id'] if scope['is_merchant'] else None,
+        )
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -2252,16 +3922,89 @@ async def start_web_server(bot):
     set_bot_instance(bot)
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_get('/', index_handler)
+    app.router.add_get('/admin', index_handler)
+    app.router.add_get('/miniapp', index_handler)
+    app.router.add_get('/favicon.ico', favicon_handler)
+    app.router.add_get('/healthz', api_health)
+    app.router.add_get('/api/health', api_health)
+    # ── 前端 SPA 静态资源路由（/assets）──
+    _dist_dir = _frontend_dist_dir()
+    app.router.add_get('/admin/{path_info:.*}', index_handler)
+    if os.path.isdir(os.path.join(_dist_dir, 'assets')):
+        app.router.add_static('/assets', os.path.join(_dist_dir, 'assets'), name='frontend_assets')
     app.router.add_static('/static', __import__('os').path.join(__import__('os').path.dirname(__import__('os').path.abspath(__file__)), 'static'), show_index=False)
+    # ── SPA fallback：非 API/WS/Static 路径默认进入当前 Web Admin。──
+    async def _spa_fallback(request):
+        return await index_handler(request)
+
+    app.router.add_get('/{path_info:(?!api|ws|static|assets|admin|miniapp).+}', _spa_fallback)
     app.router.add_post('/api/login', api_login)
+    app.router.add_post('/api/login/otp', api_login_otp)
+    app.router.add_post('/api/login/tma', api_login_tma)
+    app.router.add_post('/api/miniapp/bootstrap', api_miniapp_bootstrap)
+    app.router.add_get('/api/miniapp/context', api_miniapp_context)
+    app.router.add_post('/api/miniapp/logout_revoke', api_miniapp_logout_revoke)
+    app.router.add_get('/api/csrf-token', api_get_csrf_token)
+    if _saas_proxy_enabled():
+        app.router.add_route('*', '/api/session/context', saas_proxy_handler)
+    else:
+        app.router.add_get('/api/session/context', api_get_session_context)
+        app.router.add_post('/api/session/context', api_update_session_context)
+    app.router.add_get('/api/ai/pipeline_mode', api_get_ai_pipeline_mode)
+    app.router.add_post('/api/ai/pipeline_mode', api_set_ai_pipeline_mode)
+
+    # ── SaaS 商户管理路由 ──────────────────────────────────────────────
+    if _saas_proxy_enabled():
+        app.router.add_route('*', '/api/platform/{tail:.*}', saas_proxy_handler)
+        app.router.add_route('*', '/api/merchant/{tail:.*}', saas_proxy_handler)
+        logger.info("SaaS routes proxied to Rust backend: %s", _saas_backend_url())
+    else:
+        from backend.app.api import saas as saas_api
+
+        # 平台管理员 API
+        app.router.add_get('/api/platform/merchants', saas_api.api_platform_list_merchants)
+        app.router.add_post('/api/platform/merchants', saas_api.api_platform_create_merchant)
+        app.router.add_delete('/api/platform/merchants/{merchant_id}', saas_api.api_platform_delete_merchant)
+        app.router.add_post('/api/platform/merchants/confirm_onboarding', saas_api.api_platform_confirm_merchant_onboarding)
+        app.router.add_get('/api/platform/plans', saas_api.api_platform_list_plans)
+        app.router.add_post('/api/platform/plans', saas_api.api_platform_upsert_plan)
+        app.router.add_get('/api/platform/subscriptions', saas_api.api_platform_list_subscriptions)
+        app.router.add_get('/api/platform/payment_orders', saas_api.api_platform_list_payment_orders)
+        app.router.add_post('/api/platform/payment_orders/confirm', saas_api.api_platform_confirm_payment)
+        app.router.add_post('/api/platform/payment_orders/reject', saas_api.api_platform_reject_payment)
+        app.router.add_get('/api/platform/runtime_statuses', saas_api.api_platform_list_runtime_statuses)
+        app.router.add_get('/api/platform/payment_config', saas_api.api_get_platform_payment_config)
+        app.router.add_post('/api/platform/payment_config', saas_api.api_upsert_platform_payment_config)
+
+        # 商户自服务 API
+        app.router.add_get('/api/merchant/plans', saas_api.api_merchant_list_plans)
+        app.router.add_get('/api/merchant/profile', saas_api.api_merchant_get_profile)
+        app.router.add_post('/api/merchant/status', saas_api.api_merchant_update_status)
+        app.router.add_post('/api/merchant/bot_token', saas_api.api_merchant_save_bot_token)
+        app.router.add_get('/api/merchant/subscription', saas_api.api_merchant_get_subscription)
+        app.router.add_post('/api/merchant/payment_orders', saas_api.api_merchant_create_payment_order)
+        app.router.add_get('/api/merchant/payment_orders/latest', saas_api.api_merchant_get_latest_payment_order)
+        app.router.add_post('/api/merchant/payment_orders/mark_paid', saas_api.api_merchant_mark_payment_order_paid)
+        app.router.add_post('/api/merchant/payment_orders/submit_tx', saas_api.api_merchant_submit_payment_tx_hash)
+        app.router.add_get('/api/merchant/features', saas_api.api_merchant_get_features)
+        app.router.add_get('/api/merchant/ai/quota', saas_api.api_merchant_get_ai_quota)
+        app.router.add_get('/api/merchant/ai/usage', saas_api.api_merchant_get_ai_usage)
+        app.router.add_get('/api/merchant/audit_logs', saas_api.api_merchant_list_audit_logs)
+        app.router.add_get('/api/merchant/payment_config', saas_api.api_merchant_get_platform_payment_config)
+
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/api/users', api_get_users)
+    app.router.add_post("/api/ai/chat", api_ai_chat_bridge)
+    app.router.add_post("/api/ai/detect_ad", api_detect_advertising)
+    app.router.add_post('/api/messages/{user_id}/ai', api_ai_chat_bridge)
     app.router.add_get('/api/messages/{user_id}', api_get_messages)
     app.router.add_post('/api/messages/{user_id}', api_send_message)
     app.router.add_post('/api/broadcast', api_broadcast_message)
     app.router.add_get('/api/broadcast/targets', api_get_broadcast_targets)
     app.router.add_post('/api/broadcast/targets/sync', api_sync_broadcast_targets)
     app.router.add_post('/api/broadcast/chats', api_broadcast_to_chats)
+    app.router.add_post('/api/broadcast/send', api_broadcast_unified)
+    app.router.add_post('/api/broadcast/unified', api_broadcast_unified)
     app.router.add_get('/api/push_tasks', api_list_push_tasks)
     app.router.add_post('/api/push_tasks', api_create_push_task)
     app.router.add_post('/api/push_tasks/status', api_update_push_task_status)

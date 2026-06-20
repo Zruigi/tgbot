@@ -1,0 +1,102 @@
+{
+  "name": "AI Advertisement Management",
+  "nodes": [
+    {
+      "parameters": {
+        "prompt": "检查以下消息是否为广告: {{ $json.message }}",
+        "model": "gemini-2.5-flash-lite",
+        "userId": ""
+      },
+      "id": "ai-trigger",
+      "name": "AI Agent Trigger",
+      "type": "tgbotAiAgent",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "text": "{{ $json.message }}",
+        "contextType": "group_message"
+      },
+      "id": "ad-detect",
+      "name": "Detect Advertisement",
+      "type": "tgbotAdDetect",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "value1": "{{ $json.is_advertising }}",
+        "operation": "equal",
+        "value2": true,
+        "options": {}
+      },
+      "id": "if-ad",
+      "name": "If Ad Detected",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "content": "{{ $json.message }}",
+        "score": "{{ $json.ad_score }}",
+        "source": "ai_detection"
+      },
+      "id": "register-ad",
+      "name": "Register Ad",
+      "type": "tgbotAdCrud",
+      "typeVersion": 1,
+      "position": [850, 200]
+    },
+    {
+      "parameters": {
+        "channelId": "-1001234567890",
+        "message": "🚨 <b>AI检测到广告</b>\n\n内容: {{ $json.message }}\n评分: {{ $json.ad_score }}\n置信度: {{ $json.confidence }}",
+        "parseMode": "HTML"
+      },
+      "id": "push-channel",
+      "name": "Push to Channel",
+      "type": "tgbotChannelPost",
+      "typeVersion": 1,
+      "position": [1050, 200]
+    },
+    {
+      "parameters": {
+        "targetType": "users",
+        "message": "⚠️ 检测到疑似广告内容，已自动处理"
+      },
+      "id": "notify-admin",
+      "name": "Notify Admin",
+      "type": "tgbotBroadcast",
+      "typeVersion": 1,
+      "position": [1050, 400]
+    }
+  ],
+  "connections": {
+    "AI Agent Trigger": {
+      "main": [[{ "node": "Detect Advertisement", "type": "main", "index": 0 }]]
+    },
+    "Detect Advertisement": {
+      "main": [[{ "node": "If Ad Detected", "type": "main", "index": 0 }]]
+    },
+    "If Ad Detected": {
+      "main": [
+        [{ "node": "Register Ad", "type": "main", "index": 0 }],
+        [{ "node": "Notify Admin", "type": "main", "index": 0 }]
+      ]
+    },
+    "Register Ad": {
+      "main": [[{ "node": "Push to Channel", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": ["advertisement", "ai", "automation"],
+  "triggerCount": 1,
+  "updatedAt": "2026-06-20T13:00:00Z",
+  "versionId": "1"
+}

@@ -13,12 +13,18 @@ from telegram.ext import (
     filters,
 )
 from database import create_or_update_user, get_user
+from services.i18n import SUPPORTED_LOCALES, tr
 
 # 状态定义
 WAITING_EMAIL = 1
 
 # 邮箱正则
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+
+
+def build_email_menu_text_pattern() -> str:
+    labels = {tr(locale, "buttons.email_settings") for locale in SUPPORTED_LOCALES}
+    return r"^(?:" + "|".join(sorted(re.escape(item) for item in labels if item)) + r")$"
 
 async def email_settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """开始邮箱设置流程"""
@@ -91,27 +97,41 @@ async def unbind_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ConversationHandler.END
 
 async def cancel_email_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """取消设置"""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("已取消邮箱设置。")
+    """取消设置，若为 /start 或 /admin 则继续执行对应命令"""
+    cmd = (update.message.text or '').strip().lower() if update.message else ''
+    if cmd.startswith('/start'):
+        from handlers.start import start
+        await start(update, context)
+    elif cmd.startswith('/admin'):
+        from handlers.admin_panel import admin_panel
+        await admin_panel(update, context)
+    else:
+        query = update.callback_query
+        if query:
+            await query.answer()
+            await query.edit_message_text("已取消邮箱设置。")
+        elif update.message:
+            await update.message.reply_text("已取消邮箱设置。")
     return ConversationHandler.END
 
 # 导出 ConversationHandler 供 main.py 注册
 email_conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("email", email_settings_start),
-        CallbackQueryHandler(email_settings_start, pattern="^email_settings$")
+        CallbackQueryHandler(email_settings_start, pattern="^email_settings$"),
+        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND & filters.Regex(build_email_menu_text_pattern()), email_settings_start),
     ],
     states={
         WAITING_EMAIL: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, receive_email)
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, receive_email)
         ],
     },
     fallbacks=[
         CallbackQueryHandler(bind_email_prompt, pattern="^bind_email$"),
         CallbackQueryHandler(unbind_email, pattern="^unbind_email$"),
         CallbackQueryHandler(cancel_email_setting, pattern="^cancel_email_setting$"),
-        CommandHandler("cancel", cancel_email_setting)
+        CommandHandler("cancel", cancel_email_setting),
+        CommandHandler("start", cancel_email_setting),
+        CommandHandler("admin", cancel_email_setting),
     ],
 )

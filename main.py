@@ -4,13 +4,16 @@ Bot 主入口文件
 """
 import asyncio
 import logging
+import logging.handlers
 import os
 import sys
+from datetime import datetime, timedelta
+from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 import config
-from handlers.start import start, button_callback, restart_bot_command
+from handlers.start import start, button_callback, restart_bot_command, main_menu_message_handler, build_main_menu_text_pattern
 from handlers.wallet_panel import (
     my_wallets_command,
     wallet_my_list_callback,
@@ -19,6 +22,7 @@ from handlers.wallet_panel import (
 )
 from handlers.alert_setting import email_conv_handler
 from handlers.crypto_price import crypto_price_handler
+from handlers.merchant_onboarding import merchant_onboarding_handler
 from handlers.wallet_monitor import wallet_monitor_handler
 from handlers.customer_service import (
     handle_admin_reply,
@@ -45,25 +49,167 @@ from handlers.join_verify import (
 )
 from handlers.status import status_command, clear_command
 from handlers.admin_panel import admin_config_handler, sync_potential_command
+from handlers.channel_verify import handle_subscribe_button
+from handlers.reminder_cleanup import cleanup_expired_reminders
 import database
+from backend.app.services import get_merchant_runtime_manager, get_scheduler_service
 from database import init_db
 from web_admin import start_web_server
 from services.price_monitor import start_price_monitor
 from services.chain_monitor import start_chain_monitor
 
 # 配置日志
+for p in (
+    config.LOG_DIR,
+    config.LOG_APP_DIR,
+    config.LOG_BOT_DIR,
+    config.LOG_BACKEND_DIR,
+    config.LOG_TUNNEL_DIR,
+    config.LOG_CLOUDFLARED_DIR,
+    config.LOG_FRONTEND_DIR,
+    config.LOG_VITE_DIR,
+    config.LOG_AI_DIR,
+    config.LOG_LITELLM_DIR,
+    config.LOG_RUNTIME_DIR,
+    config.LOG_PROCESS_DIR,
+):
+    os.makedirs(p, exist_ok=True)
+
+BOT_LOG_MAX_MB = max(1, int(os.getenv("BOT_LOG_MAX_MB", "10")))
+BOT_LOG_BACKUP_COUNT = max(1, int(os.getenv("BOT_LOG_BACKUP_COUNT", "2")))
+ENABLE_DEBUG_UPDATE_LOGS = os.getenv("ENABLE_DEBUG_UPDATE_LOGS", "").strip().lower() in {"1", "true", "yes", "on"}
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
     handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.handlers.RotatingFileHandler(
+            config.BOT_LOG_PATH,
+            maxBytes=BOT_LOG_MAX_MB * 1024 * 1024,
+            backupCount=BOT_LOG_BACKUP_COUNT,
+            encoding="utf-8"
+        ),
         logging.StreamHandler()
     ]
 )
+# 抑制 httpx 等第三方库的 DEBUG/INFO 日志，防止日志膨胀
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 # 针对 Windows 控制台的 GBK 编码问题，尝试设置标准输出编码
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 logger = logging.getLogger(__name__)
+
+# 后台任务引用集合：防止 fire-and-forget 任务被 GC 回收，同时便于追踪和取消
+_background_tasks: set = set()
+
+
+def _create_tracked_task(coro, name=None):
+    """创建带追踪的后台 asyncio 任务，防止 fire-and-forget 导致的 GC 和异常吞没问题"""
+    task = asyncio.create_task(coro)
+    if name:
+        task.set_name(name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+async def migrate_legacy_log_files() -> None:
+    """将历史根目录日志迁移到 logs 目录"""
+    legacy_names = [
+        "bot.log",
+        "backend.log",
+        "frontend.log",
+        "frontend.stdout",
+        "frontend_dev.log",
+        "vite.log",
+        "litellm.log",
+        "cloudflared.log",
+        "cloudflared.stdout",
+        "cloudflared-8080.log",
+        "cloudflared-8080.stdout",
+        "dev.pids",
+        "bot_runtime.log",
+        "bot_stdout.log",
+        "bot_stderr.log",
+        "run.log",
+        "cf_frontend.log",
+        "cloudflared_frontend.log",
+    ]
+
+    category_map = {
+        "bot.log": config.LOG_BOT_DIR,
+        "backend.log": config.LOG_BACKEND_DIR,
+        "frontend.log": config.LOG_VITE_DIR,
+        "frontend.stdout": config.LOG_VITE_DIR,
+        "frontend_dev.log": config.LOG_VITE_DIR,
+        "vite.log": config.LOG_VITE_DIR,
+        "litellm.log": config.LOG_LITELLM_DIR,
+        "cloudflared.log": config.LOG_CLOUDFLARED_DIR,
+        "cloudflared.stdout": config.LOG_CLOUDFLARED_DIR,
+        "cloudflared-8080.log": config.LOG_CLOUDFLARED_DIR,
+        "cloudflared-8080.stdout": config.LOG_CLOUDFLARED_DIR,
+        "cloudflared_frontend.log": config.LOG_CLOUDFLARED_DIR,
+        "cf_frontend.log": config.LOG_CLOUDFLARED_DIR,
+        "dev.pids": config.LOG_PROCESS_DIR,
+        "bot_runtime.log": config.LOG_RUNTIME_DIR,
+        "bot_stdout.log": config.LOG_RUNTIME_DIR,
+        "bot_stderr.log": config.LOG_RUNTIME_DIR,
+        "run.log": config.LOG_RUNTIME_DIR,
+    }
+
+    for name in legacy_names:
+        src = Path(config.BASE_DIR) / name
+        if not src.exists() or not src.is_file():
+            continue
+
+        dest_dir = Path(category_map.get(name, config.LOG_APP_DIR))
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        if name.startswith("cloudflared-8080"):
+            dest_name = name.replace("cloudflared-8080", "cloudflared")
+        else:
+            dest_name = name
+
+        dest = dest_dir / dest_name
+        if dest.exists():
+            continue
+
+        try:
+            src.rename(dest)
+            logger.info(f"[日志迁移] 已迁移: {name} -> {dest.relative_to(Path(config.BASE_DIR))}")
+        except Exception as e:
+            logger.warning(f"[日志迁移] 迁移失败 {name}: {e}")
+
+
+async def cleanup_old_logs() -> None:
+    """清理超过保留时长的日志文件"""
+    try:
+        retention = max(1, int(config.LOG_RETENTION_HOURS))
+    except Exception:
+        retention = 48
+
+    cutoff = datetime.now() - timedelta(hours=retention)
+    log_dir = Path(config.LOG_DIR)
+    if not log_dir.exists():
+        return
+
+    for pattern in ("*.log", "*.stdout", "*.stderr", "*.out"):
+        for path in log_dir.rglob(pattern):
+            try:
+                mtime = datetime.fromtimestamp(path.stat().st_mtime)
+                if mtime < cutoff:
+                    path.unlink(missing_ok=True)
+                    logger.info(f"[日志清理] 已删除过期日志: {path.name}")
+            except Exception as e:
+                logger.warning(f"[日志清理] 删除日志失败 {path.name}: {e}")
+
+
+async def log_cleanup_loop() -> None:
+    """每小时执行一次日志清理"""
+    while True:
+        await cleanup_old_logs()
+        await asyncio.sleep(3600)
+
 
 async def revoke_sync_loop(bot) -> None:
     """定时对账：检查开启信息校对的群组，发现消息已被撤回则同步删除 web 记录
@@ -127,7 +273,10 @@ async def revoke_sync_loop(bot) -> None:
             async def run_group(g):
                 async with sem:
                     gid = g['group_id']
-                    target = staging_chat_id
+                    target = int(g.get('revoke_sync_chat_id') or 0)
+                    if not target:
+                        logger.debug("[信息校对] 群 %s 未分配校对信息群，跳过", gid)
+                        return gid, []
                     return gid, await check_group(gid, g['messages'], target)
 
             results = await asyncio.gather(*[run_group(g) for g in groups], return_exceptions=True)
@@ -154,6 +303,18 @@ async def revoke_sync_loop(bot) -> None:
 async def post_init(application: Application) -> None:
     """Bot 启动后的初始化操作"""
     await init_db()
+    await migrate_legacy_log_files()
+    await cleanup_old_logs()
+    
+    # 初始化财务模块
+    try:
+        from backend.app.services.finance_core import init_finance_db, init_default_chart_of_accounts
+        await init_finance_db()
+        await init_default_chart_of_accounts()
+        logger.info("✅ 财务模块数据库初始化完成")
+    except Exception as e:
+        logger.warning(f"财务模块初始化失败: {e}")
+    
     # 启动 Web 管理端
     await start_web_server(application.bot)
     
@@ -169,12 +330,15 @@ async def post_init(application: Application) -> None:
     # 2. 为管理员设置专属菜单按钮 (set_my_commands)
     try:
         from telegram import BotCommand, BotCommandScopeChat
+        await application.bot.set_my_commands([
+            BotCommand("menu", "Open interactive menu / 打开交互菜单"),
+        ])
         admin_commands = [
+            BotCommand("menu", "🧭 打开交互菜单"),
             BotCommand("admin", "⚙️ 启动机器人控制面板"),
             BotCommand("status", "📊 查看监听与监控运行状态"),
             BotCommand("sync_potential", "🔄 同步群组潜在用户"),
             BotCommand("clear", "🧹 清理当前对话缓存"),
-            BotCommand("restart_bot", "🔄 一键重启 Bot（测试）"),
         ]
         # 仅对管理员生效
         await application.bot.set_my_commands(
@@ -185,11 +349,59 @@ async def post_init(application: Application) -> None:
     except Exception as e:
         logger.warning(f"设置管理员菜单失败: {e}")
 
+    # 3. 设置 Telegram Menu Button（底部菜单栏正式 Mini App 入口）
+    try:
+        from telegram import MenuButtonWebApp, WebAppInfo
+        frontend_url = (getattr(config, 'FRONTEND_URL', '') or os.environ.get('FRONTEND_URL', '')).rstrip('/')
+        if frontend_url and '127.0.0.1' not in frontend_url and 'localhost' not in frontend_url:
+            miniapp_url = f"{frontend_url}/miniapp?entry=admin_console"
+            await application.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="控制台", web_app=WebAppInfo(url=miniapp_url))
+            )
+            await application.bot.set_chat_menu_button(
+                chat_id=config.ADMIN_ID,
+                menu_button=MenuButtonWebApp(text="控制台", web_app=WebAppInfo(url=miniapp_url))
+            )
+            logger.info(f"✅ 已设置 Menu Button Mini App 入口: {miniapp_url}")
+            logger.info(f"✅ 已设置管理员 Menu Button 入口: {miniapp_url}")
+        else:
+            logger.warning(f"FRONTEND_URL 未配置或为本地地址，跳过 Menu Button 设置")
+    except Exception as e:
+        logger.warning(f"设置 Menu Button 失败: {e}")
+
     # 启动后台监控循环任务 (挂载到后台持续运行)
-    asyncio.create_task(start_price_monitor(application))
-    asyncio.create_task(start_chain_monitor(application))
-    asyncio.create_task(revoke_sync_loop(application.bot))
+    _create_tracked_task(start_price_monitor(application), name="price_monitor")
+    _create_tracked_task(start_chain_monitor(application), name="chain_monitor")
+    _create_tracked_task(revoke_sync_loop(application.bot), name="revoke_sync")
+    _create_tracked_task(cleanup_expired_reminders(application.bot), name="reminder_cleanup")  # v5.4: 频道提醒清理任务
+    _create_tracked_task(log_cleanup_loop(), name="log_cleanup")
+    logger.info(f"✅ 日志自动清理已启用，保留时长: {config.LOG_RETENTION_HOURS} 小时")
     logger.info("✅ 价格监控与链上监控引擎已挂载后台运行")
+
+    await get_merchant_runtime_manager().start()
+    logger.info("✅ 商户 Bot 运行时管理器已启动")
+
+    await get_scheduler_service().start()
+    logger.info("✅ 商户定时任务调度器已启动")
+
+    # 启动 OTP 过期清理定时任务
+    async def _cleanup_otps_loop():
+        while True:
+            try:
+                otp_count = await database.cleanup_expired_web_login_otps()
+                grant_count = await database.cleanup_expired_web_entry_grants()
+                if otp_count > 0 or grant_count > 0:
+                    logger.info(f"已清理过期登录凭据: otp={otp_count}, grants={grant_count}")
+            except Exception as e:
+                logger.error(f"清理 OTP 失败: {e}")
+            await asyncio.sleep(3600)
+
+    _create_tracked_task(_cleanup_otps_loop(), name="otp_cleanup")
+    logger.info("✅ OTP 过期清理定时任务已启动")
+
+    from backend.app.services.merchant_notification_service import set_notification_bot
+    set_notification_bot(application.bot)
+    logger.info("✅ 商户通知服务已初始化")
 
 async def debug_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """调试用的回调处理器"""
@@ -213,11 +425,13 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("clear", clear_command))
 
-    # 注册调试处理器 (记录所有更新)
-    from telegram.ext import TypeHandler
-    application.add_handler(TypeHandler(Update, debug_callback), group=-1)
+    if ENABLE_DEBUG_UPDATE_LOGS:
+        from telegram.ext import TypeHandler
+        application.add_handler(TypeHandler(Update, debug_callback), group=-1)
+        logger.info("✅ 已启用全量更新调试日志")
 
-    # 注册 /start 命令处理器
+    # 兼容 /start 深链；正常入口统一使用 /menu + 交互菜单
+    application.add_handler(CommandHandler("menu", start))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("restart_bot", restart_bot_command))
     application.add_handler(CommandHandler("sync_potential", sync_potential_command))
@@ -229,7 +443,8 @@ def main() -> None:
     # 注册邮箱设置对话处理器
     application.add_handler(email_conv_handler)
     
-    
+    application.add_handler(merchant_onboarding_handler)
+
     # 群组监听处理器 (捕捉潜在用户)
     # 2026 修复：将追踪逻辑与关键词匹配分离到不同 group，防止拦截导致功能失效
     application.add_handler(group_track_handler, group=2) 
@@ -243,15 +458,22 @@ def main() -> None:
     application.add_handler(verify_callback_handler, group=1)
     application.add_handler(verify_message_handler, group=2)
     
-# 注册查价与钱包监听对话处理器 (放在全局通配符之前)
-    application.add_handler(crypto_price_handler)
-    application.add_handler(wallet_monitor_handler)
+    # 注册菜单驱动的会话处理器；放在兜底消息处理之前，保证 ReplyKeyboard 文本可进入会话
+    application.add_handler(crypto_price_handler, group=0)
+    application.add_handler(wallet_monitor_handler, group=0)
     
     # 1. 核心业务处理器：双向客服回复 (最高优先级)
     # 只要是回复 (Reply) 消息，无论处于何种对话状态，都优先处理为客服回复
     application.add_handler(MessageHandler(filters.REPLY & filters.User(user_id=config.ADMIN_ID), handle_admin_reply), group=0)
     
     # 2026 优化：拦截非回复类管理员消息，防止信息失踪
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Regex(build_main_menu_text_pattern()) & filters.ChatType.PRIVATE,
+            main_menu_message_handler
+        ),
+        group=0
+    )
     application.add_handler(MessageHandler(filters.User(user_id=config.ADMIN_ID) & ~filters.REPLY & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_admin_non_reply), group=0)
 
     # 2. 管理员配置处理器 (ConversationHandler)
@@ -270,9 +492,12 @@ def main() -> None:
     
     # 注册其他未实现按钮的处理器
     application.add_handler(CallbackQueryHandler(
-        button_callback,
-        pattern="^(spot_price|futures_price|wallet_monitor|admin_dashboard|contact_admin|cs_mode_test|debug_id|back_to_start|restart_bot)$",
+            button_callback,
+            pattern="^(spot_price|futures_price|wallet_monitor|admin_dashboard|contact_admin|register_merchant|cs_mode_test|debug_id|back_to_start|restart_bot|admin_web_otp|merchant_web_otp|admin_settings|email_settings)$",
     ))
+    
+    # 频道验证回调处理器 (v5.4)
+    application.add_handler(CallbackQueryHandler(handle_subscribe_button, pattern='^subscribe_'))
 
     # 全局拦截非管理员的消息，存入数据库并转发给管理员
     # 修复：只拦截私聊 (ChatType.PRIVATE) 中的消息，忽略群聊消息，防止群里别人说话也同步给客服
@@ -285,14 +510,32 @@ def main() -> None:
     logger.info("Bot 正在启动...")
     application.run_polling(stop_signals=None, allowed_updates=Update.ALL_TYPES)
 
+    # run_polling() 返回后执行优雅关停
+    # 注意: 此时事件循环已由 run_polling() 关闭，不能使用 await
+    # 调度器和运行时管理器的 async stop 会在各自的 task cancel 时自然完成
+    try:
+        scheduler = get_scheduler_service()
+        if scheduler._running:
+            scheduler._running = False
+            for t in scheduler._tasks:
+                t.cancel()
+            logger.info("✅ 调度器已标记停止")
+    except Exception as e:
+        logger.warning(f"停止调度器失败: {e}")
+
+    try:
+        runtime_mgr = get_merchant_runtime_manager()
+        runtime_mgr._started = False
+        logger.info("✅ 商户运行时管理器已标记停止")
+    except Exception as e:
+        logger.warning(f"停止商户运行时管理器失败: {e}")
+
     if config.RESTART_REQUESTED:
-        logger.info("正在按管理员请求重启进程 (subprocess.Popen)…")
+        logger.info("正在按管理员请求重启进程…")
         config.RESTART_REQUESTED = False
         import subprocess
-        # 针对 Windows 使用 start 命令开启新窗口
-        # 获取当前脚本的绝对路径
         script_path = os.path.abspath(__file__)
-        subprocess.Popen(f'start "TG_BOT_CORE" "{sys.executable}" "{script_path}"', shell=True)
+        subprocess.Popen([sys.executable, script_path], start_new_session=True)
         os._exit(0)
 
 if __name__ == "__main__":
