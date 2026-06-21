@@ -3,8 +3,8 @@
 
 use anyhow::Result;
 use serde_json::Value;
-use sqlx::PgPool;
-use tracing::{info, warn};
+use sqlx::{PgPool, Row};
+use tracing::info;
 
 use super::row_to_json;
 
@@ -232,11 +232,10 @@ pub async fn rebuild_inbox_for_tenant(
         .bind(uid)
         .bind(bot_id)
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
 
         // Latest message summary
-        let summary: Option<String> = sqlx::query_scalar::<_, String>(
+        let summary: Option<String> = sqlx::query_scalar::<_, Option<String>>(
             r#"
             SELECT content
             FROM chat.messages
@@ -249,8 +248,7 @@ pub async fn rebuild_inbox_for_tenant(
         .bind(uid)
         .bind(bot_id)
         .fetch_optional(pool)
-        .await?
-        .flatten();
+        .await?;
 
         let summary_text = match &summary {
             Some(s) if s.len() > 30 => format!("{}...", &s[..30]),
@@ -345,11 +343,11 @@ pub async fn is_user_belong_to_tenant(
 
 /// Look up the bot_id (Telegram bot user id) for a merchant's tenant.
 pub async fn get_bot_id_for_tenant(pool: &PgPool, tenant_id: &str) -> Result<Option<i64>> {
-    let bot_id: Option<i64> = sqlx::query_scalar::<_, i64>(
+    let bot_id: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT bot_id FROM merchants WHERE tenant_id = $1",
     )
     .bind(tenant_id)
     .fetch_optional(pool)
     .await?;
-    Ok(bot_id.flatten())
+    Ok(bot_id)
 }

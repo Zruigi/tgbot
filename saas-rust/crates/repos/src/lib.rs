@@ -17,7 +17,7 @@ pub mod monitor_repo;
 pub mod finance_repo;
 
 use chrono::{DateTime, Utc};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sqlx::{postgres::PgRow, Row, Column, TypeInfo};
 
 // ---------------------------------------------------------------------------

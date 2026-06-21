@@ -132,8 +132,7 @@ async fn update_inbox_on_new_message(
     )
     .bind(from_userid)
     .fetch_one(pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
     sqlx::query(
         r#"
