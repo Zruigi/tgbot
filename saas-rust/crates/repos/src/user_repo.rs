@@ -235,7 +235,7 @@ pub async fn rebuild_inbox_for_tenant(
         .await?;
 
         // Latest message summary
-        let summary: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        let summary: Option<String> = sqlx::query_scalar::<_, String>(
             r#"
             SELECT content
             FROM chat.messages
@@ -343,7 +343,7 @@ pub async fn is_user_belong_to_tenant(
 
 /// Look up the bot_id (Telegram bot user id) for a merchant's tenant.
 pub async fn get_bot_id_for_tenant(pool: &PgPool, tenant_id: &str) -> Result<Option<i64>> {
-    let bot_id: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
+    let bot_id: Option<i64> = sqlx::query_scalar::<_, i64>(
         "SELECT bot_id FROM merchants WHERE tenant_id = $1",
     )
     .bind(tenant_id)

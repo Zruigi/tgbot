@@ -170,7 +170,6 @@ pub async fn count_groups(pool: &PgPool, tenant_id: &str) -> Result<i64> {
     )
     .bind(tenant_id)
     .fetch_one(pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
     Ok(count)
 }

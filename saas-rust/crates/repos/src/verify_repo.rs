@@ -120,8 +120,7 @@ pub async fn get_stats(
         .bind(gid)
         .bind(tenant_id)
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
 
         total_unverified = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE group_id = $1 AND tenant_id = $2 AND is_verified = false AND status = 'active'",
@@ -129,32 +128,28 @@ pub async fn get_stats(
         .bind(gid)
         .bind(tenant_id)
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
 
         pending_sessions = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.verify_sessions WHERE group_id = $1 AND status = 'pending'",
         )
         .bind(gid)
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
     } else {
         total_verified = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE tenant_id = $1 AND is_verified = true",
         )
         .bind(tenant_id)
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
 
         total_unverified = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE tenant_id = $1 AND is_verified = false AND status = 'active'",
         )
         .bind(tenant_id)
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
 
         pending_sessions = sqlx::query_scalar::<_, i64>(
             r#"
@@ -165,8 +160,7 @@ pub async fn get_stats(
         )
         .bind(tenant_id)
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
     }
 
     let verify_rate = if total_verified + total_unverified > 0 {

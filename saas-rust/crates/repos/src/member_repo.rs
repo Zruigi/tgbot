@@ -248,8 +248,7 @@ pub async fn count_members(pool: &PgPool, group_id: i64, tenant_id: &str) -> Res
     .bind(group_id)
     .bind(tenant_id)
     .fetch_one(pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
     Ok(count)
 }
 
@@ -261,8 +260,7 @@ pub async fn count_verified_members(pool: &PgPool, group_id: i64, tenant_id: &st
     .bind(group_id)
     .bind(tenant_id)
     .fetch_one(pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
     Ok(count)
 }
 
