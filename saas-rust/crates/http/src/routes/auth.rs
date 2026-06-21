@@ -427,7 +427,7 @@ pub async fn login_tma(
 
     // 从 init_data 提取用户信息
     let auth_date = parsed.get("auth_date").and_then(|v| v.parse::<i64>().ok());
-    let user_json = parsed.get("user");
+    let user_json: Option<&str> = parsed.get("user").and_then(|v| v.as_str());
 
     // 检查 auth_date 是否在合理范围内 (24小时内)
     if let Some(ts) = auth_date {
