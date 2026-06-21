@@ -13,7 +13,7 @@ use uuid::Uuid;
 // AES-256-GCM encryption for bot tokens
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, Mac, MacInner};
 use sha2::Sha256;
 
 use crate::auth::resolve_scope;
@@ -21,7 +21,7 @@ use crate::state::AppState;
 
 use super::platform::{row_to_json, rows_to_json};
 
-type HmacSha256 = Hmac<Sha256>;
+type HmacSha256 = MacInner<Sha256>;
 
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
@@ -94,7 +94,8 @@ pub async fn save_bot_token_ref(
 
 fn encrypt_bot_token(plaintext: &str, tenant_id: &str) -> Result<String, String> {
     // 派生密钥: HMAC-SHA256(master_key, tenant_id)
-    const MASTER_KEY: &[u8; 32] = b"tgbot-master-key-32-bytes!!!";
+    // Note: Exactly 32 bytes required for HMAC-SHA256 key
+    const MASTER_KEY: &[u8; 32] = *b"tgbot-master-key-32bytes!!";
     let mut mac = HmacSha256::new_from_slice(MASTER_KEY).map_err(|e| e.to_string())?;
     mac.update(tenant_id.as_bytes());
     let derived_key: [u8; 32] = mac.finalize().into_bytes().into();

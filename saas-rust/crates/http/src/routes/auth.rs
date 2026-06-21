@@ -143,12 +143,13 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, Mac, MacInner};
 use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha256>;
+type HmacSha256 = MacInner<Sha256>;
 
-const SESSION_SECRET_KEY: &[u8; 32] = b"tgbot-session-secret-key-32bytes!";
+// Note: Exactly 32 bytes required for HMAC-SHA256 key
+const SESSION_SECRET_KEY: &[u8; 32] = *b"tgbot-session-secret-key-32byt";
 
 // ============== FIXED: 使用真正的 HMAC-SHA256 ==============
 fn issue_session_token(role: &str, tenant_id: &str, merchant_id: Option<i64>, issued_for: Option<&str>) -> String {
