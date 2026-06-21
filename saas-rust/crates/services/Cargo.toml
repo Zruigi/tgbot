@@ -8,6 +8,7 @@ tgbot-domain = { workspace = true }
 tgbot-repos = { workspace = true }
 tgbot-integrations = { workspace = true }
 
+sqlx = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
