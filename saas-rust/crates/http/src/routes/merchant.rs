@@ -13,7 +13,7 @@ use uuid::Uuid;
 // AES-256-GCM encryption for bot tokens
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use hmac::{Hmac, Mac, MacInner};
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::auth::resolve_scope;
@@ -21,7 +21,7 @@ use crate::state::AppState;
 
 use super::platform::{row_to_json, rows_to_json};
 
-type HmacSha256 = MacInner<Sha256>;
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
