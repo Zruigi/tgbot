@@ -1,17 +1,17 @@
-mod auth;
-mod broadcast;
-mod chat;
-mod config;
-mod finance;
-mod group;
-mod group_members;
-mod group_verify;
-mod merchant;
-mod miniapp;
-mod monitor;
-mod platform;
-mod session;
-mod telegram_webhook;
+pub mod auth;
+pub mod broadcast;
+pub mod chat;
+pub mod config;
+pub mod finance;
+pub mod group;
+pub mod group_members;
+pub mod group_verify;
+pub mod merchant;
+pub mod miniapp;
+pub mod monitor;
+pub mod platform;
+pub mod session;
+pub mod telegram_webhook;
 
 use axum::{
     routing::{delete, get, post},

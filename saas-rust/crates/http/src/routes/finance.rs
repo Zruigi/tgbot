@@ -16,6 +16,16 @@ use crate::auth::resolve_scope;
 use crate::state::AppState;
 use crate::routes::monitor::{get_period_boundaries, row_to_json as base_row_to_json, rows_to_json};
 
+// Helper to convert Uuid to i64 (takes lower 64 bits)
+fn uuid_to_i64(uuid: &Uuid) -> i64 {
+    let bytes = uuid.as_bytes();
+    let mut result = 0i64;
+    for (i, &byte) in bytes.iter().take(8).enumerate() {
+        result |= (byte as i64) << (i * 8);
+    }
+    result
+}
+
 // ============================================================================
 // Request/Response Types
 // ============================================================================
@@ -257,7 +267,7 @@ pub async fn reconcile(
     .await?;
 
     // Insert audit log
-    let admin_userid = scope.user_id.map(|u| u.as_u64() as i64).unwrap_or(0);
+    let admin_userid = scope.user_id.map(|u| uuid_to_i64(&u)).unwrap_or(0);
     sqlx::query(
         r#"
         INSERT INTO finance_audit_logs (tenant_id, admin_userid, action, target_table, target_id, reason)

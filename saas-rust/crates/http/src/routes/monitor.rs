@@ -4,7 +4,7 @@ use axum::{
     http::HeaderMap,
     Json,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Column, Row, TypeInfo};
@@ -14,6 +14,16 @@ use uuid::Uuid;
 
 use crate::auth::resolve_scope;
 use crate::state::AppState;
+
+// Helper to convert Uuid to i64 (takes lower 64 bits)
+fn uuid_to_i64(uuid: &Uuid) -> i64 {
+    let bytes = uuid.as_bytes();
+    let mut result = 0i64;
+    for (i, &byte) in bytes.iter().take(8).enumerate() {
+        result |= (byte as i64) << (i * 8);
+    }
+    result
+}
 
 // ============================================================================
 // Request/Response Types
@@ -114,7 +124,7 @@ fn rows_to_json(rows: Vec<sqlx::postgres::PgRow>) -> Vec<Value> {
     rows.into_iter().map(row_to_json).collect()
 }
 
-fn get_period_boundaries(period: &str, days: Option<i32>) -> (i64, i64) {
+pub fn get_period_boundaries(period: &str, days: Option<i32>) -> (i64, i64) {
     let now = chrono::Utc::now();
     let (start, end) = match period {
         "day" => {
@@ -237,7 +247,7 @@ pub async fn create_monitor(
     let remark = body.remark.unwrap_or_default();
 
     // Use user_id from scope or default
-    let user_id = scope.user_id.map(|u| u.as_u64() as i64).unwrap_or(0);
+    let user_id = scope.user_id.map(|u| uuid_to_i64(&u)).unwrap_or(0);
 
     let row = sqlx::query(
         r#"
@@ -474,7 +484,7 @@ pub async fn year_summary(
     let (tenant_id, merchant_id) = scope.require_merchant()?;
 
     let now = chrono::Utc::now();
-    let year_start = chrono::Datetime::<Utc>::from_naive_utc_and_offset(
+    let year_start = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
         now.date_naive().with_ordinal(1).unwrap().and_hms_opt(0, 0, 0).unwrap(),
         Utc,
     );
