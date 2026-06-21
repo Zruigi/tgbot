@@ -68,9 +68,9 @@ pub async fn get_config(
     let scope = resolve_scope(&state, &headers).await?;
     scope.require_platform()?;
 
-    let get_setting = |key: &str, default: &str| -> String {
-        // Query from admin_settings table
-        std::sync::Mutex::new(default).lock().unwrap().clone()
+    let _get_setting = |key: &str, default: &str| -> String {
+        // Query from admin_settings table - stub for now
+        default.to_string()
     };
 
     // Get settings from database
