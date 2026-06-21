@@ -291,7 +291,7 @@ pub async fn create_push_task(
     let task_id = push_task_repo::create_push_task(
         &state.pool,
         &tenant_id,
-        merchant_id,
+        Some(merchant_id),
         &task_name,
         &content,
         None, // image_file_id
