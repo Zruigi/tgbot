@@ -153,6 +153,7 @@ const SESSION_SECRET_KEY: &[u8; 32] = *b"tgbot-session-secret-key-32byt";
 // ============== FIXED: 使用真正的 HMAC-SHA256 ==============
 fn issue_session_token(role: &str, tenant_id: &str, merchant_id: Option<i64>, issued_for: Option<&str>) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
+    use hmac::Mac;  // Add this to disambiguate
 
     let payload = build_session_token_payload(role, tenant_id, merchant_id, issued_for);
     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
@@ -161,7 +162,7 @@ fn issue_session_token(role: &str, tenant_id: &str, merchant_id: Option<i64>, is
     let payload_b64 = BASE64.encode(payload_json.as_bytes());
 
     // 使用真正的 HMAC-SHA256 进行签名
-    let mut mac = HmacSha256::new_from_slice(SESSION_SECRET_KEY).expect("HMAC can accept key");
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(SESSION_SECRET_KEY).expect("HMAC can accept key");
     mac.update(payload_b64.as_bytes());
     let signature = BASE64.encode(mac.finalize().into_bytes());
 
@@ -207,7 +208,7 @@ fn verify_session_token(token: &str) -> Option<Value> {
     let signature_b64 = parts[1];
 
     // 验证 HMAC-SHA256 签名
-    let mut mac = HmacSha256::new_from_slice(SESSION_SECRET_KEY).expect("HMAC can accept key");
+    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(SESSION_SECRET_KEY).expect("HMAC can accept key");
     mac.update(payload_b64.as_bytes());
     let expected_sig = BASE64.encode(mac.finalize().into_bytes());
 
@@ -512,7 +513,7 @@ fn build_data_check_string(data: &std::collections::HashMap<String, String>) -> 
 // 计算 Telegram HMAC-SHA256 hash
 fn compute_telegram_hash(data_check_string: &str, bot_token: &str) -> String {
     // 第一轮: HMAC-SHA256(data_check_string, bot_token)
-    let mut mac = HmacSha256::new_from_slice(bot_token.as_bytes()).expect("HMAC can accept key");
+    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(bot_token.as_bytes()).expect("HMAC can accept key");
     mac.update(data_check_string.as_bytes());
     let digest = mac.finalize().into_bytes();
 
