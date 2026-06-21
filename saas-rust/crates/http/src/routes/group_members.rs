@@ -20,6 +20,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::Row;
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_domain::models::Role;
 
