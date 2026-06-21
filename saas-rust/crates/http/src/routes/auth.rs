@@ -151,8 +151,7 @@ type HmacSha256 = Hmac<Sha256>;
 const SESSION_SECRET_KEY: &[u8; 32] = b"01234567890123456789012345678901";
 
 // ============== FIXED: 使用真正的 HMAC-SHA256 ==============
-fn issue_session_token(role: &str, tenant_id: &str, merchant_id: Option<i64>, issued_for: Option<String>) -> String {
-    let issued_for: Option<&str> = issued_for.as_deref();
+fn issue_session_token(role: &str, tenant_id: &str, merchant_id: Option<i64>, issued_for: Option<&str>) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     use hmac::Mac;  // Add this to disambiguate
 
@@ -429,6 +428,7 @@ pub async fn login_tma(
     // 从 init_data 提取用户信息
     let auth_date = parsed.get("auth_date").and_then(|v| v.parse::<i64>().ok());
     let user_json: Option<String> = parsed.get("user").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let user_json_ref: Option<&str> = user_json.as_deref();
 
     // 检查 auth_date 是否在合理范围内 (24小时内)
     if let Some(ts) = auth_date {
@@ -448,7 +448,7 @@ pub async fn login_tma(
         ("merchant_owner".to_string(), tenant_hint)
     };
 
-    let session_token = issue_session_token(&role, &tenant_id, merchant_id_hint, user_json);
+    let session_token = issue_session_token(&role, &tenant_id, merchant_id_hint, user_json_ref);
 
     // Generate CSRF token
     let csrf_store = state.csrf_store.clone();
@@ -571,7 +571,7 @@ pub async fn generate_otp_internal(
     let now = chrono::Utc::now().timestamp() as f64;
     let expire_at = now + ttl_seconds as f64;
 
-    let session_token = issue_session_token(&role, &tenant_id, merchant_id, issued_for);
+    let session_token = issue_session_token(&role, &tenant_id, merchant_id, issued_for.as_deref());
 
     let otp_data = OtpData {
         token: session_token,
