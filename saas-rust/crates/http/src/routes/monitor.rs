@@ -94,7 +94,7 @@ pub struct PnlSummaryQuery {
 // Helper Functions
 // ============================================================================
 
-fn row_to_json(row: sqlx::postgres::PgRow) -> Value {
+pub fn row_to_json(row: sqlx::postgres::PgRow) -> Value {
     let mut map = serde_json::Map::new();
     for col in row.columns() {
         let name = col.name();
@@ -120,7 +120,7 @@ fn row_to_json(row: sqlx::postgres::PgRow) -> Value {
     Value::Object(map)
 }
 
-fn rows_to_json(rows: Vec<sqlx::postgres::PgRow>) -> Vec<Value> {
+pub fn rows_to_json(rows: Vec<sqlx::postgres::PgRow>) -> Vec<Value> {
     rows.into_iter().map(row_to_json).collect()
 }
 
