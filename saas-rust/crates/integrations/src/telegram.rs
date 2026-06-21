@@ -265,7 +265,7 @@ impl TelegramClient {
     pub async fn request<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
-        params: impl Serialize,
+        params: impl Serialize + std::fmt::Debug,
     ) -> Result<T> {
         let url = format!(
             "{}/bot{}/{}",
