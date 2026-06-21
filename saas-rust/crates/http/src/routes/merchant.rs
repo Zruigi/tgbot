@@ -95,7 +95,7 @@ pub async fn save_bot_token_ref(
 fn encrypt_bot_token(plaintext: &str, tenant_id: &str) -> Result<String, String> {
     // 派生密钥: HMAC-SHA256(master_key, tenant_id)
     // Note: Exactly 32 bytes required for HMAC-SHA256 key
-    const MASTER_KEY: &[u8; 32] = *b"tgbot-master-key-32bytesexac";
+    const MASTER_KEY: &[u8; 32] = *b"abcdefghijklmnopqrstuvwxyz012";
     let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(MASTER_KEY).map_err(|e| e.to_string())?;
     mac.update(tenant_id.as_bytes());
     let derived_key: [u8; 32] = mac.finalize().into_bytes().into();
