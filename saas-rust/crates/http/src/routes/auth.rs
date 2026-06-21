@@ -427,14 +427,10 @@ pub async fn login_tma(
 
     // 从 init_data 提取用户信息
     let auth_date = parsed.get("auth_date").and_then(|v| v.parse::<i64>().ok());
-    let user_val = parsed.get("user");
-    let user_json: Option<String> = user_val.map(|v| {
-        let s = v.as_str();
-        match s {
-            Some(st) => st.to_string(),
-            None => "".to_string(),
-        }
-    });
+    let user_json: Option<String> = match parsed.get("user") {
+        Some(v) => Some(v.to_string()),
+        None => None,
+    };
     let user_json_ref: Option<&str> = user_json.as_deref();
 
     // 检查 auth_date 是否在合理范围内 (24小时内)
