@@ -156,8 +156,8 @@ pub async fn send_broadcast(
 
     let summary = json!({
         "total": user_ids.len() + chat_ids.len(),
-        "success": user_success_ids.len() + chat_summary.get("success").and_then(|v| v.as_i64()).unwrap_or(0),
-        "failed": failed_items.len() + chat_summary.get("failed").and_then(|v| v.as_i64()).unwrap_or(0),
+        "success": user_success_ids.len() as i64 + chat_summary.get("success").and_then(|v| v.as_i64()).unwrap_or(0),
+        "failed": failed_items.len() as i64 + chat_summary.get("failed").and_then(|v| v.as_i64()).unwrap_or(0),
         "success_user_ids": user_success_ids,
         "success_chat_ids": chat_summary.get("success_ids"),
         "failed_items": failed_items,

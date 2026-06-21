@@ -148,7 +148,7 @@ use sha2::Sha256;
 
 // Note: Exactly 32 bytes required for HMAC-SHA256 key
 type HmacSha256 = Hmac<Sha256>;
-const SESSION_SECRET_KEY: &[u8; 32] = *b"tgbot-session-secret-key-32byt";
+const SESSION_SECRET_KEY: &[u8; 32] = *b"tgbot-session-secret-key-32by";
 
 // ============== FIXED: 使用真正的 HMAC-SHA256 ==============
 fn issue_session_token(role: &str, tenant_id: &str, merchant_id: Option<i64>, issued_for: Option<&str>) -> String {
