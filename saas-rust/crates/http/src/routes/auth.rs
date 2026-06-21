@@ -324,7 +324,7 @@ pub async fn login(
     };
 
     let otp_store = state.otp_store.clone();
-    otp_store.insert(otp, otp_data).await;
+    otp_store.insert(otp.clone(), otp_data).await;
 
     // Generate CSRF token
     let csrf_store = state.csrf_store.clone();
@@ -581,7 +581,7 @@ pub async fn generate_otp_internal(
     };
 
     let otp_store = state.otp_store.clone();
-    otp_store.insert(otp, otp_data).await;
+    otp_store.insert(otp.clone(), otp_data).await;
 
     otp
 }

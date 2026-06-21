@@ -4,6 +4,8 @@
 use crate::schema::{AgentContext, Tool, ToolExecuteResult};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
+use tgbot_integrations::telegram::{SendMessageParams, TelegramClient};
 use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -16,7 +18,31 @@ use tracing::{error, info, warn};
 /// - 向用户/群组/频道发送消息
 /// - 纯文本、带图片、自定义按钮
 /// - 目标类型：users / groups / all
-pub struct BroadcastMessageTool;
+pub struct BroadcastMessageTool {
+    telegram_client: Option<Arc<TelegramClient>>,
+}
+
+impl BroadcastMessageTool {
+    /// Create a new tool without Telegram client (for testing)
+    pub fn new() -> Self {
+        Self {
+            telegram_client: None,
+        }
+    }
+
+    /// Create a tool with Telegram client for real message sending
+    pub fn with_telegram(client: Arc<TelegramClient>) -> Self {
+        Self {
+            telegram_client: Some(client),
+        }
+    }
+}
+
+impl Default for BroadcastMessageTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl Tool for BroadcastMessageTool {
@@ -172,19 +198,68 @@ impl Tool for BroadcastMessageTool {
 
         // 群发到用户
         if !user_ids.is_empty() {
-            warn!("BroadcastMessageTool: 准备向 {} 个用户发送消息（模拟）", user_ids.len());
-            // TODO: 真实发送逻辑需接入 Bot 实例
-            // 示例: for uid in &user_ids { bot.send_message(uid, content).await? }
+            if let Some(ref client) = self.telegram_client {
+                info!("BroadcastMessageTool: 向 {} 个用户发送消息", user_ids.len());
+                for uid in &user_ids {
+                    let params = SendMessageParams {
+                        chat_id: *uid,
+                        text: content.to_string(),
+                        parse_mode: Some("HTML".to_string()),
+                        reply_markup: None,
+                        reply_to_message_id: None,
+                    };
+                    match client.send_message(params).await {
+                        Ok(_) => success += 1,
+                        Err(e) => {
+                            warn!("Failed to send to user {}: {}", uid, e);
+                            failed_items.push(serde_json::json!({
+                                "target_id": uid,
+                                "error": e.to_string()
+                            }));
+                        }
+                    }
+                }
+            } else {
+                warn!("BroadcastMessageTool: Telegram client 未配置，跳过实际发送");
+            }
             total += user_ids.len();
-            success += user_ids.len(); // 模拟全部成功
+            // If no client, count as success (mock mode)
+            if self.telegram_client.is_none() {
+                success += user_ids.len();
+            }
         }
 
         // 群发到群组
         if !chat_ids.is_empty() {
-            warn!("BroadcastMessageTool: 准备向 {} 个群组发送消息（模拟）", chat_ids.len());
-            // TODO: 真实发送逻辑
+            if let Some(ref client) = self.telegram_client {
+                info!("BroadcastMessageTool: 向 {} 个群组发送消息", chat_ids.len());
+                for gid in &chat_ids {
+                    let params = SendMessageParams {
+                        chat_id: *gid,
+                        text: content.to_string(),
+                        parse_mode: Some("HTML".to_string()),
+                        reply_markup: None,
+                        reply_to_message_id: None,
+                    };
+                    match client.send_message(params).await {
+                        Ok(_) => success += 1,
+                        Err(e) => {
+                            warn!("Failed to send to group {}: {}", gid, e);
+                            failed_items.push(serde_json::json!({
+                                "target_id": gid,
+                                "error": e.to_string()
+                            }));
+                        }
+                    }
+                }
+            } else {
+                warn!("BroadcastMessageTool: Telegram client 未配置，跳过实际发送");
+            }
             total += chat_ids.len();
-            success += chat_ids.len(); // 模拟全部成功
+            // If no client, count as success (mock mode)
+            if self.telegram_client.is_none() {
+                success += chat_ids.len();
+            }
         }
 
         if total == 0 {

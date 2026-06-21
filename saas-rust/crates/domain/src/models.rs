@@ -23,7 +23,7 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Merchant {
     pub id: Uuid,
     pub legacy_merchant_id: Option<i64>,

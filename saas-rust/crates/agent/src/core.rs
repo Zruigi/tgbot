@@ -1074,12 +1074,22 @@ impl Tool for ContentGeneratorTool {
 // 注册内置工具到 ToolRegistry
 // ---------------------------------------------------------------------------
 
-/// 创建包含内置工具的默认 ToolRegistry
+/// 创建包含内置工具的默认 ToolRegistry (无 Telegram 客户端，测试用)
 pub fn default_tool_registry() -> ToolRegistry {
+    default_tool_registry_with_telegram(None)
+}
+
+/// 创建包含内置工具的 ToolRegistry，可选传入 Telegram 客户端
+pub fn default_tool_registry_with_telegram(telegram_client: Option<Arc<tgbot_integrations::telegram::TelegramClient>>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     // 从独立模块加载的工具
     registry.register(Arc::new(FinanceQueryTool));
-    registry.register(Arc::new(BroadcastMessageTool));
+    // 注册 BroadcastMessageTool，传入可选的 Telegram 客户端
+    if let Some(client) = telegram_client {
+        registry.register(Arc::new(BroadcastMessageTool::with_telegram(client)));
+    } else {
+        registry.register(Arc::new(BroadcastMessageTool::new()));
+    }
     registry.register(Arc::new(DetectAdvertisingTool));
     // SUB-015: AI Tools - ocr/n8n/system_query/skill_manage
     registry.register(Arc::new(OcrTool::with_default_config().unwrap_or_else(|_| {

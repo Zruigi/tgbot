@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_domain::models::Role;
+use tgbot_integrations::telegram::{SendMessageParams, TelegramClient, TelegramConfig};
 
 use crate::auth::resolve_scope;
 use crate::state::AppState;
@@ -880,20 +881,64 @@ pub async fn reply_group_message(
         &quoted_text
     };
 
-    // TODO: Actually send the reply to Telegram group via bot engine.
+    // Step 1: Send the reply to Telegram group via Bot API
+    let tg_msg_id: Option<i64> = {
+        // Get bot token from registry
+        let bot_entry = state.bot_registry.get(body.group_id).await;
+
+        if let Some(entry) = bot_entry {
+            // Create Telegram client with this bot's token
+            let config = TelegramConfig {
+                bot_token: entry.bot_token,
+                api_base_url: "https://api.telegram.org".to_string(),
+                timeout_secs: 30,
+            };
+
+            match TelegramClient::new(config) {
+                Ok(client) => {
+                    let params = SendMessageParams {
+                        chat_id: body.group_id,
+                        text: body.content.trim().to_string(),
+                        parse_mode: Some("HTML".to_string()),
+                        reply_markup: None,
+                        // Key fix: set reply_to_message_id to make this a reply
+                        reply_to_message_id: Some(body.tg_msg_id),
+                    };
+
+                    match client.send_message(params).await {
+                        Ok(msg) => Some(msg.message_id),
+                        Err(e) => {
+                            tracing::warn!("Failed to send reply to Telegram: {}", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create Telegram client: {}", e);
+                    None
+                }
+            }
+        } else {
+            tracing::warn!("No bot registered for group_id={}", body.group_id);
+            None
+        }
+    };
+
+    // Step 2: Save the reply to database
     let row = sqlx::query(
         r#"
         INSERT INTO groups.group_messages (
             group_id, user_id, username, content, msg_type,
-            quoted_tg_msg_id, quoted_text, sender_type, tenant_id, timestamp
-        ) VALUES ($1, $2, 'admin', $3, 'text', $4, $5, 'admin', $6, now())
+            tg_msg_id, quoted_tg_msg_id, quoted_text, sender_type, tenant_id, timestamp
+        ) VALUES ($1, $2, 'admin', $3, 'text', $4, $5, $6, 'admin', $7, now())
         RETURNING id
         "#,
     )
     .bind(body.group_id)
     .bind(admin_user_id)
     .bind(body.content.trim())
-    .bind(body.tg_msg_id)
+    .bind(tg_msg_id)  // Store the actual Telegram message ID
+    .bind(body.tg_msg_id)  // Store the message being replied to
     .bind(quoted_text_ref)
     .bind(tenant_id)
     .fetch_one(&state.pool)
@@ -901,13 +946,13 @@ pub async fn reply_group_message(
 
     let msg_id: i64 = row.try_get("id")?;
 
-    tracing::info!("reply_group_message: saved msg_id={msg_id} replying to tg_msg_id={}", body.tg_msg_id);
+    tracing::info!("reply_group_message: saved msg_id={msg_id}, tg_msg_id={:?} replying to original tg_msg_id={}", tg_msg_id, body.tg_msg_id);
 
     Ok(Json(json!({
         "status": "ok",
         "data": {
             "msg_id": msg_id,
-            "tg_msg_id": Value::Null,
+            "tg_msg_id": tg_msg_id,
         }
     })))
 }
