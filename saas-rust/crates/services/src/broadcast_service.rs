@@ -1,8 +1,8 @@
 //! Broadcast service – message sending logic and worker integration.
 use anyhow::Result;
 use serde_json::{json, Value};
-use sqlx::PgPool;
-use tracing::{info, error};
+use sqlx::{PgPool, Row};
+use tracing::info;
 use tokio::time::{sleep, Duration};
 
 /// Send a broadcast message to a list of user IDs.
