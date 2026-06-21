@@ -1,5 +1,5 @@
-//! Verify repository — verification sessions and stats
-//! Migrated from backend/repositories/verify_repo.py
+// Verify repository — verification sessions and stats
+// Migrated from backend/repositories/verify_repo.py
 
 use anyhow::Result;
 use serde_json::Value;

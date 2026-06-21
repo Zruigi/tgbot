@@ -1,5 +1,5 @@
-//! Member repository — group members CRUD
-//! Migrated from backend/repositories/member_repo.py
+// Member repository — group members CRUD
+// Migrated from backend/repositories/member_repo.py
 
 use anyhow::Result;
 use serde_json::Value;

@@ -1,5 +1,5 @@
-//! Group repository — tracked groups CRUD
-//! Migrated from backend/repositories/group_repo.py
+// Group repository — tracked groups CRUD
+// Migrated from backend/repositories/group_repo.py
 
 use anyhow::Result;
 use serde_json::Value;

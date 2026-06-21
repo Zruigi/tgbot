@@ -1,6 +1,5 @@
-use sqlx::Row;
-//! User repository — inbox and chat-history queries
-//! Migrated from backend/repositories/user_repo.py
+// User repository — inbox and chat-history queries
+// Migrated from backend/repositories/user_repo.py
 
 use anyhow::Result;
 use serde_json::Value;

@@ -1,6 +1,6 @@
 use sqlx::Row;
-//! Message repository — message CRUD and search
-//! Migrated from backend/repositories/message_repo.py
+// Message repository — message CRUD and search
+// Migrated from backend/repositories/message_repo.py
 
 use anyhow::Result;
 use serde_json::Value;

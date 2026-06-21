@@ -1,5 +1,5 @@
-//! Audit repository — tenant audit logs
-//! Migrated from backend/repositories/audit_repo.py
+// Audit repository — tenant audit logs
+// Migrated from backend/repositories/audit_repo.py
 
 use anyhow::Result;
 use sqlx::PgPool;
