@@ -314,7 +314,7 @@ impl TelegramClient {
 
     /// Get basic information about the bot.
     pub async fn get_me(&self) -> Result<User> {
-        #[derive(Serialize)]
+        #[derive(Serialize, Debug)]
         struct Empty {}
         self.request("getMe", Empty {}).await
     }
@@ -341,7 +341,7 @@ impl TelegramClient {
 
     /// Answer a callback query (dismiss the loading animation).
     pub async fn answer_callback_query(&self, params: AnswerCallbackQueryParams) -> Result<()> {
-        #[derive(Serialize)]
+        #[derive(Serialize, Debug)]
         struct Empty {}
         self.request("answerCallbackQuery", params)
             .await
@@ -411,7 +411,7 @@ impl TelegramClient {
 
     /// Delete the webhook.
     pub async fn delete_webhook(&self) -> Result<()> {
-        #[derive(Serialize)]
+        #[derive(Serialize, Debug)]
         struct Empty {}
         #[derive(Deserialize)]
         struct WebhookResponse {
