@@ -41,7 +41,7 @@ pub fn row_to_json(row: PgRow) -> Value {
             "TIMESTAMPTZ" => row
                 .try_get::<DateTime<Utc>, _>(name)
                 .map(|v| Value::String(v.to_rfc3339())),
-            "JSON" | "JSONB" => row.try_get::<Value, _>(name).ok().unwrap_or(Value::Null),
+            "JSON" | "JSONB" => Ok(row.try_get::<Value, _>(name).ok().unwrap_or(Value::Null)),
             _ => row
                 .try_get::<String, _>(name)
                 .map(Value::String)
