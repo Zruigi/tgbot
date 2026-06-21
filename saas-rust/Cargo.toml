@@ -1,20 +1,89 @@
-[package]
-name = "tgbot-saas"
+[workspace]
+resolver = "2"
+members = [
+    "crates/app",
+    "crates/http",
+    "crates/domain",
+    "crates/repos",
+    "crates/services",
+    "crates/bot",
+    "crates/agent",
+    "crates/integrations",
+    "crates/workers",
+    "crates/migration",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.77"
+license = "MIT"
 
-[dependencies]
-anyhow = "1"
-axum = "0.7"
-chrono = { version = "0.4", features = ["serde"] }
-dotenvy = "0.15"
-jsonwebtoken = "9"
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+# Web framework (axum)
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace", "limit", "compression-gzip"] }
+
+# Telegram Bot
+teloxide = { version = "0.14", features = ["webhooks-axum"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json"] }
+
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
-thiserror = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging / Tracing
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Auth / Crypto
+jsonwebtoken = "9"
+bcrypt = "0.16"
+hmac = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+base64 = "0.22"
+hex = "0.4"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
 uuid = { version = "1", features = ["serde", "v4"] }
+
+# Environment / Config
+dotenvy = "0.15"
+
+# HTTP client (for LiteLLM, PaddleOCR, Binance, etc.)
+reqwest = { version = "0.12", features = ["json"], default-features = true }
+
+# Async trait
+async-trait = "0.1"
+
+# Validation
+validator = { version = "0.18", features = ["derive"] }
+
+# Cron / Scheduling
+cron = "0.15"
+
+# Internal crate paths
+tgbot-app = { path = "crates/app" }
+tgbot-http = { path = "crates/http" }
+tgbot-domain = { path = "crates/domain" }
+tgbot-repos = { path = "crates/repos" }
+tgbot-services = { path = "crates/services" }
+tgbot-bot = { path = "crates/bot" }
+tgbot-agent = { path = "crates/agent" }
+tgbot-integrations = { path = "crates/integrations" }
+tgbot-workers = { path = "crates/workers" }
+tgbot-migration = { path = "crates/migration" }
