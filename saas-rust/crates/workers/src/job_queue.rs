@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 

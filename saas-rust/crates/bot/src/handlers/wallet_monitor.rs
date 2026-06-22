@@ -191,7 +191,7 @@ pub async fn handle_address_input(
                 )],
             ]);
 
-            let _ = bot.delete_message(chat_id, processing_msg.id.0).await;
+            let _ = bot.delete_message(chat_id, processing_msg.id).await;
             bot.send_message(chat_id, &msg)
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)

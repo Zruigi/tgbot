@@ -7,6 +7,7 @@
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
 use teloxide::payloads::SendMessageSetters;
+use sqlx::Row;
 
 use crate::handlers::HandlerResult;
 

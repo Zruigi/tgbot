@@ -4,7 +4,7 @@
 //! Used for "join to unban" flows in group chats.
 
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId, UserId};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId, UserId, ChatMemberKind};
 use teloxide::payloads::SendMessageSetters;
 use crate::handlers::HandlerResult;
 
@@ -26,8 +26,12 @@ pub async fn check_channel_subscription(
 
     match bot.get_chat_member(teloxide::types::ChatId(channel_id).into(), UserId(user_id.try_into().unwrap())).await {
         Ok(member) => {
-            let status = member.status.as_str();
-            matches!(status, "member" | "administrator" | "creator")
+            matches!(
+                member.kind,
+                ChatMemberKind::Owner(_)
+                    | ChatMemberKind::Administrator(_)
+                    | ChatMemberKind::Member
+            )
         }
         Err(e) => {
             tracing::error!("Failed to check channel member: {}", e);
@@ -47,10 +51,10 @@ pub async fn handle_subscribe_button(
     query: CallbackQuery,
 ) -> HandlerResult<()> {
     let chat_id = match &query.message {
-        Some(m) => m.chat.id.0,
+        Some(m) => m.chat().id.0,
         None => return Ok(()),
     };
-    let message_id = query.message.as_ref().map(|m| m.id.0 as i32);
+    let message_id = query.message.as_ref().map(|m| m.id().0 as i32);
     let user_id = query.from.id.0 as i64;
 
     let data = match &query.data {
@@ -90,7 +94,7 @@ pub async fn handle_subscribe_button(
     };
 
     // Check if user has subscribed
-    let is_subscribed = check_channel_subscription(bot, UserId(user_id.try_into().unwrap()), channel_id).await;
+    let is_subscribed = check_channel_subscription(bot, user_id, channel_id).await;
 
     if is_subscribed {
         // User has subscribed – lift restrictions
@@ -262,7 +266,7 @@ pub async fn handle_start_with_channel_check(
             };
 
             // Check subscription
-            let is_subscribed = check_channel_subscription(bot, UserId(user_id.try_into().unwrap()), channel_id).await;
+            let is_subscribed = check_channel_subscription(bot, user_id, channel_id).await;
 
             if is_subscribed {
                 // Lift restrictions

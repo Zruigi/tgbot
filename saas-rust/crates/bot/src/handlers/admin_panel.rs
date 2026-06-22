@@ -173,10 +173,10 @@ pub async fn handle_admin_callback(
     web_admin_token: &str,
 ) -> HandlerResult<Option<AdminState>> {
     let chat_id = match query.message.as_ref() {
-        Some(msg) => ChatId(msg.chat.id.0),
+        Some(msg) => ChatId(msg.chat().id.0),
         None => return Ok(None),
     };
-    let message_id = query.message.as_ref().map(|m| m.id.0 as i32);
+    let message_id = query.message.as_ref().map(|m| m.id().0 as i32);
 
     // Authorization
     let from_id = query.from.id.0 as i64;

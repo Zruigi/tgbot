@@ -315,7 +315,7 @@ async fn track_group_seen(bot: &Bot, state: &GroupMonitorState, message: &Messag
     );
 
     // Check if group is monitored
-    if let Some(config) = state.group_config_cache.get(chat.id).await {
+    if let Some(config) = state.group_config_cache.get(chat.id.0).await {
         if config.is_monitored {
             // Record message to group_messages table
             // In production, this would call member_repo::save_group_message
@@ -337,7 +337,7 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
     let user = user.unwrap();
 
     // Get group config
-    let config = match state.group_config_cache.get(chat.id).await {
+    let config = match state.group_config_cache.get(chat.id.0).await {
         Some(c) => c,
         None => return,
     };
@@ -636,7 +636,7 @@ pub async fn monitor_group_keywords(
     // In production, check against config.ADMIN_ID
 
     // Get group config
-    let config = state.group_config_cache.get(chat.id).await?;
+    let config = state.group_config_cache.get(chat.id.0).await?;
 
     if !config.is_monitored {
         return None;

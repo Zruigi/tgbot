@@ -25,7 +25,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
