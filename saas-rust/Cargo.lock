@@ -3105,6 +3105,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "tgbot-domain",
+ "tgbot-integrations",
  "tgbot-repos",
  "tgbot-services",
  "tokio",

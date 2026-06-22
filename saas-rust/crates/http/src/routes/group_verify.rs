@@ -276,8 +276,7 @@ pub async fn verify_stats(
             )
             .bind(group_id)
             .fetch_one(&state.pool)
-            .await
-            .unwrap_or(0)
+            .await?
         } else {
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*)::bigint FROM groups.group_members WHERE group_id = $1 AND tenant_id = $2 AND is_verified = true",
@@ -285,24 +284,21 @@ pub async fn verify_stats(
             .bind(group_id)
             .bind(tenant_id)
             .fetch_one(&state.pool)
-            .await
-            .unwrap_or(0)
+            .await?
         }
     } else if tenant_id.is_empty() {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE is_verified = true",
         )
         .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0)
+        .await?
     } else {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE tenant_id = $1 AND is_verified = true",
         )
         .bind(tenant_id)
         .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0)
+        .await?
     };
 
     // Total unverified members
@@ -321,8 +317,7 @@ pub async fn verify_stats(
             .bind(group_id)
             .bind(tenant_id)
             .fetch_one(&state.pool)
-            .await
-            .unwrap_or(0)
+            .await?
         }
     } else if tenant_id.is_empty() {
         sqlx::query_scalar::<_, i64>(
@@ -337,7 +332,6 @@ pub async fn verify_stats(
         .bind(tenant_id)
         .fetch_one(&state.pool)
         .await?
-    }
     };
 
     // Recent verifications (within the time window)
@@ -366,8 +360,7 @@ pub async fn verify_stats(
             .bind(tenant_id)
             .bind(days)
             .fetch_one(&state.pool)
-            .await
-            .unwrap_or(0)
+            .await?
         }
     } else if tenant_id.is_empty() {
         sqlx::query_scalar::<_, i64>(
@@ -392,7 +385,6 @@ pub async fn verify_stats(
         .bind(days)
         .fetch_one(&state.pool)
         .await?
-    }
     };
 
     // Pending verify sessions
@@ -415,8 +407,7 @@ pub async fn verify_stats(
             .bind(group_id)
             .bind(tenant_id)
             .fetch_one(&state.pool)
-            .await
-            .unwrap_or(0)
+            .await?
         }
     } else if tenant_id.is_empty() {
         sqlx::query_scalar::<_, i64>(
@@ -435,8 +426,7 @@ pub async fn verify_stats(
         .bind(tenant_id)
         .fetch_one(&state.pool)
         .await?
-    }
-    .unwrap_or(0);
+    };
 
     Ok(Json(json!({
         "status": "ok",
@@ -516,7 +506,7 @@ pub async fn verify_growth(
             .bind(tenant_id)
             .bind(days)
             .fetch_all(&state.pool)
-            .await
+            .await?
         }
     } else if tenant_id.is_empty() {
         sqlx::query(

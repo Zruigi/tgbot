@@ -462,7 +462,8 @@ pub async fn export_transactions(
         .fetch_all(&state.pool)
         .await?;
 
-    Ok(Json(json!({ "status": "ok", "data": rows_to_json(rows), "count": rows.len() })))
+    let count = rows.len();
+    Ok(Json(json!({ "status": "ok", "data": rows_to_json(rows), "count": count })))
 }
 
 // GET /api/monitors/transactions - List transactions
