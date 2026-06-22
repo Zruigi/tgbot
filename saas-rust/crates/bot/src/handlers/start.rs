@@ -237,7 +237,7 @@ async fn handle_unmute_deeplink(
                 member.kind,
                 teloxide::types::ChatMemberKind::Owner(_)
                 | teloxide::types::ChatMemberKind::Administrator(_)
-                | teloxide::types::ChatMemberKind::Member(_)
+                | teloxide::types::ChatMemberKind::Member
             );
 
             if is_member {

@@ -6,6 +6,7 @@
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId, UserId};
 use teloxide::payloads::SendMessageSetters;
+use crate::handlers::HandlerResult;
 
 // ---------------------------------------------------------------------------
 // Check channel subscription

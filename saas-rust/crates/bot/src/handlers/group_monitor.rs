@@ -275,7 +275,7 @@ pub async fn track_group_message(
     state: &GroupMonitorState,
     message: &Message,
 ) -> Option<()> {
-    let chat = message.chat().clone();
+    let chat = message.chat.clone();
 
     // Only process group and supergroup messages
     if !matches!(chat.kind, ChatType::Group | ChatType::Supergroup) {
@@ -304,7 +304,7 @@ pub async fn track_group_message(
 
 /// Track group seen - update group info in database
 async fn track_group_seen(bot: &Bot, state: &GroupMonitorState, message: &Message) {
-    let chat = message.chat().clone();
+    let chat = message.chat.clone();
 
     // In Rust, we would call repository functions here
     // For now, this is a placeholder that logs the activity
@@ -326,7 +326,7 @@ async fn track_group_seen(bot: &Bot, state: &GroupMonitorState, message: &Messag
 
 /// Channel verification checker
 async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Message) {
-    let chat = message.chat().clone();
+    let chat = message.chat.clone();
     let user = message.from.as_ref();
 
     // Skip if no user or if it's a sender_chat (channelanonymous)
@@ -362,7 +362,7 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
     // Check if user is admin/creator
     if let Ok(member) = bot.get_chat_member(chat.id, user_id).await {
         if matches!(
-            member.status(),
+            member.kind.status(),
             teloxide::types::ChatMemberStatus::Administrator
                 | teloxide::types::ChatMemberStatus::Owner
         ) {
@@ -393,7 +393,7 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
 
     if !is_member {
         // Delete user's message
-        let _ = bot.delete_message(chat.id, message.id()).await;
+        let _ = bot.delete_message(chat.id, message.id).await;
 
         // Send verification prompt
         let user_name = user
@@ -431,7 +431,7 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
 async fn check_channel_membership(bot: &Bot, user_id: UserId, channel_id: i64) -> bool {
     match bot.get_chat_member(ChatId(channel_id), user_id).await {
         Ok(member) => matches!(
-            member.status(),
+            member.kind.status(),
             teloxide::types::ChatMemberStatus::Member
                 | teloxide::types::ChatMemberStatus::Administrator
                 | teloxide::types::ChatMemberStatus::Owner
@@ -456,7 +456,7 @@ async fn handle_group_address_auto_query(
         return;
     }
 
-    let group_id = message.chat().id.0;
+    let group_id = message.chat.id.0;
     let user_id = message.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
     // Process up to 3 addresses
@@ -491,7 +491,7 @@ async fn handle_group_address_auto_query(
                 let tip_lines = build_address_tip_lines(addr, &snapshot);
                 let tip = tip_lines.join("\n");
 
-                if let Err(e) = bot.send_message(message.chat().id, tip).parse_mode(teloxide::types::ParseMode::Html).await {
+                if let Err(e) = bot.send_message(message.chat.id, tip).parse_mode(teloxide::types::ParseMode::Html).await {
                     warn!("[GroupMonitor] Failed to send address tip: {}", e);
                 }
             }
@@ -629,7 +629,7 @@ pub async fn monitor_group_keywords(
 ) -> Option<()> {
     let text = message.text()?;
     let user = message.from.as_ref()?;
-    let chat = message.chat();
+    let chat = message.chat;
 
     // Skip admin messages
     // In production, check against config.ADMIN_ID
@@ -692,7 +692,7 @@ pub async fn handle_new_group_member(
     message: &Message,
 ) -> Option<()> {
     let new_members = message.new_chat_members()?;
-    let chat = message.chat();
+    let chat = message.chat;
 
     for member in new_members {
         if member.is_bot {
@@ -720,7 +720,7 @@ pub async fn handle_group_left_member(
     message: &Message,
 ) -> Option<()> {
     let left_member = message.left_chat_member()?;
-    let chat = message.chat();
+    let chat = message.chat;
 
     if left_member.is_bot {
         return None;
@@ -745,7 +745,7 @@ pub async fn track_channel_seen(
     state: &GroupMonitorState,
     message: &Message,
 ) -> Option<()> {
-    let chat = message.chat().clone();
+    let chat = message.chat.clone();
 
     if !matches!(chat.kind, ChatType::Channel) {
         return None;
