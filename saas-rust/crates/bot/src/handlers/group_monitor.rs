@@ -396,7 +396,7 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
         let _ = bot.delete_message(chat.id, message.id).await;
 
         // Send verification prompt
-        let first_name = user.first_name.as_deref().unwrap_or("朋友");
+        let first_name = &user.first_name;
         let user_name = user
             .username
             .as_ref()
@@ -671,7 +671,7 @@ pub async fn monitor_group_keywords(
     );
 
     // Send auto-invite to user
-    let first_name = user.first_name.as_deref().unwrap_or("朋友");
+    let first_name = &user.first_name;
     let invite_text = format!(
         "👋 <b>你好 {}！</b>\n\n我们在群组 <b>{}</b> 注意到你提到了关于 <code>{}</code> 的内容。\n\n欢迎直接咨询我们的官方客服，我们将为您提供 1对1 的专业解答和支持！",
         first_name,
