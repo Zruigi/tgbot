@@ -393,7 +393,7 @@ pub async fn verify_stats(
         .fetch_one(&state.pool)
         .await?
     }
-    .unwrap_or(0);
+    };
 
     // Pending verify sessions
     let pending_sessions: i64 = if let Some(group_id) = q.group_id {
