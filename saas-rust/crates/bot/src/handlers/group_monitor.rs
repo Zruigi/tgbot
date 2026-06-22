@@ -275,10 +275,10 @@ pub async fn track_group_message(
     state: &GroupMonitorState,
     message: &Message,
 ) -> Option<()> {
-    let chat = message.chat.clone();
+    let chat = message.chat().clone();
 
     // Only process group and supergroup messages
-    if !matches!(chat.r#type, ChatType::Group | ChatType::Supergroup) {
+    if !matches!(chat.kind, ChatType::Group | ChatType::Supergroup) {
         return None;
     }
 
@@ -287,7 +287,7 @@ pub async fn track_group_message(
 
     info!(
         "[GroupMonitor] Message from {} in {} ({})",
-        user.id, chat.title.as_deref().unwrap_or("Unknown"), chat.id
+        user.id, chat.title().as_deref().unwrap_or("Unknown"), chat.id
     );
 
     // Track group seen (update group info in database)
@@ -304,13 +304,13 @@ pub async fn track_group_message(
 
 /// Track group seen - update group info in database
 async fn track_group_seen(bot: &Bot, state: &GroupMonitorState, message: &Message) {
-    let chat = message.chat.clone();
+    let chat = message.chat().clone();
 
     // In Rust, we would call repository functions here
     // For now, this is a placeholder that logs the activity
     debug!(
         "[GroupMonitor] Tracking group: {} ({})",
-        chat.title.as_deref().unwrap_or("Unknown"),
+        chat.title().as_deref().unwrap_or("Unknown"),
         chat.id
     );
 
@@ -326,7 +326,7 @@ async fn track_group_seen(bot: &Bot, state: &GroupMonitorState, message: &Messag
 
 /// Channel verification checker
 async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Message) {
-    let chat = message.chat.clone();
+    let chat = message.chat().clone();
     let user = message.from.as_ref();
 
     // Skip if no user or if it's a sender_chat (channelanonymous)
@@ -364,7 +364,7 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
         if matches!(
             member.status(),
             teloxide::types::ChatMemberStatus::Administrator
-                | teloxide::types::ChatMemberStatus::Creator
+                | teloxide::types::ChatMemberStatus::Owner
         ) {
             return;
         }
@@ -393,7 +393,7 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
 
     if !is_member {
         // Delete user's message
-        let _ = bot.delete_message(chat.id, message.id).await;
+        let _ = bot.delete_message(chat.id, message.id()).await;
 
         // Send verification prompt
         let user_name = user
@@ -434,7 +434,7 @@ async fn check_channel_membership(bot: &Bot, user_id: UserId, channel_id: i64) -
             member.status(),
             teloxide::types::ChatMemberStatus::Member
                 | teloxide::types::ChatMemberStatus::Administrator
-                | teloxide::types::ChatMemberStatus::Creator
+                | teloxide::types::ChatMemberStatus::Owner
         ),
         Err(e) => {
             warn!("[ChannelVerify] Failed to check membership: {}", e);
@@ -456,7 +456,7 @@ async fn handle_group_address_auto_query(
         return;
     }
 
-    let group_id = message.chat.id.0;
+    let group_id = message.chat().id.0;
     let user_id = message.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
     // Process up to 3 addresses
@@ -491,7 +491,7 @@ async fn handle_group_address_auto_query(
                 let tip_lines = build_address_tip_lines(addr, &snapshot);
                 let tip = tip_lines.join("\n");
 
-                if let Err(e) = bot.send_message(message.chat.id, tip).parse_mode(teloxide::types::ParseMode::Html).await {
+                if let Err(e) = bot.send_message(message.chat().id, tip).parse_mode(teloxide::types::ParseMode::Html).await {
                     warn!("[GroupMonitor] Failed to send address tip: {}", e);
                 }
             }
@@ -629,7 +629,7 @@ pub async fn monitor_group_keywords(
 ) -> Option<()> {
     let text = message.text()?;
     let user = message.from.as_ref()?;
-    let chat = &message.chat;
+    let chat = message.chat();
 
     // Skip admin messages
     // In production, check against config.ADMIN_ID
@@ -673,7 +673,7 @@ pub async fn monitor_group_keywords(
     let invite_text = format!(
         "👋 <b>你好 {}！</b>\n\n我们在群组 <b>{}</b> 注意到你提到了关于 <code>{}</code> 的内容。\n\n欢迎直接咨询我们的官方客服，我们将为您提供 1对1 的专业解答和支持！",
         user.first_name.as_ref().unwrap_or("朋友"),
-        chat.title.as_deref().unwrap_or("Unknown"),
+        chat.title().as_deref().unwrap_or("Unknown"),
         matched_keywords.first().unwrap_or(&"相关内容".to_string())
     );
 
@@ -692,7 +692,7 @@ pub async fn handle_new_group_member(
     message: &Message,
 ) -> Option<()> {
     let new_members = message.new_chat_members()?;
-    let chat = &message.chat;
+    let chat = message.chat();
 
     for member in new_members {
         if member.is_bot {
@@ -703,7 +703,7 @@ pub async fn handle_new_group_member(
             "[GroupMonitor] New member: {} (@{}) joined {}",
             member.id.0,
             member.username.as_deref().unwrap_or("None"),
-            chat.title.as_deref().unwrap_or("Unknown")
+            chat.title().as_deref().unwrap_or("Unknown")
         );
 
         // Save member to database
@@ -720,7 +720,7 @@ pub async fn handle_group_left_member(
     message: &Message,
 ) -> Option<()> {
     let left_member = message.left_chat_member()?;
-    let chat = &message.chat;
+    let chat = message.chat();
 
     if left_member.is_bot {
         return None;
@@ -730,7 +730,7 @@ pub async fn handle_group_left_member(
         "[GroupMonitor] Member left: {} (@{}) left {}",
         left_member.id.0,
         left_member.username.as_deref().unwrap_or("None"),
-        chat.title.as_deref().unwrap_or("Unknown")
+        chat.title().as_deref().unwrap_or("Unknown")
     );
 
     // Update member status in database
@@ -745,15 +745,15 @@ pub async fn track_channel_seen(
     state: &GroupMonitorState,
     message: &Message,
 ) -> Option<()> {
-    let chat = message.chat.clone();
+    let chat = message.chat().clone();
 
-    if !matches!(chat.r#type, ChatType::Channel) {
+    if !matches!(chat.kind, ChatType::Channel) {
         return None;
     }
 
     info!(
         "[GroupMonitor] Channel seen: {} ({})",
-        chat.title.as_deref().unwrap_or("Unknown"),
+        chat.title().as_deref().unwrap_or("Unknown"),
         chat.id
     );
 
