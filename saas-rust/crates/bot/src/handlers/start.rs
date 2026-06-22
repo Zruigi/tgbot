@@ -5,6 +5,7 @@
 //! - Deep Linking 自助解禁：unmute_{group_id} 参数处理
 
 use teloxide::{
+    prelude::*,
     types::{ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery},
     Bot,
 };
@@ -15,7 +16,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::info;
 use std::num::NonZeroUsize;
-use teloxide::payloads::{SendMessageSetters, EditMessageTextSetters};
+use teloxide::payloads::{SendMessageSetters, EditMessageTextSetters, AnswerCallbackQuerySetters};
 
 // ---------------------------------------------------------------------------
 // 频率限制缓存：{user_id: last_verify_time}，TTL 60秒，上限 1000 条
@@ -336,17 +337,17 @@ pub async fn button_callback(
                     member.kind,
                     teloxide::types::ChatMemberKind::Owner(_)
                     | teloxide::types::ChatMemberKind::Administrator(_)
-                    | teloxide::types::ChatMemberKind::Member(_)
+                    | teloxide::types::ChatMemberKind::Member
                 );
 
                 if is_member {
-                    callback.answer("⏳ 正在处理解禁请求，请稍候...").await?;
+                    bot.answer_callback_query(&callback.id).text("⏳ 正在处理解禁请求，请稍候...").await?;
                     execute_unmute(&bot, user_id, group_id).await?;
                     return Ok(());
                 }
             }
 
-            callback.answer("❌ 未检测到你的关注，请先关注频道后再试").await?;
+            bot.answer_callback_query(&callback.id).text("❌ 未检测到你的关注，请先关注频道后再试").await?;
         }
         return Ok(());
     }
@@ -355,19 +356,19 @@ pub async fn button_callback(
     if data == "lang_menu" {
         let text = "语言设置\n\n当前语言: 中文";
         if let Some(msg) = &callback.message {
-            bot.edit_message_text(msg.chat.id, msg.id, text)
+            bot.edit_message_text(msg.chat().id, msg.id(), text)
                 .reply_markup(language_keyboard("zh-CN"))
                 .parse_mode(teloxide::types::ParseMode::Html)
                 .await?;
         }
-        callback.answer("").await?;
+        bot.answer_callback_query(&callback.id).await?;
         return Ok(());
     }
 
     // 设置语言
     if let Some(locale) = data.strip_prefix("lang_set:") {
         let text = format!("语言已设置为: {}", language_label(locale));
-        callback.answer(&text).await?;
+        bot.answer_callback_query(&callback.id).text(&text).await?;
 
         // 返回主菜单
         let has_merchant_console = false;
@@ -378,7 +379,7 @@ pub async fn button_callback(
         };
 
         if let Some(msg) = &callback.message {
-            bot.edit_message_text(msg.chat.id, msg.id, "请选择功能:")
+            bot.edit_message_text(msg.chat().id, msg.id(), "请选择功能:")
                 .reply_markup(keyboard)
                 .await?;
         }
@@ -388,16 +389,16 @@ pub async fn button_callback(
     // 管理后台 OTP
     if data == "admin_web_otp" {
         if !is_admin_user {
-            callback.answer("权限不足").await?;
+            bot.answer_callback_query(&callback.id).text("权限不足").await?;
             return Ok(());
         }
 
         // TODO: 生成 OTP 链接
         let text = "管理后台\n\n(OTP 链接生成功能开发中)";
         if let Some(msg) = &callback.message {
-            bot.edit_message_text(msg.chat.id, msg.id, text).await?;
+            bot.edit_message_text(msg.chat().id, msg.id(), text).await?;
         }
-        callback.answer("").await?;
+        bot.answer_callback_query(&callback.id).await?;
         return Ok(());
     }
 
@@ -406,9 +407,9 @@ pub async fn button_callback(
         // TODO: 检查商户绑定状态并生成 OTP
         let text = "商户后台\n\n(OTP 链接生成功能开发中)";
         if let Some(msg) = &callback.message {
-            bot.edit_message_text(msg.chat.id, msg.id, text).await?;
+            bot.edit_message_text(msg.chat().id, msg.id(), text).await?;
         }
-        callback.answer("").await?;
+        bot.answer_callback_query(&callback.id).await?;
         return Ok(());
     }
 
@@ -416,13 +417,13 @@ pub async fn button_callback(
     if data == "contact_admin" {
         let text = "联系客服\n\n请直接发送消息，客服会尽快回复您。";
         if let Some(msg) = &callback.message {
-            bot.edit_message_text(msg.chat.id, msg.id, text)
+            bot.edit_message_text(msg.chat().id, msg.id(), text)
                 .reply_markup(InlineKeyboardMarkup::new(vec![
                     vec![InlineKeyboardButton::callback("返回主菜单", "back_to_start")],
                 ]))
                 .await?;
         }
-        callback.answer("").await?;
+        bot.answer_callback_query(&callback.id).await?;
         return Ok(());
     }
 
@@ -436,17 +437,17 @@ pub async fn button_callback(
         };
 
         if let Some(msg) = &callback.message {
-            bot.edit_message_text(msg.chat.id, msg.id, "请选择功能:")
+            bot.edit_message_text(msg.chat().id, msg.id(), "请选择功能:")
                 .reply_markup(keyboard)
                 .await?;
         }
-        callback.answer("").await?;
+        bot.answer_callback_query(&callback.id).await?;
         return Ok(());
     }
 
     // 系统设置（仅提示）
     if data == "admin_settings" {
-        callback.answer("系统设置请在 Web 后台操作").await?;
+        bot.answer_callback_query(&callback.id).text("系统设置请在 Web 后台操作").await?;
         return Ok(());
     }
 
@@ -455,13 +456,13 @@ pub async fn button_callback(
         // TODO: 跳转商户注册流程
         let text = "商户注册\n\n(商户注册功能开发中)";
         if let Some(msg) = &callback.message {
-            bot.edit_message_text(msg.chat.id, msg.id, text).await?;
+            bot.edit_message_text(msg.chat().id, msg.id(), text).await?;
         }
-        callback.answer("").await?;
+        bot.answer_callback_query(&callback.id).await?;
         return Ok(());
     }
 
-    callback.answer("功能开发中").await?;
+    bot.answer_callback_query(&callback.id).text("功能开发中").await?;
     Ok(())
 }
 
