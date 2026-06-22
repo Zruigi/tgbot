@@ -338,7 +338,7 @@ pub async fn verify_stats(
         .fetch_one(&state.pool)
         .await?
     }
-    .unwrap_or(0);
+    };
 
     // Recent verifications (within the time window)
     let recently_verified: i64 = if let Some(group_id) = q.group_id {
