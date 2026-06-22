@@ -101,7 +101,6 @@ pub async fn get_verify_config(
             .bind(tenant_id)
             .fetch_all(&state.pool)
             .await
-            .unwrap_or(0)
         }
     } else if tenant_id.is_empty() {
         // Platform admin: all groups with verify_enabled
@@ -518,7 +517,6 @@ pub async fn verify_growth(
             .bind(days)
             .fetch_all(&state.pool)
             .await
-            .unwrap_or(0)
         }
     } else if tenant_id.is_empty() {
         sqlx::query(
