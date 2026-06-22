@@ -100,7 +100,7 @@ pub async fn get_verify_config(
             .bind(group_id)
             .bind(tenant_id)
             .fetch_all(&state.pool)
-            .await
+            .await?
         }
     } else if tenant_id.is_empty() {
         // Platform admin: all groups with verify_enabled
