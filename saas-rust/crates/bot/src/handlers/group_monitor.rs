@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{ChatPermissions, ChatType, Message};
+use teloxide::types::{ChatPermissions, Message};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -278,7 +278,7 @@ pub async fn track_group_message(
     let chat = message.chat.clone();
 
     // Only process group and supergroup messages
-    if !matches!(chat.kind, ChatType::Group | ChatType::Supergroup) {
+    if !chat.is_group() && !chat.is_supergroup() {
         return None;
     }
 
@@ -398,8 +398,9 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
         // Send verification prompt
         let user_name = user
             .first_name
-            .as_deref()
-            .or(user.username.as_deref())
+            .as_ref()
+            .map(|s| s.as_str())
+            .or(user.username.as_ref().map(|s| s.as_str()))
             .unwrap_or(&format!("User{}", user_id.0));
 
         let template = config
@@ -747,7 +748,7 @@ pub async fn track_channel_seen(
 ) -> Option<()> {
     let chat = message.chat.clone();
 
-    if !matches!(chat.kind, ChatType::Channel) {
+    if !chat.is_channel() {
         return None;
     }
 
