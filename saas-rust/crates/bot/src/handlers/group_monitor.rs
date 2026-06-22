@@ -402,7 +402,6 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
             .as_ref()
             .map(|s| s.as_str())
             .unwrap_or(first_name);
-            .unwrap_or(&format!("User{}", user_id.0));
 
         let template = config
             .verify_msg_template
