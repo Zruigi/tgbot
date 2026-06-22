@@ -23,7 +23,7 @@ pub async fn check_channel_subscription(
         return true;
     }
 
-    match bot.get_chat_member(channel_id, UserId(user_id.try_into().unwrap())).await {
+    match bot.get_chat_member(teloxide::types::ChatId(channel_id).into(), UserId(user_id.try_into().unwrap())).await {
         Ok(member) => {
             let status = member.status.as_str();
             matches!(status, "member" | "administrator" | "creator")
@@ -96,7 +96,7 @@ pub async fn handle_subscribe_button(
         bot.restrict_chat_member(
             teloxide::types::ChatId(group_id),
             UserId(user_id.try_into().unwrap()),
-            teloxide::types::ChatPermissions::any(),
+            teloxide::types::ChatPermissions::all(),
         )
         .await?;
 
@@ -268,7 +268,7 @@ pub async fn handle_start_with_channel_check(
                 bot.restrict_chat_member(
                     teloxide::types::ChatId(group_id),
                     UserId(user_id.try_into().unwrap()),
-                    teloxide::types::ChatPermissions::any(),
+                    teloxide::types::ChatPermissions::all(),
                 )
                 .await?;
 
