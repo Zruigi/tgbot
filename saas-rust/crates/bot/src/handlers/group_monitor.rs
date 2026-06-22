@@ -403,13 +403,14 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
             .map(|s| s.as_str())
             .unwrap_or(first_name);
 
+        let default_template = format!(
+            "🚫 {}, please follow channel {} before speaking!",
+            user_name, channel_id
+        );
         let template = config
             .verify_msg_template
             .as_deref()
-            .unwrap_or(&format!(
-                "🚫 {}, please follow channel {} before speaking!",
-                user_name, channel_id
-            ));
+            .unwrap_or(&default_template);
 
         let text = template
             .replace("{user}", &format!(r#"<a href="tg://user?id={}">{}</a>"#, user_id.0, user_name))
