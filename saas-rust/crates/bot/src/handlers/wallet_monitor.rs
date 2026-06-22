@@ -7,7 +7,8 @@
 use std::fmt::Write;
 
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
+use teloxide::payloads::SendMessageSetters;
 
 use crate::handlers::HandlerResult;
 
@@ -89,7 +90,7 @@ pub async fn start_wallet_monitor(
                 请输入您要查询和监听的 USDT 地址：\n\
                 支持 <code>TRC20</code> (T开头) 或 <code>BSC</code> (0x开头)";
 
-    bot.edit_message_text(chat_id, message_id, text)
+    bot.edit_message_text(chat_id, MessageId(message_id), text)
         .parse_mode(ParseMode::Html)
         .await?;
 
@@ -203,7 +204,7 @@ pub async fn handle_address_input(
             tracing::error!("Wallet query failed for {address}: {e}");
             bot.edit_message_text(
                 chat_id,
-                processing_msg.id.0 as i32,
+                MessageId(processing_msg.id.0 as i32),
                 "❌ 查询失败：无法连接至链上节点。地址已尝试保存至监听列表。",
             )
             .await?;

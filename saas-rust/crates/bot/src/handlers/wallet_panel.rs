@@ -5,7 +5,8 @@
 //! Admin users can view all monitors system-wide.
 
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
+use teloxide::payloads::SendMessageSetters;
 
 use crate::handlers::HandlerResult;
 
@@ -190,7 +191,7 @@ pub async fn wallet_my_list_callback(
     pool: &sqlx::PgPool,
 ) -> HandlerResult<()> {
     let (text, kb) = build_wallet_keyboard(pool, user_id, false).await;
-    bot.edit_message_text(chat_id, message_id, &text)
+    bot.edit_message_text(chat_id, MessageId(message_id), &text)
         .parse_mode(ParseMode::Html)
         .reply_markup(InlineKeyboardMarkup::new(kb))
         .await?;
@@ -211,19 +212,13 @@ pub async fn wallet_admin_all_callback(
     pool: &sqlx::PgPool,
 ) -> HandlerResult<()> {
     if user_id != admin_id {
-        bot.answer_callback_query(
-            &teloxide::types::CallbackQuery::default(), // placeholder; real usage passes query id
-        )
-        .text("无权限")
-        .show_alert(true)
-        .await
-        .ok();
+        // Can't answer without callback query - just return
         // In production, the caller handles the callback answer before invoking this.
         return Ok(());
     }
 
     let (text, kb) = build_wallet_keyboard(pool, user_id, true).await;
-    bot.edit_message_text(chat_id, message_id, &text)
+    bot.edit_message_text(chat_id, MessageId(message_id), &text)
         .parse_mode(ParseMode::Html)
         .reply_markup(InlineKeyboardMarkup::new(kb))
         .await?;
@@ -271,7 +266,7 @@ pub async fn unwatch_callback(
 
     let admin_view = mode == "a";
     let (text, kb) = build_wallet_keyboard(pool, user_id, admin_view).await;
-    bot.edit_message_text(chat_id, message_id, &text)
+    bot.edit_message_text(chat_id, MessageId(message_id), &text)
         .parse_mode(ParseMode::Html)
         .reply_markup(InlineKeyboardMarkup::new(kb))
         .await?;

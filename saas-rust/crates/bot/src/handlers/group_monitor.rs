@@ -12,8 +12,6 @@ use teloxide::types::{ChatPermissions, ChatType, Message};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::telegram_client::TelegramClient;
-
 // ---------------------------------------------------------------------------
 // Configuration Constants
 // ---------------------------------------------------------------------------
@@ -127,30 +125,21 @@ pub struct PermissionRecord {
 // Cache Structures
 // ---------------------------------------------------------------------------
 
-/// Thread-safe group config cache
-pub type GroupConfigCache = Arc<RwLock<HashMap<i64, GroupConfig>>>;
-
-/// Thread-safe avatar cache
-pub type AvatarCache = Arc<RwLock<HashMap<i64, String>>>;
-
-/// Thread-safe verification cooldown cache
-pub type VerifyCooldownCache = Arc<RwLock<HashMap<(i64, i64), f64>>>;
-
-/// Address query cooldown to prevent duplicate queries within 30 minutes
-pub type AddressQueryCooldown = Arc<RwLock<HashMap<(i64, String), f64>>>;
+/// Thread-safe group config cache (newtype wrapper for impl)
+pub struct GroupConfigCache(Arc<RwLock<HashMap<i64, GroupConfig>>>);
 
 impl GroupConfigCache {
     pub fn new() -> Self {
-        Arc::new(RwLock::new(HashMap::new()))
+        Self(Arc::new(RwLock::new(HashMap::new())))
     }
 
     pub async fn get(&self, group_id: i64) -> Option<GroupConfig> {
-        let cache = self.read().await;
+        let cache = self.0.read().await;
         cache.get(&group_id).cloned()
     }
 
     pub async fn set(&self, group_id: i64, config: GroupConfig) {
-        let mut cache = self.write().await;
+        let mut cache = self.0.write().await;
         // Keep cache size bounded
         if cache.len() > 500 {
             // Remove oldest entries (simple strategy: clear half)
@@ -163,7 +152,7 @@ impl GroupConfigCache {
     }
 
     pub async fn clear(&self, group_id: Option<i64>) {
-        let mut cache = self.write().await;
+        let mut cache = self.0.write().await;
         if let Some(gid) = group_id {
             cache.remove(&gid);
         } else {
@@ -172,18 +161,21 @@ impl GroupConfigCache {
     }
 }
 
+/// Thread-safe avatar cache (newtype wrapper for impl)
+pub struct AvatarCache(Arc<RwLock<HashMap<i64, String>>>);
+
 impl AvatarCache {
     pub fn new() -> Self {
-        Arc::new(RwLock::new(HashMap::new()))
+        Self(Arc::new(RwLock::new(HashMap::new())))
     }
 
     pub async fn get(&self, user_id: i64) -> Option<String> {
-        let cache = self.read().await;
+        let cache = self.0.read().await;
         cache.get(&user_id).cloned()
     }
 
     pub async fn set(&self, user_id: i64, avatar: String) {
-        let mut cache = self.write().await;
+        let mut cache = self.0.write().await;
         if cache.len() > 2000 {
             // Clear oldest half
             let keys: Vec<_> = cache.keys().take(1000).cloned().collect();
@@ -195,6 +187,12 @@ impl AvatarCache {
     }
 }
 
+/// Thread-safe verification cooldown cache
+pub type VerifyCooldownCache = Arc<RwLock<HashMap<(i64, i64), f64>>>;
+
+/// Address query cooldown to prevent duplicate queries within 30 minutes
+pub type AddressQueryCooldown = Arc<RwLock<HashMap<(i64, String), f64>>>;
+
 // ---------------------------------------------------------------------------
 // Handler State
 // ---------------------------------------------------------------------------
@@ -204,17 +202,17 @@ pub struct GroupMonitorState {
     pub avatar_cache: AvatarCache,
     pub verify_cooldown: VerifyCooldownCache,
     pub address_query_cooldown: AddressQueryCooldown,
-    pub telegram_client: TelegramClient,
+    pub _telegram_client: (),
 }
 
 impl GroupMonitorState {
-    pub fn new(telegram_client: TelegramClient) -> Self {
+    pub fn new() -> Self {
         Self {
             group_config_cache: GroupConfigCache::new(),
             avatar_cache: AvatarCache::new(),
-            verify_cooldown: VerifyCooldownCache::new(RwLock::new(HashMap::new())),
-            address_query_cooldown: AddressQueryCooldown::new(RwLock::new(HashMap::new())),
-            telegram_client,
+            verify_cooldown: Arc::new(RwLock::new(HashMap::new())),
+            address_query_cooldown: Arc::new(RwLock::new(HashMap::new())),
+            _telegram_client: (),
         }
     }
 }
@@ -280,7 +278,7 @@ pub async fn track_group_message(
     let chat = message.chat.clone();
 
     // Only process group and supergroup messages
-    if !matches!(chat.type, ChatType::Group | ChatType::Supergroup) {
+    if !matches!(chat.r#type, ChatType::Group | ChatType::Supergroup) {
         return None;
     }
 
@@ -357,7 +355,7 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
     let user_id = user.id;
 
     // Skip Telegram system accounts
-    if user_id.0 == 777000 {
+    if user_id.0 as i64 == 777000 {
         return;
     }
 
@@ -376,7 +374,7 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
     {
         let cooldown = state.verify_cooldown.read().await;
         let now = chrono::Utc::now().timestamp() as f64;
-        if let Some(last_check) = cooldown.get(&(chat.id.0, user_id.0)) {
+        if let Some(last_check) = cooldown.get(&(chat.id.0, user_id.0 as i64)) {
             if now - last_check < 30.0 {
                 // Within 30 seconds cooldown
                 return;
@@ -387,7 +385,7 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
     // Update cooldown
     {
         let mut cooldown = state.verify_cooldown.write().await;
-        cooldown.insert((chat.id.0, user_id.0), chrono::Utc::now().timestamp() as f64);
+        cooldown.insert((chat.id.0, user_id.0 as i64), chrono::Utc::now().timestamp() as f64);
     }
 
     // Check if user is member of the channel
@@ -674,7 +672,7 @@ pub async fn monitor_group_keywords(
     // Send auto-invite to user
     let invite_text = format!(
         "👋 <b>你好 {}！</b>\n\n我们在群组 <b>{}</b> 注意到你提到了关于 <code>{}</code> 的内容。\n\n欢迎直接咨询我们的官方客服，我们将为您提供 1对1 的专业解答和支持！",
-        user.first_name.as_deref().unwrap_or("朋友"),
+        user.first_name.as_ref().unwrap_or("朋友"),
         chat.title.as_deref().unwrap_or("Unknown"),
         matched_keywords.first().unwrap_or(&"相关内容".to_string())
     );
@@ -749,7 +747,7 @@ pub async fn track_channel_seen(
 ) -> Option<()> {
     let chat = message.chat.clone();
 
-    if !matches!(chat.type, ChatType::Channel) {
+    if !matches!(chat.r#type, ChatType::Channel) {
         return None;
     }
 
@@ -773,13 +771,9 @@ pub async fn track_channel_seen(
 pub async fn mute_user(bot: &Bot, chat_id: i64, user_id: i64) -> Result<(), teloxide::RequestError> {
     info!("[Verify] Attempting to mute user {} in chat {}", user_id, chat_id);
     bot.restrict_chat_member(
-        chat_id,
-        user_id,
-        ChatPermissions::default()
-            .can_send_messages(false)
-            .can_send_polls(false)
-            .can_send_other_messages(false)
-            .can_add_web_page_previews(false),
+        teloxide::types::ChatId(chat_id),
+        teloxide::types::UserId(user_id.try_into().unwrap()),
+        ChatPermissions::empty(),
     )
     .await?;
     info!("[Verify] Muted user {} in chat {}", user_id, chat_id);
@@ -789,16 +783,9 @@ pub async fn mute_user(bot: &Bot, chat_id: i64, user_id: i64) -> Result<(), telo
 /// Unmute a user in a group
 pub async fn unmute_user(bot: &Bot, chat_id: i64, user_id: i64) -> Result<(), teloxide::RequestError> {
     bot.restrict_chat_member(
-        chat_id,
-        user_id,
-        ChatPermissions::default()
-            .can_send_messages(true)
-            .can_send_polls(true)
-            .can_send_other_messages(true)
-            .can_add_web_page_previews(true)
-            .can_change_info(false)
-            .can_invite_users(true)
-            .can_pin_messages(false),
+        teloxide::types::ChatId(chat_id),
+        teloxide::types::UserId(user_id.try_into().unwrap()),
+        ChatPermissions::all(),
     )
     .await?;
     Ok(())
@@ -807,9 +794,9 @@ pub async fn unmute_user(bot: &Bot, chat_id: i64, user_id: i64) -> Result<(), te
 /// Kick a user from a group (ban + unban to allow rejoin)
 pub async fn kick_user(bot: &Bot, chat_id: i64, user_id: i64) -> Result<(), teloxide::RequestError> {
     info!("[Verify] Kicking user {} from chat {}", user_id, chat_id);
-    bot.ban_chat_member(chat_id, user_id).await?;
+    bot.ban_chat_member(teloxide::types::ChatId(chat_id), teloxide::types::UserId(user_id.try_into().unwrap())).await?;
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    bot.unban_chat_member(chat_id, user_id).await?;
+    bot.unban_chat_member(teloxide::types::ChatId(chat_id), teloxide::types::UserId(user_id.try_into().unwrap())).await?;
     info!("[Verify] Kicked user {} from chat {}", user_id, chat_id);
     Ok(())
 }

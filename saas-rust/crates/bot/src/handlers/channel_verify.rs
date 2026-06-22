@@ -4,9 +4,8 @@
 //! Used for "join to unban" flows in group chats.
 
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
-
-use crate::handlers::HandlerResult;
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId, UserId};
+use teloxide::payloads::SendMessageSetters;
 
 // ---------------------------------------------------------------------------
 // Check channel subscription
@@ -24,7 +23,7 @@ pub async fn check_channel_subscription(
         return true;
     }
 
-    match bot.get_chat_member(channel_id, user_id).await {
+    match bot.get_chat_member(channel_id, UserId(user_id.try_into().unwrap())).await {
         Ok(member) => {
             let status = member.status.as_str();
             matches!(status, "member" | "administrator" | "creator")
@@ -90,13 +89,13 @@ pub async fn handle_subscribe_button(
     };
 
     // Check if user has subscribed
-    let is_subscribed = check_channel_subscription(bot, user_id, channel_id).await;
+    let is_subscribed = check_channel_subscription(bot, UserId(user_id.try_into().unwrap()), channel_id).await;
 
     if is_subscribed {
         // User has subscribed – lift restrictions
         bot.restrict_chat_member(
-            chat_id::ChatId(group_id),
-            user_id,
+            teloxide::types::ChatId(group_id),
+            UserId(user_id.try_into().unwrap()),
             teloxide::types::ChatPermissions::any(),
         )
         .await?;
@@ -109,12 +108,12 @@ pub async fn handle_subscribe_button(
 
         // Optionally delete the reminder message
         if let Some(mid) = message_id {
-            let _ = bot.delete_message(chat_id::ChatId(group_id), mid).await;
+            let _ = bot.delete_message(teloxide::types::ChatId(group_id), MessageId(mid)).await;
         }
 
         tracing::info!(
             "User {} verified and unrestricted (group {})",
-            user_id,
+            UserId(user_id.try_into().unwrap()),
             group_id
         );
     } else {
@@ -124,7 +123,7 @@ pub async fn handle_subscribe_button(
         let keyboard = InlineKeyboardMarkup::new(vec![
             vec![InlineKeyboardButton::url(
                 "📢 关注频道",
-                channel_link.clone(),
+                channel_link.parse().unwrap(),
             )],
             vec![InlineKeyboardButton::callback(
                 "✅ 已关注，重新验证",
@@ -139,7 +138,7 @@ pub async fn handle_subscribe_button(
                  📢 频道链接: {}",
                 channel_link
             );
-            bot.edit_message_text(chat_id::ChatId(group_id), mid, &text)
+            bot.edit_message_text(teloxide::types::ChatId(group_id), MessageId(mid), &text)
                 .reply_markup(keyboard)
                 .await?;
         }
@@ -204,7 +203,7 @@ pub async fn send_channel_reminder_message(
     );
 
     let msg = bot
-        .send_message(chat_id::ChatId(group_id), text)
+        .send_message(teloxide::types::ChatId(group_id), text)
         .parse_mode(ParseMode::Html)
         .reply_markup(keyboard)
         .await?;
@@ -262,13 +261,13 @@ pub async fn handle_start_with_channel_check(
             };
 
             // Check subscription
-            let is_subscribed = check_channel_subscription(bot, user_id, channel_id).await;
+            let is_subscribed = check_channel_subscription(bot, UserId(user_id.try_into().unwrap()), channel_id).await;
 
             if is_subscribed {
                 // Lift restrictions
                 bot.restrict_chat_member(
-                    chat_id::ChatId(group_id),
-                    user_id,
+                    teloxide::types::ChatId(group_id),
+                    UserId(user_id.try_into().unwrap()),
                     teloxide::types::ChatPermissions::any(),
                 )
                 .await?;
@@ -281,7 +280,7 @@ pub async fn handle_start_with_channel_check(
 
                 tracing::info!(
                     "User {} verified via deep link and unrestricted (group {})",
-                    user_id,
+                    UserId(user_id.try_into().unwrap()),
                     group_id
                 );
             } else {

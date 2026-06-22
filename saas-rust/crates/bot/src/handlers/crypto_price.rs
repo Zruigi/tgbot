@@ -4,7 +4,8 @@
 //! with inline keyboard for adding price alerts.
 
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
+use teloxide::payloads::SendMessageSetters;
 
 use crate::handlers::HandlerResult;
 
@@ -21,8 +22,9 @@ pub enum CryptoPriceState {
 // Price type
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PriceType {
+    #[default]
     Spot,
     Futures,
 }
@@ -60,7 +62,7 @@ pub async fn start_price_query(
     price_type: PriceType,
 ) -> HandlerResult<CryptoPriceState> {
     let text = "🔍 <b>价格查询</b>\n\n请输入您要查询的币种（例如：<code>BTC/USDT</code> 或 <code>ETH/USDT</code>）：";
-    bot.edit_message_text(chat_id, message_id, text)
+    bot.edit_message_text(chat_id, MessageId(message_id), text)
         .parse_mode(ParseMode::Html)
         .await?;
     Ok(CryptoPriceState::WaitingSymbol)

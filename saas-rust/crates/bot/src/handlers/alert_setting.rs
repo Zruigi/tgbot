@@ -4,7 +4,8 @@
 //! Users can bind an email address to receive notifications.
 
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
+use teloxide::payloads::SendMessageSetters;
 
 use crate::handlers::HandlerResult;
 
@@ -72,7 +73,7 @@ pub async fn email_settings_start(
     let keyboard = InlineKeyboardMarkup::new(keyboard_buttons);
 
     if let Some(mid) = message_id {
-        bot.edit_message_text(chat_id, mid, &text)
+        bot.edit_message_text(chat_id, MessageId(mid), &text)
             .parse_mode(ParseMode::Html)
             .reply_markup(keyboard)
             .await?;
@@ -103,7 +104,7 @@ pub async fn bind_email_prompt(
 
     bot.edit_message_text(
         chat_id,
-        message_id,
+        MessageId(message_id),
         "请输入你要绑定的邮箱地址：\n(例如: example@gmail.com)",
     )
     .reply_markup(keyboard)
@@ -122,7 +123,7 @@ pub async fn unbind_email(
 ) -> HandlerResult<()> {
     set_user_email(pool, user_id, None).await;
 
-    bot.edit_message_text(chat_id, message_id, "✅ 邮箱已成功解绑。")
+    bot.edit_message_text(chat_id, MessageId(message_id), "✅ 邮箱已成功解绑。")
         .await?;
     Ok(())
 }
@@ -134,7 +135,7 @@ pub async fn cancel_email_setting(
     message_id: Option<i32>,
 ) -> HandlerResult<()> {
     if let Some(mid) = message_id {
-        bot.edit_message_text(chat_id, mid, "已取消邮箱设置。")
+        bot.edit_message_text(chat_id, MessageId(mid), "已取消邮箱设置。")
             .await?;
     } else {
         bot.send_message(chat_id, "已取消邮箱设置。").await?;

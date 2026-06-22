@@ -4,8 +4,8 @@
 //! LLM model selection, API key verification, and system settings.
 
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
-use teloxide::utils::markdown;
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
+use teloxide::payloads::SendMessageSetters;
 
 use crate::handlers::HandlerResult;
 
@@ -142,7 +142,7 @@ pub async fn admin_panel(
     ]);
 
     if let Some(mid) = message_id {
-        bot.edit_message_text(chat_id, mid, &text)
+        bot.edit_message_text(chat_id, MessageId(mid), &text)
             .parse_mode(ParseMode::Html)
             .reply_markup(keyboard)
             .await?;
@@ -213,7 +213,7 @@ pub async fn handle_admin_callback(
                 vec![InlineKeyboardButton::callback("🔙 返回", "adm:main")],
             ]);
             if let Some(mid) = message_id {
-                bot.edit_message_text(chat_id, mid, "请选择 AI 厂商 (2026 规格)：")
+                bot.edit_message_text(chat_id, MessageId(mid), "请选择 AI 厂商 (2026 规格)：")
                     .reply_markup(keyboard)
                     .await?;
             }
@@ -243,7 +243,7 @@ pub async fn handle_admin_callback(
             if let Some(mid) = message_id {
                 bot.edit_message_text(
                     chat_id,
-                    mid,
+                    MessageId(mid),
                     format!("选择 {provider} 旗舰型号："),
                 )
                 .reply_markup(InlineKeyboardMarkup::new(btns))
@@ -268,7 +268,7 @@ pub async fn handle_admin_callback(
             if let Some(mid) = message_id {
                 bot.edit_message_text(
                     chat_id,
-                    mid,
+                    MessageId(mid),
                     format!(
                         "✅ 已锁定: <code>{model_code}</code>\n\
                          请输入 <b>API Key</b> 进行验证 (输入 /skip 保持原样)："
@@ -283,7 +283,7 @@ pub async fn handle_admin_callback(
             if let Some(mid) = message_id {
                 bot.edit_message_text(
                     chat_id,
-                    mid,
+                    MessageId(mid),
                     "⌨️ <b>自定义模型接入</b>\n\n请输入完整的模型名称 (例如: <code>gpt-6.0</code>)：",
                 )
                 .parse_mode(ParseMode::Html)
@@ -296,7 +296,7 @@ pub async fn handle_admin_callback(
             if let Some(mid) = message_id {
                 bot.edit_message_text(
                     chat_id,
-                    mid,
+                    MessageId(mid),
                     format!(
                         "📝 <b>翻译补充提示词</b>\n\
                          当前: <code>{curr}</code>\n\n\
@@ -417,14 +417,14 @@ pub async fn save_token(
             save_admin_setting(db, key_field, token).await;
             bot.edit_message_text(
                 chat_id,
-                status_msg.id.0 as i32,
+                MessageId(status_msg.id.0 as i32),
                 format!("✅ 验证成功！{model} 已激活。"),
             )
             .await?;
         } else {
             bot.edit_message_text(
                 chat_id,
-                status_msg.id.0 as i32,
+                MessageId(status_msg.id.0 as i32),
                 "❌ 验证失败！请检查 Token 或网络。",
             )
             .await?;
