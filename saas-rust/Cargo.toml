@@ -47,7 +47,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 # Auth / Crypto
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 bcrypt = "0.16"
 hmac = "0.12"
 sha2 = "0.10"
