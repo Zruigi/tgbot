@@ -24,7 +24,7 @@ pub async fn check_channel_subscription(
         return true;
     }
 
-    match bot.get_chat_member(teloxide::types::ChatId(channel_id).into(), UserId(user_id.try_into().unwrap())).await {
+    match bot.get_chat_member(teloxide::types::Recipient::Id(teloxide::types::ChatId(channel_id)), teloxide::types::UserId(user_id.try_into().unwrap())).await {
         Ok(member) => {
             matches!(
                 member.kind,

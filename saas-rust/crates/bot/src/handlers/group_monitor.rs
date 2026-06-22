@@ -396,11 +396,12 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
         let _ = bot.delete_message(chat.id, message.id).await;
 
         // Send verification prompt
+        let first_name = user.first_name.as_ref().map(|s| s.as_str()).unwrap_or("朋友");
         let user_name = user
-            .first_name
+            .username
             .as_ref()
             .map(|s| s.as_str())
-            .or(user.username.as_ref().map(|s| s.as_str()))
+            .unwrap_or(first_name);
             .unwrap_or(&format!("User{}", user_id.0));
 
         let template = config
@@ -630,7 +631,7 @@ pub async fn monitor_group_keywords(
 ) -> Option<()> {
     let text = message.text()?;
     let user = message.from.as_ref()?;
-    let chat = message.chat;
+    let chat = message.chat.clone();
 
     // Skip admin messages
     // In production, check against config.ADMIN_ID
@@ -671,9 +672,10 @@ pub async fn monitor_group_keywords(
     );
 
     // Send auto-invite to user
+    let first_name = user.first_name.as_ref().map(|s| s.as_str()).unwrap_or("朋友");
     let invite_text = format!(
         "👋 <b>你好 {}！</b>\n\n我们在群组 <b>{}</b> 注意到你提到了关于 <code>{}</code> 的内容。\n\n欢迎直接咨询我们的官方客服，我们将为您提供 1对1 的专业解答和支持！",
-        user.first_name.as_ref().unwrap_or("朋友"),
+        first_name,
         chat.title().as_deref().unwrap_or("Unknown"),
         matched_keywords.first().unwrap_or(&"相关内容".to_string())
     );
@@ -693,7 +695,7 @@ pub async fn handle_new_group_member(
     message: &Message,
 ) -> Option<()> {
     let new_members = message.new_chat_members()?;
-    let chat = message.chat;
+    let chat = message.chat.clone();
 
     for member in new_members {
         if member.is_bot {
@@ -721,7 +723,7 @@ pub async fn handle_group_left_member(
     message: &Message,
 ) -> Option<()> {
     let left_member = message.left_chat_member()?;
-    let chat = message.chat;
+    let chat = message.chat.clone();
 
     if left_member.is_bot {
         return None;
