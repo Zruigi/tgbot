@@ -329,11 +329,14 @@ pub async fn get_categories(
         let account_id: i64 = row.try_get("account_id")?;
         let parent_id: Option<i64> = row.try_get("parent_id")?;
 
-        if let Some(parent_id) = parent_id {
-            if let Some(parent_node) = node_map.get_mut(&parent_id) {
-                if let Some(children) = parent_node.get_mut("children").and_then(|v| v.as_array_mut()) {
-                    if let Some(node) = node_map.get(&account_id) {
-                        children.push(node.clone());
+        if let Some(pid) = parent_id {
+            // First, get the child node (if exists)
+            let child_node = node_map.get(&account_id).cloned();
+            if let Some(child) = child_node {
+                // Then get the parent node separately
+                if let Some(parent_node) = node_map.get_mut(&pid) {
+                    if let Some(children) = parent_node.get_mut("children").and_then(|v| v.as_array_mut()) {
+                        children.push(child);
                     }
                 }
             }

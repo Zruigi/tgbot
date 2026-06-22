@@ -271,14 +271,14 @@ pub async fn verify_stats(
     // Total verified members
     let total_verified: i64 = if let Some(group_id) = q.group_id {
         if tenant_id.is_empty() {
-            sqlx::query_scalar(
+            sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*)::bigint FROM groups.group_members WHERE group_id = $1 AND is_verified = true",
             )
             .bind(group_id)
             .fetch_one(&state.pool)
             .await?
         } else {
-            sqlx::query_scalar(
+            sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*)::bigint FROM groups.group_members WHERE group_id = $1 AND tenant_id = $2 AND is_verified = true",
             )
             .bind(group_id)
@@ -287,13 +287,13 @@ pub async fn verify_stats(
             .await?
         }
     } else if tenant_id.is_empty() {
-        sqlx::query_scalar(
+        sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE is_verified = true",
         )
         .fetch_one(&state.pool)
         .await?
     } else {
-        sqlx::query_scalar(
+        sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE tenant_id = $1 AND is_verified = true",
         )
         .bind(tenant_id)
@@ -305,14 +305,14 @@ pub async fn verify_stats(
     // Total unverified members
     let total_unverified: i64 = if let Some(group_id) = q.group_id {
         if tenant_id.is_empty() {
-            sqlx::query_scalar(
+            sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*)::bigint FROM groups.group_members WHERE group_id = $1 AND is_verified = false AND status = 'active'",
             )
             .bind(group_id)
             .fetch_one(&state.pool)
             .await?
         } else {
-            sqlx::query_scalar(
+            sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*)::bigint FROM groups.group_members WHERE group_id = $1 AND tenant_id = $2 AND is_verified = false AND status = 'active'",
             )
             .bind(group_id)
@@ -321,13 +321,13 @@ pub async fn verify_stats(
             .await?
         }
     } else if tenant_id.is_empty() {
-        sqlx::query_scalar(
+        sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE is_verified = false AND status = 'active'",
         )
         .fetch_one(&state.pool)
         .await?
     } else {
-        sqlx::query_scalar(
+        sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE tenant_id = $1 AND is_verified = false AND status = 'active'",
         )
         .bind(tenant_id)
@@ -339,7 +339,7 @@ pub async fn verify_stats(
     // Recent verifications (within the time window)
     let recently_verified: i64 = if let Some(group_id) = q.group_id {
         if tenant_id.is_empty() {
-            sqlx::query_scalar(
+            sqlx::query_scalar::<_, i64>(
                 r#"
                 SELECT COUNT(*)::bigint FROM groups.group_members
                 WHERE group_id = $1 AND is_verified = true
@@ -351,7 +351,7 @@ pub async fn verify_stats(
             .fetch_one(&state.pool)
             .await?
         } else {
-            sqlx::query_scalar(
+            sqlx::query_scalar::<_, i64>(
                 r#"
                 SELECT COUNT(*)::bigint FROM groups.group_members
                 WHERE group_id = $1 AND tenant_id = $2 AND is_verified = true
@@ -365,7 +365,7 @@ pub async fn verify_stats(
             .await?
         }
     } else if tenant_id.is_empty() {
-        sqlx::query_scalar(
+        sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)::bigint FROM groups.group_members
             WHERE is_verified = true
@@ -376,7 +376,7 @@ pub async fn verify_stats(
         .fetch_one(&state.pool)
         .await?
     } else {
-        sqlx::query_scalar(
+        sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)::bigint FROM groups.group_members
             WHERE tenant_id = $1 AND is_verified = true
@@ -393,14 +393,14 @@ pub async fn verify_stats(
     // Pending verify sessions
     let pending_sessions: i64 = if let Some(group_id) = q.group_id {
         if tenant_id.is_empty() {
-            sqlx::query_scalar(
+            sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*)::bigint FROM groups.verify_sessions WHERE group_id = $1 AND status = 'pending'",
             )
             .bind(group_id)
             .fetch_one(&state.pool)
             .await?
         } else {
-            sqlx::query_scalar(
+            sqlx::query_scalar::<_, i64>(
                 r#"
                 SELECT COUNT(*)::bigint FROM groups.verify_sessions vs
                 WHERE vs.group_id = $1 AND vs.status = 'pending'
@@ -413,13 +413,13 @@ pub async fn verify_stats(
             .await?
         }
     } else if tenant_id.is_empty() {
-        sqlx::query_scalar(
+        sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.verify_sessions WHERE status = 'pending'",
         )
         .fetch_one(&state.pool)
         .await?
     } else {
-        sqlx::query_scalar(
+        sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)::bigint FROM groups.verify_sessions vs
             WHERE vs.status = 'pending'
