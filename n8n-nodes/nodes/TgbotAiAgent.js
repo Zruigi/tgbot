@@ -59,6 +59,20 @@ module.exports = {
       default: "",
       description: "Optional Telegram chat_id/group_id context.",
     },
+    {
+      displayName: "Timeout Seconds",
+      name: "timeoutSeconds",
+      type: "number",
+      default: 120,
+      description: "Maximum time to wait for the Agent API before returning a timeout result.",
+    },
+    {
+      displayName: "Fail Workflow On Error",
+      name: "failWorkflowOnError",
+      type: "boolean",
+      default: false,
+      description: "When disabled, API errors are returned as item JSON so downstream fallback nodes can run.",
+    },
   ],
   async execute() {
     const items = this.getInputData();
@@ -72,38 +86,61 @@ module.exports = {
       const featureKey = this.getNodeParameter("featureKey", i);
       const tenantId = this.getNodeParameter("tenantId", i);
       const chatId = this.getNodeParameter("chatId", i);
+      const timeoutSeconds = Number(this.getNodeParameter("timeoutSeconds", i) || 120);
+      const failWorkflowOnError = Boolean(this.getNodeParameter("failWorkflowOnError", i));
       
-      const response = await this.makeRequest({
-        url: baseUrl + "/api/ai/chat",
-        method: "POST",
-        body: {
-          userId: Number(userId || -99999),
-          content: prompt,
-          message: prompt,
-          model: model,
-          feature_key: featureKey,
-          tenant_id: tenantId || undefined,
-          context: {
+      try {
+        const response = await this.makeRequest({
+          url: baseUrl + "/api/ai/chat",
+          method: "POST",
+          timeoutMs: Math.max(1, timeoutSeconds) * 1000,
+          body: {
+            userId: Number(userId || -99999),
+            content: prompt,
+            message: prompt,
+            model: model,
+            feature_key: featureKey,
             tenant_id: tenantId || undefined,
-            chat_id: chatId ? Number(chatId) : undefined,
-            group_id: chatId ? Number(chatId) : undefined,
+            context: {
+              tenant_id: tenantId || undefined,
+              chat_id: chatId ? Number(chatId) : undefined,
+              group_id: chatId ? Number(chatId) : undefined,
+            },
           },
-        },
-        headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
-      });
-      
-      items[i].json = {
-        success: response.status === "ok",
-        response: response.reply || (response.data && response.data.reply) || response.text || "",
-        tool_calls: response.tool_calls_made || [],
-        tool_results: response.tool_results || {},
-        evidence: response.evidence || response.tool_results || {},
-        data_complete: response.data_complete,
-        analysis_allowed: response.analysis_allowed,
-        requires_confirmation: Boolean(response.requires_confirmation),
-        action_taken: Boolean(response.is_action_taken),
-        raw: response,
-      };
+          headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
+        });
+        
+        items[i].json = {
+          ...items[i].json,
+          success: response.status === "ok",
+          response: response.reply || (response.data && response.data.reply) || response.text || "",
+          tool_calls: response.tool_calls_made || [],
+          tool_results: response.tool_results || {},
+          evidence: response.evidence || response.tool_results || {},
+          data_complete: response.data_complete,
+          analysis_allowed: response.analysis_allowed,
+          requires_confirmation: Boolean(response.requires_confirmation),
+          action_taken: Boolean(response.is_action_taken),
+          raw: response,
+        };
+      } catch (error) {
+        if (failWorkflowOnError) {
+          throw error;
+        }
+        items[i].json = {
+          ...items[i].json,
+          success: false,
+          response: "查询超时或工具执行失败，请稍后重试。",
+          error: error.message || String(error),
+          tool_calls: [],
+          tool_results: {},
+          evidence: {},
+          data_complete: false,
+          analysis_allowed: false,
+          requires_confirmation: false,
+          action_taken: false,
+        };
+      }
     }
     return [items];
   },
@@ -130,7 +167,11 @@ module.exports = {
           resolve(parsed);
         });
       });
+      const timeout = setTimeout(() => {
+        req.destroy(new Error(`TGBot API timeout after ${options.timeoutMs}ms`));
+      }, options.timeoutMs || 120000);
       req.on("error", reject);
+      req.on("close", () => clearTimeout(timeout));
       if (options.body) req.write(JSON.stringify(options.body));
       req.end();
     });
