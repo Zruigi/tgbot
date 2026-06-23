@@ -96,7 +96,9 @@ class AIAgent:
 
                 tool_instance = get_tool(tool_name)
                 if not tool_instance:
-                    all_results.append({"tool_name": tool_name, "error": f"未知工具: {tool_name}"})
+                    error_result = {"success": False, "message": f"未知工具: {tool_name}"}
+                    tool_results[tool_name or "unknown_tool"] = error_result
+                    all_results.append({"tool_name": tool_name, "error": error_result["message"], "success": False})
                     continue
 
                 tool_calls_made.append(tool_name)
@@ -106,10 +108,17 @@ class AIAgent:
                     context_user_id=ctx.user_id,
                 )
                 if not safety_result.passed or safety_result.needs_confirmation:
+                    error_result = {
+                        "success": False,
+                        "message": safety_result.reason or "该工具不能预执行",
+                        "blocked": True,
+                    }
+                    tool_results[tool_name] = error_result
                     all_results.append({
                         "tool_name": tool_name,
-                        "error": safety_result.reason or "该工具不能预执行",
+                        "error": error_result["message"],
                         "blocked": True,
+                        "success": False,
                     })
                     continue
 
@@ -135,6 +144,7 @@ class AIAgent:
                     )
                 except Exception as e:
                     logger.error(f"预执行工具 {tool_name} 异常: {e}", exc_info=True)
+                    tool_results[tool_name] = {"success": False, "message": str(e)}
                     all_results.append({"tool_name": tool_name, "error": str(e), "success": False})
 
             results_summary = self._format_tool_results(all_results)
@@ -193,9 +203,14 @@ class AIAgent:
 
                     tool_instance = get_tool(tool_name)
                     if not tool_instance:
+                        tool_results[tool_name or "unknown_tool"] = {
+                            "success": False,
+                            "message": f"未知工具: {tool_name}",
+                        }
                         all_results.append({
                             "tool_name": tool_name,
                             "error": f"未知工具: {tool_name}",
+                            "success": False,
                         })
                         continue
 
@@ -209,10 +224,16 @@ class AIAgent:
                     )
 
                     if not safety_result.passed:
+                        tool_results[tool_name] = {
+                            "success": False,
+                            "message": safety_result.reason,
+                            "blocked": True,
+                        }
                         all_results.append({
                             "tool_name": tool_name,
                             "error": safety_result.reason,
                             "blocked": True,
+                            "success": False,
                         })
                         continue
 
@@ -246,6 +267,10 @@ class AIAgent:
                         # ★ 关键修复：检查执行结果是否失败
                         # 如果 success=False，不走确认流程，直接记录错误
                         if not result.get("success", True):
+                            failure_result = dict(result)
+                            failure_result["_params"] = exec_params
+                            failure_result["success"] = False
+                            tool_results[tool_name] = failure_result
                             all_results.append({
                                 "tool_name": tool_name,
                                 "success": False,
@@ -300,6 +325,10 @@ class AIAgent:
 
                     except Exception as e:
                         logger.error(f"工具 {tool_name} 执行异常: {e}", exc_info=True)
+                        tool_results[tool_name] = {
+                            "success": False,
+                            "message": str(e),
+                        }
                         all_results.append({
                             "tool_name": tool_name,
                             "error": str(e),
@@ -336,7 +365,10 @@ class AIAgent:
                 break
 
         if not final_text:
-            final_text = "我已收到您的请求，但未能生成合适的回复。"
+            if tool_calls_made:
+                final_text = "工具调用已达到上限或未返回最终结论，请缩小查询范围后重试。"
+            else:
+                final_text = "我已收到您的请求，但未能生成合适的回复。"
 
         # 输出脱敏
         final_text = await self.safety.sanitize_output(final_text)

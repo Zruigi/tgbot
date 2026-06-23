@@ -1367,7 +1367,7 @@ class SystemQueryTool(BaseTool):
 
             elif query_type == "group_ad_messages":
                 import aiosqlite
-                lim = max(1, int(limit or 10))
+                lim = max(1, min(int(limit or 10), 50))
                 gid = int(group_id) if str(group_id or "").strip() else None
                 if gid is None and str(group_name or "").strip():
                     resolved = await self._resolve_group_name(tenant_id=tenant_id, group_name=str(group_name))
