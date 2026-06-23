@@ -30,6 +30,7 @@ def create_app() -> web.Application:
     # 存储全局对象
     app['token_manager'] = token_manager
     app['rate_limiter'] = rate_limiter
+    app['bot_instance'] = _bot_instance
     
     # 注册认证路由
     app.router.add_post('/api/login', auth.api_login)
@@ -73,6 +74,7 @@ def create_app() -> web.Application:
     app.router.add_put('/api/push_tasks/status', broadcast.api_update_push_task_status)
     
     # 注册 AI 路由
+    app.router.add_post('/api/ai/chat', ai.api_ai_chat)             # n8n Agent 节点使用的路径
     app.router.add_post('/api/messages/{user_id}/ai', ai.api_ai_chat)  # 前端 ChatPanel.vue 使用的路径
     app.router.add_post('/api/ai/chat/{user_id}', ai.api_ai_chat)      # 兼容旧路径
     app.router.add_get('/api/openai/models', ai.api_openai_models)
