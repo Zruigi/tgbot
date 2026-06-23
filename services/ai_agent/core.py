@@ -6,6 +6,7 @@ AI Agent 核心引擎 — 对话管理 + Function Calling 循环 + 安全约束�
 import json
 import logging
 import asyncio
+import re
 from typing import Any, Dict, List, Optional
 
 from .schema import (
@@ -82,7 +83,80 @@ class AIAgent:
         needs_confirmation = False
         final_text = ""
 
+        preflight_tool_calls = self._build_preflight_tool_calls(user_message, tool_schemas)
+        if preflight_tool_calls:
+            all_results = []
+            for tc in preflight_tool_calls:
+                tool_name = tc.get("function", {}).get("name", "")
+                args_str = tc.get("function", {}).get("arguments", "{}")
+                try:
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                except Exception:
+                    args = {}
+
+                tool_instance = get_tool(tool_name)
+                if not tool_instance:
+                    all_results.append({"tool_name": tool_name, "error": f"未知工具: {tool_name}"})
+                    continue
+
+                tool_calls_made.append(tool_name)
+                safety_result: SafetyCheckResult = await self.safety.check_tool_call(
+                    tool_name=tool_name,
+                    params=args,
+                    context_user_id=ctx.user_id,
+                )
+                if not safety_result.passed or safety_result.needs_confirmation:
+                    all_results.append({
+                        "tool_name": tool_name,
+                        "error": safety_result.reason or "该工具不能预执行",
+                        "blocked": True,
+                    })
+                    continue
+
+                try:
+                    exec_params = safety_result.sanitized_params or args
+                    result = await tool_instance.execute(exec_params, context=ctx)
+                    if result.get("action_taken"):
+                        action_taken = True
+                    stored_result = dict(result)
+                    stored_result["_params"] = exec_params
+                    tool_results[tool_name] = stored_result
+                    all_results.append({
+                        "tool_name": tool_name,
+                        "result": result,
+                        "success": bool(result.get("success", True)),
+                        "blocked": False,
+                    })
+                    self.safety.log_action(
+                        tool_name=tool_name,
+                        params=args,
+                        result=result,
+                        user_id=ctx.user_id,
+                    )
+                except Exception as e:
+                    logger.error(f"预执行工具 {tool_name} 异常: {e}", exc_info=True)
+                    all_results.append({"tool_name": tool_name, "error": str(e), "success": False})
+
+            results_summary = self._format_tool_results(all_results)
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"[工具执行结果]\n{results_summary}\n\n"
+                    "请基于以上真实工具结果直接回答用户，不要说你还需要查询。"
+                    "如果证据状态里 analysis_allowed=false、data_complete=false 或 evidence_count=0，"
+                    "必须明确说明当前没有足够消息证据，不能回答“未发现广告/没有异常”。"
+                ),
+            })
+            final_text, _ = await self._call_llm(
+                messages=messages,
+                model=model or "gemini-2.5-flash-lite",
+                tools=[],
+                round_num=2,
+            )
+
         while round_num < MAX_TOOL_CALL_ROUNDS:
+            if final_text:
+                break
             round_num += 1
             
             try:
@@ -100,7 +174,10 @@ class AIAgent:
                     break
 
                 # 处理 tool_calls
-                messages.append({"role": "assistant", "content": answer or "", "tool_calls": []})
+                # OpenAI-compatible gateways reject an empty tool_calls array.
+                # We use user-role tool result summaries below, so no native
+                # tool call metadata is needed here.
+                messages.append({"role": "assistant", "content": answer or ""})
 
                 all_results = []
                 has_dangerous = False
@@ -241,7 +318,11 @@ class AIAgent:
                 else:
                     messages.append({
                         "role": "user", 
-                        "content": f"[工具执行结果]\n{results_summary}\n\n请基于以上结果简洁回复用户。",
+                        "content": (
+                            f"[工具执行结果]\n{results_summary}\n\n"
+                            "请基于以上结果简洁回复用户。"
+                            "如果证据状态显示没有消息证据或不允许分析，必须说明数据不可用，不能下安全结论。"
+                        ),
                     })
 
                 # 如果有危险操作需要确认，提前退出让用户确认
@@ -350,8 +431,21 @@ class AIAgent:
                 "群发公告", "批量发送",
             ],
             "detect_advertising": [
-                "检测广告", "是不是广告", "广告检测", "垃圾信息检测",
-                "是否广告", "鉴别广告",
+                "检测广告", "广告检测", "这条是不是广告", "这段是不是广告", "鉴别这条", "检测这条消息",
+            ],
+            "query_ad_clusters": [
+                "垃圾信息检测", "是否有广告", "是否存在广告",
+                "有没有广告", "群广告", "疑似广告", "广告消息", "灰黑产",
+                "打广告", "发广告", "谁在打广告", "哪些人打广告", "有哪些人打广告",
+                "清理广告", "处理广告",
+            ],
+            "delete_ad_message": [
+                "删除一条广告", "删除最近广告", "删除广告消息",
+                "识别广告并删除一条", "删掉这条广告",
+            ],
+            "delete_ad_cluster": [
+                "删除cluster", "删除 cluster", "delete_ad_cluster", "删除广告cluster",
+                "删除广告聚类", "批量删除广告",
             ],
             "generate_content": [
                 "帮我写", "生成文案", "写一段", "生成内容",
@@ -359,9 +453,12 @@ class AIAgent:
             ],
             "system_query": [
                 "系统状态", "系统概览", "有多少群", "群组统计",
-                "系统信息", "活跃群组",
+                "有几个群", "几个群", "有多少频道", "有几个频道", "几个频道",
+                "绑定群", "绑定频道", "群列表", "频道列表", "机器人绑定",
+                "系统信息", "活跃群组", "群消息", "群聊消息", "频道消息",
                 "最近消息", "最近有谁", "谁给我发", "谁给我发送", "最近发消息",
-                "广告消息", "群广告", "疑似广告",
+                "广告消息", "群广告", "疑似广告", "打广告", "发广告", "灰黑产",
+                "哪些人打广告", "有哪些人打广告", "谁在打广告",
             ],
             "skill_manage": [
                 "新增skill", "增加skill", "添加skill", "技能管理",
@@ -394,7 +491,7 @@ class AIAgent:
                 best_score = score
                 best_match = name
 
-        if best_match == "system_query" and best_score >= 8:
+        if best_match in {"system_query", "detect_advertising", "query_ad_clusters"} and best_score >= 8:
             return best_match
         return best_match if best_score >= 16 else None
 
@@ -423,17 +520,71 @@ class AIAgent:
         if tool_name == "detect_advertising":
             return {"text": text, "context_type": "private_message"}
 
+        if tool_name == "query_ad_clusters":
+            args = {"status": "pending", "limit": 20, "window_minutes": 60}
+            group_match = re.search(r"(?:group_id|群|群组)\s*[:：=]?\s*(-?\d{5,})", text, re.I)
+            if group_match:
+                args["group_id"] = int(group_match.group(1))
+            return args
+
+        if tool_name == "delete_ad_message":
+            args = {"delete_latest_ad": True}
+            group_match = re.search(r"(?:group_id|群|群组)\s*[:：=]?\s*(-?\d{5,})", text, re.I)
+            tg_msg_match = re.search(r"(?:tg_msg_id|消息|message)\s*[:：=]?\s*(\d{1,12})", text, re.I)
+            msg_id_match = re.search(r"(?:msg_id|数据库消息)\s*[:：=]?\s*(\d{1,12})", text, re.I)
+            if group_match:
+                args["group_id"] = int(group_match.group(1))
+            if tg_msg_match:
+                args["tg_msg_id"] = int(tg_msg_match.group(1))
+            if msg_id_match:
+                args["msg_id"] = int(msg_id_match.group(1))
+            return args
+
+        if tool_name == "delete_ad_cluster":
+            cluster_match = re.search(r"(?:cluster_id|cluster|聚类)\s*[:：=]?\s*([a-zA-Z0-9:_-]+)", text, re.I)
+            args = {"dry_run": True}
+            if cluster_match:
+                args["cluster_id"] = cluster_match.group(1)
+            return args
+
         if tool_name == "generate_content":
             return {"topic": text, "style": "professional", "length": "medium", "purpose": "announcement"}
 
         if tool_name == "system_query":
             lower = text.lower()
+            group_name = self._extract_group_name(text)
+            if any(k in text for k in (
+                "广告消息", "群广告", "疑似广告", "广告群消息", "有没有广告", "是否有广告",
+                "灰黑产", "推广", "垃圾信息", "打广告", "发广告", "谁在广告",
+                "谁在打广告", "哪些人打广告", "有哪些人打广告",
+            )):
+                args = {"query_type": "group_ad_messages", "limit": 20}
+                if group_name:
+                    args["group_name"] = group_name
+                return args
             if any(k in text for k in ("最近有谁", "谁给我发", "谁给我发送", "最近发消息", "谁发了消息")):
                 return {"query_type": "recent_senders", "limit": 10}
+            if any(k in text for k in (
+                "有多少群", "有几个群", "几个群", "有多少频道", "有几个频道", "几个频道",
+                "绑定群", "绑定频道", "绑定群聊", "群列表", "频道列表", "机器人绑定",
+                "我有多少群", "我有几个群", "我有多少频道", "我有几个频道",
+            )):
+                return {"query_type": "bound_chats", "limit": 20}
+            if any(k in text for k in ("频道消息", "频道发言", "最近频道", "频道动态")):
+                args = {"query_type": "channel_messages", "limit": 10}
+                if group_name:
+                    args["group_name"] = group_name
+                return args
+            if any(k in text for k in ("群消息", "群聊消息", "最近群消息", "群聊动态", "群里消息")):
+                args = {"query_type": "group_messages", "limit": 10}
+                if group_name:
+                    args["group_name"] = group_name
+                return args
             if "最近消息" in text:
-                return {"query_type": "recent_messages", "limit": 10}
-            if any(k in text for k in ("广告消息", "群广告", "疑似广告", "广告群消息")):
-                return {"query_type": "group_ad_messages", "limit": 20}
+                args = {"query_type": "group_messages", "limit": 10} if any(k in text for k in ("群", "群聊")) else {"query_type": "recent_messages", "limit": 10}
+                if group_name and args["query_type"] == "group_messages":
+                    args["group_name"] = group_name
+                return args
             if "潜在用户" in text:
                 return {"query_type": "potential_users", "limit": 10}
             if any(k in text for k in ("监听", "地址列表", "监控地址")):
@@ -448,7 +599,7 @@ class AIAgent:
             lower = text.lower()
             if "导入" in text:
                 return {"action": "import_builtin"}
-            if any(k in lower for k in ("新增", "添加", "增加")) and "skill" in lower:
+            if any(k in text for k in ("新增", "添加", "增加")) and ("skill" in lower or "技能" in text):
                 return {"action": "add"}
             if "启用" in text:
                 return {"action": "enable"}
@@ -459,6 +610,67 @@ class AIAgent:
             return {"action": "list"}
 
         return {}
+
+    def _extract_group_name(self, text: str) -> str:
+        """从常见中文表达里尽量提取群名，用于只读查询预执行。"""
+        raw = text or ""
+        bold = re.search(r"\*\*([^*]{2,80})\*\*", raw)
+        if bold:
+            return bold.group(1).strip()
+        quoted = re.search(r"[「『“\"]([^」』”\"]{2,80})[」』”\"]", raw)
+        if quoted:
+            return quoted.group(1).strip()
+        possessive = re.search(r"(?:我的)?(?:那个|这个)?([^，。,.!?！？\n]{2,60}?)(?:的)?群(?:聊|组)?", raw)
+        if possessive:
+            candidate = possessive.group(1).strip()
+            candidate = re.sub(r"^(?:检查|检测|查询|查看|检索|分析|一下|下|我的|那个|这个)+", "", candidate).strip()
+            if candidate:
+                return candidate
+        named = re.search(r"(?:检查|检测|查询|查看|检索|分析)\s*(?:一下|下)?\s*([^，。,.!?！？\n]{2,80}?群)", raw)
+        if named:
+            candidate = named.group(1).strip()
+            candidate = re.sub(r"^(?:我的|那个|这个)+", "", candidate).strip()
+            return candidate
+        return ""
+
+    def _build_preflight_tool_calls(self, user_text: str, tools: list) -> List[dict]:
+        """对明确的只读查询先执行工具，再让 LLM 总结真实结果。"""
+        text = (user_text or "").strip()
+        if len(text) < 4:
+            return []
+
+        matched_tool_name = self._match_tool_from_text(text, tools)
+        if matched_tool_name not in {"system_query", "query_ad_clusters"}:
+            return []
+
+        args = self._build_fallback_args(matched_tool_name, text)
+        calls = [{
+            "function": {
+                "name": matched_tool_name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            }
+        }]
+        if matched_tool_name == "query_ad_clusters":
+            return calls
+
+        query_type = args.get("query_type")
+        needs_sdk_visibility = query_type in {"group_messages", "channel_messages", "group_ad_messages", "bound_chats"}
+        sdk_available = any(t.get("function", {}).get("name") == "telegram_sdk_query" for t in tools)
+        if needs_sdk_visibility and sdk_available:
+            sdk_args = {
+                "operation": "bot_visibility_status" if query_type != "bound_chats" else "bound_chat_capabilities",
+                "limit": 10,
+                "include_admins": False,
+            }
+            if args.get("group_id"):
+                sdk_args["chat_id"] = args["group_id"]
+            calls.append({
+                "function": {
+                    "name": "telegram_sdk_query",
+                    "arguments": json.dumps(sdk_args, ensure_ascii=False),
+                }
+            })
+        return calls
 
 
     async def _call_llm(
@@ -548,9 +760,27 @@ class AIAgent:
             else:
                 result = r.get("result", {})
                 msg = result.get("message", "完成")
-                data_preview = str(result.get("data", ""))[:200]
+                preview_limit = 1200 if name == "system_query" else 500
+                data = result.get("data", "")
+                evidence_meta = {
+                    "source": result.get("source"),
+                    "data_complete": result.get("data_complete"),
+                    "analysis_allowed": result.get("analysis_allowed"),
+                    "evidence_count": result.get("evidence_count"),
+                    "summary": result.get("summary"),
+                    "limitation": result.get("limitation"),
+                }
+                try:
+                    data_preview = json.dumps(data, ensure_ascii=False, default=str)[:preview_limit]
+                except Exception:
+                    data_preview = str(data)[:preview_limit]
                 conf_note = " ⚠️ 需确认" if r.get("needs_confirmation") else ""
-                parts.append(f"- [{name}] ✅ {msg}{conf_note}\n  数据: {data_preview}")
+                meta_preview = json.dumps(
+                    {k: v for k, v in evidence_meta.items() if v is not None},
+                    ensure_ascii=False,
+                    default=str,
+                )
+                parts.append(f"- [{name}] ✅ {msg}{conf_note}\n  证据状态: {meta_preview}\n  数据: {data_preview}")
         
         return "工具执行结果:\n" + "\n".join(parts)
 

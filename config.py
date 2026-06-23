@@ -102,6 +102,18 @@ DEFAULT_LLM = os.getenv("DEFAULT_LLM", "gemini")
 
 # --- Web 管理端配置 ---
 WEB_ADMIN_TOKEN = os.getenv("WEB_ADMIN_TOKEN", "bot_admin_secret_2026")
+N8N_GROUP_MESSAGE_WEBHOOK_URL = os.getenv("N8N_GROUP_MESSAGE_WEBHOOK_URL", "").strip()
+
+# --- Telegram 广告检测聚合管线 ---
+AD_PIPELINE_ENABLED = os.getenv("AD_PIPELINE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+AD_PIPELINE_PG_DSN = os.getenv("AD_PIPELINE_PG_DSN", "").strip()
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text").strip()
+AD_SIMILARITY_THRESHOLD = float(os.getenv("AD_SIMILARITY_THRESHOLD", "0.92"))
+AD_MIN_DUPLICATE_COUNT = int(os.getenv("AD_MIN_DUPLICATE_COUNT", "2"))
+AD_DELETE_ENABLED = os.getenv("AD_DELETE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+AD_KICK_ENABLED = os.getenv("AD_KICK_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+AD_EMBEDDING_DIM = int(os.getenv("AD_EMBEDDING_DIM", "768"))
 
 # --- 安全加固配置 ---
 import hashlib as _hashlib

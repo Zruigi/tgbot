@@ -36,9 +36,14 @@ AGENT_SYSTEM_TEMPLATE = """你是 {bot_name} 的 AI 助手 Agent，具备以下�
 | "给所有人发通知" | 先生成文案 → 调用 broadcast_message（需确认）|
 | "帮我写个公告" | 调用 generate_content |
 | "这条是不是广告" | 调用 detect_advertising |
+| "删除最近一条广告消息" | 调用 delete_ad_message，等待确认后执行 |
 | "系统现在什么状态" | 调用 system_query(stats_overview) |
+| "我有几个群几个频道" | 调用 system_query(bound_chats) |
+| "查最近群消息" | 先调用 system_query(group_messages)，再结合 telegram_sdk_query(bot_visibility_status) |
+| "查最近频道消息" | 先调用 system_query(channel_messages)，再结合 telegram_sdk_query(bot_visibility_status) |
 | "最近有谁给我发消息" | 调用 system_query(recent_senders) |
-| "查下最近群广告消息" | 调用 system_query(group_ad_messages) |
+| "查下最近群广告消息/有没有广告/谁在打广告" | 先调用 query_ad_clusters，再基于聚合证据回复 |
+| "删除广告 cluster" | 调用 delete_ad_cluster，等待确认后执行 |
 
 当前时间: {current_time}
 运行环境: Telegram Bot 管理后台
@@ -69,10 +74,29 @@ TOOL_INSTRUCTIONS = """
 - 输出广告评分 + 详细发现 + 处理建议
 - 用途："这是不是广告"、"检测这条消息"
 
+### 4b. 🧹 广告删除 (delete_ad_message)
+- 删除已识别或已标记的群广告消息
+- 可按 group_id + tg_msg_id 删除，也可删除最近一条已标记广告
+- ⚠️ 危险操作：必须等待管理员确认
+- 用途："删除最近一条广告消息"、"识别广告并删除一条广告"
+
+### 4c. 🧬 广告聚合管线 (query_ad_clusters / delete_ad_cluster)
+- query_ad_clusters：读取已落库群/频道消息，按 MD5/重复次数/实时广告评分聚合候选广告摘要；PostgreSQL/pgvector 可用时读取 sidecar cluster，不可用时降级使用 SQLite
+- delete_ad_cluster：按 cluster 批量删除对应 Telegram 消息；默认 dry-run，只有 AD_DELETE_ENABLED=true 且用户确认后才实际执行
+- 当用户要求判断某个群/频道“有没有广告、灰黑产、推广、谁在打广告”时，必须先调用 query_ad_clusters，再回复
+- 如果 evidence_count=0 或 analysis_allowed=false，只能说明“当前没有可见且已落库的消息证据”，不能说“未发现广告”
+
 ### 5. 🔍 系统查询 (system_query)
-- 统计概览、活跃群组、监听地址列表
-- 最近消息、潜在用户统计、群广告消息
-- 用途："系统状态"、"有多少群"、"最近动态"
+- 统计概览、活跃群组、绑定群/频道、监听地址列表
+- 最近私聊消息、最近群聊消息、频道消息、潜在用户统计、群广告消息
+- 用途："系统状态"、"有多少群和频道"、"最近群消息"、"最近频道消息"
+- 对消息内容做判断时必须看工具结果里的 evidence_count / analysis_allowed：
+  - evidence_count=0 或 analysis_allowed=false 时，只能说明“当前没有可见消息证据/机器人未收到或未落库”，不能说“未发现广告/没有异常”。
+
+### 5b. 📡 Telegram SDK 查询 (telegram_sdk_query)
+- 查询 Telegram 官方 Bot API 可见元数据和权限：getChat、getChatMember、getChatMemberCount、getChatAdministrators、forwardMessage 存在性探测
+- Bot API 不支持按 chat_id 拉取任意历史消息；消息正文必须来自 bot 已收到并写入 SQL 的 updates
+- 用途："机器人在这个群有没有权限"、"为什么查不到群消息"、"校对某条消息是否还存在"
 
 ### 6. 🧩 Skill 管理 (skill_manage)
 - 查看/新增/更新/停用 AI 助手技能

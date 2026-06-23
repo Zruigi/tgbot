@@ -734,6 +734,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not user or not user_message: return
     
     user_id = user.id
+    admin_id = int(config.ADMIN_ID)
     
     # 忽略来自管理员的消息 (管理员由 handle_admin_reply 处理)
     if str(user_id) == str(config.ADMIN_ID):
@@ -916,6 +917,8 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await database.update_admin_info(user_id, admin_tg_name)
 
     if not target_user_id:
+        if (user_message.text or "").lstrip().startswith("/"):
+            return
         # 如果是群聊中引用的消息，静默忽略（不是Bot转发的通知消息）
         chat = user_message.chat
         if chat and chat.type in ('group', 'supergroup'):
@@ -978,7 +981,7 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 发送给用户
         # 2026 规格：在消息头部注入管理员身份标签与工号信息
         # 优化文案：移除硬编码的“管理员回复”，改为更专业的引导文案
-        admin_tag = format_admin_tag(admin_id, admin_display_name, admin_worker_no)
+        admin_tag = format_admin_tag(user_id, admin_display_name, admin_worker_no)
         
         sent_msg = None
         reply_to_id = original_tg_msg_id

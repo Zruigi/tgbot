@@ -24,6 +24,22 @@
         "description": "Detect advertisement in text"
       },
       {
+        "name": "Tgbot Ad Cluster",
+        "key": "tgbotAdCluster",
+        "displayName": "TGBot Ad Cluster",
+        "group": ["transform"],
+        "version": 1,
+        "description": "Query, ingest, backfill, and delete aggregated advertisement clusters"
+      },
+      {
+        "name": "Tgbot Telegram SDK Query",
+        "key": "tgbotTelegramSdkQuery",
+        "displayName": "TGBot Telegram SDK Query",
+        "group": ["transform"],
+        "version": 1,
+        "description": "Query Telegram Bot API metadata and permissions"
+      },
+      {
         "name": "Tgbot Advertisement CRUD",
         "key": "tgbotAdCrud",
         "displayName": "TGBot Ad Management",

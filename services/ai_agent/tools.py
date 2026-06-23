@@ -17,6 +17,50 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
+def _context_metadata(context: Any) -> Dict[str, Any]:
+    metadata = getattr(context, "metadata", None)
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _context_scoped_tenant_id(context: Any) -> Optional[str]:
+    """Return tenant_id only when the agent is running in merchant scope."""
+    metadata = _context_metadata(context)
+    role = str(metadata.get("role") or "").strip()
+    tenant_id = str(metadata.get("tenant_id") or "").strip()
+    if role == "merchant_owner" and tenant_id and tenant_id != "platform":
+        return tenant_id
+    return None
+
+
+def _context_merchant_id(context: Any) -> Optional[int]:
+    merchant_id = _context_metadata(context).get("merchant_id")
+    try:
+        return int(merchant_id) if merchant_id is not None and str(merchant_id).strip() else None
+    except Exception:
+        return None
+
+
+async def _resolve_scope_bot_id(
+    db: Any,
+    *,
+    tenant_id: Optional[str],
+    merchant_id: Optional[int],
+) -> int:
+    if merchant_id is not None:
+        cursor = await db.execute("SELECT bot_id FROM merchants WHERE id = ? LIMIT 1", (int(merchant_id),))
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return int(row[0])
+
+    if tenant_id:
+        cursor = await db.execute("SELECT bot_id FROM merchants WHERE tenant_id = ? LIMIT 1", (tenant_id,))
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return int(row[0])
+
+    return int(config.ADMIN_ID)
+
+
 def _is_path_inside_project(path: str) -> bool:
     try:
         proj = os.path.realpath(_PROJECT_ROOT)
@@ -623,14 +667,211 @@ class AdDetectorTool(BaseTool):
         }
 
 
+# ===== 工具 4b：广告删除 =====
+
+class DeleteAdMessageTool(BaseTool):
+    """删除已经识别为广告的群消息"""
+    name = "delete_ad_message"
+    description = (
+        "删除群内广告消息。可以按 group_id + tg_msg_id 精确删除，或删除最近一条已标记广告消息。"
+        "只处理广告消息，删除前需要管理员确认。"
+    )
+    category = "security"
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "properties": {
+                "group_id": {"type": "integer", "description": "群组 ID，可选"},
+                "tg_msg_id": {"type": "integer", "description": "Telegram 消息 ID，可选"},
+                "msg_id": {"type": "integer", "description": "数据库消息 ID，可选"},
+                "delete_latest_ad": {"type": "boolean", "description": "未指定消息时删除最近一条广告消息"},
+            },
+            "required": []
+        }
+
+    async def _find_candidate(self, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        import aiosqlite
+
+        group_id = params.get("group_id")
+        tg_msg_id = params.get("tg_msg_id")
+        msg_id = params.get("msg_id")
+        where = ["COALESCE(is_advertising, 0) = 1", "tg_msg_id IS NOT NULL"]
+        sql_params: List[Any] = []
+
+        if msg_id:
+            where.append("msg_id = ?")
+            sql_params.append(int(msg_id))
+        if group_id:
+            where.append("group_id = ?")
+            sql_params.append(int(group_id))
+        if tg_msg_id:
+            where.append("tg_msg_id = ?")
+            sql_params.append(int(tg_msg_id))
+
+        async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                f"""
+                SELECT msg_id, group_id, tg_msg_id, user_id, username, content,
+                       COALESCE(ad_score, 0) AS ad_score,
+                       COALESCE(ad_confidence, 'low') AS ad_confidence
+                FROM group_messages
+                WHERE {' AND '.join(where)}
+                ORDER BY COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) DESC, msg_id DESC
+                LIMIT 1
+                """,
+                tuple(sql_params),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def execute(self, params: Dict[str, Any], context=None) -> dict:
+        candidate = await self._find_candidate(params)
+        if not candidate:
+            return {
+                "success": False,
+                "message": "没有找到可删除的已标记广告消息；请先执行广告检测或提供 group_id/tg_msg_id",
+            }
+
+        bot = getattr(context, "bot_instance", None) if context is not None else None
+        if not bot:
+            return {"success": False, "message": "bot 未初始化，无法删除 Telegram 群消息"}
+
+        group_id = int(candidate["group_id"])
+        tg_msg_id = int(candidate["tg_msg_id"])
+        user_id = int(candidate.get("user_id") or 0)
+
+        if user_id:
+            try:
+                member = await bot.get_chat_member(group_id, user_id)
+                if getattr(member, "status", "") in ("administrator", "creator"):
+                    return {"success": False, "message": "不能删除群管理员或群主消息"}
+            except Exception as exc:
+                logger.warning("检查群成员身份失败，继续按机器人权限删除: %s", exc)
+
+        await bot.delete_message(chat_id=group_id, message_id=tg_msg_id)
+        deleted = await database.delete_group_message(group_id, tg_msg_id)
+        return {
+            "success": True,
+            "action_taken": True,
+            "data": {
+                "group_id": group_id,
+                "tg_msg_id": tg_msg_id,
+                "msg_id": candidate.get("msg_id"),
+                "db_deleted": bool(deleted),
+                "ad_score": candidate.get("ad_score"),
+                "content_preview": str(candidate.get("content") or "")[:120],
+            },
+            "message": f"已删除广告消息 group_id={group_id}, tg_msg_id={tg_msg_id}",
+        }
+
+
+# ===== 工具 4c：广告聚合查询 =====
+
+class QueryAdClustersTool(BaseTool):
+    """查询广告聚合候选摘要，供 LLM 先取证再判断。"""
+    name = "query_ad_clusters"
+    description = (
+        "查询当前已落库群/频道消息的广告聚合候选。会按 MD5 去重、实时广告评分、重复次数聚合，"
+        "PostgreSQL/pgvector 可用时读取 sidecar cluster，不可用时降级查询 SQLite group_messages。"
+    )
+    category = "security"
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "properties": {
+                "group_id": {"type": "integer", "description": "可选，限制某个群/频道"},
+                "status": {"type": "string", "enum": ["pending", "ad", "not_ad", "all"], "description": "cluster 状态"},
+                "limit": {"type": "integer", "description": "返回 cluster 数量，默认20"},
+                "window_minutes": {"type": "integer", "description": "SQLite fallback 查询窗口，默认60分钟"},
+            },
+            "required": []
+        }
+
+    async def execute(self, params: Dict[str, Any], context=None) -> dict:
+        from services.ad_pipeline import get_ad_pipeline
+
+        tenant_id = _context_scoped_tenant_id(context)
+        group_id = params.get("group_id")
+        result = await get_ad_pipeline().query_clusters(
+            tenant_id=tenant_id,
+            group_id=int(group_id) if str(group_id or "").strip() else None,
+            status=str(params.get("status") or "pending"),
+            limit=max(1, int(params.get("limit") or 20)),
+            window_minutes=max(1, int(params.get("window_minutes") or 60)),
+        )
+        return result
+
+
+class DeleteAdClusterTool(BaseTool):
+    """按广告聚合 cluster 批量删除对应 Telegram 群/频道消息。"""
+    name = "delete_ad_cluster"
+    description = (
+        "删除一个广告 cluster 下的所有消息。默认 dry-run，只有 AD_DELETE_ENABLED=true 且参数 dry_run=false 时才实际删除。"
+        "执行前会跳过管理员/群主消息。"
+    )
+    category = "security"
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "properties": {
+                "cluster_id": {"type": "string", "description": "query_ad_clusters 返回的 cluster_id"},
+                "message_refs": {"type": "array", "items": {"type": "object"}, "description": "可选，cluster 的 message_refs"},
+                "dry_run": {"type": "boolean", "description": "是否模拟执行，默认 true"},
+                "ban_senders": {"type": "boolean", "description": "是否同时封禁发送者，默认 false 且受 AD_KICK_ENABLED 控制"},
+            },
+            "required": ["cluster_id"]
+        }
+
+    async def execute(self, params: Dict[str, Any], context=None) -> dict:
+        from services.ad_pipeline import delete_cluster_messages, get_ad_pipeline
+
+        cluster_id = str(params.get("cluster_id") or "").strip()
+        if not cluster_id:
+            return {"success": False, "message": "缺少 cluster_id"}
+
+        refs = params.get("message_refs") or []
+        if not refs:
+            clusters_result = await get_ad_pipeline().query_clusters(
+                tenant_id=_context_scoped_tenant_id(context),
+                status="all",
+                limit=100,
+            )
+            clusters = (clusters_result.get("data") or {}).get("clusters") or []
+            matched = next((c for c in clusters if str(c.get("cluster_id")) == cluster_id), None)
+            refs = (matched or {}).get("message_refs") or []
+
+        if not refs:
+            return {"success": False, "message": "没有找到该 cluster 的 message_refs，无法删除"}
+
+        bot = getattr(context, "bot_instance", None) if context is not None else None
+        if not bot:
+            try:
+                import web_admin
+                bot = web_admin._bot_instance
+            except Exception:
+                bot = None
+
+        result = await delete_cluster_messages(
+            cluster={"cluster_id": cluster_id, "message_refs": refs},
+            bot=bot,
+            dry_run=bool(params.get("dry_run", True)),
+            ban_senders=bool(params.get("ban_senders", False)),
+        )
+        return result
+
+
 # ===== 工具 5：系统查询 =====
 
 class SystemQueryTool(BaseTool):
     """系统状态与配置查询工具"""
     name = "system_query"
     description = (
-        "查询系统状态和数据统计。支持：在线用户数、监听地址数、群组列表、"
-        "最近消息统计、系统运行时间等。"
+        "查询系统状态和数据统计。支持：在线用户数、监听地址数、绑定群/频道、"
+        "群聊消息、频道消息、最近消息统计、系统运行时间等。"
     )
     category = "system"
 
@@ -642,7 +883,10 @@ class SystemQueryTool(BaseTool):
                     "type": "string",
                     "enum": [
                         "stats_overview",      # 统计概览
+                        "bound_chats",         # 机器人绑定的群组和频道
                         "active_groups",       # 活跃群组
+                        "group_messages",      # 群聊消息
+                        "channel_messages",    # 频道消息
                         "monitors_list",       # 监听列表
                         "recent_senders",      # 最近发消息的用户
                         "recent_messages",     # 最近消息
@@ -660,25 +904,273 @@ class SystemQueryTool(BaseTool):
                     "type": "integer",
                     "description": "群组ID（可选，不填则查询全部群组）"
                 },
+                "group_name": {
+                    "type": "string",
+                    "description": "群组/频道名称关键词（可选，用于先解析 chat_id）"
+                },
             },
             "required": ["query_type"]
         }
+
+    def _tenant_id_from_context(self, context) -> Optional[str]:
+        return _context_scoped_tenant_id(context)
+
+    async def _table_columns(self, db, table_name: str) -> set:
+        cursor = await db.execute(f"PRAGMA table_info({table_name})")
+        return {row[1] for row in await cursor.fetchall()}
+
+    def _serialize_chat_target(self, row: Dict[str, Any], chat_type: str) -> Dict[str, Any]:
+        return {
+            "chat_id": row.get("chat_id") or row.get("group_id"),
+            "title": row.get("chat_title") or row.get("group_title") or "",
+            "chat_type": chat_type,
+            "username": row.get("chat_username"),
+            "is_monitored": bool(row.get("is_monitored", 0)) if "is_monitored" in row else None,
+            "can_broadcast": bool(row.get("can_broadcast", 1)) if "can_broadcast" in row else None,
+            "tenant_id": row.get("tenant_id"),
+            "updated_at": row.get("updated_at"),
+        }
+
+    async def _query_bound_chats(self, tenant_id: Optional[str], limit: int) -> dict:
+        groups = await database.get_tracked_groups_with_stats(tenant_id=tenant_id)
+        targets = await database.get_broadcast_targets(enabled_only=False, tenant_id=tenant_id)
+
+        tracked_by_id: Dict[int, Dict[str, Any]] = {}
+        for group in groups:
+            try:
+                chat_id = int(group.get("group_id"))
+            except Exception:
+                continue
+            tracked_by_id[chat_id] = self._serialize_chat_target(group, "supergroup")
+
+        channels: List[Dict[str, Any]] = []
+        broadcast_only_groups: List[Dict[str, Any]] = []
+        for target in targets:
+            try:
+                chat_id = int(target.get("chat_id"))
+            except Exception:
+                continue
+            chat_type = str(target.get("chat_type") or "")
+            serialized = self._serialize_chat_target(target, chat_type)
+            if chat_id in tracked_by_id:
+                tracked_by_id[chat_id].update({
+                    "chat_type": chat_type or tracked_by_id[chat_id].get("chat_type"),
+                    "username": serialized.get("username") or tracked_by_id[chat_id].get("username"),
+                    "can_broadcast": serialized.get("can_broadcast"),
+                    "updated_at": serialized.get("updated_at") or tracked_by_id[chat_id].get("updated_at"),
+                })
+            elif chat_type == "channel":
+                channels.append(serialized)
+            else:
+                serialized["source"] = "broadcast_targets_only"
+                broadcast_only_groups.append(serialized)
+
+        groups_only = list(tracked_by_id.values())
+        all_targets = groups_only + channels + broadcast_only_groups
+
+        return {
+            "success": True,
+            "data_complete": True,
+            "evidence_count": len(all_targets),
+            "data": {
+                "group_count": len(groups_only),
+                "channel_count": len(channels),
+                "broadcast_only_group_count": len(broadcast_only_groups),
+                "total_count": len(all_targets),
+                "groups": groups_only[:limit],
+                "channels": channels[:limit],
+                "broadcast_only_groups": broadcast_only_groups[:limit],
+            },
+            "count": len(all_targets),
+            "message": (
+                f"机器人绑定聊天：群组 {len(groups_only)} 个，频道 {len(channels)} 个"
+                + (f"，另有仅广播目标群 {len(broadcast_only_groups)} 个" if broadcast_only_groups else "")
+            ),
+        }
+
+    async def _query_group_message_rows(
+        self,
+        *,
+        tenant_id: Optional[str],
+        limit: int,
+        group_id: Optional[int],
+        channel_only: bool,
+    ) -> dict:
+        import aiosqlite
+
+        lim = max(1, min(int(limit or 10), 100))
+        where_parts = []
+        params_sql: List[Any] = []
+
+        if group_id is not None:
+            where_parts.append("gm.group_id = ?")
+            params_sql.append(group_id)
+        if channel_only:
+            where_parts.append("COALESCE(gm.sender_type, '') = 'channel'")
+
+        async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+            db.row_factory = aiosqlite.Row
+            gm_cols = await self._table_columns(db, "group_messages")
+            if not gm_cols:
+                return {
+                    "success": True,
+                    "data_complete": False,
+                    "analysis_allowed": False,
+                    "evidence_count": 0,
+                    "data": [],
+                    "count": 0,
+                    "message": "当前数据库尚未创建群消息表",
+                }
+            if tenant_id and "tenant_id" in gm_cols:
+                where_parts.append("gm.tenant_id = ?")
+                params_sql.append(tenant_id)
+
+            tg_cols = await self._table_columns(db, "tracked_groups")
+            join_group_title = bool(tg_cols)
+            where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+            title_select = "tg.group_title AS group_title" if join_group_title else "NULL AS group_title"
+            title_join = "LEFT JOIN tracked_groups tg ON tg.group_id = gm.group_id" if join_group_title else ""
+
+            cursor = await db.execute(
+                f"""
+                SELECT gm.msg_id, gm.group_id, gm.tg_msg_id, gm.user_id, gm.username,
+                       gm.content, gm.msg_type, gm.sender_type, gm.message_ts, gm.timestamp,
+                       COALESCE(gm.is_advertising, 0) AS is_advertising,
+                       COALESCE(gm.ad_score, 0) AS ad_score,
+                       COALESCE(gm.ad_confidence, 'low') AS ad_confidence,
+                       gm.ad_findings,
+                       {title_select}
+                FROM group_messages gm
+                {title_join}
+                {where_sql}
+                ORDER BY COALESCE(gm.message_ts, CAST(strftime('%s', gm.timestamp) AS INTEGER)) DESC,
+                         gm.tg_msg_id DESC,
+                         gm.msg_id DESC
+                LIMIT ?
+                """,
+                (*params_sql, lim),
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+
+        for row in rows:
+            raw_findings = row.get("ad_findings")
+            if isinstance(raw_findings, str) and raw_findings.strip():
+                try:
+                    row["ad_findings"] = json.loads(raw_findings)
+                except Exception:
+                    pass
+            live_text = str(row.get("content") or "").strip()
+            if live_text and row.get("sender_type") in {"user", "channel", None, ""}:
+                try:
+                    live_flags = detect_advertising_signals(
+                        text=live_text,
+                        context_type="channel_message" if channel_only else "group_message",
+                    )
+                    row["live_is_advertising"] = bool(live_flags.get("is_advertising"))
+                    row["live_ad_score"] = int(live_flags.get("ad_score", 0) or 0)
+                    row["live_ad_confidence"] = str(live_flags.get("confidence") or "low")
+                    row["live_ad_findings"] = live_flags.get("findings") or []
+                    row["live_ad_recommendation"] = live_flags.get("recommendation") or ""
+                    if row["live_ad_score"] > int(row.get("ad_score") or 0):
+                        row["ad_score"] = row["live_ad_score"]
+                        row["is_advertising"] = 1 if row["live_is_advertising"] else row.get("is_advertising", 0)
+                        row["ad_confidence"] = row["live_ad_confidence"]
+                except Exception:
+                    row["live_ad_error"] = "live_detection_failed"
+
+        label = "频道消息" if channel_only else "群聊消息"
+        has_evidence = len(rows) > 0
+        live_ad_count = sum(1 for row in rows if row.get("live_is_advertising"))
+        distinct_senders = len({row.get("user_id") for row in rows if row.get("user_id")})
+        return {
+            "success": True,
+            "source": "sql.group_messages",
+            "data_complete": has_evidence,
+            "analysis_allowed": has_evidence,
+            "evidence_count": len(rows),
+            "summary": {
+                "distinct_senders": distinct_senders,
+                "live_ad_count": live_ad_count,
+                "live_detection_applied": True,
+            },
+            "limitation": (
+                None if has_evidence else
+                "没有 SQL 消息证据；不能据此判断该群/频道没有广告或没有异常。"
+            ),
+            "data": rows,
+            "count": len(rows),
+            "message": (
+                f"{label}列表 (前{len(rows)}条)"
+                if has_evidence else
+                f"未查询到可见的{label}；只能说明当前 SQL 没有 bot 已收到并落库的消息"
+            ),
+        }
+
+    async def _resolve_group_name(self, *, tenant_id: Optional[str], group_name: str) -> dict:
+        import aiosqlite
+
+        name = str(group_name or "").strip().strip("*「」『』“”\"' ")
+        if not name:
+            return {"status": "empty", "matches": []}
+
+        async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+            db.row_factory = aiosqlite.Row
+            tg_cols = await self._table_columns(db, "tracked_groups")
+            if not tg_cols:
+                return {"status": "not_found", "matches": []}
+            where = ["group_title LIKE ?"]
+            params: List[Any] = [f"%{name}%"]
+            if tenant_id and "tenant_id" in tg_cols:
+                where.append("tenant_id = ?")
+                params.append(tenant_id)
+            monitored_expr = "is_monitored" if "is_monitored" in tg_cols else "0 AS is_monitored"
+            tenant_expr = "tenant_id" if "tenant_id" in tg_cols else "NULL AS tenant_id"
+            updated_expr = "updated_at" if "updated_at" in tg_cols else "CURRENT_TIMESTAMP AS updated_at"
+            updated_order = "updated_at" if "updated_at" in tg_cols else "CURRENT_TIMESTAMP"
+            cursor = await db.execute(
+                f"""
+                SELECT group_id, group_title, {monitored_expr}, {tenant_expr}, {updated_expr}
+                FROM tracked_groups
+                WHERE {' AND '.join(where)}
+                ORDER BY
+                    CASE WHEN group_title = ? THEN 0 ELSE 1 END,
+                    {updated_order} DESC
+                LIMIT 10
+                """,
+                (*params, name),
+            )
+            matches = [dict(row) for row in await cursor.fetchall()]
+
+        if not matches:
+            return {"status": "not_found", "matches": [], "query": name}
+        if len(matches) > 1:
+            return {"status": "ambiguous", "matches": matches, "query": name}
+        return {"status": "ok", "matches": matches, "query": name, "group_id": int(matches[0]["group_id"])}
 
     async def execute(self, params: Dict[str, Any], context=None) -> dict:
         query_type = params.get("query_type", "stats_overview")
         limit = params.get("limit", 10)
         group_id = params.get("group_id")
+        group_name = params.get("group_name")
+        tenant_id = self._tenant_id_from_context(context)
+        merchant_id = _context_merchant_id(context)
 
         try:
             if query_type == "stats_overview":
                 # 多维度聚合统计
-                groups = await database.get_tracked_groups_with_stats()
-                users = await database.get_inbox_list()
+                groups = await database.get_tracked_groups_with_stats(tenant_id=tenant_id)
+                users = await database.get_inbox_list(tenant_id=tenant_id, merchant_id=merchant_id)
+                targets = await database.get_broadcast_targets(enabled_only=True, tenant_id=tenant_id)
+                channels = [t for t in targets if t.get("chat_type") == "channel"]
 
                 import aiosqlite
                 async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+                    monitor_cols = await self._table_columns(db, "address_monitors")
+                    monitor_tenant_sql = " AND tenant_id = ?" if tenant_id and "tenant_id" in monitor_cols else ""
+                    monitor_params = (tenant_id,) if monitor_tenant_sql else ()
                     cursor = await db.execute(
-                        "SELECT COUNT(*) FROM address_monitors WHERE is_active=1"
+                        f"SELECT COUNT(*) FROM address_monitors WHERE is_active=1{monitor_tenant_sql}",
+                        monitor_params,
                     )
                     monitor_count = (await cursor.fetchone())[0]
 
@@ -686,6 +1178,7 @@ class SystemQueryTool(BaseTool):
                     "success": True,
                     "data": {
                         "group_count": len(groups),
+                        "channel_count": len(channels),
                         "user_count": len([u for u in users if u.get('from_userid')]),
                         "monitor_count": monitor_count,
                         "ai_enabled": True,
@@ -693,14 +1186,53 @@ class SystemQueryTool(BaseTool):
                     "message": "系统统计概览",
                 }
 
+            elif query_type == "bound_chats":
+                return await self._query_bound_chats(tenant_id, max(1, int(limit or 10)))
+
             elif query_type == "active_groups":
-                groups = await database.get_tracked_groups_with_stats()
+                groups = await database.get_tracked_groups_with_stats(tenant_id=tenant_id)
                 return {
                     "success": True,
                     "data": groups[:limit],
                     "count": len(groups),
                     "message": f"活跃群组列表 (前{min(limit, len(groups))}个)",
                 }
+
+            elif query_type == "group_messages":
+                gid = int(group_id) if str(group_id or "").strip() else None
+                if gid is None and str(group_name or "").strip():
+                    resolved = await self._resolve_group_name(tenant_id=tenant_id, group_name=str(group_name))
+                    if resolved.get("status") != "ok":
+                        return {
+                            "success": True,
+                            "source": "sql.tracked_groups",
+                            "data_complete": False,
+                            "analysis_allowed": False,
+                            "evidence_count": 0,
+                            "data": resolved,
+                            "count": len(resolved.get("matches") or []),
+                            "message": "群名称无法唯一解析，不能继续判断最近消息",
+                        }
+                    gid = int(resolved["group_id"])
+                return await self._query_group_message_rows(
+                    tenant_id=tenant_id,
+                    limit=max(1, int(limit or 10)),
+                    group_id=gid,
+                    channel_only=False,
+                )
+
+            elif query_type == "channel_messages":
+                gid = int(group_id) if str(group_id or "").strip() else None
+                if gid is None and str(group_name or "").strip():
+                    resolved = await self._resolve_group_name(tenant_id=tenant_id, group_name=str(group_name))
+                    if resolved.get("status") == "ok":
+                        gid = int(resolved["group_id"])
+                return await self._query_group_message_rows(
+                    tenant_id=tenant_id,
+                    limit=max(1, int(limit or 10)),
+                    group_id=gid,
+                    channel_only=True,
+                )
 
             elif query_type == "monitors_list":
                 import aiosqlite
@@ -711,15 +1243,18 @@ class SystemQueryTool(BaseTool):
                     inflow_expr = "inflow_20" if "inflow_20" in cols else "0 AS inflow_20"
                     outflow_expr = "outflow_20" if "outflow_20" in cols else "0 AS outflow_20"
                     profit_expr = "profit_20" if "profit_20" in cols else "0 AS profit_20"
+                    tenant_sql = "AND tenant_id = ?" if tenant_id and "tenant_id" in cols else ""
+                    sql_params = (tenant_id, max(1, int(limit or 10))) if tenant_sql else (max(1, int(limit or 10)),)
 
                     cursor = await db.execute(
                         f"""
                         SELECT monitor_id, address, network, remark,
                                {inflow_expr}, {outflow_expr}, {profit_expr}
                         FROM address_monitors WHERE is_active=1
+                        {tenant_sql}
                         ORDER BY monitor_id DESC LIMIT ?
                     """,
-                        (limit,),
+                        sql_params,
                     )
                     monitors = [dict(row) for row in await cursor.fetchall()]
                 return {
@@ -731,7 +1266,7 @@ class SystemQueryTool(BaseTool):
 
             elif query_type == "recent_senders":
                 # 最近给管理员发消息的用户（优先走 inbox，性能更稳）
-                inbox_rows = await database.get_inbox_list()
+                inbox_rows = await database.get_inbox_list(tenant_id=tenant_id, merchant_id=merchant_id)
                 ai_uid = int(os.getenv("AI_ASSISTANT_USER_ID", "900000001"))
 
                 senders = []
@@ -759,16 +1294,24 @@ class SystemQueryTool(BaseTool):
                 import aiosqlite
                 async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
                     db.row_factory = aiosqlite.Row
+                    msg_cols = await self._table_columns(db, "messages")
+                    counterpart_id = await _resolve_scope_bot_id(db, tenant_id=tenant_id, merchant_id=merchant_id)
+                    tenant_sql = "AND tenant_id = ?" if tenant_id and "tenant_id" in msg_cols else ""
+                    sql_params: List[Any] = [counterpart_id, counterpart_id]
+                    if tenant_sql:
+                        sql_params.append(tenant_id)
+                    sql_params.append(max(1, int(limit or 10)))
                     cursor = await db.execute(
-                        """
+                        f"""
                         SELECT msg_id, from_userid, to_userid, content, type AS msg_type, timestamp, status
                         FROM messages
                         WHERE is_deleted = 0
                           AND (to_userid = ? OR from_userid = ?)
+                          {tenant_sql}
                         ORDER BY timestamp DESC
                         LIMIT ?
                         """,
-                        (config.ADMIN_ID, config.ADMIN_ID, max(1, int(limit or 10))),
+                        tuple(sql_params),
                     )
                     rows = [dict(row) for row in await cursor.fetchall()]
 
@@ -777,7 +1320,7 @@ class SystemQueryTool(BaseTool):
                 for row in rows:
                     from_uid = int(row.get("from_userid", 0) or 0)
                     to_uid = int(row.get("to_userid", 0) or 0)
-                    direction = "inbound" if to_uid == int(config.ADMIN_ID) else "outbound"
+                    direction = "inbound" if to_uid == int(counterpart_id) else "outbound"
                     if from_uid == ai_uid or to_uid == ai_uid:
                         continue
                     messages.append({
@@ -801,12 +1344,19 @@ class SystemQueryTool(BaseTool):
                 import aiosqlite
                 async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
                     db.row_factory = aiosqlite.Row
-                    cursor = await db.execute("""
-                        SELECT user_id, username, source_group, profile_tags, 
-                               first_seen, last_active
-                        FROM potential_users 
-                        ORDER BY last_active DESC LIMIT ?
-                    """, (limit,))
+                    p_cols = await self._table_columns(db, "potential_users")
+                    group_title_expr = "group_title" if "group_title" in p_cols else "NULL AS group_title"
+                    captured_select = "captured_at" if "captured_at" in p_cols else "NULL AS captured_at"
+                    captured_order = "captured_at" if "captured_at" in p_cols else "CURRENT_TIMESTAMP"
+                    tenant_sql = "WHERE tenant_id = ?" if tenant_id and "tenant_id" in p_cols else ""
+                    sql_params = (tenant_id, max(1, int(limit or 10))) if tenant_sql else (max(1, int(limit or 10)),)
+                    cursor = await db.execute(f"""
+                        SELECT user_id, username, first_name, group_id, {group_title_expr},
+                               profile_tags, keywords, {captured_select}
+                        FROM potential_users
+                        {tenant_sql}
+                        ORDER BY COALESCE({captured_order}, CURRENT_TIMESTAMP) DESC LIMIT ?
+                    """, sql_params)
                     potentials = [dict(row) for row in await cursor.fetchall()]
                 return {
                     "success": True,
@@ -819,6 +1369,21 @@ class SystemQueryTool(BaseTool):
                 import aiosqlite
                 lim = max(1, int(limit or 10))
                 gid = int(group_id) if str(group_id or "").strip() else None
+                if gid is None and str(group_name or "").strip():
+                    resolved = await self._resolve_group_name(tenant_id=tenant_id, group_name=str(group_name))
+                    if resolved.get("status") == "ok":
+                        gid = int(resolved["group_id"])
+                    else:
+                        return {
+                            "success": True,
+                            "source": "sql.tracked_groups",
+                            "data_complete": False,
+                            "analysis_allowed": False,
+                            "evidence_count": 0,
+                            "data": resolved,
+                            "count": len(resolved.get("matches") or []),
+                            "message": "群名称无法唯一解析，不能继续判断广告消息",
+                        }
                 where_sql = "WHERE COALESCE(is_advertising, 0) = 1"
                 params_sql: List[Any] = []
                 if gid is not None:
@@ -836,6 +1401,9 @@ class SystemQueryTool(BaseTool):
                             "count": 0,
                             "message": "当前数据库尚未启用广告标记字段",
                         }
+                    if tenant_id and "tenant_id" in gm_cols:
+                        where_sql += " AND tenant_id = ?"
+                        params_sql.append(tenant_id)
 
                     cursor = await db.execute(
                         f"""
@@ -861,12 +1429,44 @@ class SystemQueryTool(BaseTool):
                             row["ad_findings"] = json.loads(raw_findings)
                         except Exception:
                             pass
+                    live_text = str(row.get("content") or "").strip()
+                    if live_text:
+                        try:
+                            live_flags = detect_advertising_signals(text=live_text, context_type="group_message")
+                            row["live_is_advertising"] = bool(live_flags.get("is_advertising"))
+                            row["live_ad_score"] = int(live_flags.get("ad_score", 0) or 0)
+                            row["live_ad_findings"] = live_flags.get("findings") or []
+                        except Exception:
+                            pass
+
+                if not rows and gid is not None:
+                    recent = await self._query_group_message_rows(
+                        tenant_id=tenant_id,
+                        limit=max(lim, 50),
+                        group_id=gid,
+                        channel_only=False,
+                    )
+                    candidate_rows = recent.get("data") or []
+                    rows = [
+                        row for row in candidate_rows
+                        if row.get("live_is_advertising") or int(row.get("live_ad_score") or 0) >= 40
+                    ][:lim]
 
                 return {
                     "success": True,
+                    "source": "sql.group_messages",
+                    "data_complete": len(rows) > 0,
+                    "analysis_allowed": len(rows) > 0,
+                    "evidence_count": len(rows),
+                    "summary": {
+                        "live_detection_applied": True,
+                        "matched_live_ads": len(rows),
+                        "group_id": gid,
+                    },
+                    "limitation": None if rows else "没有已标记或实时命中的广告消息证据；不能据此判断群内不存在广告。",
                     "data": rows,
                     "count": len(rows),
-                    "message": f"广告消息列表 (前{len(rows)}条)",
+                    "message": f"广告消息列表 (前{len(rows)}条，含实时检测)" if rows else "未查询到已标记或实时命中的广告消息",
                 }
 
             else:
@@ -875,6 +1475,309 @@ class SystemQueryTool(BaseTool):
         except Exception as e:
             logger.error(f"SystemQueryTool 执行失败: {e}")
             return {"success": False, "message": f"系统查询错误: {e}"}
+
+
+# ===== 工具 5b：Telegram SDK 官方接口查询 =====
+
+class TelegramSdkQueryTool(BaseTool):
+    """通过 Telegram Bot API 查询官方可见的群/频道元数据与机器人权限。"""
+    name = "telegram_sdk_query"
+    description = (
+        "查询 Telegram Bot API 官方可见信息：getChat、getChatMember、"
+        "getChatMemberCount、getChatAdministrators、forwardMessage 存在性探测。"
+        "注意：Bot API 不支持按 chat_id 拉取任意历史消息。"
+    )
+    category = "system"
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "chat_capabilities",
+                        "bound_chat_capabilities",
+                        "bot_visibility_status",
+                        "message_existence_probe",
+                    ],
+                    "description": "SDK 查询类型"
+                },
+                "chat_id": {"type": "integer", "description": "Telegram chat_id，可选"},
+                "group_id": {"type": "integer", "description": "兼容字段，等同 chat_id"},
+                "tg_msg_id": {"type": "integer", "description": "需要探测的 Telegram 消息 ID"},
+                "staging_chat_id": {"type": "integer", "description": "forwardMessage 存在性探测使用的校对群 ID"},
+                "limit": {"type": "integer", "description": "批量查询数量限制，默认10"},
+                "include_admins": {"type": "boolean", "description": "是否拉取管理员列表，默认 true"},
+            },
+            "required": ["operation"]
+        }
+
+    def _tenant_id_from_context(self, context) -> Optional[str]:
+        return _context_scoped_tenant_id(context)
+
+    def _get_bot(self, context):
+        bot = getattr(context, "bot_instance", None) if context is not None else None
+        if bot:
+            return bot
+        try:
+            import web_admin
+            return web_admin._bot_instance
+        except Exception:
+            return None
+
+    def _obj_to_dict(self, obj: Any) -> Dict[str, Any]:
+        if obj is None:
+            return {}
+        if isinstance(obj, dict):
+            return obj
+        if hasattr(obj, "to_dict"):
+            try:
+                return obj.to_dict()
+            except Exception:
+                pass
+        out: Dict[str, Any] = {}
+        for key in (
+            "id", "type", "title", "username", "first_name", "last_name",
+            "status", "custom_title", "can_be_edited", "can_manage_chat",
+            "can_delete_messages", "can_manage_video_chats", "can_restrict_members",
+            "can_promote_members", "can_change_info", "can_invite_users",
+            "can_post_messages", "can_edit_messages", "can_pin_messages",
+            "can_manage_topics", "is_anonymous",
+        ):
+            if hasattr(obj, key):
+                value = getattr(obj, key)
+                if not callable(value):
+                    out[key] = value
+        return out
+
+    def _bot_member_permissions(self, member: Any) -> Dict[str, Any]:
+        data = self._obj_to_dict(member)
+        status = data.get("status") or getattr(member, "status", None)
+        permissions = {"status": status}
+        for key in (
+            "can_manage_chat", "can_delete_messages", "can_manage_video_chats",
+            "can_restrict_members", "can_promote_members", "can_change_info",
+            "can_invite_users", "can_post_messages", "can_edit_messages",
+            "can_pin_messages", "can_manage_topics",
+        ):
+            if key in data:
+                permissions[key] = bool(data.get(key))
+            elif hasattr(member, key):
+                permissions[key] = bool(getattr(member, key))
+        return permissions
+
+    async def _target_chats(self, tenant_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
+        groups = await database.get_tracked_groups_with_stats(tenant_id=tenant_id)
+        targets = await database.get_broadcast_targets(enabled_only=False, tenant_id=tenant_id)
+        by_id: Dict[int, Dict[str, Any]] = {}
+        for group in groups:
+            try:
+                chat_id = int(group.get("group_id"))
+            except Exception:
+                continue
+            by_id[chat_id] = {
+                "chat_id": chat_id,
+                "title": group.get("group_title") or group.get("title") or "",
+                "chat_type": "group",
+                "tenant_id": group.get("tenant_id"),
+                "source": "tracked_groups",
+            }
+        for target in targets:
+            try:
+                chat_id = int(target.get("chat_id"))
+            except Exception:
+                continue
+            by_id.setdefault(chat_id, {
+                "chat_id": chat_id,
+                "title": target.get("chat_title") or "",
+                "chat_type": target.get("chat_type") or "",
+                "tenant_id": target.get("tenant_id"),
+                "source": "broadcast_targets",
+            })
+        return list(by_id.values())[:max(1, min(int(limit or 10), 50))]
+
+    async def _inspect_chat(self, bot: Any, chat_id: int, tenant_id: Optional[str], include_admins: bool) -> Dict[str, Any]:
+        item: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "source": "telegram_bot_api",
+            "history_fetch_supported": False,
+            "history_fetch_note": "Telegram Bot API 不支持按 chat_id 拉取任意历史消息；消息正文只能来自 bot 实际收到并落库的 updates。",
+            "errors": [],
+        }
+        chat_obj = None
+        try:
+            chat_obj = await bot.get_chat(chat_id)
+            chat = self._obj_to_dict(chat_obj)
+            item.update({
+                "chat_type": chat.get("type") or getattr(chat_obj, "type", None),
+                "title": chat.get("title") or getattr(chat_obj, "title", None),
+                "username": chat.get("username") or getattr(chat_obj, "username", None),
+            })
+        except Exception as exc:
+            item["errors"].append(f"getChat: {str(exc)[:200]}")
+
+        bot_user = None
+        try:
+            bot_user = await bot.get_me()
+            item["bot_id"] = getattr(bot_user, "id", None) or self._obj_to_dict(bot_user).get("id")
+            item["bot_username"] = getattr(bot_user, "username", None) or self._obj_to_dict(bot_user).get("username")
+        except Exception as exc:
+            item["errors"].append(f"getMe: {str(exc)[:200]}")
+
+        if item.get("bot_id"):
+            try:
+                member = await bot.get_chat_member(chat_id=chat_id, user_id=int(item["bot_id"]))
+                item["bot_status"] = getattr(member, "status", None) or self._obj_to_dict(member).get("status")
+                item["bot_permissions"] = self._bot_member_permissions(member)
+            except Exception as exc:
+                item["errors"].append(f"getChatMember(bot): {str(exc)[:200]}")
+
+        try:
+            item["member_count"] = await bot.get_chat_member_count(chat_id)
+        except Exception as exc:
+            item["errors"].append(f"getChatMemberCount: {str(exc)[:200]}")
+
+        admin_count = None
+        if include_admins:
+            try:
+                admins = await bot.get_chat_administrators(chat_id)
+                admin_count = len(admins or [])
+                item["admin_count"] = admin_count
+                item["admins"] = [
+                    {
+                        "user_id": self._obj_to_dict(getattr(a, "user", None)).get("id"),
+                        "username": self._obj_to_dict(getattr(a, "user", None)).get("username"),
+                        "status": getattr(a, "status", None) or self._obj_to_dict(a).get("status"),
+                    }
+                    for a in (admins or [])[:20]
+                ]
+            except Exception as exc:
+                item["errors"].append(f"getChatAdministrators: {str(exc)[:200]}")
+
+        try:
+            await database.upsert_telegram_chat_capability_snapshot(
+                chat_id=int(chat_id),
+                tenant_id=tenant_id,
+                chat_type=item.get("chat_type"),
+                title=item.get("title"),
+                username=item.get("username"),
+                member_count=item.get("member_count"),
+                admin_count=admin_count if admin_count is not None else item.get("admin_count"),
+                bot_status=item.get("bot_status"),
+                bot_permissions=item.get("bot_permissions") or {},
+                history_fetch_supported=False,
+                last_error="; ".join(item.get("errors") or []) or None,
+            )
+        except Exception as exc:
+            item["snapshot_error"] = str(exc)[:200]
+
+        item["success"] = not bool(item.get("errors"))
+        item["data_complete"] = bool(item.get("bot_status")) and not bool(item.get("errors"))
+        return item
+
+    async def _message_existence_probe(self, bot: Any, params: Dict[str, Any], tenant_id: Optional[str]) -> dict:
+        chat_id = int(params.get("chat_id") or params.get("group_id") or 0)
+        tg_msg_id = int(params.get("tg_msg_id") or 0)
+        staging_chat_id = params.get("staging_chat_id")
+        if not staging_chat_id and chat_id:
+            try:
+                staging_chat_id = await database.get_group_revoke_sync_chat_id(chat_id)
+            except Exception:
+                staging_chat_id = None
+        if not chat_id or not tg_msg_id:
+            return {"success": False, "message": "message_existence_probe 需要 chat_id/group_id 和 tg_msg_id"}
+        if not staging_chat_id:
+            return {
+                "success": False,
+                "message": "缺少 staging_chat_id 或群组未配置校对信息群，无法用 forwardMessage 探测消息是否仍存在",
+                "data": {"chat_id": chat_id, "tg_msg_id": tg_msg_id, "source": "telegram_bot_api"},
+            }
+        try:
+            forwarded = await bot.forward_message(
+                chat_id=int(staging_chat_id),
+                from_chat_id=chat_id,
+                message_id=tg_msg_id,
+            )
+            try:
+                await bot.delete_message(chat_id=int(staging_chat_id), message_id=forwarded.message_id)
+            except Exception:
+                pass
+            return {
+                "success": True,
+                "data_complete": True,
+                "evidence_count": 1,
+                "data": {
+                    "chat_id": chat_id,
+                    "tg_msg_id": tg_msg_id,
+                    "exists": True,
+                    "source": "telegram_bot_api.forwardMessage",
+                },
+                "message": "消息存在性探测成功：该消息可被 forwardMessage 读取",
+            }
+        except Exception as exc:
+            return {
+                "success": True,
+                "data_complete": True,
+                "evidence_count": 1,
+                "data": {
+                    "chat_id": chat_id,
+                    "tg_msg_id": tg_msg_id,
+                    "exists": False,
+                    "source": "telegram_bot_api.forwardMessage",
+                    "error": str(exc)[:300],
+                },
+                "message": "消息存在性探测完成：该消息无法被 forwardMessage 读取，可能已删除或 bot 无权限",
+            }
+
+    async def execute(self, params: Dict[str, Any], context=None) -> dict:
+        operation = params.get("operation") or "chat_capabilities"
+        tenant_id = self._tenant_id_from_context(context)
+        limit = max(1, min(int(params.get("limit") or 10), 50))
+        include_admins = bool(params.get("include_admins", True))
+        bot = self._get_bot(context)
+        if not bot:
+            return {
+                "success": False,
+                "message": "bot 未初始化，无法调用 Telegram 官方 SDK",
+                "data": {"source": "telegram_bot_api", "history_fetch_supported": False},
+            }
+
+        try:
+            if operation == "message_existence_probe":
+                return await self._message_existence_probe(bot, params, tenant_id)
+
+            explicit_chat_id = params.get("chat_id") or params.get("group_id")
+            if explicit_chat_id:
+                rows = [{"chat_id": int(explicit_chat_id)}]
+            else:
+                rows = await self._target_chats(tenant_id, limit)
+
+            inspected = []
+            for row in rows:
+                inspected.append(await self._inspect_chat(bot, int(row["chat_id"]), tenant_id, include_admins))
+
+            visibility_notes = []
+            if operation == "bot_visibility_status":
+                visibility_notes.append("Bot API 没有拉取任意群/频道历史消息的方法。")
+                visibility_notes.append("能分析的消息必须是 bot 已收到 update 并写入 SQL 的消息；群 privacy mode、管理员权限和 bot 入群时间都会影响可见性。")
+
+            return {
+                "success": True,
+                "data_complete": bool(inspected),
+                "evidence_count": len(inspected),
+                "data": {
+                    "operation": operation,
+                    "items": inspected,
+                    "history_fetch_supported": False,
+                    "visibility_notes": visibility_notes,
+                },
+                "count": len(inspected),
+                "message": f"Telegram SDK 查询完成：{len(inspected)} 个聊天；历史消息拉取不受 Bot API 支持",
+            }
+        except Exception as e:
+            logger.error(f"TelegramSdkQueryTool 执行失败: {e}", exc_info=True)
+            return {"success": False, "message": f"Telegram SDK 查询错误: {e}"}
 
 
 # ===== 工具 6：Skill 管理 =====
@@ -1021,5 +1924,9 @@ register_tool(FinanceTool())
 register_tool(BroadcastTool())
 register_tool(ContentGeneratorTool())
 register_tool(AdDetectorTool())
+register_tool(DeleteAdMessageTool())
+register_tool(QueryAdClustersTool())
+register_tool(DeleteAdClusterTool())
 register_tool(SystemQueryTool())
+register_tool(TelegramSdkQueryTool())
 register_tool(SkillManageTool())

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from handlers.customer.admin_reply_handlers import (
     build_admin_feedback,
     classify_message_content,
+    extract_target_user_info,
     extract_quoted_message_info,
     prepare_translation_feedback,
 )
@@ -92,3 +93,22 @@ def test_extract_quoted_message_info_yuanwen_marker():
     )
     info = extract_quoted_message_info(rm)
     assert info["text"] == "inner"
+
+
+async def test_extract_target_user_info_falls_back_to_userid_text(monkeypatch):
+    async def no_mapping(_message_id):
+        return None
+
+    monkeypatch.setattr("database.get_user_id_by_admin_msg", no_mapping)
+    monkeypatch.setattr("database.get_original_msg_id_by_admin_msg", no_mapping)
+
+    reply = SimpleNamespace(
+        message_id=42,
+        text='新咨询\nUserID: <code>123456</code>\n\n内容: hello',
+        caption=None,
+    )
+
+    target_user_id, original_tg_msg_id = await extract_target_user_info(reply)
+
+    assert target_user_id == 123456
+    assert original_tg_msg_id is None

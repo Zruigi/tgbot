@@ -11,8 +11,14 @@ LOG_TUNNEL_DIR="${LOG_ROOT}/tunnel"
 LOG_CLOUDFLARED_DIR="${LOG_TUNNEL_DIR}/cloudflared"
 LOG_RUNTIME_DIR="${LOG_ROOT}/runtime"
 LOG_AI_DIR="${LOG_ROOT}/ai"
+LOG_LITELLM_DIR="${LOG_AI_DIR}/litellm"
 LOG_FILE="${LOG_CLOUDFLARED_DIR}/cloudflared.log"
 BACKEND_LOG="${LOG_BACKEND_DIR}/backend.log"
+BOT_STDOUT_LOG="${PROJECT_DIR}/bot_stdout.log"
+BOT_STDERR_LOG="${PROJECT_DIR}/bot_stderr.log"
+BOT_RUNTIME_STDOUT_LOG="${LOG_RUNTIME_DIR}/bot_stdout.log"
+BOT_RUNTIME_STDERR_LOG="${LOG_RUNTIME_DIR}/bot_stderr.log"
+BOT_LEGACY_LOG="${PROJECT_DIR}/bot.log"
 ENV_FILE=".env"
 ENV_BACKUP_KEEP=5
 PYTHON_BIN="${PROJECT_DIR}/venv/bin/python3"
@@ -23,6 +29,10 @@ PYTHON_CMD="${PYTHON_BIN} main.py"
 TUNNEL_PORT=8080
 LITELLM_PORT=4000
 LITELLM_CONTAINER="litellm"
+LITELLM_MODE="${LITELLM_MODE:-auto}"
+LITELLM_CONFIG="${PROJECT_DIR}/litellm_config.yaml"
+GOOGLE_CREDENTIALS_PATH="${PROJECT_DIR}/Google api/tgbot-490920-05d1ad1b3310.json"
+LITELLM_STATUS="not-started"
 TUNNEL_MAX_RETRIES=3
 TUNNEL_WAIT_BASE=10
 TUNNEL_WAIT_MAX=45
@@ -37,6 +47,85 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
+
+normalize_litellm_mode() {
+    LITELLM_MODE="$(printf "%s" "${LITELLM_MODE:-auto}" | tr '[:upper:]' '[:lower:]')"
+    case "$LITELLM_MODE" in
+        auto|required|off)
+            ;;
+        *)
+            echo -e "${YELLOW}⚠️ LITELLM_MODE=${LITELLM_MODE} 无效，已回退为 auto${NC}"
+            LITELLM_MODE="auto"
+            ;;
+    esac
+}
+
+show_file_tail() {
+    local label="$1"
+    local file="$2"
+    local lines="${3:-80}"
+
+    if [ -f "$file" ] && [ -s "$file" ]; then
+        echo -e "${YELLOW}📄 ${label} 最后 ${lines} 行: ${file}${NC}"
+        tail -n "$lines" "$file" 2>/dev/null || true
+    else
+        echo -e "${YELLOW}⚠️ ${label} 日志为空或不存在: ${file}${NC}"
+    fi
+}
+
+validate_prerequisites() {
+    local ok=1
+
+    normalize_litellm_mode
+
+    if [ ! -f "$ENV_FILE" ]; then
+        echo -e "${RED}❌ 未找到 .env 文件: ${PROJECT_DIR}/${ENV_FILE}${NC}"
+        ok=0
+    else
+        load_env_to_process "$ENV_FILE" || ok=0
+    fi
+
+    if [ -z "${BOT_TOKEN:-}" ]; then
+        echo -e "${RED}❌ .env 缺少 BOT_TOKEN，Telegram Bot 无法启动${NC}"
+        ok=0
+    fi
+    if [ -z "${ADMIN_ID:-}" ]; then
+        echo -e "${RED}❌ .env 缺少 ADMIN_ID，Telegram Bot 无法启动${NC}"
+        ok=0
+    fi
+
+    if [ -z "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
+        echo -e "${RED}❌ Python 不可用：未找到 ${PROJECT_DIR}/venv/bin/python3 或系统 python3${NC}"
+        ok=0
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+        echo -e "${RED}❌ npm 未安装或不在 PATH 中，无法构建前端${NC}"
+        ok=0
+    fi
+    if ! command -v cloudflared >/dev/null 2>&1; then
+        echo -e "${RED}❌ cloudflared 未安装或不在 PATH 中，无法创建公网隧道${NC}"
+        ok=0
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}❌ curl 未安装或不在 PATH 中，无法检测后端端口${NC}"
+        ok=0
+    fi
+    if ! command -v ss >/dev/null 2>&1; then
+        echo -e "${RED}❌ ss 未安装或不在 PATH 中，无法检测端口占用${NC}"
+        ok=0
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        if [ "$LITELLM_MODE" = "required" ]; then
+            echo -e "${RED}❌ LITELLM_MODE=required，但 Docker 未安装或不在 PATH 中${NC}"
+            ok=0
+        elif [ "$LITELLM_MODE" = "auto" ]; then
+            echo -e "${YELLOW}⚠️ Docker 未安装或不在 PATH 中，LiteLLM 将跳过；Bot 主服务仍会启动${NC}"
+        fi
+    fi
+
+    [ "$ok" -eq 1 ]
+}
 
 backup_env_file() {
     local env_file="$1"
@@ -421,14 +510,18 @@ start_tunnel_and_get_url() {
 show_backend_log_tail() {
     local lines="${1:-80}"
 
-    if [ -f "$BACKEND_LOG" ] && [ -s "$BACKEND_LOG" ]; then
-        echo -e "${YELLOW}📄 后端日志最后 ${lines} 行:${NC}"
-        tail -n "$lines" "$BACKEND_LOG" 2>/dev/null || true
-    elif command -v journalctl >/dev/null 2>&1; then
-        echo -e "${YELLOW}📄 systemd 服务日志最后 ${lines} 行:${NC}"
+    show_file_tail "后端 nohup" "$BACKEND_LOG" "$lines"
+    show_file_tail "systemd stdout" "$BOT_STDOUT_LOG" "$lines"
+    show_file_tail "systemd stderr" "$BOT_STDERR_LOG" "$lines"
+    show_file_tail "runtime stdout" "$BOT_RUNTIME_STDOUT_LOG" "$lines"
+    show_file_tail "runtime stderr" "$BOT_RUNTIME_STDERR_LOG" "$lines"
+    show_file_tail "Bot legacy" "$BOT_LEGACY_LOG" "$lines"
+
+    if command -v journalctl >/dev/null 2>&1; then
+        echo -e "${YELLOW}📄 systemd tgbot.service 最后 ${lines} 行:${NC}"
         journalctl -u tgbot.service --no-pager -n "$lines" 2>/dev/null || true
     else
-        echo -e "${YELLOW}⚠️ 后端日志文件不存在: ${BACKEND_LOG}${NC}"
+        echo -e "${YELLOW}⚠️ journalctl 不可用，无法读取 systemd 日志${NC}"
     fi
 }
 
@@ -439,11 +532,13 @@ is_pid_alive() {
 
 extract_backend_start_error() {
     local error_lines=""
+    local log_path
 
-    # 检查 nohup 后端日志
-    if [ -f "$BACKEND_LOG" ]; then
-        error_lines="$(grep -E "Traceback|ImportError|ModuleNotFoundError|SyntaxError|NameError|AttributeError|RuntimeError|ValueError" "$BACKEND_LOG" 2>/dev/null | tail -n 5)"
-    fi
+    for log_path in "$BACKEND_LOG" "$BOT_STDERR_LOG" "$BOT_STDOUT_LOG" "$BOT_RUNTIME_STDERR_LOG" "$BOT_RUNTIME_STDOUT_LOG" "$BOT_LEGACY_LOG"; do
+        if [ -z "$error_lines" ] && [ -f "$log_path" ]; then
+            error_lines="$(grep -E "Traceback|ImportError|ModuleNotFoundError|SyntaxError|NameError|AttributeError|RuntimeError|ValueError" "$log_path" 2>/dev/null | tail -n 5)"
+        fi
+    done
 
     # 检查 systemd 服务日志（journalctl）
     if [ -z "$error_lines" ] && command -v journalctl >/dev/null 2>&1; then
@@ -451,6 +546,103 @@ extract_backend_start_error() {
     fi
 
     echo "$error_lines"
+}
+
+show_litellm_logs() {
+    if command -v docker >/dev/null 2>&1; then
+        echo -e "${YELLOW}📄 LiteLLM Docker 日志最后 60 行:${NC}"
+        docker logs --tail 60 "${LITELLM_CONTAINER}" 2>/dev/null || true
+    fi
+}
+
+start_litellm_service() {
+    normalize_litellm_mode
+
+    if [ "$LITELLM_MODE" = "off" ]; then
+        LITELLM_STATUS="skipped: LITELLM_MODE=off"
+        echo -e "${YELLOW}⚠️ 已设置 LITELLM_MODE=off，跳过 LiteLLM${NC}"
+        return 0
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        LITELLM_STATUS="skipped: docker unavailable"
+        if [ "$LITELLM_MODE" = "required" ]; then
+            echo -e "${RED}❌ LITELLM_MODE=required，但 Docker 不可用${NC}"
+            return 1
+        fi
+        echo -e "${YELLOW}⚠️ Docker 不可用，跳过 LiteLLM；Bot 主服务继续启动${NC}"
+        return 0
+    fi
+
+    if [ ! -f "$LITELLM_CONFIG" ]; then
+        LITELLM_STATUS="skipped: missing litellm_config.yaml"
+        if [ "$LITELLM_MODE" = "required" ]; then
+            echo -e "${RED}❌ LITELLM_MODE=required，但缺少 ${LITELLM_CONFIG}${NC}"
+            return 1
+        fi
+        echo -e "${YELLOW}⚠️ 缺少 ${LITELLM_CONFIG}，跳过 LiteLLM；Bot 主服务继续启动${NC}"
+        return 0
+    fi
+
+    echo -e "${GREEN}🤖 正在启动 LiteLLM AI 服务...${NC}"
+    docker rm -f "${LITELLM_CONTAINER}" > /dev/null 2>&1 || true
+
+    local gemini_key="${GEMINI_API_KEY:-}"
+    if [ -z "$gemini_key" ] && [ -f "$ENV_FILE" ]; then
+        gemini_key="$(grep "^GEMINI_API_KEY=" "$ENV_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")"
+    fi
+
+    local docker_args=(
+        docker run -d
+        --name "${LITELLM_CONTAINER}"
+        --restart unless-stopped
+        -p "${LITELLM_PORT}:4000"
+        -v "${LITELLM_CONFIG}:/app/config.yaml:ro"
+        -e "GEMINI_API_KEY=${gemini_key}"
+    )
+
+    if [ -f "$GOOGLE_CREDENTIALS_PATH" ]; then
+        docker_args+=(
+            -v "${GOOGLE_CREDENTIALS_PATH}:/app/Google_api/tgbot-490920-05d1ad1b3310.json:ro"
+            -e "GOOGLE_APPLICATION_CREDENTIALS=/app/Google_api/tgbot-490920-05d1ad1b3310.json"
+        )
+    else
+        echo -e "${YELLOW}⚠️ 未找到 Google 凭据文件，LiteLLM 将不挂载 GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_CREDENTIALS_PATH}${NC}"
+    fi
+
+    docker_args+=(
+        ghcr.io/berriai/litellm:main-latest
+        --config /app/config.yaml
+        --host 0.0.0.0
+    )
+
+    if ! "${docker_args[@]}" > /dev/null 2>&1; then
+        LITELLM_STATUS="failed: docker run"
+        show_litellm_logs
+        if [ "$LITELLM_MODE" = "required" ]; then
+            echo -e "${RED}❌ LiteLLM Docker 容器创建失败${NC}"
+            return 1
+        fi
+        echo -e "${YELLOW}⚠️ LiteLLM Docker 容器创建失败，Bot 主服务继续启动${NC}"
+        return 0
+    fi
+
+    sleep 3
+    if docker ps -q --filter "name=${LITELLM_CONTAINER}" | grep -q . 2>/dev/null; then
+        LITELLM_STATUS="running: http://localhost:${LITELLM_PORT}"
+        echo -e "${GREEN}✅ LiteLLM 容器已启动 (端口: ${LITELLM_PORT})${NC}"
+        return 0
+    fi
+
+    LITELLM_STATUS="failed: container exited"
+    show_litellm_logs
+    if [ "$LITELLM_MODE" = "required" ]; then
+        echo -e "${RED}❌ LiteLLM 容器启动失败${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}⚠️ LiteLLM 容器启动失败，Bot 主服务继续启动${NC}"
+    return 0
 }
 
 start_backend_with_env_validation() {
@@ -535,13 +727,13 @@ start_backend_with_env_validation() {
 echo -e "${YELLOW}开始执行自动化隧道启动流程...${NC}"
 
 cd "$PROJECT_DIR" || exit 1
-mkdir -p "$LOG_APP_DIR" "$LOG_BACKEND_DIR" "$LOG_TUNNEL_DIR" "$LOG_CLOUDFLARED_DIR" "$LOG_RUNTIME_DIR" "$LOG_AI_DIR"
-warn_if_system_cf_tunnel_running
+mkdir -p "$LOG_APP_DIR" "$LOG_BACKEND_DIR" "$LOG_TUNNEL_DIR" "$LOG_CLOUDFLARED_DIR" "$LOG_RUNTIME_DIR" "$LOG_AI_DIR" "$LOG_LITELLM_DIR"
 
-if [ ! -f "$ENV_FILE" ]; then
-    echo -e "${RED}❌ 未找到 .env 文件: ${PROJECT_DIR}/${ENV_FILE}${NC}"
+if ! validate_prerequisites; then
+    echo -e "${RED}❌ 启动前检查失败，已中止${NC}"
     exit 1
 fi
+warn_if_system_cf_tunnel_running
 
 # 1. 清理旧进程
 echo -e "${YELLOW}🧹 清理旧的 Cloudflare、Python 和 LiteLLM 进程...${NC}"
@@ -550,7 +742,9 @@ if ! kill_backend_processes; then
     echo -e "${RED}❌ 无法确认旧后端已停止，重启中止${NC}"
     exit 1
 fi
-docker rm -f "${LITELLM_CONTAINER}" > /dev/null 2>&1 || true
+if command -v docker >/dev/null 2>&1; then
+    docker rm -f "${LITELLM_CONTAINER}" > /dev/null 2>&1 || true
+fi
 sleep 2
 
 if pgrep cloudflared > /dev/null 2>&1; then
@@ -565,9 +759,9 @@ ensure_no_stale_cloudflared_80 || exit 1
 echo -e "${YELLOW}🔨 构建前端...${NC}"
 cd "${PROJECT_DIR}/frontend" || exit 1
 
-# 检查node_modules是否存在
-if [ ! -d "node_modules" ]; then
-    echo -e "${YELLOW}📦 安装前端依赖...${NC}"
+# 检查依赖是否完整；node_modules 目录存在但 .bin/vite 缺失时也需要修复
+if [ ! -d "node_modules" ] || [ ! -x "node_modules/.bin/vite" ] || [ "package.json" -nt "node_modules/.package-lock.json" ] || [ "package-lock.json" -nt "node_modules/.package-lock.json" ]; then
+    echo -e "${YELLOW}📦 安装/修复前端依赖...${NC}"
     npm install || {
         echo -e "${RED}❌ 前端依赖安装失败${NC}"
         exit 1
@@ -593,47 +787,12 @@ cd "$PROJECT_DIR" || exit 1
 
 sync_merchants_to_supabase_if_enabled || exit 1
 
-# 2. 启动 LiteLLM 服务
-echo -e "${GREEN}🤖 正在启动 LiteLLM AI 服务...${NC}"
-if ! command -v docker &>/dev/null; then
-    echo -e "${RED}❌ Docker 未安装或不在 PATH 中！${NC}"
+# 3. 启动 LiteLLM 服务（默认非阻断）
+if ! start_litellm_service; then
     exit 1
 fi
 
-if [ ! -f "${PROJECT_DIR}/litellm_config.yaml" ]; then
-    echo -e "${RED}❌ litellm_config.yaml 配置文件不存在！${NC}"
-    exit 1
-fi
-
-GEMINI_API_KEY=$(grep GEMINI_API_KEY .env 2>/dev/null | cut -d= -f2)
-
-docker run -d \
-    --name "${LITELLM_CONTAINER}" \
-    --restart unless-stopped \
-    -p "${LITELLM_PORT}:4000" \
-    -v "${PROJECT_DIR}/litellm_config.yaml:/app/config.yaml:ro" \
-    -v "${PROJECT_DIR}/Google api/tgbot-490920-05d1ad1b3310.json:/app/Google_api/tgbot-490920-05d1ad1b3310.json:ro" \
-    -e "GEMINI_API_KEY=${GEMINI_API_KEY}" \
-    -e "GOOGLE_APPLICATION_CREDENTIALS=/app/Google_api/tgbot-490920-05d1ad1b3310.json" \
-    ghcr.io/berriai/litellm:main-latest \
-    --config /app/config.yaml \
-    --host 0.0.0.0 > /dev/null 2>&1
-
-if [ $? -ne 0 ]; then
-    echo -e "${RED}❌ LiteLLM Docker 容器创建失败！${NC}"
-    exit 1
-fi
-
-sleep 3
-if docker ps -q --filter "name=${LITELLM_CONTAINER}" | grep -q . 2>/dev/null; then
-    echo -e "${GREEN}✅ LiteLLM 容器已启动 (端口: ${LITELLM_PORT})${NC}"
-else
-    echo -e "${RED}❌ LiteLLM 容器启动失败！${NC}"
-    echo -e "${YELLOW}查看日志: docker logs ${LITELLM_CONTAINER}${NC}"
-    exit 1
-fi
-
-# 3. 启动隧道并获取域名（可用即用，不可用重试）
+# 4. 启动隧道并获取域名（可用即用，不可用重试）
 if ! start_tunnel_and_get_url; then
     echo -e "${RED}❌ 未能获取 Cloudflare 可用域名（重试 ${TUNNEL_MAX_RETRIES} 次后仍失败）${NC}"
     echo -e "${YELLOW}查看日志: tail -80 ${LOG_FILE}${NC}"
@@ -643,18 +802,19 @@ fi
 
 echo -e "${GREEN}✨ 获取到新域名: ${NEW_URL}${NC}"
 
-# 4. 写入 .env + 导出当前环境
+# 5. 写入 .env + 导出当前环境
 echo -e "${YELLOW}📝 正在写入 .env 中的 WEB_BASE_URL / FRONTEND_URL...${NC}"
 write_env_url "$NEW_URL"
 echo -e "${GREEN}✅ .env 与当前 shell 环境已同步新域名${NC}"
 
-# 5. 启动后端并校验生效
+# 6. 启动后端并校验生效
 kill_backend_processes
 if ! start_backend_with_env_validation "$NEW_URL"; then
+    show_backend_log_tail 100
     exit 1
 fi
 
-# 6. 再次确认隧道目标进程没有偏移到 80 端口
+# 7. 再次确认隧道目标进程没有偏移到 80 端口
 ensure_no_stale_cloudflared_80 || exit 1
 ensure_only_expected_cloudflared_target || exit 1
 
@@ -662,8 +822,13 @@ echo -e "${GREEN}==========================================${NC}"
 echo -e "${GREEN}🎉 全部启动成功！${NC}"
 echo -e "${GREEN}🌐 访问地址: ${NEW_URL}${NC}"
 echo -e "${GREEN}📱 Mini App: Telegram 聊天底部菜单栏 → 🏪 控制台${NC}"
-echo -e "${GREEN}🤖 LiteLLM: http://localhost:${LITELLM_PORT}${NC}"
+echo -e "${GREEN}🔌 后端: http://localhost:${TUNNEL_PORT}${NC}"
+echo -e "${GREEN}🤖 LiteLLM: ${LITELLM_STATUS}${NC}"
 echo -e "${GREEN}📄 后端日志: ${BACKEND_LOG}${NC}"
+echo -e "${GREEN}📄 systemd stdout: ${BOT_STDOUT_LOG}${NC}"
+echo -e "${GREEN}📄 systemd stderr: ${BOT_STDERR_LOG}${NC}"
+echo -e "${GREEN}📄 runtime stdout: ${BOT_RUNTIME_STDOUT_LOG}${NC}"
+echo -e "${GREEN}📄 runtime stderr: ${BOT_RUNTIME_STDERR_LOG}${NC}"
 echo -e "${GREEN}📄 隧道日志: ${LOG_FILE}${NC}"
 echo -e "${GREEN}📄 AI日志: docker logs ${LITELLM_CONTAINER}${NC}"
 echo -e "${GREEN}==========================================${NC}"
