@@ -17,11 +17,17 @@ AD_KEYWORDS: List[str] = [
     "内部消息", "内幕", "必涨", "抄底",
     # 违规平台
     "电报群", "telegram群", "飞机群", "梯子",
+    # 灰黑产/资源推广常见话术
+    "黑u", "黒u", "假钞", "接码", "料子", "一手料", "出料", "数据",
+    "ssn", "护照", "驾照", "身份证", "企业套件", "实名", "三件套",
+    "苹果pay", "apple pay", "绑好的", "网银", "鱼", "菠菜", "开云",
+    "招商", "注册赠送", "彩金", "日入", "收益日结", "代刷", "广告截图",
 ]
 
 _URL_PATTERN = re.compile(r"https?://\S+")
 _REPEAT_PATTERN = re.compile(r"(.)\1{5,}")
 _PHONE_LIKE_PATTERN = re.compile(r"\d{5,11}")
+_TG_CONTACT_PATTERN = re.compile(r"@[A-Za-z0-9_]{4,32}")
 
 
 def detect_advertising_signals(
@@ -53,6 +59,11 @@ def detect_advertising_signals(
         ad_score += min(len(matched_keywords) * 15, 45)
         findings.append(f"命中广告关键词: {', '.join(matched_keywords)}")
 
+    tg_contacts = _TG_CONTACT_PATTERN.findall(raw)
+    if tg_contacts:
+        ad_score += 20 if len(tg_contacts) == 1 else 30
+        findings.append(f"包含 Telegram 联系方式: {', '.join(tg_contacts[:5])}")
+
     urls = _URL_PATTERN.findall(raw)
     if len(urls) >= 3:
         ad_score += 20
@@ -72,6 +83,11 @@ def detect_advertising_signals(
     if len(phone_like) >= 2:
         ad_score += 15
         findings.append("发现多个疑似电话号码/ID")
+
+    promo_phrases = sum(1 for kw in ("长期", "稳定", "源头", "货源", "需要的", "滴滴", "主营", "出售", "可挑", "全网") if kw in raw)
+    if promo_phrases >= 2:
+        ad_score += 20
+        findings.append("命中多处资源/交易推广话术")
 
     is_ad = ad_score >= 40
     confidence = "high" if ad_score >= 60 else "medium" if ad_score >= 40 else "low"
@@ -93,4 +109,3 @@ def detect_advertising_signals(
         "context_type": context_type,
         "recommendation": recommendation,
     }
-

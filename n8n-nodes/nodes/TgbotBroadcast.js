@@ -1,6 +1,7 @@
 /**
  * TGBot Broadcast Node
  */
+const http = require("http");
 const https = require("https");
 
 module.exports = {
@@ -42,7 +43,7 @@ module.exports = {
       required: true,
     },
   ],
-  async execute(this) {
+  async execute() {
     const items = this.getInputData();
     const creds = await this.getCredentials("tgbotApi");
     const { baseUrl, apiKey } = creds;
@@ -52,31 +53,82 @@ module.exports = {
       const targetId = this.getNodeParameter("targetId", i);
       const message = this.getNodeParameter("message", i);
       
-      let url = baseUrl + "/api/broadcast/unified";
+      const targets = await this.resolveTargets(baseUrl, apiKey, targetType, targetId);
       const body = {
-        target_type: targetType,
-        target_id: targetId || undefined,
         content: message,
+        user_ids: targets.user_ids,
+        chat_ids: targets.chat_ids,
+        retry_count: 1,
       };
       
       const response = await this.makeRequest({
-        url: url, method: "POST", body: body,
+        url: baseUrl + "/api/broadcast/unified", method: "POST", body: body,
         headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
       });
       
-      items[i].json = { success: true, sent_count: response.sent_count || 0, failed: response.failed || [] };
+      const summary = response.summary || {};
+      items[i].json = {
+        success: response.status === "ok",
+        sent_count: summary.success || 0,
+        failed: response.failed_items || summary.failed_items || [],
+        summary,
+      };
     }
     return [items];
+  },
+  async resolveTargets(baseUrl, apiKey, targetType, targetId) {
+    if (targetType === "user") {
+      if (!targetId) throw new Error("Target ID is required for Specific User");
+      return { user_ids: [Number(targetId)], chat_ids: [] };
+    }
+    if (targetType === "group") {
+      if (!targetId) throw new Error("Target ID is required for Specific Group");
+      return { user_ids: [], chat_ids: [Number(targetId)] };
+    }
+    if (targetType === "users") {
+      const response = await this.makeRequest({
+        url: baseUrl + "/api/users",
+        method: "GET",
+        headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
+      });
+      const userIds = (response.data || [])
+        .map(u => Number(u.user_id || u.userid || u.id))
+        .filter(Boolean);
+      return { user_ids: [...new Set(userIds)], chat_ids: [] };
+    }
+
+    const response = await this.makeRequest({
+      url: baseUrl + "/api/broadcast/targets?chat_types=group,supergroup,channel",
+      method: "GET",
+      headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
+    });
+    const chatIds = (response.data || [])
+      .map(t => Number(t.chat_id || t.id))
+      .filter(Boolean);
+    return { user_ids: [], chat_ids: [...new Set(chatIds)] };
   },
   makeRequest(options) {
     return new Promise((resolve, reject) => {
       const url = new URL(options.url);
-      const req = https.request({
-        hostname: url.hostname, port: 443, path: url.pathname, method: options.method, headers: options.headers,
+      const client = url.protocol === "http:" ? http : https;
+      const req = client.request({
+        hostname: url.hostname,
+        port: url.port || (url.protocol === "http:" ? 80 : 443),
+        path: url.pathname + url.search,
+        method: options.method,
+        headers: options.headers,
       }, (res) => {
         let data = "";
         res.on("data", c => data += c);
-        res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve({}); } });
+        res.on("end", () => {
+          let parsed;
+          try { parsed = JSON.parse(data); } catch { parsed = {}; }
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`TGBot API ${res.statusCode}: ${data}`));
+            return;
+          }
+          resolve(parsed);
+        });
       });
       req.on("error", reject);
       if (options.body) req.write(JSON.stringify(options.body));

@@ -11,6 +11,8 @@
 module.exports = function() {
   const nodes = [
     require('./nodes/TgbotAiAgent'),
+    require('./nodes/TgbotTelegramSdkQuery'),
+    require('./nodes/TgbotAdCluster'),
     require('./nodes/TgbotAdDetect'),
     require('./nodes/TgbotAdCrud'),
     require('./nodes/TgbotBroadcast'),

@@ -20,6 +20,9 @@ DANGEROUS_ACTIONS = {
     "broadcast_message",         # 当前工具名
     # 数据修改
     "delete_data",              # 删除数据
+    "delete_ad_message",        # 删除广告群消息
+    "delete_ad_cluster",        # 批量删除广告聚类消息
+    "ban_ad_senders",           # 封禁广告发送者
     "reverse_ledger",           # 红字冲销
     "reconcile_ledger",         # 核销账目
     "skill_manage",             # Skill 配置写操作

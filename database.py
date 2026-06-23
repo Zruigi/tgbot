@@ -552,6 +552,15 @@ async def init_db():
         if 'ad_findings' not in gm_columns:
             await db.execute("ALTER TABLE group_messages ADD COLUMN ad_findings TEXT DEFAULT NULL")
             logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_findings 字段")
+        if 'ad_cluster_id' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN ad_cluster_id TEXT DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_cluster_id 字段")
+        if 'ad_checked_at' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN ad_checked_at DATETIME DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_checked_at 字段")
+        if 'ad_action_status' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN ad_action_status TEXT DEFAULT 'none'")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_action_status 字段")
 
         # 检查并添加缺失的列 (group_members 迁移 - 验证字段)
         cursor = await db.execute("PRAGMA table_info(group_members)")
@@ -570,6 +579,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_query ON group_messages(group_id, timestamp DESC)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_ts ON group_messages(group_id, message_ts DESC)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_ad ON group_messages(group_id, is_advertising, ad_score DESC)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_ad_cluster ON group_messages(ad_cluster_id)")
         await db.execute(
             """
             DELETE FROM group_messages
@@ -583,6 +593,29 @@ async def init_db():
             """
         )
         await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_group_msg_unique_tg ON group_messages(group_id, tg_msg_id) WHERE tg_msg_id IS NOT NULL")
+
+        # 17b. Telegram SDK 权限/元数据快照表
+        # 只记录官方 Bot API 可校验的元数据，不把它当作消息历史来源。
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS telegram_chat_capability_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                tenant_id TEXT DEFAULT 'default',
+                chat_type TEXT DEFAULT NULL,
+                title TEXT DEFAULT NULL,
+                username TEXT DEFAULT NULL,
+                member_count INTEGER DEFAULT NULL,
+                admin_count INTEGER DEFAULT NULL,
+                bot_status TEXT DEFAULT NULL,
+                bot_permissions_json TEXT DEFAULT NULL,
+                history_fetch_supported BOOLEAN DEFAULT 0,
+                source TEXT DEFAULT 'telegram_bot_api',
+                last_error TEXT DEFAULT NULL,
+                last_checked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, tenant_id)
+            )
+        ''')
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_tg_cap_snap_tenant ON telegram_chat_capability_snapshots(tenant_id)")
 
         # 18. group_address_hits 表（群内地址自动识别去重）
         await db.execute('''
@@ -660,6 +693,15 @@ async def init_db():
                 if 'ad_findings' not in gm_columns:
                     logger.info("迁移 group_messages: 新增 ad_findings 列")
                     await db.execute("ALTER TABLE group_messages ADD COLUMN ad_findings TEXT DEFAULT NULL")
+                if 'ad_cluster_id' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 ad_cluster_id 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN ad_cluster_id TEXT DEFAULT NULL")
+                if 'ad_checked_at' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 ad_checked_at 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN ad_checked_at DATETIME DEFAULT NULL")
+                if 'ad_action_status' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 ad_action_status 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN ad_action_status TEXT DEFAULT 'none'")
                 await db.execute("UPDATE group_messages SET message_ts = CAST(strftime('%s', timestamp) AS INTEGER) WHERE message_ts IS NULL OR message_ts = 0")
 
             # 1. 检查 tracked_groups 列
@@ -2463,6 +2505,72 @@ async def get_tracked_group_tenant_id(group_id: int) -> Optional[str]:
                 return None
             tenant_id = row[0]
             return str(tenant_id).strip() if tenant_id is not None else None
+
+
+async def upsert_telegram_chat_capability_snapshot(
+    *,
+    chat_id: int,
+    tenant_id: Optional[str] = None,
+    chat_type: Optional[str] = None,
+    title: Optional[str] = None,
+    username: Optional[str] = None,
+    member_count: Optional[int] = None,
+    admin_count: Optional[int] = None,
+    bot_status: Optional[str] = None,
+    bot_permissions: Optional[Union[str, Dict[str, Any]]] = None,
+    history_fetch_supported: bool = False,
+    source: str = "telegram_bot_api",
+    last_error: Optional[str] = None,
+) -> bool:
+    """缓存 Telegram Bot API 能力快照；不存消息正文。"""
+    if isinstance(bot_permissions, str):
+        permissions_text = bot_permissions
+    else:
+        try:
+            permissions_text = json.dumps(bot_permissions or {}, ensure_ascii=False)
+        except Exception:
+            permissions_text = "{}"
+
+    normalized_tenant = _normalize_tenant_id(tenant_id) or await get_tracked_group_tenant_id(chat_id) or 'default'
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT INTO telegram_chat_capability_snapshots (
+                chat_id, tenant_id, chat_type, title, username, member_count, admin_count,
+                bot_status, bot_permissions_json, history_fetch_supported, source,
+                last_error, last_checked_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(chat_id, tenant_id) DO UPDATE SET
+                chat_type=excluded.chat_type,
+                title=excluded.title,
+                username=excluded.username,
+                member_count=excluded.member_count,
+                admin_count=excluded.admin_count,
+                bot_status=excluded.bot_status,
+                bot_permissions_json=excluded.bot_permissions_json,
+                history_fetch_supported=excluded.history_fetch_supported,
+                source=excluded.source,
+                last_error=excluded.last_error,
+                last_checked_at=CURRENT_TIMESTAMP
+            """,
+            (
+                int(chat_id),
+                normalized_tenant,
+                chat_type,
+                title,
+                username,
+                member_count,
+                admin_count,
+                bot_status,
+                permissions_text,
+                1 if history_fetch_supported else 0,
+                source,
+                last_error,
+            ),
+        )
+        await db.commit()
+        return True
 
 
 async def upsert_tracked_group(group_id: int, title: str, tenant_id: Optional[str] = None):

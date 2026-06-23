@@ -49,6 +49,103 @@ for k in KEYWORD_PROFILE_TAGS.keys():
     DEFAULT_KEYWORDS.extend(k.split('|'))
 
 
+def _message_content_payload(message) -> dict:
+    msg_type = 'text'
+    media_file_id = None
+    msg_content = message.text or message.caption or ''
+
+    if message.photo:
+        msg_type = 'photo'
+        media_file_id = message.photo[-1].file_id
+        if not msg_content:
+            msg_content = '[图片]'
+    elif message.animation:
+        msg_type = 'animation'
+        media_file_id = message.animation.file_id
+        if not msg_content:
+            msg_content = '[动图]'
+    elif message.sticker:
+        msg_type = 'sticker'
+        media_file_id = message.sticker.file_id
+        if not msg_content:
+            msg_content = f"[表情包] {message.sticker.emoji or ''}".strip()
+    elif message.video:
+        msg_type = 'video'
+        media_file_id = message.video.file_id
+        if not msg_content:
+            msg_content = '[视频]'
+    elif message.voice:
+        msg_type = 'voice'
+        media_file_id = message.voice.file_id
+        if not msg_content:
+            msg_content = '[语音]'
+    elif message.audio:
+        msg_type = 'audio'
+        media_file_id = message.audio.file_id
+        if not msg_content:
+            msg_content = '[音频]'
+    elif message.document:
+        msg_type = 'document'
+        media_file_id = message.document.file_id
+        if not msg_content:
+            msg_content = f"[文件] {message.document.file_name or ''}".strip()
+    elif not msg_content:
+        msg_type = 'media'
+        msg_content = f"[{message.effective_attachment.__class__.__name__ if message.effective_attachment else '媒体'}]"
+
+    return {"msg_type": msg_type, "file_id": media_file_id, "content": msg_content}
+
+
+async def _emit_n8n_message_hook(*, event_type: str, chat, message, content: str, tenant_id: Optional[str], enabled: bool) -> None:
+    if not enabled:
+        return
+    sender_id = None
+    sender_username = None
+    if message.from_user:
+        sender_id = message.from_user.id
+        sender_username = message.from_user.username
+    elif message.sender_chat:
+        sender_id = message.sender_chat.id
+        sender_username = getattr(message.sender_chat, "username", None)
+
+    payload = {
+        "event": event_type,
+        "tenant_id": tenant_id or "default",
+        "chat_id": chat.id,
+        "group_id": chat.id,
+        "chat_title": chat.title or "",
+        "chat_type": chat.type,
+        "tg_msg_id": message.message_id,
+        "idempotency_key": f"{tenant_id or 'default'}:{chat.id}:{message.message_id}",
+        "message_ts": int(message.date.timestamp()) if message.date else None,
+        "content": content,
+        "sender_user_id": sender_id,
+        "sender_username": sender_username,
+        "sender_type": "channel" if message.sender_chat else ("bot" if message.from_user and message.from_user.is_bot else "user"),
+        "source": "telegram_update",
+    }
+
+    if getattr(config, "AD_PIPELINE_ENABLED", False):
+        try:
+            from services.ad_pipeline import get_ad_pipeline
+            await get_ad_pipeline().upsert_event(payload, compute_embedding=False)
+        except Exception as exc:
+            logger.debug("广告管线事件同步失败: %s", exc)
+
+    try:
+        webhook_url = (
+            await database.get_admin_setting("n8n_group_message_webhook_url", "")
+            or getattr(config, "N8N_GROUP_MESSAGE_WEBHOOK_URL", "")
+        )
+        webhook_url = str(webhook_url or "").strip()
+        if not webhook_url:
+            return
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(webhook_url, json=payload)
+    except Exception as exc:
+        logger.debug("n8n 消息 hook 触发失败: %s", exc)
+
+
 async def _get_group_config(group_id: int) -> dict:
     """获取群组配置（带缓存逻辑）"""
     if group_id in _group_config_cache:
@@ -369,49 +466,14 @@ async def track_group_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         
         # 2026 规格：如果群组已开启监听，则记录消息历史（用于“爬取最近50条消息”类似需求）
         group_cfg = await _get_group_config(chat.id)
+        tenant_id = await database.get_tracked_group_tenant_id(chat.id)
+        _avatar = None
+        msg_content = message.text or message.caption or ''
         if group_cfg["is_monitored"]:
-            msg_type = 'text'
-            media_file_id = None
-            msg_content = message.text or message.caption or ''
-
-            if message.photo:
-                msg_type = 'photo'
-                media_file_id = message.photo[-1].file_id
-                if not msg_content:
-                    msg_content = '[图片]'
-            elif message.animation:
-                msg_type = 'animation'
-                media_file_id = message.animation.file_id
-                if not msg_content:
-                    msg_content = '[动图]'
-            elif message.sticker:
-                msg_type = 'sticker'
-                media_file_id = message.sticker.file_id
-                if not msg_content:
-                    msg_content = f"[表情包] {message.sticker.emoji or ''}".strip()
-            elif message.video:
-                msg_type = 'video'
-                media_file_id = message.video.file_id
-                if not msg_content:
-                    msg_content = '[视频]'
-            elif message.voice:
-                msg_type = 'voice'
-                media_file_id = message.voice.file_id
-                if not msg_content:
-                    msg_content = '[语音]'
-            elif message.audio:
-                msg_type = 'audio'
-                media_file_id = message.audio.file_id
-                if not msg_content:
-                    msg_content = '[音频]'
-            elif message.document:
-                msg_type = 'document'
-                media_file_id = message.document.file_id
-                if not msg_content:
-                    msg_content = f"[文件] {message.document.file_name or ''}".strip()
-            elif not msg_content:
-                msg_type = 'media'
-                msg_content = f"[{message.effective_attachment.__class__.__name__ if message.effective_attachment else '媒体'}]"
+            payload = _message_content_payload(message)
+            msg_type = payload["msg_type"]
+            media_file_id = payload["file_id"]
+            msg_content = payload["content"]
 
             sender_type = 'user'
             if message.sender_chat:
@@ -445,7 +507,6 @@ async def track_group_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     logger.debug("广告识别失败: %s", ad_ex)
 
             # 获取头像（带缓存，每用户只调一次 get_chat）
-            _avatar = None
             if message.from_user:
                 _uid = message.from_user.id
                 if _uid not in _avatar_cache:
@@ -474,6 +535,16 @@ async def track_group_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 ad_score=int(ad_flags.get("ad_score", 0) or 0),
                 ad_confidence=str(ad_flags.get("confidence") or "low"),
                 ad_findings=ad_flags.get("findings") or [],
+                tenant_id=tenant_id,
+            )
+
+            await _emit_n8n_message_hook(
+                event_type="group_message",
+                chat=chat,
+                message=message,
+                content=msg_content,
+                tenant_id=tenant_id,
+                enabled=bool(group_cfg.get("is_monitored")),
             )
 
         # 始终把发言人写入 group_members（即使未开启监听，也可用于“成员管理”弹窗展示）
@@ -514,19 +585,65 @@ async def track_group_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def track_channel_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """记录机器人可见的频道，用于广播目标选择"""
+    """记录机器人可见的频道与频道 post，用于广播目标选择和 Agent 查询证据。"""
     message = update.effective_message
     if not message or not message.chat or message.chat.type != "channel":
         return
 
     chat = message.chat
     try:
+        existing_tenant_id = await database.get_broadcast_target_tenant_id(chat.id)
         await database.upsert_broadcast_target(
             chat_id=chat.id,
             chat_title=chat.title or "未命名频道",
             chat_type="channel",
             chat_username=getattr(chat, "username", None),
             can_broadcast=True,
+            tenant_id=existing_tenant_id,
+        )
+        tenant_id = await database.get_broadcast_target_tenant_id(chat.id)
+        payload = _message_content_payload(message)
+        text_for_ad = (message.text or message.caption or "").strip()
+        ad_flags = {
+            "is_advertising": False,
+            "ad_score": 0,
+            "ad_confidence": "low",
+            "ad_findings": [],
+        }
+        if text_for_ad:
+            try:
+                ad_flags = detect_advertising_signals(
+                    text=text_for_ad,
+                    context_type="channel_message",
+                )
+            except Exception as ad_ex:
+                logger.debug("频道广告识别失败: %s", ad_ex)
+
+        await database.save_group_message(
+            group_id=chat.id,
+            user_id=message.sender_chat.id if message.sender_chat else chat.id,
+            username=getattr(message.sender_chat, "username", None) or getattr(chat, "username", None) or "Channel",
+            content=payload["content"],
+            msg_type=payload["msg_type"],
+            file_id=payload["file_id"],
+            tg_msg_id=message.message_id,
+            sender_type="channel",
+            quoted_tg_msg_id=message.reply_to_message.message_id if message.reply_to_message else None,
+            quoted_text=(message.reply_to_message.text or message.reply_to_message.caption) if message.reply_to_message else None,
+            message_ts=int(message.date.timestamp()) if message.date else None,
+            is_advertising=bool(ad_flags.get("is_advertising")),
+            ad_score=int(ad_flags.get("ad_score", 0) or 0),
+            ad_confidence=str(ad_flags.get("confidence") or "low"),
+            ad_findings=ad_flags.get("findings") or [],
+            tenant_id=tenant_id,
+        )
+        await _emit_n8n_message_hook(
+            event_type="channel_message",
+            chat=chat,
+            message=message,
+            content=payload["content"],
+            tenant_id=tenant_id,
+            enabled=True,
         )
     except Exception as e:
         logger.debug("track_channel_seen: %s", e)

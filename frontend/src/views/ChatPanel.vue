@@ -292,6 +292,11 @@ import { isLikelyTgUsername, openTgUserProfile, tgUserProfileHref, tgUserLinkLab
 const chatStore = useChatStore()
 const themeStore = useThemeStore()
 const router = useRouter()
+const AI_ASSISTANT_USER_ID = -99999
+
+function isAiAssistantUserId(userId: unknown): boolean {
+  return Number(userId) === AI_ASSISTANT_USER_ID
+}
 
 // ★ AI 正在输入/输出状态（独立于消息状态，用于全局UI提示）
 const aiTyping = ref(false)
@@ -330,7 +335,7 @@ const normalizedUsers = computed(() =>
 
 // Agent Assistant contact - fixed entry
 const agentAssistantContact = {
-  from_userid: -99999,
+  from_userid: AI_ASSISTANT_USER_ID,
   from_username: 'Agent助手',
   username: 'agent_assistant',
   is_ai_assistant: true,
@@ -351,12 +356,16 @@ const filteredUsers = computed(() => {
 })
 
 const selectedUserRecord = computed(() =>
-  normalizedUsers.value.find((u: any) =>
-    Number(u.from_userid || u.user_id) === Number(chatStore.selectedUserId)
-  ) || null
+  isAiAssistantUserId(chatStore.selectedUserId)
+    ? agentAssistantContact
+    : normalizedUsers.value.find((u: any) =>
+      Number(u.from_userid || u.user_id) === Number(chatStore.selectedUserId)
+    ) || null
 )
 
-const isSelectedAiAssistant = computed(() => Boolean(selectedUserRecord.value?.is_ai_assistant))
+const isSelectedAiAssistant = computed(() =>
+  isAiAssistantUserId(chatStore.selectedUserId) || Boolean(selectedUserRecord.value?.is_ai_assistant)
+)
 const chatBackgroundLayerStyle = computed(() => {
   const bg = themeStore.settings.chatBackground
   if (!bg) return null
@@ -512,6 +521,7 @@ async function fetchUsers() { await chatStore.fetchUsers() }
 // Polling: fetch page 1 and merge any new messages at the end
 async function pollLatestMessages() {
   if (!chatStore.selectedUserId) return
+  if (isSelectedAiAssistant.value) return
   try {
     const res = await fetch(`/api/messages/${chatStore.selectedUserId}?page=1`, {
       headers: authH(),
@@ -572,9 +582,14 @@ function upsertMessagesFromLatest(fresh: any[]) {
 
 async function selectUser(u: any) {
   // Handle Agent Assistant
-  if (u.is_ai_assistant || u.from_userid === -99999) {
-    chatStore.selectedUserId = -99999
+  if (u.is_ai_assistant || isAiAssistantUserId(u.from_userid)) {
+    chatStore.selectedUserId = AI_ASSISTANT_USER_ID
     chatStore.selectedUserName = 'Agent 助手'
+    chatStore.messages = []
+    msgPage.value = 1
+    hasMoreMessages.value = true
+    newMsgCount.value = 0
+    await fetchMessages()
     return
   }
   chatStore.selectedUserId = u.from_userid
@@ -720,6 +735,7 @@ function onMsgTouchEnd() {
 
 async function deleteMessage(msg: any) {
   if (!chatStore.selectedUserId || !msg.tg_msg_id) return
+  if (isSelectedAiAssistant.value) return
   if (!confirm('确定删除这条消息？')) return
   await fetch(`/api/messages/${chatStore.selectedUserId}/delete`, {
     method: 'POST', headers: authH(), keepalive: true,
@@ -947,6 +963,32 @@ async function sendMessageAsync(
       // ★ 显示全局"AI 正在输入..."状态
       aiTyping.value = true
       aiTypingText.value = ''
+      const aiHeartbeatMsgId = Date.now() + 3
+      const heartbeatTexts = [
+        '正在分析指令...',
+        '正在调用工具读取系统数据...',
+        '正在检查群/频道权限与消息证据...',
+        '正在等待模型整理结果...',
+      ]
+      let heartbeatIndex = 0
+      chatStore.messages = [...chatStore.messages, {
+        msg_id: aiHeartbeatMsgId,
+        from_userid: AI_ASSISTANT_USER_ID,
+        to_userid: 0,
+        content: heartbeatTexts[0],
+        timestamp: new Date().toISOString(),
+        status: 'thinking',
+        type: 'text',
+        msg_type: 'text',
+      }]
+      const heartbeatTimer = setInterval(() => {
+        heartbeatIndex = Math.min(heartbeatIndex + 1, heartbeatTexts.length - 1)
+        const nextText = heartbeatTexts[heartbeatIndex]
+        aiTypingText.value = nextText
+        chatStore.messages = chatStore.messages.map((m: any) =>
+          m.msg_id === aiHeartbeatMsgId ? { ...m, content: nextText, timestamp: new Date().toISOString() } : m
+        )
+      }, 1800)
 
       try {
         // AI 请求统一走独立路由，避免与 /api/messages/{user_id} 发生匹配歧义
@@ -996,6 +1038,7 @@ async function sendMessageAsync(
 
           // ★ AI 回复文本缓存（用于"正在输出中"预览）
           aiTypingText.value = aiReplyText
+          chatStore.messages = chatStore.messages.filter((m: any) => m.msg_id !== aiHeartbeatMsgId)
           
           const aiMsg = {
             msg_id: Date.now() + 1,
@@ -1019,6 +1062,7 @@ async function sendMessageAsync(
         } else if (!aiReplyRaw && !aiMediaUrlFromServer && ok) {
           // 成功但无回复内容
           console.warn('[发送消息] AI 返回成功但无回复内容')
+          chatStore.messages = chatStore.messages.filter((m: any) => m.msg_id !== aiHeartbeatMsgId)
           chatStore.messages = [...chatStore.messages, {
             msg_id: Date.now() + 2,
             from_userid: userId, to_userid: 0,
@@ -1030,6 +1074,7 @@ async function sendMessageAsync(
         }
       } catch (err: any) {
         console.error('[发送消息] AI 请求异常:', err)
+        chatStore.messages = chatStore.messages.filter((m: any) => m.msg_id !== aiHeartbeatMsgId)
         // 标记为失败并显示具体错误
         chatStore.messages = chatStore.messages.map((m: any) =>
           m.msg_id === optimisticMsg.msg_id ? { ...m, status: 'failed' } : m
@@ -1046,6 +1091,7 @@ async function sendMessageAsync(
           type: 'text', msg_type: 'text'
         }]
       } finally {
+        clearInterval(heartbeatTimer)
         // ★ 无论成败，都关闭"正在输入中"状态
         aiTyping.value = false
       }
@@ -1141,6 +1187,10 @@ async function sendMessageAsync(
 
 async function markAsRead() {
   if (!chatStore.selectedUserId) return
+  if (isSelectedAiAssistant.value) {
+    newMsgCount.value = 0
+    return
+  }
   const uid = Number(chatStore.selectedUserId)
   const res = await fetch(`/api/mark_read/${uid}`, { method: 'POST', headers: authH(), keepalive: true })
   const data = await res.json().catch(() => ({ status: 'error' }))
@@ -1161,6 +1211,10 @@ async function markAsRead() {
 
 async function deleteChat() {
   if (!chatStore.selectedUserId || !confirm('确定清空记录？')) return
+  if (isSelectedAiAssistant.value) {
+    chatStore.messages = []
+    return
+  }
   await fetch(`/api/delete_chat/${chatStore.selectedUserId}`, { method: 'POST', headers: authH(), keepalive: true })
   chatStore.messages = []
 }

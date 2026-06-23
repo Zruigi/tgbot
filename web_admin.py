@@ -26,7 +26,6 @@ from urllib.parse import urlencode, quote, parse_qsl
 from html import escape
 from typing import Optional, Dict, Any
 from backend.repositories import merchant_repo
-from backend.app.api.ai import api_detect_advertising
 from services.secret_manager import SecretManager
 
 # OTP 一次性登录凭证存储: {otp: {token, expire_at, role, tenant_id, merchant_id, issued_for}}
@@ -34,6 +33,10 @@ _otp_store: Dict[str, dict] = {}
 
 # CSRF Token 存储 {csrf_token: expire_timestamp}
 _csrf_token_store: Dict[str, float] = {}
+
+# AI Agent 会话缓存。key = tenant/user/channel，value = {"ctx": AgentContext, "pending": AgentResponse}
+_ai_agent_sessions: Dict[str, Dict[str, Any]] = {}
+AI_ASSISTANT_USER_ID = int(os.getenv("AI_ASSISTANT_USER_ID", "-99999"))
 
 ENTRY_GRANT_TTL_SECONDS = 30 * 86400
 ENTRY_PROOF_COOKIE = 'entry_proof'
@@ -823,6 +826,23 @@ def _request_scope_context(request) -> Dict[str, Any]:
         'merchant_id': int(session.get('merchant_id')) if session.get('merchant_id') is not None else None,
         'is_merchant': role == 'merchant_owner' and bool(str(session.get('tenant_id') or '').strip()),
     }
+
+
+async def _resolve_ai_chat_counterpart_id(scope: Dict[str, Any]) -> int:
+    """Resolve the local admin/bot side used to persist the virtual Agent chat."""
+    if scope.get('is_merchant') and scope.get('merchant_id') is not None:
+        try:
+            async with aiosqlite.connect(database.DB_NAME) as db:
+                async with db.execute(
+                    "SELECT bot_id FROM merchants WHERE id = ? LIMIT 1",
+                    (int(scope['merchant_id']),),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row and row[0]:
+                        return int(row[0])
+        except Exception as exc:
+            logger.debug("resolve ai counterpart bot_id failed: %s", exc)
+    return int(config.ADMIN_ID)
 
 
 async def _resolve_business_window() -> Dict[str, Any]:
@@ -1641,6 +1661,9 @@ async def api_get_messages(request):
         page = int(request.query.get('page', 1))
         limit = 50
         offset = (page - 1) * limit
+
+        if user_id < 0 and user_id != AI_ASSISTANT_USER_ID:
+            return web.json_response({"status": "ok", "data": []})
         
         messages = await database.get_chat_history(
             user_id,
@@ -1776,6 +1799,11 @@ async def api_send_message(request):
     try:
         scope = _request_scope_context(request)
         user_id = int(request.match_info['user_id'])
+        if user_id < 0:
+            return web.json_response(
+                {"status": "error", "message": "虚拟助手会话请使用 /api/ai/chat"},
+                status=400,
+            )
         
         raw_input_text = ""
         reply_to_msg_id = None
@@ -2089,9 +2117,9 @@ async def _resolve_ai_pipeline_mode(tenant_id: str) -> str:
     if tenant_key:
         mode = await database.get_admin_setting(tenant_key, None)
     if not mode:
-        mode = await database.get_admin_setting('ai_pipeline_mode', 'legacy')
-    mode = str(mode or 'legacy').strip()
-    return mode if mode == 'legacy' else 'legacy'
+        mode = await database.get_admin_setting('ai_pipeline_mode', 'agent')
+    mode = str(mode or 'agent').strip().lower()
+    return mode if mode in {'agent', 'legacy'} else 'agent'
 
 
 async def api_get_ai_pipeline_mode(request):
@@ -2106,7 +2134,7 @@ async def api_get_ai_pipeline_mode(request):
             'data': {
                 'tenantId': tenant_id or 'platform',
                 'mode': mode,
-                'modes': ['legacy'],
+                'modes': ['agent', 'legacy'],
             },
         })
     except Exception as e:
@@ -2122,7 +2150,7 @@ async def api_set_ai_pipeline_mode(request):
         data = await request.json()
         tenant_id = str(data.get('tenantId') or data.get('tenant_id') or 'platform').strip() or 'platform'
         mode = str(data.get('mode') or '').strip()
-        if mode != 'legacy':
+        if mode not in {'agent', 'legacy'}:
             return web.json_response({'status': 'error', 'message': 'invalid pipeline mode'}, status=400)
 
         key = 'ai_pipeline_mode' if tenant_id == 'platform' else f'ai_pipeline_mode:{tenant_id}'
@@ -2132,17 +2160,136 @@ async def api_set_ai_pipeline_mode(request):
         return web.json_response({'status': 'error', 'message': str(e)}, status=500)
 
 
+async def _load_enabled_ai_custom_skills() -> list:
+    try:
+        rows = await database.list_ai_custom_skills(enabled_only=True)
+        if isinstance(rows, list):
+            return rows[:20]
+    except Exception as exc:
+        logger.debug("加载 AI 自定义技能失败: %s", exc)
+    return []
+
+
+def _agent_session_key(*, tenant_id: str, user_id: int, scope: Dict[str, Any]) -> str:
+    merchant_id = scope.get('merchant_id')
+    role = scope.get('role') or 'platform_admin'
+    return f"{tenant_id or 'platform'}:{role}:{merchant_id or ''}:{user_id}"
+
+
+def _is_agent_confirmation_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", str(text or "").strip().lower())
+    return normalized in {
+        "确认",
+        "确认执行",
+        "确认删除",
+        "继续",
+        "执行",
+        "yes",
+        "ok",
+        "confirm",
+    }
+
+
+async def _run_ai_agent_chat(
+    *,
+    user_id: int,
+    input_text: str,
+    model: str,
+    tenant_id: str,
+    scope: Dict[str, Any],
+):
+    from backend.app.services.ai_service import get_ai_service
+    from services.ai_agent.core import get_agent
+    from services.ai_agent.schema import AgentContext
+
+    async def llm_call(messages: list, model: str = ""):
+        return await get_ai_service().chat_messages(
+            messages=messages,
+            model=model or "gemini-2.5-flash-lite",
+        )
+
+    session_key = _agent_session_key(tenant_id=tenant_id, user_id=user_id, scope=scope)
+    session = _ai_agent_sessions.get(session_key)
+    custom_skills = await _load_enabled_ai_custom_skills()
+
+    if not session:
+        restored_history = []
+        try:
+            history_tenant_id = tenant_id if tenant_id != 'platform' else None
+            db_history = await database.get_chat_history(
+                user_id,
+                limit=12,
+                tenant_id=history_tenant_id,
+                merchant_id=scope.get('merchant_id'),
+            )
+            for row in db_history:
+                content = str(row.get('content') or '').strip()
+                if not content:
+                    continue
+                from_uid = int(row.get('from_userid') or 0)
+                role = 'assistant' if from_uid == int(user_id) else 'user'
+                restored_history.append({"role": role, "content": content[:3000]})
+        except Exception as hist_err:
+            logger.debug("恢复 AI Agent 历史失败: %s", hist_err)
+
+        ctx = AgentContext(
+            user_id=user_id,
+            channel='web_ai_chat',
+            sandbox_id=f"sbx_{tenant_id or 'platform'}_{user_id}",
+            metadata={
+                'tenant_id': tenant_id,
+                'merchant_id': scope.get('merchant_id'),
+                'role': scope.get('role'),
+                'custom_skills': custom_skills,
+            },
+            bot_instance=_bot_instance,
+            conversation_history=restored_history,
+        )
+        session = {'ctx': ctx, 'pending': None, 'updated_at': time.time()}
+        _ai_agent_sessions[session_key] = session
+    else:
+        ctx = session['ctx']
+        ctx.metadata['custom_skills'] = custom_skills
+        ctx.metadata['tenant_id'] = tenant_id
+        ctx.metadata['merchant_id'] = scope.get('merchant_id')
+        ctx.metadata['role'] = scope.get('role')
+        ctx.bot_instance = _bot_instance
+        session['updated_at'] = time.time()
+
+    # Soft cleanup to avoid unbounded growth.
+    if len(_ai_agent_sessions) > 300:
+        cutoff = time.time() - 6 * 3600
+        for key in list(_ai_agent_sessions.keys()):
+            if float(_ai_agent_sessions[key].get('updated_at') or 0) < cutoff:
+                _ai_agent_sessions.pop(key, None)
+
+    agent = get_agent(llm_call_fn=llm_call)
+    pending = session.get('pending')
+    if pending is not None and _is_agent_confirmation_text(input_text):
+        result = await agent.confirm_and_execute(pending, ctx)
+        session['pending'] = None
+        return result
+
+    result = await agent.process_message(input_text, ctx=ctx, model=model)
+    session['pending'] = result if result.requires_confirmation else None
+    return result
+
+
 async def api_ai_chat_bridge(request):
-    """Legacy AI chat endpoint."""
+    """AI chat endpoint used by the virtual Agent assistant."""
     try:
         data = await request.json()
-        raw_user_id = request.match_info.get('user_id') or data.get('userId') or data.get('user_id')
+        raw_user_id = request.match_info.get('user_id') or data.get('userId') or data.get('user_id') or AI_ASSISTANT_USER_ID
         user_id = int(raw_user_id)
         input_text = str(data.get('content') or data.get('input') or data.get('message') or '').strip()
         model = str(data.get('model') or 'gemini-2.5-flash-lite')
         feature_key = str(data.get('feature_key') or 'general')
         idempotency_key = str(data.get('idempotencyKey') or data.get('idempotency_key') or '').strip()
         scope = _request_scope_context(request)
+        body_tenant_id = str(data.get('tenant_id') or (data.get('context') or {}).get('tenant_id') or '').strip()
+        if body_tenant_id and scope.get('role') == 'platform_admin':
+            scope['tenant_id'] = body_tenant_id
+            scope['is_merchant'] = body_tenant_id not in {'', 'platform'}
         tenant_id = scope['tenant_id'] or 'platform'
 
         if not input_text:
@@ -2161,79 +2308,59 @@ async def api_ai_chat_bridge(request):
         except Exception:
             quota_check = {'allowed': True}
 
+        agent_result = None
+        if mode == 'agent':
+            try:
+                agent_result = await _run_ai_agent_chat(
+                    user_id=user_id,
+                    input_text=input_text,
+                    model=model,
+                    tenant_id=tenant_id,
+                    scope=scope,
+                )
+                reply = agent_result.text
+            except Exception as agent_err:
+                logger.error(f"AI Agent 调用失败: {agent_err}", exc_info=True)
+                return web.json_response(
+                    {'status': 'error', 'message': f'AI Agent 调用失败: {str(agent_err)[:200]}'},
+                    status=502,
+                )
+        else:
+            try:
+                from backend.app.services.ai_service import get_ai_service
+                reply = await get_ai_service().chat(user_id=user_id, message=input_text, model=model)
+            except Exception as ai_err:
+                logger.error(f"AI 服务调用失败: {ai_err}")
+                return web.json_response(
+                    {'status': 'error', 'message': f'LLM 服务调用失败: {str(ai_err)[:200]}'},
+                    status=502,
+                )
+
         try:
-            # --- 真实 AI Agent（替换原来的 stub） ---
-            import aiohttp
-            from services.ai_agent.core import AIAgent
-            from services.ai_agent.schema import AgentContext, AgentRole
-
-            # 构建 LLM 调用函数（通过 LiteLLM 代理）
-            _llm_api_key = config.LLM_API_KEY or 'sk-vertex-1300'
-            _llm_base_url = config.LLM_BASE_URL or 'http://127.0.0.1:4000/v1'
-
-            # 将用户传入的 model 名映射到 LiteLLM 注册名
-            _model_map = {
-                'gemini-2.5-flash-lite': 'gemini-flash',
-                'gemini-2.5-pro': 'gemini-opus',
-                'gemini-2.5-pro-preview': 'gemini-3.1-pro-preview',
-                'gpt-4': 'gpt-4',
-                'gpt-3.5-turbo': 'gpt-3.5-turbo',
-            }
-
-            async def _llm_call_fn(messages, model='', tools=None):
-                resolved_model = _model_map.get(model, 'gemini-flash')
-                url = f'{_llm_base_url}/chat/completions'
-                payload = {
-                    'model': resolved_model,
-                    'messages': messages,
-                    'max_tokens': 2048,
-                    'temperature': 0.7,
-                }
-                # Only add tools if non-empty (DeepSeek doesn't support empty tools array)
-                if tools:
-                    payload['tools'] = tools
-                headers = {
-                    'Content-Type': 'application/json',
-                    'Authorization': f'Bearer {_llm_api_key}',
-                }
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                        result = await resp.json()
-                choices = result.get('choices', [])
-                if choices:
-                    text = choices[0].get('message', {}).get('content', '')
-                else:
-                    text = result.get('error', {}).get('message', '[LLM] 调用失败')
-                usage = result.get('usage', {})
-                return text, usage
-
-            # 确定角色：管理员用 ASSISTANT，普通用户用 ASSISTANT（目前不限制）
-            is_admin = str(user_id) in [str(a) for a in config.ADMIN_TG_IDS]
-            agent_role = AgentRole.ASSISTANT
-
-            # 构建 Agent 上下文
-            agent_ctx = AgentContext(
-                user_id=user_id,
-                channel='web_ai_chat',
-                conversation_history=[],
-                active_role=agent_role,
-                metadata={
-                    'tenant_id': tenant_id,
-                    'is_admin': is_admin,
-                },
+            counterpart_id = await _resolve_ai_chat_counterpart_id(scope)
+            effective_tenant_id = tenant_id if tenant_id != 'platform' else None
+            await database.save_message(
+                from_userid=counterpart_id,
+                to_userid=user_id,
+                content=input_text,
+                msg_type='text',
+                is_read=True,
+                username='Admin',
+                status='sent',
+                tenant_id=effective_tenant_id,
             )
-
-            # 创建并运行 Agent
-            agent = AIAgent(llm_call_fn=_llm_call_fn)
-            agent_response = await agent.process_message(
-                user_message=input_text,
-                ctx=agent_ctx,
-                model=model,
+            await database.save_message(
+                from_userid=user_id,
+                to_userid=counterpart_id,
+                content=reply,
+                msg_type='text',
+                is_read=True,
+                username='Agent助手',
+                status='received',
+                tenant_id=effective_tenant_id,
             )
-            reply = agent_response.text if agent_response else '[AI] 处理失败，请稍后重试'
-        except Exception as ai_err:
-            logger.error(f"AI 服务调用失败: {ai_err}", exc_info=True)
-            reply = f'[AI] 处理异常: {ai_err}'[:500]
+        except Exception as persist_err:
+            logger.warning("AI Agent 会话落库失败: %s", persist_err)
 
         try:
             from backend.repositories.ai_usage_repo import save_ai_usage_log
@@ -2258,16 +2385,177 @@ async def api_ai_chat_bridge(request):
         except Exception:
             pass
 
-        return web.json_response({
+        payload = {
             'status': 'ok',
             'reply': reply,
             'data': {'reply': reply},
             'pipelineMode': mode,
-        })
+            'reply_text': reply,
+            'reply_msg_type': 'text',
+        }
+        if agent_result is not None:
+            evidence = {}
+            data_complete_values = []
+            analysis_allowed_values = []
+            for tool_name, tool_result in (agent_result.tool_results or {}).items():
+                if isinstance(tool_result, dict):
+                    evidence[tool_name] = {
+                        'source': tool_result.get('source'),
+                        'data_complete': tool_result.get('data_complete'),
+                        'analysis_allowed': tool_result.get('analysis_allowed'),
+                        'evidence_count': tool_result.get('evidence_count'),
+                        'limitation': tool_result.get('limitation'),
+                    }
+                    if tool_result.get('data_complete') is not None:
+                        data_complete_values.append(bool(tool_result.get('data_complete')))
+                    if tool_result.get('analysis_allowed') is not None:
+                        analysis_allowed_values.append(bool(tool_result.get('analysis_allowed')))
+            payload.update({
+                'tool_calls_made': agent_result.tool_calls_made,
+                'tool_results': agent_result.tool_results,
+                'evidence': evidence,
+                'data_complete': all(data_complete_values) if data_complete_values else None,
+                'analysis_allowed': all(analysis_allowed_values) if analysis_allowed_values else None,
+                'is_action_taken': agent_result.is_action_taken,
+                'requires_confirmation': agent_result.requires_confirmation,
+                'action_summary': agent_result.action_summary,
+            })
+        return web.json_response(payload)
     except ValueError:
         return web.json_response({'status': 'error', 'message': '用户 ID 无效'}, status=400)
     except Exception as e:
         logger.error(f"AI 聊天失败：{e}")
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_agent_telegram_sdk_query(request):
+    """n8n/Agent 只读工具端口：查询 Telegram Bot API 官方可见信息。"""
+    try:
+        data = await request.json()
+        scope = _request_scope_context(request)
+        body_tenant_id = str(data.get('tenant_id') or (data.get('context') or {}).get('tenant_id') or '').strip()
+        if body_tenant_id and scope.get('role') == 'platform_admin':
+            scope['tenant_id'] = body_tenant_id
+            scope['is_merchant'] = body_tenant_id not in {'', 'platform'}
+
+        from services.ai_agent.schema import AgentContext
+        from services.ai_agent.tools import TelegramSdkQueryTool
+
+        tenant_id = scope.get('tenant_id') or 'platform'
+        ctx = AgentContext(
+            user_id=int(data.get('userId') or data.get('user_id') or AI_ASSISTANT_USER_ID),
+            channel='n8n_tool',
+            sandbox_id=f"n8n_{tenant_id}",
+            metadata={
+                'tenant_id': tenant_id,
+                'merchant_id': scope.get('merchant_id'),
+                'role': scope.get('role'),
+            },
+            bot_instance=_bot_instance,
+        )
+        result = await TelegramSdkQueryTool().execute(data, context=ctx)
+        return web.json_response({'status': 'ok' if result.get('success', True) else 'error', **result})
+    except Exception as e:
+        logger.error("Telegram SDK query API failed: %s", e, exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_ad_pipeline_event(request):
+    """n8n/Python hook: ingest one already-received Telegram message into the ad pipeline."""
+    try:
+        data = await request.json()
+        scope = _request_scope_context(request)
+        if data.get('tenant_id') and scope.get('role') == 'platform_admin':
+            tenant_id = str(data.get('tenant_id') or '').strip()
+        else:
+            tenant_id = scope.get('tenant_id') if scope.get('is_merchant') else str(data.get('tenant_id') or 'default')
+        if tenant_id:
+            data['tenant_id'] = tenant_id
+
+        from services.ad_pipeline import get_ad_pipeline
+        result = await get_ad_pipeline().upsert_event(
+            data,
+            compute_embedding=bool(data.get('compute_embedding', False)),
+        )
+        return web.json_response({'status': 'ok' if result.get('success', True) else 'error', **result})
+    except Exception as e:
+        logger.error("Ad pipeline event API failed: %s", e, exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_ad_pipeline_backfill(request):
+    """Backfill recent SQLite group_messages into the optional pgvector sidecar."""
+    try:
+        data = await request.json()
+        scope = _request_scope_context(request)
+        tenant_id = scope.get('tenant_id') if scope.get('is_merchant') else str(data.get('tenant_id') or '').strip() or None
+        from services.ad_pipeline import get_ad_pipeline
+        result = await get_ad_pipeline().backfill_from_sqlite(
+            tenant_id=tenant_id,
+            days=max(1, int(data.get('days') or 3)),
+            limit=max(1, min(int(data.get('limit') or 1000), 10000)),
+        )
+        return web.json_response({'status': 'ok' if result.get('success', True) else 'error', **result})
+    except Exception as e:
+        logger.error("Ad pipeline backfill API failed: %s", e, exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_query_ad_clusters(request):
+    """Agent/n8n read tool: query aggregated suspected ad clusters."""
+    try:
+        data = await request.json() if request.method != 'GET' else dict(request.query)
+        scope = _request_scope_context(request)
+        body_tenant_id = str(data.get('tenant_id') or (data.get('context') or {}).get('tenant_id') or '').strip() if isinstance(data, dict) else ''
+        tenant_id = scope.get('tenant_id') if scope.get('is_merchant') else body_tenant_id or None
+        group_id_raw = data.get('group_id') or data.get('chat_id') if isinstance(data, dict) else None
+        from services.ad_pipeline import get_ad_pipeline
+        result = await get_ad_pipeline().query_clusters(
+            tenant_id=tenant_id,
+            group_id=int(group_id_raw) if str(group_id_raw or '').strip() else None,
+            status=str(data.get('status') or 'pending'),
+            limit=max(1, int(data.get('limit') or 20)),
+            window_minutes=max(1, int(data.get('window_minutes') or 60)),
+        )
+        return web.json_response({'status': 'ok' if result.get('success', True) else 'error', **result})
+    except Exception as e:
+        logger.error("Query ad clusters API failed: %s", e, exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+
+
+async def api_delete_ad_cluster(request):
+    """Agent/n8n action tool: delete messages belonging to a cluster via Python bot instance."""
+    try:
+        data = await request.json()
+        cluster_id = str(data.get('cluster_id') or '').strip()
+        if not cluster_id:
+            return web.json_response({'status': 'error', 'message': 'cluster_id 不能为空'}, status=400)
+        if not _bot_instance:
+            return web.json_response({'status': 'error', 'message': 'bot 未初始化'}, status=500)
+
+        from services.ad_pipeline import delete_cluster_messages, get_ad_pipeline
+        refs = data.get('message_refs') or []
+        if not refs:
+            scope = _request_scope_context(request)
+            tenant_id = scope.get('tenant_id') if scope.get('is_merchant') else str(data.get('tenant_id') or '').strip() or None
+            clusters_result = await get_ad_pipeline().query_clusters(
+                tenant_id=tenant_id,
+                status='all',
+                limit=100,
+            )
+            clusters = (clusters_result.get('data') or {}).get('clusters') or []
+            matched = next((c for c in clusters if str(c.get('cluster_id')) == cluster_id), None)
+            refs = (matched or {}).get('message_refs') or []
+
+        result = await delete_cluster_messages(
+            cluster={'cluster_id': cluster_id, 'message_refs': refs},
+            bot=_bot_instance,
+            dry_run=bool(data.get('dry_run', True)),
+            ban_senders=bool(data.get('ban_senders', False)),
+        )
+        return web.json_response({'status': 'ok' if result.get('success', True) else 'error', **result})
+    except Exception as e:
+        logger.error("Delete ad cluster API failed: %s", e, exc_info=True)
         return web.json_response({'status': 'error', 'message': str(e)}, status=500)
 
 
@@ -3995,7 +4283,15 @@ async def start_web_server(bot):
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/api/users', api_get_users)
     app.router.add_post("/api/ai/chat", api_ai_chat_bridge)
-    app.router.add_post("/api/ai/detect_ad", api_detect_advertising)
+    app.router.add_post("/api/agent/tools/telegram-sdk-query", api_agent_telegram_sdk_query)
+    app.router.add_post("/api/agent/tools/query-ad-clusters", api_query_ad_clusters)
+    app.router.add_post("/api/agent/tools/delete-ad-cluster", api_delete_ad_cluster)
+    app.router.add_get("/api/ad-clusters", api_query_ad_clusters)
+    app.router.add_post("/api/ad-pipeline/events/group-message", api_ad_pipeline_event)
+    app.router.add_post("/api/ad-pipeline/backfill", api_ad_pipeline_backfill)
+    if not _saas_proxy_enabled():
+        from backend.app.api import ai as ai_api
+        app.router.add_post("/api/ai/detect_ad", ai_api.api_detect_advertising)
     app.router.add_post('/api/messages/{user_id}/ai', api_ai_chat_bridge)
     app.router.add_get('/api/messages/{user_id}', api_get_messages)
     app.router.add_post('/api/messages/{user_id}', api_send_message)

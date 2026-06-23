@@ -1,0 +1,11 @@
+[build]
+# Disable parallel compilation to avoid race conditions
+jobs = 1
+
+[profile.dev]
+opt-level = 0
+debug = false
+
+[profile.release]
+opt-level = "s"
+lto = false

@@ -33,6 +33,16 @@ function getAuthHeaders(includeCsrf = false): Record<string, string> {
   if (!token) {
     token = localStorage.getItem('admin_token') || ''
   }
+  if (!token) {
+    const cookie = document.cookie
+      .split('; ')
+      .find((item) => item.startsWith('admin_token='))
+    if (cookie) {
+      try {
+        token = decodeURIComponent(cookie.split('=').slice(1).join('='))
+      } catch {}
+    }
+  }
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -188,6 +198,16 @@ export async function apiFormData(
       try { token = decodeURIComponent(atob(sessionToken)) } catch {}
     }
     if (!token) token = localStorage.getItem('admin_token') || ''
+    if (!token) {
+      const cookie = document.cookie
+        .split('; ')
+        .find((item) => item.startsWith('admin_token='))
+      if (cookie) {
+        try {
+          token = decodeURIComponent(cookie.split('=').slice(1).join('='))
+        } catch {}
+      }
+    }
 
     if (token) headers['Authorization'] = `Bearer ${token}`
     if (csrfToken) headers['X-CSRF-Token'] = csrfToken

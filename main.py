@@ -464,7 +464,7 @@ def main() -> None:
     
     # 1. 核心业务处理器：双向客服回复 (最高优先级)
     # 只要是回复 (Reply) 消息，无论处于何种对话状态，都优先处理为客服回复
-    application.add_handler(MessageHandler(filters.REPLY & filters.User(user_id=config.ADMIN_ID), handle_admin_reply), group=0)
+    application.add_handler(MessageHandler(filters.REPLY & filters.User(user_id=config.ADMIN_ID) & ~filters.COMMAND, handle_admin_reply), group=0)
     
     # 2026 优化：拦截非回复类管理员消息，防止信息失踪
     application.add_handler(

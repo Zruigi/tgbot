@@ -4,6 +4,7 @@
 每个函数负责单一职责，便于测试和维护
 """
 import logging
+import re
 from typing import Optional, Dict, Any, Tuple
 from telegram import Update, Message
 from telegram.ext import ContextTypes
@@ -17,6 +18,13 @@ async def extract_target_user_info(reply_to_message: Message) -> Tuple[Optional[
     """从被回复的消息中提取目标用户 ID 和原始消息 ID"""
     target_user_id = await database.get_user_id_by_admin_msg(reply_to_message.message_id)
     original_tg_msg_id = await database.get_original_msg_id_by_admin_msg(reply_to_message.message_id)
+
+    if not target_user_id:
+        message_text = str(reply_to_message.text or reply_to_message.caption or "")
+        match = re.search(r"(?:UserID|用户\s*ID|用户ID)\s*[:：]\s*(?:<code>)?(-?\d+)(?:</code>)?", message_text, re.IGNORECASE)
+        if match:
+            target_user_id = int(match.group(1))
+
     return target_user_id, original_tg_msg_id
 
 

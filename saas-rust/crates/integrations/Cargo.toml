@@ -1,0 +1,19 @@
+[package]
+name = "tgbot-integrations"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tgbot-domain = { workspace = true }
+
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+
+# Base64 encoding for PaddleOCR image uploads
+base64 = "0.22"
