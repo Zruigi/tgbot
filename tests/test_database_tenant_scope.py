@@ -119,8 +119,40 @@ async def tenant_db(tmp_path):
                 ad_score INTEGER DEFAULT 0,
                 ad_confidence TEXT,
                 ad_findings TEXT,
+                ad_text_hash TEXT,
                 tenant_id TEXT DEFAULT 'default',
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE ad_text_fingerprints (
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                text_hash TEXT NOT NULL,
+                normalized_text TEXT NOT NULL,
+                representative_text TEXT,
+                source_msg_id INTEGER,
+                confirmed_by TEXT DEFAULT 'agent',
+                confirmed_count INTEGER DEFAULT 1,
+                hit_count INTEGER DEFAULT 0,
+                first_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_hit_at DATETIME,
+                PRIMARY KEY (tenant_id, text_hash)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE ad_sender_profiles (
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                sender_id INTEGER NOT NULL,
+                confirmed_ad_count INTEGER DEFAULT 0,
+                last_text_hash TEXT,
+                first_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant_id, sender_id)
             )
             """
         )
@@ -308,3 +340,37 @@ async def test_virtual_agents_never_appear_as_regular_inbox_users(tenant_db):
     assert database.AI_ASSISTANT_USER_ID not in user_ids
     assert 900000001 not in user_ids
     assert 4321 in user_ids
+
+
+@pytest.mark.asyncio
+async def test_confirmed_ad_text_bypasses_future_llm_detection(tenant_db):
+    await database.confirm_ad_fingerprint(
+        tenant_id="tenant_a",
+        sender_id=7001,
+        content="高收益项目联系 @first_account",
+        source_msg_id=10,
+        confirmed_by="test",
+    )
+    await database.save_group_message(
+        group_id=1001,
+        user_id=7002,
+        username="repeat_sender",
+        content="高收益项目联系 @second_account",
+        tenant_id="tenant_a",
+    )
+
+    async with aiosqlite.connect(database.DB_NAME) as db:
+        row = await (await db.execute(
+            """
+            SELECT is_advertising, ad_score, ad_confidence, ad_findings
+            FROM group_messages WHERE user_id = 7002
+            """
+        )).fetchone()
+    assert row[0] == 1
+    assert row[1] == 95
+    assert row[2] == "high"
+    assert "命中已确认广告文本库" in row[3]
+    assert await database.get_ad_fingerprint_stats("tenant_a") == {
+        "confirmed_text_count": 1,
+        "confirmed_sender_count": 1,
+    }

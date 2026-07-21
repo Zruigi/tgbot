@@ -92,7 +92,7 @@ module.exports = {
         headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
       });
       const userIds = (response.data || [])
-        .map(u => Number(u.user_id || u.userid || u.id))
+        .map(u => Number(u.from_userid || u.user_id || u.userid || u.id))
         .filter(Boolean);
       return { user_ids: [...new Set(userIds)], chat_ids: [] };
     }

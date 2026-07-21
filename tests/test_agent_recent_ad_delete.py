@@ -55,6 +55,29 @@ async def _create_ad_db(path, *, now: int) -> None:
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE ad_text_fingerprints (
+                tenant_id TEXT NOT NULL DEFAULT 'default', text_hash TEXT NOT NULL,
+                normalized_text TEXT NOT NULL, representative_text TEXT, source_msg_id INTEGER,
+                confirmed_by TEXT DEFAULT 'agent', confirmed_count INTEGER DEFAULT 1,
+                hit_count INTEGER DEFAULT 0, first_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_hit_at DATETIME,
+                PRIMARY KEY (tenant_id, text_hash)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE ad_sender_profiles (
+                tenant_id TEXT NOT NULL DEFAULT 'default', sender_id INTEGER NOT NULL,
+                confirmed_ad_count INTEGER DEFAULT 0, last_text_hash TEXT,
+                first_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant_id, sender_id)
+            )
+            """
+        )
         rows = [
             (-1001, 101, 701, "ad_one", "user", "高收益项目加微信", now - 300, 1, 91, 0, "tenant-a"),
             (-1001, 102, 702, "ad_two", "user", "注册送福利", now - 3600, 1, 85, 0, "tenant-a"),
@@ -180,6 +203,39 @@ async def test_agent_prepares_then_confirms_recent_ad_deletion(tmp_path, monkeyp
             "SELECT COUNT(*) FROM tenant_audit_logs WHERE action = 'agent_delete_recent_ads'"
         )
         assert (await audit_cur.fetchone())[0] == 1
+        fingerprint_cur = await db.execute("SELECT COUNT(*) FROM ad_text_fingerprints")
+        assert (await fingerprint_cur.fetchone())[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_respects_explicit_recent_ad_batch_size(tmp_path, monkeypatch):
+    import config
+    import database
+    from services.ai_agent.core import AIAgent
+    from services.ai_agent.schema import AgentContext
+
+    now = int(time.time())
+    db_path = tmp_path / "agent_delete_one_recent_ad.sqlite3"
+    await _create_ad_db(db_path, now=now)
+    monkeypatch.setattr(config, "DB_NAME", str(db_path), raising=False)
+    monkeypatch.setattr(database, "DB_NAME", str(db_path), raising=False)
+    monkeypatch.setattr(config, "AD_DELETE_ENABLED", True, raising=False)
+
+    bot = FakeBot()
+    ctx = AgentContext(
+        user_id=-99999,
+        bot_instance=bot,
+        metadata={"role": "merchant_owner", "tenant_id": "tenant-a", "chat_id": -1001},
+    )
+    agent = AIAgent(llm_call_fn=None)
+
+    pending = await agent.process_message("删除最近1条广告", ctx)
+
+    refs = pending.tool_results["query_recent_ad_messages"]["data"]["candidate_refs"]
+    assert pending.requires_confirmation is True
+    assert len(refs) == 1
+    assert refs[0]["tg_msg_id"] == 101
+    assert bot.deleted == []
 
 
 @pytest.mark.asyncio
@@ -214,6 +270,97 @@ async def test_short_ad_check_queries_database_without_llm(tmp_path, monkeypatch
     assert "最近 24 小时共找到 2 条合格广告" in response.text
     assert "请稍等" not in response.text
     assert llm_calls == []
+
+
+@pytest.mark.asyncio
+async def test_recent_ad_snapshot_excludes_groups_without_delete_permission(tmp_path, monkeypatch):
+    import config
+    import database
+    from services.ai_agent.schema import AgentContext
+    from services.ai_agent.tools import QueryRecentAdMessagesTool
+
+    now = int(time.time())
+    db_path = tmp_path / "permission_filtered_ads.sqlite3"
+    await _create_ad_db(db_path, now=now)
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO group_messages (
+                group_id, tg_msg_id, user_id, username, sender_type, content,
+                message_ts, is_advertising, ad_score, tenant_id
+            ) VALUES (-2002, 201, 801, 'denied_ad', 'user', '无权限群广告', ?, 1, 90, 'tenant-a')
+            """,
+            (now - 200,),
+        )
+        await db.commit()
+    monkeypatch.setattr(config, "DB_NAME", str(db_path), raising=False)
+    monkeypatch.setattr(database, "DB_NAME", str(db_path), raising=False)
+
+    class PermissionBot(FakeBot):
+        async def get_chat_member(self, chat_id, user_id):
+            if int(user_id) == 999001:
+                return SimpleNamespace(
+                    status="administrator",
+                    can_delete_messages=int(chat_id) != -2002,
+                )
+            return SimpleNamespace(status="member")
+
+    result = await QueryRecentAdMessagesTool().execute(
+        {"hours": 24, "limit": 50},
+        AgentContext(
+            user_id=-99999,
+            bot_instance=PermissionBot(),
+            metadata={"role": "merchant_owner", "tenant_id": "tenant-a"},
+        ),
+    )
+
+    assert result["data"]["snapshot_count"] == 3
+    assert result["data"]["deletable_count"] == 2
+    assert result["data"]["permission_excluded_count"] == 1
+    assert {ref["tg_msg_id"] for ref in result["data"]["candidate_refs"]} == {101, 102}
+
+
+@pytest.mark.asyncio
+async def test_explicit_sender_cleanup_expands_snapshot_without_llm(tmp_path, monkeypatch):
+    import config
+    import database
+    from services.ai_agent.core import AIAgent
+    from services.ai_agent.schema import AgentContext
+
+    now = int(time.time())
+    db_path = tmp_path / "sender_expanded_ads.sqlite3"
+    await _create_ad_db(db_path, now=now)
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO group_messages (
+                group_id, tg_msg_id, user_id, username, sender_type, content,
+                message_ts, is_advertising, ad_score, tenant_id
+            ) VALUES (-1001, 109, 701, 'ad_one', 'user', '该广告发送者的普通历史消息', ?, 0, 0, 'tenant-a')
+            """,
+            (now - 100,),
+        )
+        await db.commit()
+    monkeypatch.setattr(config, "DB_NAME", str(db_path), raising=False)
+    monkeypatch.setattr(database, "DB_NAME", str(db_path), raising=False)
+    monkeypatch.setattr(config, "AD_DELETE_ENABLED", True, raising=False)
+
+    bot = FakeBot()
+    response = await AIAgent(llm_call_fn=None).process_message(
+        "删除广告以及发布者的所有消息",
+        AgentContext(
+            user_id=-99999,
+            bot_instance=bot,
+            metadata={"role": "merchant_owner", "tenant_id": "tenant-a", "chat_id": -1001},
+        ),
+    )
+
+    assert response.requires_confirmation is True
+    query_data = response.tool_results["query_recent_ad_messages"]["data"]
+    assert query_data["sender_expanded_count"] == 1
+    assert query_data["deletable_count"] == 3
+    assert {ref["tg_msg_id"] for ref in query_data["candidate_refs"]} == {101, 102, 109}
+    assert "广告发送者的 1 条同时间窗消息" in response.text
 
 
 @pytest.mark.asyncio

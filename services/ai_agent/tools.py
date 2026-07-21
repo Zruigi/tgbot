@@ -688,6 +688,10 @@ class QueryRecentAdMessagesTool(BaseTool):
                 "group_id": {"type": "integer", "description": "可选，限定某个群"},
                 "limit": {"type": "integer", "description": "候选上限，默认20，最大50"},
                 "sample_size": {"type": "integer", "description": "随机时间样本数，默认5，最大10"},
+                "include_sender_messages": {
+                    "type": "boolean",
+                    "description": "仅在用户明确要求时，将已确认广告发送者在同一时间窗内的其他用户消息加入快照",
+                },
             },
             "required": [],
         }
@@ -699,12 +703,48 @@ class QueryRecentAdMessagesTool(BaseTool):
         except Exception:
             return None
 
+    async def _deletable_group_ids(self, rows: List[Dict[str, Any]], context: Any) -> tuple[Optional[set[int]], List[Dict[str, Any]]]:
+        bot = getattr(context, "bot_instance", None) if context is not None else None
+        if not bot:
+            return None, []
+        try:
+            bot_user = await bot.get_me()
+            bot_id = int(getattr(bot_user, "id", 0) or 0)
+        except Exception as exc:
+            return set(), [{"group_id": None, "reason": f"bot_identity_check_failed:{str(exc)[:120]}"}]
+
+        allowed: set[int] = set()
+        excluded: List[Dict[str, Any]] = []
+        for group_id in sorted({int(row["group_id"]) for row in rows}):
+            try:
+                member = await bot.get_chat_member(group_id, bot_id)
+                status = str(getattr(member, "status", "") or "")
+                can_delete = status == "creator" or (
+                    status == "administrator" and bool(getattr(member, "can_delete_messages", False))
+                )
+                if can_delete:
+                    allowed.add(group_id)
+                else:
+                    excluded.append({
+                        "group_id": group_id,
+                        "reason": "bot_missing_delete_permission",
+                        "bot_status": status,
+                        "can_delete_messages": bool(getattr(member, "can_delete_messages", False)),
+                    })
+            except Exception as exc:
+                excluded.append({
+                    "group_id": group_id,
+                    "reason": f"permission_check_failed:{str(exc)[:120]}",
+                })
+        return allowed, excluded
+
     async def execute(self, params: Dict[str, Any], context=None) -> dict:
         import aiosqlite
 
         hours = max(1, min(int(params.get("hours") or 24), 24))
         limit = max(1, min(int(params.get("limit") or 20), 50))
         sample_size = max(1, min(int(params.get("sample_size") or 5), 10))
+        include_sender_messages = bool(params.get("include_sender_messages", False))
         group_id = params.get("group_id")
         cutoff_ts = int(time.time()) - hours * 3600
         tenant_id = _context_scoped_tenant_id(context)
@@ -792,9 +832,64 @@ class QueryRecentAdMessagesTool(BaseTool):
                 (*sql_params, limit),
             )
             rows = [dict(row) for row in await cur.fetchall()]
+            for row in rows:
+                row["match_reason"] = "advertisement"
 
+            confirmed_sender_ids = sorted({int(row.get("user_id") or 0) for row in rows if row.get("user_id")})
+            sender_expanded_count = 0
+            if include_sender_messages and confirmed_sender_ids and len(rows) < limit:
+                existing_ids = sorted({int(row["msg_id"]) for row in rows})
+                sender_where = [
+                    f"user_id IN ({','.join('?' for _ in confirmed_sender_ids)})",
+                    "tg_msg_id IS NOT NULL",
+                    "COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) >= ?",
+                    "COALESCE(sender_type, 'user') = 'user'",
+                    "user_id != ?",
+                ]
+                sender_params: List[Any] = [*confirmed_sender_ids, cutoff_ts, int(config.ADMIN_ID)]
+                if existing_ids:
+                    sender_where.append(f"msg_id NOT IN ({','.join('?' for _ in existing_ids)})")
+                    sender_params.extend(existing_ids)
+                if "is_deleted" in columns:
+                    sender_where.append("COALESCE(is_deleted, 0) = 0")
+                if "ad_action_status" in columns:
+                    sender_where.append("COALESCE(ad_action_status, 'none') NOT IN ('deleted', 'deleting')")
+                if tenant_id and "tenant_id" in columns:
+                    sender_where.append("tenant_id = ?")
+                    sender_params.append(tenant_id)
+                if str(group_id or "").strip():
+                    sender_where.append("group_id = ?")
+                    sender_params.append(int(group_id))
+                sender_params.append(limit - len(rows))
+                sender_cur = await db.execute(
+                    f"""
+                    SELECT msg_id, group_id, tg_msg_id, user_id, username, content,
+                           {sender_type_expr}, {tenant_expr}, {score_expr},
+                           COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) AS effective_ts
+                    FROM group_messages
+                    WHERE {' AND '.join(sender_where)}
+                    ORDER BY effective_ts DESC, msg_id DESC
+                    LIMIT ?
+                    """,
+                    tuple(sender_params),
+                )
+                for sender_row in [dict(row) for row in await sender_cur.fetchall()]:
+                    sender_row["match_reason"] = "confirmed_sender_history"
+                    rows.append(sender_row)
+                    sender_expanded_count += 1
+
+        allowed_group_ids, permission_excluded_groups = await self._deletable_group_ids(rows, context)
+        authorized_sender_ids = {
+            int(row.get("user_id") or 0)
+            for row in rows
+            if row.get("match_reason") == "advertisement"
+            and (allowed_group_ids is None or int(row["group_id"]) in allowed_group_ids)
+            and row.get("user_id")
+        }
         refs = []
         records = []
+        permission_excluded_count = 0
+        sender_scope_excluded_count = 0
         for row in rows:
             ref = {
                 "msg_id": int(row["msg_id"]),
@@ -804,14 +899,27 @@ class QueryRecentAdMessagesTool(BaseTool):
                 "user_id": int(row.get("user_id") or 0),
                 "message_ts": int(row.get("effective_ts") or 0),
                 "tenant_id": str(row.get("tenant_id") or "default"),
+                "match_reason": str(row.get("match_reason") or "advertisement"),
             }
-            refs.append(ref)
+            group_is_deletable = allowed_group_ids is None or int(row["group_id"]) in allowed_group_ids
+            sender_scope_allowed = (
+                row.get("match_reason") != "confirmed_sender_history"
+                or int(row.get("user_id") or 0) in authorized_sender_ids
+            )
+            is_deletable = group_is_deletable and sender_scope_allowed
+            if not group_is_deletable:
+                permission_excluded_count += 1
+            elif not sender_scope_allowed:
+                sender_scope_excluded_count += 1
+            if is_deletable:
+                refs.append(ref)
             records.append({
                 **ref,
                 "username": row.get("username") or "",
                 "ad_score": int(row.get("ad_score") or 0),
                 "recorded_at": self._iso_time(row.get("effective_ts")),
                 "content_preview": str(row.get("content") or "")[:120],
+                "deletable": is_deletable,
             })
 
         snapshot_ts = int(time.time())
@@ -827,6 +935,13 @@ class QueryRecentAdMessagesTool(BaseTool):
                 "snapshot_created_at": snapshot_ts,
                 "total_eligible_count": total_count,
                 "snapshot_count": len(records),
+                "deletable_count": len(refs),
+                "permission_excluded_count": permission_excluded_count,
+                "permission_excluded_groups": permission_excluded_groups,
+                "sender_scope_excluded_count": sender_scope_excluded_count,
+                "include_sender_messages": include_sender_messages,
+                "confirmed_sender_ids": sorted(authorized_sender_ids),
+                "sender_expanded_count": sender_expanded_count,
                 "earliest_recorded_at": self._iso_time(earliest_ts),
                 "latest_recorded_at": self._iso_time(latest_ts),
                 "random_sample_times": sampled_times,
@@ -838,6 +953,7 @@ class QueryRecentAdMessagesTool(BaseTool):
                     "bot_messages_excluded": True,
                     "channel_posts_excluded": True,
                     "minimum_ad_score": 40,
+                    "delete_permission_prechecked": allowed_group_ids is not None,
                 },
             },
             "count": len(records),
@@ -866,6 +982,8 @@ class DeleteRecentAdMessagesTool(BaseTool):
                 "cutoff_ts": {"type": "integer", "description": "快照时间窗下界"},
                 "snapshot_created_at": {"type": "integer", "description": "快照生成时间"},
                 "hours": {"type": "integer", "description": "查询小时数"},
+                "include_sender_messages": {"type": "boolean", "description": "快照是否明确包含广告发送者的其他消息"},
+                "confirmed_sender_ids": {"type": "array", "items": {"type": "integer"}},
             },
             "required": ["message_refs", "cutoff_ts", "snapshot_created_at"],
         }
@@ -935,6 +1053,11 @@ class DeleteRecentAdMessagesTool(BaseTool):
             return {"success": False, "action_taken": False, "message": "删除快照已超过15分钟，请重新查询"}
 
         tenant_id = _context_scoped_tenant_id(context)
+        include_sender_messages = bool(params.get("include_sender_messages", False))
+        confirmed_sender_ids = {
+            int(sender_id) for sender_id in (params.get("confirmed_sender_ids") or [])
+            if str(sender_id or "").strip()
+        }
         verified: List[Dict[str, Any]] = []
         rejected: List[Dict[str, Any]] = []
         async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
@@ -947,21 +1070,27 @@ class DeleteRecentAdMessagesTool(BaseTool):
                     group_id = int(ref.get("group_id") or ref.get("chat_id"))
                     tg_msg_id = int(ref.get("tg_msg_id"))
                     user_id = int(ref.get("user_id") or 0)
+                    match_reason = str(ref.get("match_reason") or "advertisement")
                 except Exception:
                     rejected.append({"ref": ref, "reason": "invalid_reference"})
                     continue
 
                 where = [
                     "msg_id = ?", "group_id = ?", "tg_msg_id = ?", "user_id = ?",
-                    "COALESCE(is_advertising, 0) = 1",
                     "COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) >= ?",
                     "COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) <= ?",
                     "COALESCE(sender_type, 'user') = 'user'",
                     "user_id != ?",
                 ]
                 sql_params: List[Any] = [msg_id, group_id, tg_msg_id, user_id, cutoff_ts, snapshot_created_at, int(config.ADMIN_ID)]
-                if "ad_score" in columns:
-                    where.append("COALESCE(ad_score, 0) >= 40")
+                if match_reason == "confirmed_sender_history":
+                    if not include_sender_messages or user_id not in confirmed_sender_ids:
+                        rejected.append({"msg_id": msg_id, "reason": "sender_expansion_not_authorized"})
+                        continue
+                else:
+                    where.append("COALESCE(is_advertising, 0) = 1")
+                    if "ad_score" in columns:
+                        where.append("COALESCE(ad_score, 0) >= 40")
                 if "is_deleted" in columns:
                     where.append("COALESCE(is_deleted, 0) = 0")
                 if "ad_action_status" in columns:
@@ -1062,6 +1191,17 @@ class DeleteRecentAdMessagesTool(BaseTool):
                         (int(row["msg_id"]),),
                     )
                     await db.commit()
+            if bool(row.get("is_advertising")) and int(row.get("ad_score") or 0) >= 40:
+                try:
+                    await database.confirm_ad_fingerprint(
+                        tenant_id=row.get("tenant_id"),
+                        sender_id=user_id,
+                        content=str(row.get("content") or ""),
+                        source_msg_id=int(row["msg_id"]),
+                        confirmed_by=f"agent:{getattr(context, 'user_id', '')}",
+                    )
+                except Exception as exc:
+                    logger.warning("已删除广告写入指纹库失败 msg_id=%s: %s", row.get("msg_id"), exc)
             deleted.append({"msg_id": row.get("msg_id"), "group_id": group_id, "tg_msg_id": tg_msg_id})
 
         batch_id = f"recent_ads:{snapshot_created_at}:{getattr(context, 'user_id', 'agent')}"

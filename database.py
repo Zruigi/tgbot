@@ -17,6 +17,7 @@ from config import (
     LEGACY_AI_ASSISTANT_USER_IDS,
     VIRTUAL_AI_ASSISTANT_USER_IDS,
 )
+from services.ad_text import ad_text_hash, normalize_ad_text
 
 logger = logging.getLogger(__name__)
 
@@ -551,6 +552,7 @@ async def init_db():
                 ad_score INTEGER DEFAULT 0,
                 ad_confidence TEXT DEFAULT 'low',
                 ad_findings TEXT DEFAULT NULL,
+                ad_text_hash TEXT DEFAULT NULL,
                 is_deleted BOOLEAN DEFAULT 0,
                 deleted_at DATETIME DEFAULT NULL
             )
@@ -578,6 +580,9 @@ async def init_db():
         if 'ad_findings' not in gm_columns:
             await db.execute("ALTER TABLE group_messages ADD COLUMN ad_findings TEXT DEFAULT NULL")
             logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_findings 字段")
+        if 'ad_text_hash' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN ad_text_hash TEXT DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_text_hash 字段")
         if 'ad_cluster_id' not in gm_columns:
             await db.execute("ALTER TABLE group_messages ADD COLUMN ad_cluster_id TEXT DEFAULT NULL")
             logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_cluster_id 字段")
@@ -612,6 +617,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_ts ON group_messages(group_id, message_ts DESC)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_ad ON group_messages(group_id, is_advertising, ad_score DESC)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_ad_cluster ON group_messages(ad_cluster_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_group_msg_ad_text_hash ON group_messages(ad_text_hash)")
         await db.execute(
             """
             DELETE FROM group_messages
@@ -648,6 +654,36 @@ async def init_db():
             )
         ''')
         await db.execute("CREATE INDEX IF NOT EXISTS idx_tg_cap_snap_tenant ON telegram_chat_capability_snapshots(tenant_id)")
+
+        # 17c. 已确认广告文本/发送者知识库。模型只判定未知簇，已知文本直接按哈希命中。
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS ad_text_fingerprints (
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                text_hash TEXT NOT NULL,
+                normalized_text TEXT NOT NULL,
+                representative_text TEXT,
+                source_msg_id INTEGER DEFAULT NULL,
+                confirmed_by TEXT DEFAULT 'agent',
+                confirmed_count INTEGER DEFAULT 1,
+                hit_count INTEGER DEFAULT 0,
+                first_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_hit_at DATETIME DEFAULT NULL,
+                PRIMARY KEY (tenant_id, text_hash)
+            )
+        ''')
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ad_text_fingerprint_hash ON ad_text_fingerprints(text_hash)")
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS ad_sender_profiles (
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                sender_id INTEGER NOT NULL,
+                confirmed_ad_count INTEGER DEFAULT 0,
+                last_text_hash TEXT DEFAULT NULL,
+                first_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant_id, sender_id)
+            )
+        ''')
 
         # 18. group_address_hits 表（群内地址自动识别去重）
         await db.execute('''
@@ -725,6 +761,9 @@ async def init_db():
                 if 'ad_findings' not in gm_columns:
                     logger.info("迁移 group_messages: 新增 ad_findings 列")
                     await db.execute("ALTER TABLE group_messages ADD COLUMN ad_findings TEXT DEFAULT NULL")
+                if 'ad_text_hash' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 ad_text_hash 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN ad_text_hash TEXT DEFAULT NULL")
                 if 'ad_cluster_id' not in gm_columns:
                     logger.info("迁移 group_messages: 新增 ad_cluster_id 列")
                     await db.execute("ALTER TABLE group_messages ADD COLUMN ad_cluster_id TEXT DEFAULT NULL")
@@ -1167,6 +1206,50 @@ async def init_db():
         ]
         for _tbl in _verify_tenant_index_tables:
             await db.execute(f"CREATE INDEX IF NOT EXISTS idx_{_tbl}_tenant ON {_tbl}(tenant_id)")
+
+        # Backfill stable hashes once. 18k-100k rows stay local and never consume LLM tokens.
+        async with db.execute(
+            "SELECT msg_id, content FROM group_messages WHERE ad_text_hash IS NULL AND COALESCE(content, '') != ''"
+        ) as cursor:
+            hash_rows = await cursor.fetchall()
+        if hash_rows:
+            await db.executemany(
+                "UPDATE group_messages SET ad_text_hash = ? WHERE msg_id = ?",
+                [(ad_text_hash(content), int(msg_id)) for msg_id, content in hash_rows],
+            )
+
+        # Existing successfully deleted ads become the initial confirmed knowledge base.
+        async with db.execute(
+            """
+            SELECT msg_id, tenant_id, user_id, content, ad_text_hash
+            FROM group_messages
+            WHERE COALESCE(is_deleted, 0) = 1
+              AND COALESCE(is_advertising, 0) = 1
+              AND COALESCE(ad_text_hash, '') != ''
+            """
+        ) as cursor:
+            confirmed_rows = await cursor.fetchall()
+        for msg_id, tenant_id, sender_id, content, text_hash in confirmed_rows:
+            effective_tenant = str(tenant_id or "default")
+            await db.execute(
+                """
+                INSERT INTO ad_text_fingerprints (
+                    tenant_id, text_hash, normalized_text, representative_text,
+                    source_msg_id, confirmed_by, confirmed_count
+                ) VALUES (?, ?, ?, ?, ?, 'migration', 1)
+                ON CONFLICT(tenant_id, text_hash) DO NOTHING
+                """,
+                (effective_tenant, text_hash, normalize_ad_text(content), content, int(msg_id)),
+            )
+            if sender_id:
+                await db.execute(
+                    """
+                    INSERT INTO ad_sender_profiles (tenant_id, sender_id, confirmed_ad_count, last_text_hash)
+                    VALUES (?, ?, 1, ?)
+                    ON CONFLICT(tenant_id, sender_id) DO NOTHING
+                    """,
+                    (effective_tenant, int(sender_id), text_hash),
+                )
 
         await db.commit()
 
@@ -2960,6 +3043,105 @@ async def search_messages(keyword: str, group_id: int = None, user_id: int = Non
     return results[:limit]
 
 
+async def confirm_ad_fingerprint(
+    *,
+    tenant_id: Optional[str],
+    sender_id: Optional[int],
+    content: str,
+    source_msg_id: Optional[int],
+    confirmed_by: str = "agent",
+) -> str:
+    """Persist one confirmed ad so identical future text bypasses the LLM."""
+    effective_tenant = _normalize_tenant_id(tenant_id) or "default"
+    text_hash = ad_text_hash(content)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT INTO ad_text_fingerprints (
+                tenant_id, text_hash, normalized_text, representative_text,
+                source_msg_id, confirmed_by, confirmed_count,
+                first_confirmed_at, last_confirmed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(tenant_id, text_hash) DO UPDATE SET
+                representative_text = excluded.representative_text,
+                source_msg_id = excluded.source_msg_id,
+                confirmed_by = excluded.confirmed_by,
+                confirmed_count = ad_text_fingerprints.confirmed_count + 1,
+                last_confirmed_at = CURRENT_TIMESTAMP
+            """,
+            (
+                effective_tenant,
+                text_hash,
+                normalize_ad_text(content),
+                content,
+                source_msg_id,
+                confirmed_by,
+            ),
+        )
+        if sender_id:
+            await db.execute(
+                """
+                INSERT INTO ad_sender_profiles (
+                    tenant_id, sender_id, confirmed_ad_count, last_text_hash,
+                    first_confirmed_at, last_confirmed_at
+                ) VALUES (?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(tenant_id, sender_id) DO UPDATE SET
+                    confirmed_ad_count = ad_sender_profiles.confirmed_ad_count + 1,
+                    last_text_hash = excluded.last_text_hash,
+                    last_confirmed_at = CURRENT_TIMESTAMP
+                """,
+                (effective_tenant, int(sender_id), text_hash),
+            )
+        await db.commit()
+    return text_hash
+
+
+async def get_ad_fingerprint_stats(tenant_id: Optional[str] = None) -> Dict[str, int]:
+    effective_tenant = _normalize_tenant_id(tenant_id)
+    where = "WHERE tenant_id = ?" if effective_tenant else ""
+    params = (effective_tenant,) if effective_tenant else ()
+    async with aiosqlite.connect(DB_NAME) as db:
+        text_cur = await db.execute(f"SELECT COUNT(*) FROM ad_text_fingerprints {where}", params)
+        sender_cur = await db.execute(f"SELECT COUNT(*) FROM ad_sender_profiles {where}", params)
+        return {
+            "confirmed_text_count": int((await text_cur.fetchone())[0] or 0),
+            "confirmed_sender_count": int((await sender_cur.fetchone())[0] or 0),
+        }
+
+
+async def list_ad_fingerprints(tenant_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    effective_tenant = _normalize_tenant_id(tenant_id)
+    where = "WHERE tenant_id = ?" if effective_tenant else ""
+    params: List[Any] = [effective_tenant] if effective_tenant else []
+    params.append(max(1, min(int(limit or 50), 200)))
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            f"""
+            SELECT tenant_id, text_hash, representative_text, confirmed_by,
+                   confirmed_count, hit_count, first_confirmed_at,
+                   last_confirmed_at, last_hit_at
+            FROM ad_text_fingerprints
+            {where}
+            ORDER BY last_confirmed_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+
+async def delete_ad_fingerprint(*, tenant_id: Optional[str], text_hash: str) -> bool:
+    effective_tenant = _normalize_tenant_id(tenant_id) or "default"
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "DELETE FROM ad_text_fingerprints WHERE tenant_id = ? AND text_hash = ?",
+            (effective_tenant, str(text_hash or "").strip()),
+        )
+        await db.commit()
+        return int(cur.rowcount or 0) > 0
+
+
 async def save_group_message(
     group_id: int,
     user_id: int,
@@ -2990,16 +3172,44 @@ async def save_group_message(
         except Exception:
             findings_text = None
 
+    content_hash = ad_text_hash(content) if str(content or "").strip() else None
+
     async with aiosqlite.connect(DB_NAME) as db:
         effective_tenant_id = _normalize_tenant_id(tenant_id) or await _resolve_tenant_id_from_group(db, group_id) or 'default'
+        if content_hash:
+            fingerprint_cur = await db.execute(
+                "SELECT 1 FROM ad_text_fingerprints WHERE tenant_id = ? AND text_hash = ? LIMIT 1",
+                (effective_tenant_id, content_hash),
+            )
+            if await fingerprint_cur.fetchone():
+                is_advertising = True
+                ad_score = max(95, int(ad_score or 0))
+                ad_confidence = "high"
+                findings = []
+                if findings_text:
+                    try:
+                        findings = json.loads(findings_text)
+                    except Exception:
+                        findings = [findings_text]
+                if "命中已确认广告文本库" not in findings:
+                    findings.append("命中已确认广告文本库")
+                findings_text = json.dumps(findings, ensure_ascii=False)
+                await db.execute(
+                    """
+                    UPDATE ad_text_fingerprints
+                    SET hit_count = hit_count + 1, last_hit_at = CURRENT_TIMESTAMP
+                    WHERE tenant_id = ? AND text_hash = ?
+                    """,
+                    (effective_tenant_id, content_hash),
+                )
         await db.execute(
             """
             INSERT OR IGNORE INTO group_messages (
                 group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, file_id,
                 quoted_tg_msg_id, quoted_text, message_ts, avatar_file_id,
-                is_advertising, ad_score, ad_confidence, ad_findings, tenant_id
+                is_advertising, ad_score, ad_confidence, ad_findings, ad_text_hash, tenant_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, file_id,
@@ -3008,6 +3218,7 @@ async def save_group_message(
                 int(ad_score or 0),
                 (ad_confidence or "low"),
                 findings_text,
+                content_hash,
                 effective_tenant_id,
             )
         )

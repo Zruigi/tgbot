@@ -54,7 +54,7 @@ module.exports = {
       const parseMode = this.getNodeParameter("parseMode", i);
       
       const response = await this.makeRequest({
-        url: baseUrl + "/api/broadcast/chats",
+        url: baseUrl + "/api/broadcast/unified",
         method: "POST",
         body: { chat_ids: [Number(channelId)], content: message, parse_mode: parseMode, retry_count: 1 },
         headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },

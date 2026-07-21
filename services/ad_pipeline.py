@@ -9,7 +9,6 @@ by the bot, with optional PostgreSQL + pgvector sidecar storage.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import re
@@ -23,24 +22,18 @@ import httpx
 import config
 import database
 from services.ai_agent.ad_detection import detect_advertising_signals
+from services.ad_text import ad_text_hash, normalize_ad_text
 
 logger = logging.getLogger(__name__)
 
 
-_URL_RE = re.compile(r"https?://\S+|t\.me/\S+|@\w{3,}", re.I)
-_SPACE_RE = re.compile(r"\s+")
-
-
 def normalize_text(text: str) -> str:
     """Normalize text for exact duplicate grouping without hiding intent."""
-    value = str(text or "").strip().lower()
-    value = _URL_RE.sub("[link]", value)
-    value = _SPACE_RE.sub(" ", value)
-    return value.strip()
+    return normalize_ad_text(text)
 
 
 def text_md5(text: str) -> str:
-    return hashlib.md5(normalize_text(text).encode("utf-8")).hexdigest()
+    return ad_text_hash(text)
 
 
 def _now_ts() -> int:

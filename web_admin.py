@@ -2475,6 +2475,75 @@ async def api_agent_telegram_sdk_query(request):
         return web.json_response({'status': 'error', 'message': str(e)}, status=500)
 
 
+async def api_agent_tool_manifest(request):
+    """Single source of truth for MiniApp and n8n tool discovery."""
+    from services.ai_agent.safety import DANGEROUS_ACTIONS
+    from services.ai_agent.tools import get_tools_for_llm
+
+    tools = get_tools_for_llm()
+    for schema in tools:
+        name = str((schema.get('function') or {}).get('name') or '')
+        schema['dangerous'] = name in DANGEROUS_ACTIONS
+    return web.json_response({'status': 'ok', 'count': len(tools), 'tools': tools})
+
+
+async def api_agent_ad_fingerprints(request):
+    """n8n/Agent shared advertisement text knowledge-base API."""
+    try:
+        scope = _request_scope_context(request)
+        data = await request.json() if request.method != 'GET' else {}
+        requested_tenant = str(
+            data.get('tenant_id') or request.rel_url.query.get('tenant_id') or ''
+        ).strip()
+        tenant_id = (
+            scope.get('tenant_id') if scope.get('is_merchant')
+            else requested_tenant or 'default'
+        )
+
+        if request.method == 'GET':
+            rows = await database.list_ad_fingerprints(
+                tenant_id=tenant_id,
+                limit=int(request.rel_url.query.get('limit') or 50),
+            )
+            return web.json_response({
+                'status': 'ok',
+                'data': rows,
+                'count': len(rows),
+                'stats': await database.get_ad_fingerprint_stats(tenant_id),
+            })
+
+        content = str(data.get('content') or data.get('text') or '').strip()
+        if not content:
+            return web.json_response({'status': 'error', 'message': 'content required'}, status=400)
+        text_hash = await database.confirm_ad_fingerprint(
+            tenant_id=tenant_id,
+            sender_id=data.get('sender_id'),
+            content=content,
+            source_msg_id=data.get('source_msg_id'),
+            confirmed_by=str(data.get('confirmed_by') or 'n8n'),
+        )
+        return web.json_response({'status': 'ok', 'text_hash': text_hash, 'tenant_id': tenant_id})
+    except Exception as exc:
+        logger.error("Agent ad fingerprint API failed: %s", exc, exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=500)
+
+
+async def api_agent_delete_ad_fingerprint(request):
+    try:
+        scope = _request_scope_context(request)
+        tenant_id = (
+            scope.get('tenant_id') if scope.get('is_merchant')
+            else str(request.rel_url.query.get('tenant_id') or 'default').strip()
+        )
+        deleted = await database.delete_ad_fingerprint(
+            tenant_id=tenant_id,
+            text_hash=request.match_info.get('text_hash') or '',
+        )
+        return web.json_response({'status': 'ok', 'deleted': deleted})
+    except Exception as exc:
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=500)
+
+
 async def api_ad_pipeline_event(request):
     """n8n/Python hook: ingest one already-received Telegram message into the ad pipeline."""
     try:
@@ -4299,6 +4368,10 @@ async def start_web_server(bot):
     app.router.add_get('/api/users', api_get_users)
     app.router.add_post("/api/ai/chat", api_ai_chat_bridge)
     app.router.add_post("/api/agent/tools/telegram-sdk-query", api_agent_telegram_sdk_query)
+    app.router.add_get("/api/agent/tools/manifest", api_agent_tool_manifest)
+    app.router.add_get("/api/agent/ad-fingerprints", api_agent_ad_fingerprints)
+    app.router.add_post("/api/agent/ad-fingerprints", api_agent_ad_fingerprints)
+    app.router.add_delete("/api/agent/ad-fingerprints/{text_hash}", api_agent_delete_ad_fingerprint)
     app.router.add_post("/api/agent/tools/query-ad-clusters", api_query_ad_clusters)
     app.router.add_post("/api/agent/tools/delete-ad-cluster", api_delete_ad_cluster)
     app.router.add_get("/api/ad-clusters", api_query_ad_clusters)

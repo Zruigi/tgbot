@@ -27,7 +27,8 @@ async def test_agent_uses_llm_and_keeps_user_message_separate():
 
     assert response.text == "这是来自真实 LLM 调用链路的回答，不是回声。"
     assert response.text != f"[AI] 收到您的消息：{user_text}"
-    assert seen_messages[-1] == {"role": "user", "content": user_text}
+    assert seen_messages[-1]["role"] == "user"
+    assert f"用户请求: {user_text}" in seen_messages[-1]["content"]
     assert seen_messages[0]["role"] == "system"
     assert user_text not in seen_messages[0]["content"]
 
@@ -53,7 +54,8 @@ async def test_agent_detects_advertising_with_tool():
     )
 
     assert "detect_advertising" in response.tool_calls_made
-    assert "这条消息广告特征明显" in response.text
+    assert "评分 30/100" in response.text
+    assert "微信" in response.text
 
 
 @pytest.mark.asyncio

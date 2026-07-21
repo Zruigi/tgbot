@@ -67,20 +67,20 @@ module.exports = {
       const score = this.getNodeParameter("score", i);
       const source = this.getNodeParameter("source", i);
       
-      let url = baseUrl + "/api/advertisements";
+      let url = baseUrl + "/api/agent/ad-fingerprints";
       let method = "POST";
-      let body = { content, score, source };
+      let body = { content, score, confirmed_by: source };
       
       if (operation === "read" && adId) {
-        url = baseUrl + "/api/advertisements/" + adId;
+        url = baseUrl + "/api/agent/ad-fingerprints?limit=200";
         method = "GET";
         body = null;
       } else if (operation === "delete" && adId) {
-        url = baseUrl + "/api/advertisements/" + adId;
+        url = baseUrl + "/api/agent/ad-fingerprints/" + encodeURIComponent(adId);
         method = "DELETE";
         body = null;
       } else if (operation === "list") {
-        url = baseUrl + "/api/advertisements?status=pending";
+        url = baseUrl + "/api/agent/ad-fingerprints?limit=200";
         method = "GET";
         body = null;
       }
@@ -90,7 +90,12 @@ module.exports = {
         headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
       });
       
-      items[i].json = { success: true, operation, data: response };
+      const rows = response.data || [];
+      items[i].json = {
+        success: response.status === "ok",
+        operation,
+        data: operation === "read" ? rows.find(row => row.text_hash === adId) || null : response,
+      };
     }
     return [items];
   },

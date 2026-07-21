@@ -72,10 +72,13 @@ class AIAgent:
         
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(ctx.conversation_history)
-        messages.append({"role": "user", "content": user_message})
-
         # 获取工具 schemas
         tool_schemas = get_tools_for_llm()
+        from .prompts import build_tool_use_prompt
+        messages.append({
+            "role": "user",
+            "content": build_tool_use_prompt(user_message[:2000], tool_schemas),
+        })
 
         # Function Calling 循环
         round_num = 0
@@ -175,6 +178,8 @@ class AIAgent:
                 final_text = self._format_recent_ad_result(tool_results["query_recent_ad_messages"])
             elif "system_query" in tool_results:
                 final_text = self._format_system_query_result(tool_results["system_query"])
+            elif "detect_advertising" in tool_results:
+                final_text = self._format_ad_detection_result(tool_results["detect_advertising"])
             else:
                 final_text, _ = await self._call_llm(
                     messages=messages,
@@ -436,13 +441,13 @@ class AIAgent:
                         # 从 metadata 中恢复参数
                         result = await tool_instance.execute(prev_result.get("_params", {}), context=ctx)
                         executed_results[tool_name] = result
-                        
+                        if result.get("action_taken"):
+                            action_taken = True
+
                         # ★ 关键修复：检查执行结果
                         if not result.get("success", True):
                             has_failure = True
                             failure_messages.append(f"{tool_name}: {result.get('message', '执行失败')}")
-                        elif result.get("action_taken"):
-                            action_taken = True
                     except Exception as e:
                         executed_results[tool_name] = {"error": str(e), "success": False}
                         has_failure = True
@@ -493,12 +498,23 @@ class AIAgent:
 
         hours_match = re.search(r"(\d{1,3})\s*(?:小时|h)", user_text, re.I)
         hours = max(1, min(int(hours_match.group(1)) if hours_match else 24, 24))
+        count_match = re.search(r"(?:最近\s*)?(\d{1,2})\s*条", user_text, re.I)
+        requested_limit = max(1, min(int(count_match.group(1)) if count_match else 50, 50))
         group_match = re.search(r"(?:group_id|群|群组)\s*[:：=]?\s*(-?\d{5,})", user_text, re.I)
         query_params: Dict[str, Any] = {
             "hours": hours,
-            "limit": 50,
+            "limit": requested_limit,
             "sample_size": 5,
         }
+        include_sender_messages = any(
+            phrase in re.sub(r"\s+", "", user_text)
+            for phrase in (
+                "发布者的所有消息", "发布者所有消息", "发送者的所有消息",
+                "发送者所有消息", "该用户所有消息", "他们的所有消息",
+            )
+        )
+        if include_sender_messages:
+            query_params["include_sender_messages"] = True
         if group_match:
             query_params["group_id"] = int(group_match.group(1))
         elif isinstance(ctx.metadata, dict):
@@ -544,6 +560,8 @@ class AIAgent:
             "cutoff_ts": int(data.get("cutoff_ts") or 0),
             "snapshot_created_at": int(data.get("snapshot_created_at") or 0),
             "hours": hours,
+            "include_sender_messages": include_sender_messages,
+            "confirmed_sender_ids": data.get("confirmed_sender_ids") or [],
         }
         pending_delete = {
             "success": True,
@@ -565,11 +583,22 @@ class AIAgent:
             if pending_delete["data"]["delete_enabled"] else
             "当前 AD_DELETE_ENABLED 未开启，即使确认也会被后端阻止。"
         )
+        permission_excluded_count = int(data.get("permission_excluded_count") or 0)
+        permission_note = (
+            f"另有 {permission_excluded_count} 条位于机器人无删除权限的群，未纳入本次快照。\n"
+            if permission_excluded_count else ""
+        )
+        sender_note = (
+            f"已按明确指令额外纳入这些广告发送者的 {int(data.get('sender_expanded_count') or 0)} 条同时间窗消息。\n"
+            if include_sender_messages else ""
+        )
         text = (
             f"已查询最近 {hours} 小时广告记录，安全快照锁定 {len(refs)} 条。\n"
             f"最新时间：{data.get('latest_recorded_at') or '无'}\n"
             f"最早时间：{data.get('earliest_recorded_at') or '无'}\n"
             f"随机时间样本：{samples}\n\n"
+            f"{permission_note}"
+            f"{sender_note}"
             "已排除管理员、bot、频道转发和低分记录；单次最多50条，快照15分钟后失效。\n"
             f"{delete_switch_note}\n"
             "请回复「确认」执行这份精确快照，其他回复均不会删除。"
@@ -597,12 +626,16 @@ class AIAgent:
         if not count:
             return result.get("limitation") or f"最近 {hours} 小时没有可安全处理的已标记用户广告。"
         samples = "、".join(data.get("random_sample_times") or []) or "无"
+        deletable_count = int(data.get("deletable_count", count) or 0)
+        permission_note = ""
+        if deletable_count < count:
+            permission_note = f"\n其中 {deletable_count} 条具备删除权限，{count - deletable_count} 条因机器人群权限不足被排除。"
         return (
             f"最近 {hours} 小时共找到 {data.get('total_eligible_count', count)} 条合格广告，"
             f"本次快照返回 {count} 条。\n"
             f"最新时间：{data.get('latest_recorded_at') or '无'}\n"
             f"最早时间：{data.get('earliest_recorded_at') or '无'}\n"
-            f"随机时间样本：{samples}"
+            f"随机时间样本：{samples}{permission_note}"
         )
 
     @staticmethod
@@ -674,6 +707,18 @@ class AIAgent:
             return (result.get("message") or "系统查询完成") + ("\n" + "，".join(summary_items) if summary_items else "")
         return result.get("message") or "系统查询完成。"
 
+    @staticmethod
+    def _format_ad_detection_result(result: Dict[str, Any]) -> str:
+        if not result.get("success", True):
+            return f"广告检测失败：{result.get('message') or '未知错误'}"
+        data = result.get("data") or {}
+        findings = data.get("findings") or []
+        verdict = "检测为广告" if data.get("is_advertising") else "未达到广告判定阈值"
+        text = f"{verdict}，评分 {int(data.get('ad_score') or 0)}/100，置信度 {data.get('confidence') or 'low'}。"
+        if findings:
+            text += "\n依据：" + "；".join(str(item) for item in findings[:8])
+        return text
+
     def _match_tool_from_text(self, text: str, tools: list) -> Optional[str]:
         """根据用户文本做启发式工具匹配（仅作为 LLM 未显式返回 tool_call 时的兜底）"""
         if not text:
@@ -727,6 +772,10 @@ class AIAgent:
                 "最近消息", "最近有谁", "谁给我发", "谁给我发送", "最近发消息",
                 "广告消息", "群广告", "疑似广告", "打广告", "发广告", "灰黑产",
                 "哪些人打广告", "有哪些人打广告", "谁在打广告",
+            ],
+            "telegram_sdk_query": [
+                "机器人权限", "bot权限", "删除权限", "群权限", "频道权限",
+                "机器人能不能删除", "为什么删除失败", "telegram sdk",
             ],
             "skill_manage": [
                 "新增skill", "增加skill", "添加skill", "技能管理",
@@ -806,6 +855,20 @@ class AIAgent:
             if group_match:
                 args["group_id"] = int(group_match.group(1))
             return args
+
+        if tool_name == "telegram_sdk_query":
+            group_match = re.search(r"(?:group_id|chat_id|群|群组)\s*[:：=]?\s*(-?\d{5,})", text, re.I)
+            if group_match:
+                return {
+                    "operation": "chat_capabilities",
+                    "chat_id": int(group_match.group(1)),
+                    "include_admins": False,
+                }
+            return {
+                "operation": "bound_chat_capabilities",
+                "limit": 20,
+                "include_admins": False,
+            }
 
         if tool_name == "delete_ad_message":
             args = {"delete_latest_ad": True}
@@ -921,7 +984,14 @@ class AIAgent:
             return []
 
         matched_tool_name = self._match_tool_from_text(text, tools)
-        if matched_tool_name not in {"system_query", "query_ad_clusters", "query_recent_ad_messages"}:
+        if matched_tool_name not in {
+            "finance_query",
+            "detect_advertising",
+            "system_query",
+            "telegram_sdk_query",
+            "query_ad_clusters",
+            "query_recent_ad_messages",
+        }:
             return []
 
         args = self._build_fallback_args(matched_tool_name, text)
@@ -931,7 +1001,13 @@ class AIAgent:
                 "arguments": json.dumps(args, ensure_ascii=False),
             }
         }]
-        if matched_tool_name in {"query_ad_clusters", "query_recent_ad_messages"}:
+        if matched_tool_name in {
+            "finance_query",
+            "detect_advertising",
+            "telegram_sdk_query",
+            "query_ad_clusters",
+            "query_recent_ad_messages",
+        }:
             return calls
 
         query_type = args.get("query_type")
@@ -995,6 +1071,8 @@ class AIAgent:
                     if message.get("role") == "user":
                         latest_user_text = str(message.get("content", "") or "")
                         break
+                if "用户请求:" in latest_user_text:
+                    latest_user_text = latest_user_text.rsplit("用户请求:", 1)[-1].strip()
 
                 # 只在消息长度足够时才进行启发式匹配，过短的消息（如"你好"）跳过
                 matched_tool_name = None
