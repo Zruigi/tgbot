@@ -43,6 +43,8 @@ AGENT_SYSTEM_TEMPLATE = """你是 {bot_name} 的 AI 助手 Agent，具备以下�
 | "查最近频道消息" | 先调用 system_query(channel_messages)，再结合 telegram_sdk_query(bot_visibility_status) |
 | "最近有谁给我发消息" | 调用 system_query(recent_senders) |
 | "查下最近群广告消息/有没有广告/谁在打广告" | 先调用 query_ad_clusters，再基于聚合证据回复 |
+| "最近24小时广告记录时间" | 调用 query_recent_ad_messages，返回最早/最晚和随机时间样本 |
+| "执行删除 最近24小时的广告" | 先锁定精确快照，等待确认后调用 delete_recent_ad_messages |
 | "删除广告 cluster" | 调用 delete_ad_cluster，等待确认后执行 |
 
 当前时间: {current_time}
@@ -85,6 +87,11 @@ TOOL_INSTRUCTIONS = """
 - delete_ad_cluster：按 cluster 批量删除对应 Telegram 消息；默认 dry-run，只有 AD_DELETE_ENABLED=true 且用户确认后才实际执行
 - 当用户要求判断某个群/频道“有没有广告、灰黑产、推广、谁在打广告”时，必须先调用 query_ad_clusters，再回复
 - 如果 evidence_count=0 或 analysis_allowed=false，只能说明“当前没有可见且已落库的消息证据”，不能说“未发现广告”
+
+### 4d. ⏱ 最近广告安全删除 (query_recent_ad_messages / delete_recent_ad_messages)
+- query_recent_ad_messages：只查询1-24小时内已标记、广告分数>=40的用户消息，默认排除管理员、bot和频道转发
+- delete_recent_ad_messages：只能删除前一步锁定的精确快照，单次最多50条，快照15分钟失效，必须二次确认
+- 禁止 LLM 自行构造 message_id、扩大时间窗或将未标记消息加入删除列表
 
 ### 5. 🔍 系统查询 (system_query)
 - 统计概览、活跃群组、绑定群/频道、监听地址列表

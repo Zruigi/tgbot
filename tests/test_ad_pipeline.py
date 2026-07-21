@@ -134,5 +134,7 @@ async def test_agent_prefetches_ad_clusters_before_llm_reply(tmp_path, monkeypat
 
     assert response.tool_calls_made[0] == "query_ad_clusters"
     assert "query_ad_clusters" in response.tool_results
-    assert seen_messages
-    assert "[工具执行结果]" in seen_messages[0][-1]["content"]
+    assert seen_messages == []
+    assert "已检查" in response.text
+    assert "疑似广告聚类" in response.text
+    assert "请稍等" not in response.text

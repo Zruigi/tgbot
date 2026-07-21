@@ -2197,6 +2197,7 @@ async def _run_ai_agent_chat(
     model: str,
     tenant_id: str,
     scope: Dict[str, Any],
+    chat_id: Optional[int] = None,
 ):
     from backend.app.services.ai_service import get_ai_service
     from services.ai_agent.core import get_agent
@@ -2241,6 +2242,8 @@ async def _run_ai_agent_chat(
                 'merchant_id': scope.get('merchant_id'),
                 'role': scope.get('role'),
                 'custom_skills': custom_skills,
+                'chat_id': chat_id,
+                'group_id': chat_id,
             },
             bot_instance=_bot_instance,
             conversation_history=restored_history,
@@ -2253,6 +2256,8 @@ async def _run_ai_agent_chat(
         ctx.metadata['tenant_id'] = tenant_id
         ctx.metadata['merchant_id'] = scope.get('merchant_id')
         ctx.metadata['role'] = scope.get('role')
+        ctx.metadata['chat_id'] = chat_id
+        ctx.metadata['group_id'] = chat_id
         ctx.bot_instance = _bot_instance
         session['updated_at'] = time.time()
 
@@ -2287,6 +2292,15 @@ async def api_ai_chat_bridge(request):
         idempotency_key = str(data.get('idempotencyKey') or data.get('idempotency_key') or '').strip()
         scope = _request_scope_context(request)
         body_tenant_id = str(data.get('tenant_id') or (data.get('context') or {}).get('tenant_id') or '').strip()
+        body_context = data.get('context') if isinstance(data.get('context'), dict) else {}
+        raw_chat_id = (
+            data.get('chatId') or data.get('chat_id') or data.get('group_id')
+            or body_context.get('chat_id') or body_context.get('group_id')
+        )
+        try:
+            chat_id = int(raw_chat_id) if str(raw_chat_id or '').strip() else None
+        except Exception:
+            chat_id = None
         if body_tenant_id and scope.get('role') == 'platform_admin':
             scope['tenant_id'] = body_tenant_id
             scope['is_merchant'] = body_tenant_id not in {'', 'platform'}
@@ -2317,6 +2331,7 @@ async def api_ai_chat_bridge(request):
                     model=model,
                     tenant_id=tenant_id,
                     scope=scope,
+                    chat_id=chat_id,
                 )
                 reply = agent_result.text
             except Exception as agent_err:

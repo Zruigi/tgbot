@@ -571,3 +571,174 @@ async def test_agent_reads_bound_chats_and_group_messages(tmp_path, monkeypatch)
     assert any(row["content"] == "群里的一条真实消息" for row in group_rows["data"])
     assert channel_rows["count"] == 1
     assert channel_rows["data"][0]["content"] == "频道身份发出的消息"
+
+
+@pytest.mark.asyncio
+async def test_agent_records_tool_exception_in_tool_results(monkeypatch):
+    from services.ai_agent import core as core_mod
+    from services.ai_agent.core import AIAgent
+    from services.ai_agent.schema import AgentContext
+    from services.ai_agent.tools import BaseTool
+
+    class BrokenTool(BaseTool):
+        name = "broken_query"
+        description = "Broken read-only test tool"
+
+        async def execute(self, params, context=None):
+            raise RuntimeError("database timeout")
+
+    calls = 0
+
+    async def fake_llm(messages, model=""):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (
+                '__TOOL_CALL__{"function":{"name":"broken_query","arguments":"{}"}}',
+                {"total_tokens": 8},
+            )
+        return "查询工具执行失败，请稍后重试。", {"total_tokens": 8}
+
+    monkeypatch.setattr(
+        core_mod,
+        "get_tools_for_llm",
+        lambda: [BrokenTool().schema_for_llm],
+    )
+    monkeypatch.setattr(
+        core_mod,
+        "get_tool",
+        lambda name: BrokenTool() if name == "broken_query" else None,
+    )
+
+    response = await AIAgent(llm_call_fn=fake_llm).process_message(
+        "查一下最近群广告消息",
+        AgentContext(user_id=-99999),
+    )
+
+    assert response.tool_calls_made == ["broken_query"]
+    assert response.tool_results["broken_query"]["success"] is False
+    assert "database timeout" in response.tool_results["broken_query"]["message"]
+    assert "失败" in response.text
+
+
+@pytest.mark.asyncio
+async def test_system_query_group_ad_messages_clamps_large_limit(tmp_path, monkeypatch):
+    import config
+    import database
+    from services.ai_agent.schema import AgentContext
+    from services.ai_agent.tools import SystemQueryTool
+
+    db_path = tmp_path / "agent_group_ad_limit.sqlite3"
+    monkeypatch.setattr(config, "DB_NAME", str(db_path), raising=False)
+    monkeypatch.setattr(database, "DB_NAME", str(db_path), raising=False)
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE group_messages (
+                msg_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER,
+                tg_msg_id INTEGER,
+                user_id INTEGER,
+                username TEXT,
+                content TEXT,
+                msg_type TEXT DEFAULT 'text',
+                sender_type TEXT DEFAULT 'user',
+                message_ts INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_advertising INTEGER DEFAULT 0,
+                ad_score INTEGER DEFAULT 0,
+                ad_confidence TEXT DEFAULT 'low',
+                ad_findings TEXT DEFAULT NULL,
+                tenant_id TEXT DEFAULT 'default'
+            )
+            """
+        )
+        for idx in range(60):
+            await db.execute(
+                """
+                INSERT INTO group_messages (
+                    group_id, tg_msg_id, user_id, username, content,
+                    message_ts, is_advertising, ad_score, ad_confidence, tenant_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (-1001, idx + 1, 800 + idx, f"ad_{idx}", "注册送福利广告", 5000 + idx, 1, 90, "high", "tenant-a"),
+            )
+        await db.commit()
+
+    ctx = AgentContext(
+        user_id=123,
+        metadata={"role": "merchant_owner", "tenant_id": "tenant-a", "merchant_id": 1},
+    )
+    result = await SystemQueryTool().execute(
+        {"query_type": "group_ad_messages", "limit": 500},
+        context=ctx,
+    )
+
+    assert result["success"] is True
+    assert result["count"] == 50
+    assert len(result["data"]) == 50
+
+
+@pytest.mark.asyncio
+async def test_api_ai_chat_uses_agent_for_virtual_assistant(monkeypatch):
+    import json
+    from services.ai_agent.schema import AgentResponse
+    from backend.app.api import ai as ai_api
+
+    class FakeQuota:
+        async def check_available(self, tenant_id, amount=1):
+            return {"allowed": True}
+
+        async def record_usage(self, tenant_id, amount=1):
+            return None
+
+    class FakeRequest:
+        match_info = {}
+        app = {}
+
+        def get(self, key, default=None):
+            if key == "session":
+                return {
+                    "role": "platform_admin",
+                    "tenant_id": "tenant-a",
+                    "merchant_id": 7,
+                    "authenticated": True,
+                }
+            return default
+
+        async def json(self):
+            return {
+                "userId": -99999,
+                "content": "查一下群里有没有广告",
+                "model": "gemini-2.5-flash-lite",
+            }
+
+    async def fake_run_agent_chat(**kwargs):
+        assert kwargs["user_id"] == -99999
+        assert kwargs["scope"]["tenant_id"] == "tenant-a"
+        return AgentResponse(
+            text="查到 1 条广告证据",
+            tool_calls_made=["system_query"],
+            tool_results={
+                "system_query": {
+                    "success": True,
+                    "source": "sql.group_messages",
+                    "data_complete": True,
+                    "analysis_allowed": True,
+                    "evidence_count": 1,
+                }
+            },
+        )
+
+    monkeypatch.setattr(ai_api, "get_quota_service", lambda: FakeQuota())
+    monkeypatch.setattr(ai_api, "save_ai_usage_log", lambda **kwargs: None)
+    monkeypatch.setattr(ai_api, "_run_ai_agent_chat", fake_run_agent_chat)
+
+    response = await ai_api.api_ai_chat(FakeRequest())
+    payload = json.loads(response.text)
+
+    assert payload["status"] == "ok"
+    assert payload["reply"] == "查到 1 条广告证据"
+    assert payload["tool_calls_made"] == ["system_query"]
+    assert payload["evidence"]["system_query"]["evidence_count"] == 1

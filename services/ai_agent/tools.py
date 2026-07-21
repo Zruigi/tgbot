@@ -7,6 +7,8 @@ AI Agent 内置工具集 — 每个工具封装一个系统功能
 import logging
 import os
 import json
+import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import httpx
 import database
@@ -664,6 +666,432 @@ class AdDetectorTool(BaseTool):
                 f"{'⚠️ 检测到广告内容' if is_ad else '✅ 未检出广告'} "
                 f"(得分: {ad_score}/100, 置信度: {confidence})"
             ),
+        }
+
+
+# ===== 工具 4a：最近广告记录查询 =====
+
+class QueryRecentAdMessagesTool(BaseTool):
+    """查询最近时间窗内可安全处理的广告消息快照。"""
+    name = "query_recent_ad_messages"
+    description = (
+        "查询最近24小时内已落库、已标记为广告的用户消息，返回精确消息引用、"
+        "最早/最晚记录时间以及随机时间样本。默认排除管理员、bot 和频道转发。"
+    )
+    category = "security"
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "properties": {
+                "hours": {"type": "integer", "description": "查询窗口，1-24 小时，默认24"},
+                "group_id": {"type": "integer", "description": "可选，限定某个群"},
+                "limit": {"type": "integer", "description": "候选上限，默认20，最大50"},
+                "sample_size": {"type": "integer", "description": "随机时间样本数，默认5，最大10"},
+            },
+            "required": [],
+        }
+
+    @staticmethod
+    def _iso_time(ts: Any) -> Optional[str]:
+        try:
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone().isoformat()
+        except Exception:
+            return None
+
+    async def execute(self, params: Dict[str, Any], context=None) -> dict:
+        import aiosqlite
+
+        hours = max(1, min(int(params.get("hours") or 24), 24))
+        limit = max(1, min(int(params.get("limit") or 20), 50))
+        sample_size = max(1, min(int(params.get("sample_size") or 5), 10))
+        group_id = params.get("group_id")
+        cutoff_ts = int(time.time()) - hours * 3600
+        tenant_id = _context_scoped_tenant_id(context)
+
+        async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+            db.row_factory = aiosqlite.Row
+            schema_cur = await db.execute("PRAGMA table_info(group_messages)")
+            columns = {row[1] for row in await schema_cur.fetchall()}
+            required = {"msg_id", "group_id", "tg_msg_id", "user_id", "content", "message_ts", "is_advertising"}
+            if not required.issubset(columns):
+                return {
+                    "success": False,
+                    "message": "group_messages 缺少广告查询所需字段",
+                    "data_complete": False,
+                    "analysis_allowed": False,
+                    "evidence_count": 0,
+                }
+
+            where = [
+                "COALESCE(is_advertising, 0) = 1",
+                "tg_msg_id IS NOT NULL",
+                "COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) >= ?",
+                "COALESCE(sender_type, 'user') = 'user'",
+                "user_id != ?",
+            ]
+            sql_params: List[Any] = [cutoff_ts, int(config.ADMIN_ID)]
+            if "ad_score" in columns:
+                where.append("COALESCE(ad_score, 0) >= 40")
+            if "is_deleted" in columns:
+                where.append("COALESCE(is_deleted, 0) = 0")
+            if "ad_action_status" in columns:
+                where.append("COALESCE(ad_action_status, 'none') NOT IN ('deleted', 'deleting')")
+            if tenant_id and "tenant_id" in columns:
+                where.append("tenant_id = ?")
+                sql_params.append(tenant_id)
+            if str(group_id or "").strip():
+                where.append("group_id = ?")
+                sql_params.append(int(group_id))
+
+            where_sql = " AND ".join(where)
+            stats_cur = await db.execute(
+                f"""
+                SELECT COUNT(*) AS total_count,
+                       MIN(COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER))) AS earliest_ts,
+                       MAX(COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER))) AS latest_ts
+                FROM group_messages
+                WHERE {where_sql}
+                """,
+                tuple(sql_params),
+            )
+            stats = await stats_cur.fetchone()
+            total_count = int(stats["total_count"] or 0)
+            earliest_ts = int(stats["earliest_ts"] or 0)
+            latest_ts = int(stats["latest_ts"] or 0)
+
+            sample_cur = await db.execute(
+                f"""
+                SELECT COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) AS effective_ts
+                FROM group_messages
+                WHERE {where_sql}
+                ORDER BY RANDOM()
+                LIMIT ?
+                """,
+                (*sql_params, sample_size),
+            )
+            sampled_times = [
+                self._iso_time(row["effective_ts"])
+                for row in await sample_cur.fetchall()
+                if row["effective_ts"]
+            ]
+
+            sender_type_expr = "sender_type" if "sender_type" in columns else "'user' AS sender_type"
+            tenant_expr = "tenant_id" if "tenant_id" in columns else "'default' AS tenant_id"
+            score_expr = "COALESCE(ad_score, 0) AS ad_score" if "ad_score" in columns else "0 AS ad_score"
+            cur = await db.execute(
+                f"""
+                SELECT msg_id, group_id, tg_msg_id, user_id, username, content,
+                       {sender_type_expr}, {tenant_expr}, {score_expr},
+                       COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) AS effective_ts
+                FROM group_messages
+                WHERE {where_sql}
+                ORDER BY effective_ts DESC, msg_id DESC
+                LIMIT ?
+                """,
+                (*sql_params, limit),
+            )
+            rows = [dict(row) for row in await cur.fetchall()]
+
+        refs = []
+        records = []
+        for row in rows:
+            ref = {
+                "msg_id": int(row["msg_id"]),
+                "group_id": int(row["group_id"]),
+                "chat_id": int(row["group_id"]),
+                "tg_msg_id": int(row["tg_msg_id"]),
+                "user_id": int(row.get("user_id") or 0),
+                "message_ts": int(row.get("effective_ts") or 0),
+                "tenant_id": str(row.get("tenant_id") or "default"),
+            }
+            refs.append(ref)
+            records.append({
+                **ref,
+                "username": row.get("username") or "",
+                "ad_score": int(row.get("ad_score") or 0),
+                "recorded_at": self._iso_time(row.get("effective_ts")),
+                "content_preview": str(row.get("content") or "")[:120],
+            })
+
+        snapshot_ts = int(time.time())
+        return {
+            "success": True,
+            "source": "sqlite.group_messages",
+            "data_complete": True,
+            "analysis_allowed": bool(records),
+            "evidence_count": len(records),
+            "data": {
+                "hours": hours,
+                "cutoff_ts": cutoff_ts,
+                "snapshot_created_at": snapshot_ts,
+                "total_eligible_count": total_count,
+                "snapshot_count": len(records),
+                "earliest_recorded_at": self._iso_time(earliest_ts),
+                "latest_recorded_at": self._iso_time(latest_ts),
+                "random_sample_times": sampled_times,
+                "records": records,
+                "candidate_refs": refs,
+                "safety_policy": {
+                    "max_batch": 50,
+                    "admin_messages_excluded": True,
+                    "bot_messages_excluded": True,
+                    "channel_posts_excluded": True,
+                    "minimum_ad_score": 40,
+                },
+            },
+            "count": len(records),
+            "limitation": (
+                None if records else
+                f"最近 {hours} 小时没有找到符合安全删除条件的已标记用户广告；不代表群历史中没有广告。"
+            ),
+            "message": f"最近 {hours} 小时查到 {total_count} 条合格广告，本次快照锁定 {len(records)} 条",
+        }
+
+
+class DeleteRecentAdMessagesTool(BaseTool):
+    """删除查询快照中的最近广告消息。"""
+    name = "delete_recent_ad_messages"
+    description = (
+        "按 query_recent_ad_messages 生成的精确快照删除广告。"
+        "必须二次确认，最多50条，且会逐条复核租户、时间、广告标记、发送者和 bot 权限。"
+    )
+    category = "security"
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "properties": {
+                "message_refs": {"type": "array", "items": {"type": "object"}, "description": "查询快照的精确消息引用"},
+                "cutoff_ts": {"type": "integer", "description": "快照时间窗下界"},
+                "snapshot_created_at": {"type": "integer", "description": "快照生成时间"},
+                "hours": {"type": "integer", "description": "查询小时数"},
+            },
+            "required": ["message_refs", "cutoff_ts", "snapshot_created_at"],
+        }
+
+    async def _audit(self, *, context: Any, action: str, payload: Dict[str, Any]) -> None:
+        import aiosqlite
+
+        metadata = _context_metadata(context)
+        tenant_id = _context_scoped_tenant_id(context) or str(metadata.get("tenant_id") or "default")
+        try:
+            async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+                table_cur = await db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tenant_audit_logs'"
+                )
+                if not await table_cur.fetchone():
+                    return
+                await db.execute(
+                    """
+                    INSERT INTO tenant_audit_logs (
+                        tenant_id, merchant_id, operator_role, operator_id,
+                        action, resource_type, resource_id, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'group_messages', ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        tenant_id,
+                        _context_merchant_id(context),
+                        str(metadata.get("role") or "agent"),
+                        str(getattr(context, "user_id", "") or ""),
+                        action,
+                        str(payload.get("batch_id") or "recent_ads"),
+                        json.dumps(payload, ensure_ascii=False, default=str),
+                    ),
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.warning("广告删除审计写入失败: %s", exc)
+
+    async def execute(self, params: Dict[str, Any], context=None) -> dict:
+        import aiosqlite
+
+        refs = params.get("message_refs") or []
+        if not isinstance(refs, list) or not refs:
+            return {"success": False, "action_taken": False, "message": "缺少经过查询锁定的广告消息快照"}
+        if len(refs) > 50:
+            return {"success": False, "action_taken": False, "message": "单次删除不能超过50条"}
+        if not bool(getattr(config, "AD_DELETE_ENABLED", False)):
+            return {
+                "success": False,
+                "action_taken": False,
+                "blocked": True,
+                "message": "AD_DELETE_ENABLED 未开启，已阻止真实删除",
+            }
+
+        bot = getattr(context, "bot_instance", None) if context is not None else None
+        if not bot:
+            return {"success": False, "action_taken": False, "message": "bot 未初始化，无法删除 Telegram 消息"}
+
+        try:
+            cutoff_ts = int(params.get("cutoff_ts") or 0)
+            snapshot_created_at = int(params.get("snapshot_created_at") or 0)
+        except Exception:
+            return {"success": False, "action_taken": False, "message": "快照时间参数无效"}
+        now_ts = int(time.time())
+        if cutoff_ts <= 0 or snapshot_created_at <= 0 or snapshot_created_at > now_ts + 60:
+            return {"success": False, "action_taken": False, "message": "快照时间参数不合法"}
+        if now_ts - snapshot_created_at > 15 * 60:
+            return {"success": False, "action_taken": False, "message": "删除快照已超过15分钟，请重新查询"}
+
+        tenant_id = _context_scoped_tenant_id(context)
+        verified: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
+        async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+            db.row_factory = aiosqlite.Row
+            schema_cur = await db.execute("PRAGMA table_info(group_messages)")
+            columns = {row[1] for row in await schema_cur.fetchall()}
+            for ref in refs:
+                try:
+                    msg_id = int(ref.get("msg_id"))
+                    group_id = int(ref.get("group_id") or ref.get("chat_id"))
+                    tg_msg_id = int(ref.get("tg_msg_id"))
+                    user_id = int(ref.get("user_id") or 0)
+                except Exception:
+                    rejected.append({"ref": ref, "reason": "invalid_reference"})
+                    continue
+
+                where = [
+                    "msg_id = ?", "group_id = ?", "tg_msg_id = ?", "user_id = ?",
+                    "COALESCE(is_advertising, 0) = 1",
+                    "COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) >= ?",
+                    "COALESCE(message_ts, CAST(strftime('%s', timestamp) AS INTEGER)) <= ?",
+                    "COALESCE(sender_type, 'user') = 'user'",
+                    "user_id != ?",
+                ]
+                sql_params: List[Any] = [msg_id, group_id, tg_msg_id, user_id, cutoff_ts, snapshot_created_at, int(config.ADMIN_ID)]
+                if "ad_score" in columns:
+                    where.append("COALESCE(ad_score, 0) >= 40")
+                if "is_deleted" in columns:
+                    where.append("COALESCE(is_deleted, 0) = 0")
+                if "ad_action_status" in columns:
+                    where.append("COALESCE(ad_action_status, 'none') NOT IN ('deleted', 'deleting')")
+                if tenant_id and "tenant_id" in columns:
+                    where.append("tenant_id = ?")
+                    sql_params.append(tenant_id)
+                cur = await db.execute(
+                    f"SELECT * FROM group_messages WHERE {' AND '.join(where)} LIMIT 1",
+                    tuple(sql_params),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    rejected.append({"msg_id": msg_id, "reason": "snapshot_revalidation_failed"})
+                    continue
+                verified.append(dict(row))
+
+        try:
+            bot_user = await bot.get_me()
+            bot_id = int(getattr(bot_user, "id", 0) or 0)
+        except Exception as exc:
+            return {"success": False, "action_taken": False, "message": f"无法校验 bot 身份: {str(exc)[:160]}"}
+        if not bot_id:
+            return {"success": False, "action_taken": False, "message": "无法获取 bot ID"}
+
+        permission_cache: Dict[int, bool] = {}
+        deleted: List[Dict[str, Any]] = []
+        failures: List[Dict[str, Any]] = []
+        for row in verified:
+            group_id = int(row["group_id"])
+            tg_msg_id = int(row["tg_msg_id"])
+            user_id = int(row.get("user_id") or 0)
+
+            if group_id not in permission_cache:
+                try:
+                    bot_member = await bot.get_chat_member(group_id, bot_id)
+                    status = str(getattr(bot_member, "status", "") or "")
+                    permission_cache[group_id] = status == "creator" or (
+                        status == "administrator" and bool(getattr(bot_member, "can_delete_messages", False))
+                    )
+                except Exception:
+                    permission_cache[group_id] = False
+            if not permission_cache[group_id]:
+                failures.append({"msg_id": row.get("msg_id"), "reason": "bot_missing_delete_permission"})
+                continue
+
+            try:
+                sender_member = await bot.get_chat_member(group_id, user_id)
+                if str(getattr(sender_member, "status", "") or "") in {"administrator", "creator"}:
+                    failures.append({"msg_id": row.get("msg_id"), "reason": "sender_is_admin"})
+                    continue
+            except Exception as exc:
+                failures.append({"msg_id": row.get("msg_id"), "reason": f"sender_check_failed:{str(exc)[:120]}"})
+                continue
+
+            try:
+                claimed = True
+                if "ad_action_status" in row:
+                    async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+                        claim_cur = await db.execute(
+                            """
+                            UPDATE group_messages
+                            SET ad_action_status = 'deleting'
+                            WHERE msg_id = ?
+                              AND COALESCE(ad_action_status, 'none') NOT IN ('deleted', 'deleting')
+                            """,
+                            (int(row["msg_id"]),),
+                        )
+                        await db.commit()
+                        claimed = claim_cur.rowcount == 1
+                if not claimed:
+                    failures.append({"msg_id": row.get("msg_id"), "reason": "already_claimed_or_deleted"})
+                    continue
+
+                await bot.delete_message(chat_id=group_id, message_id=tg_msg_id)
+            except Exception as exc:
+                if "ad_action_status" in row:
+                    async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+                        await db.execute(
+                            "UPDATE group_messages SET ad_action_status = 'failed' WHERE msg_id = ? AND ad_action_status = 'deleting'",
+                            (int(row["msg_id"]),),
+                        )
+                        await db.commit()
+                failures.append({"msg_id": row.get("msg_id"), "reason": f"telegram_delete_failed:{str(exc)[:160]}"})
+                continue
+
+            async with aiosqlite.connect(config.DB_NAME, timeout=10) as db:
+                set_parts = []
+                if "is_deleted" in row:
+                    set_parts.append("is_deleted = 1")
+                if "deleted_at" in row:
+                    set_parts.append("deleted_at = CURRENT_TIMESTAMP")
+                if "ad_action_status" in row:
+                    set_parts.append("ad_action_status = 'deleted'")
+                if set_parts:
+                    await db.execute(
+                        f"UPDATE group_messages SET {', '.join(set_parts)} WHERE msg_id = ?",
+                        (int(row["msg_id"]),),
+                    )
+                    await db.commit()
+            deleted.append({"msg_id": row.get("msg_id"), "group_id": group_id, "tg_msg_id": tg_msg_id})
+
+        batch_id = f"recent_ads:{snapshot_created_at}:{getattr(context, 'user_id', 'agent')}"
+        await self._audit(
+            context=context,
+            action="agent_delete_recent_ads",
+            payload={
+                "batch_id": batch_id,
+                "snapshot_created_at": snapshot_created_at,
+                "cutoff_ts": cutoff_ts,
+                "requested_count": len(refs),
+                "verified_count": len(verified),
+                "deleted": deleted,
+                "rejected": rejected,
+                "failures": failures,
+            },
+        )
+        return {
+            "success": not failures and not rejected,
+            "action_taken": bool(deleted),
+            "data": {
+                "batch_id": batch_id,
+                "requested_count": len(refs),
+                "verified_count": len(verified),
+                "deleted_count": len(deleted),
+                "deleted": deleted,
+                "rejected": rejected,
+                "failures": failures,
+            },
+            "message": f"删除完成：成功 {len(deleted)} 条，拒绝 {len(rejected)} 条，失败 {len(failures)} 条",
         }
 
 
@@ -1924,6 +2352,8 @@ register_tool(FinanceTool())
 register_tool(BroadcastTool())
 register_tool(ContentGeneratorTool())
 register_tool(AdDetectorTool())
+register_tool(QueryRecentAdMessagesTool())
+register_tool(DeleteRecentAdMessagesTool())
 register_tool(DeleteAdMessageTool())
 register_tool(QueryAdClustersTool())
 register_tool(DeleteAdClusterTool())

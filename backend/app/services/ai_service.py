@@ -138,8 +138,18 @@ class AIService:
         model: str = "",
         temperature: float = 0.3,
         timeout_seconds: float = 110.0,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
-        """Call the configured OpenAI-compatible LLM and return text + usage."""
+        """Call the configured OpenAI-compatible LLM and return text + usage.
+
+        Args:
+            messages: Chat messages for the LLM.
+            model: Model name override.
+            temperature: Sampling temperature.
+            timeout_seconds: HTTP request timeout.
+            response_format: Optional response format constraint,
+                e.g. {"type": "json_object"} for JSON mode.
+        """
         runtime = await self._resolve_runtime_config(model)
         api_key = runtime["api_key"]
         if not api_key:
@@ -151,6 +161,8 @@ class AIService:
             "temperature": temperature,
             "max_tokens": 2048,
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",

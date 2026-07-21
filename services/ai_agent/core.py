@@ -9,6 +9,8 @@ import asyncio
 import re
 from typing import Any, Dict, List, Optional
 
+import config
+
 from .schema import (
     AgentContext,
     AgentResponse,
@@ -82,6 +84,16 @@ class AIAgent:
         action_taken = False
         needs_confirmation = False
         final_text = ""
+
+        # 删除最近广告是高风险操作：用 Python 确定性生成候选快照，
+        # 不让 LLM 自行构造 message_id 或扩大删除范围。
+        prepared_delete = await self._prepare_recent_ad_deletion(user_message, ctx)
+        if prepared_delete is not None:
+            ctx.conversation_history.append({"role": "user", "content": user_message})
+            ctx.conversation_history.append({"role": "assistant", "content": prepared_delete.text})
+            if len(ctx.conversation_history) > 40:
+                ctx.conversation_history = ctx.conversation_history[-40:]
+            return prepared_delete
 
         preflight_tool_calls = self._build_preflight_tool_calls(user_message, tool_schemas)
         if preflight_tool_calls:
@@ -157,12 +169,17 @@ class AIAgent:
                     "必须明确说明当前没有足够消息证据，不能回答“未发现广告/没有异常”。"
                 ),
             })
-            final_text, _ = await self._call_llm(
-                messages=messages,
-                model=model or "gemini-2.5-flash-lite",
-                tools=[],
-                round_num=2,
-            )
+            if "query_ad_clusters" in tool_results:
+                final_text = self._format_ad_cluster_result(tool_results["query_ad_clusters"])
+            elif "query_recent_ad_messages" in tool_results:
+                final_text = self._format_recent_ad_result(tool_results["query_recent_ad_messages"])
+            else:
+                final_text, _ = await self._call_llm(
+                    messages=messages,
+                    model=model or "gemini-2.5-flash-lite",
+                    tools=[],
+                    round_num=2,
+                )
 
         while round_num < MAX_TOOL_CALL_ROUNDS:
             if final_text:
@@ -445,6 +462,152 @@ class AIAgent:
             confidence=1.0 if not has_failure else 0.7,
         )
 
+    @staticmethod
+    def _is_recent_ad_delete_request(text: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(text or "").lower())
+        has_delete = any(word in normalized for word in ("删除", "清理", "移除", "删掉", "执行删除"))
+        has_ad = any(word in normalized for word in ("广告", "垃圾信息", "牛皮癣"))
+        has_window = any(word in normalized for word in ("最近", "24小时", "小时内", "今天"))
+        return has_delete and has_ad and has_window
+
+    async def _prepare_recent_ad_deletion(
+        self,
+        user_text: str,
+        ctx: AgentContext,
+    ) -> Optional[AgentResponse]:
+        if not self._is_recent_ad_delete_request(user_text):
+            return None
+
+        hours_match = re.search(r"(\d{1,3})\s*(?:小时|h)", user_text, re.I)
+        hours = max(1, min(int(hours_match.group(1)) if hours_match else 24, 24))
+        group_match = re.search(r"(?:group_id|群|群组)\s*[:：=]?\s*(-?\d{5,})", user_text, re.I)
+        query_params: Dict[str, Any] = {
+            "hours": hours,
+            "limit": 50,
+            "sample_size": 5,
+        }
+        if group_match:
+            query_params["group_id"] = int(group_match.group(1))
+        elif isinstance(ctx.metadata, dict):
+            context_group_id = ctx.metadata.get("group_id") or ctx.metadata.get("chat_id")
+            if str(context_group_id or "").strip():
+                try:
+                    query_params["group_id"] = int(context_group_id)
+                except Exception:
+                    pass
+
+        query_tool = get_tool("query_recent_ad_messages")
+        if not query_tool:
+            return AgentResponse(
+                text="最近广告查询工具未加载，未执行任何删除。",
+                tool_calls_made=["query_recent_ad_messages"],
+                tool_results={"query_recent_ad_messages": {"success": False, "message": "tool_not_loaded"}},
+                confidence=0.0,
+            )
+
+        try:
+            query_result = await query_tool.execute(query_params, context=ctx)
+        except Exception as exc:
+            logger.error("生成最近广告删除快照失败: %s", exc, exc_info=True)
+            return AgentResponse(
+                text=f"查询最近 {hours} 小时广告失败，未执行任何删除。",
+                tool_calls_made=["query_recent_ad_messages"],
+                tool_results={"query_recent_ad_messages": {"success": False, "message": str(exc)}},
+                confidence=0.0,
+            )
+
+        data = query_result.get("data") or {}
+        refs = data.get("candidate_refs") or []
+        if not query_result.get("success", True) or not refs:
+            return AgentResponse(
+                text=self._format_recent_ad_result(query_result),
+                tool_calls_made=["query_recent_ad_messages"],
+                tool_results={"query_recent_ad_messages": query_result},
+                confidence=0.9 if query_result.get("success", True) else 0.2,
+            )
+
+        delete_params = {
+            "message_refs": refs,
+            "cutoff_ts": int(data.get("cutoff_ts") or 0),
+            "snapshot_created_at": int(data.get("snapshot_created_at") or 0),
+            "hours": hours,
+        }
+        pending_delete = {
+            "success": True,
+            "needs_confirmation": True,
+            "action_taken": False,
+            "_params": delete_params,
+            "message": f"已锁定 {len(refs)} 条候选广告，等待确认删除",
+            "data": {
+                "candidate_count": len(refs),
+                "latest_recorded_at": data.get("latest_recorded_at"),
+                "earliest_recorded_at": data.get("earliest_recorded_at"),
+                "random_sample_times": data.get("random_sample_times") or [],
+                "delete_enabled": bool(getattr(config, "AD_DELETE_ENABLED", False)),
+            },
+        }
+        samples = "、".join(data.get("random_sample_times") or []) or "无"
+        delete_switch_note = (
+            "真实删除开关已开启。"
+            if pending_delete["data"]["delete_enabled"] else
+            "当前 AD_DELETE_ENABLED 未开启，即使确认也会被后端阻止。"
+        )
+        text = (
+            f"已查询最近 {hours} 小时广告记录，安全快照锁定 {len(refs)} 条。\n"
+            f"最新时间：{data.get('latest_recorded_at') or '无'}\n"
+            f"最早时间：{data.get('earliest_recorded_at') or '无'}\n"
+            f"随机时间样本：{samples}\n\n"
+            "已排除管理员、bot、频道转发和低分记录；单次最多50条，快照15分钟后失效。\n"
+            f"{delete_switch_note}\n"
+            "请回复「确认」执行这份精确快照，其他回复均不会删除。"
+        )
+        return AgentResponse(
+            text=text,
+            tool_calls_made=["query_recent_ad_messages", "delete_recent_ad_messages"],
+            tool_results={
+                "query_recent_ad_messages": query_result,
+                "delete_recent_ad_messages": pending_delete,
+            },
+            is_action_taken=False,
+            requires_confirmation=True,
+            action_summary=f"待确认删除最近{hours}小时广告 {len(refs)} 条",
+            confidence=1.0,
+        )
+
+    @staticmethod
+    def _format_recent_ad_result(result: Dict[str, Any]) -> str:
+        if not result.get("success", True):
+            return f"最近广告记录查询失败：{result.get('message') or '未知错误'}。未执行任何删除。"
+        data = result.get("data") or {}
+        count = int(data.get("snapshot_count") or 0)
+        hours = int(data.get("hours") or 24)
+        if not count:
+            return result.get("limitation") or f"最近 {hours} 小时没有可安全处理的已标记用户广告。"
+        samples = "、".join(data.get("random_sample_times") or []) or "无"
+        return (
+            f"最近 {hours} 小时共找到 {data.get('total_eligible_count', count)} 条合格广告，"
+            f"本次快照返回 {count} 条。\n"
+            f"最新时间：{data.get('latest_recorded_at') or '无'}\n"
+            f"最早时间：{data.get('earliest_recorded_at') or '无'}\n"
+            f"随机时间样本：{samples}"
+        )
+
+    @staticmethod
+    def _format_ad_cluster_result(result: Dict[str, Any]) -> str:
+        if not result.get("success", True):
+            return f"广告聚合查询失败：{result.get('message') or '未知错误'}"
+        evidence_count = int(result.get("evidence_count") or 0)
+        data = result.get("data") or {}
+        clusters = data.get("clusters") or []
+        if evidence_count <= 0 or result.get("analysis_allowed") is False:
+            return result.get("limitation") or "当前没有 bot 已收到并落库的消息证据，不能判断群内没有广告。"
+        if not clusters:
+            return (
+                f"已检查当前时间窗内 {evidence_count} 条已落库消息，未形成疑似广告聚类。"
+                "这不代表群聊全部历史中没有广告。"
+            )
+        return f"已检查 {evidence_count} 条已落库消息，发现 {len(clusters)} 个疑似广告聚类。"
+
     def _match_tool_from_text(self, text: str, tools: list) -> Optional[str]:
         """根据用户文本做启发式工具匹配（仅作为 LLM 未显式返回 tool_call 时的兜底）"""
         if not text:
@@ -470,6 +633,13 @@ class AIAgent:
                 "有没有广告", "群广告", "疑似广告", "广告消息", "灰黑产",
                 "打广告", "发广告", "谁在打广告", "哪些人打广告", "有哪些人打广告",
                 "清理广告", "处理广告",
+            ],
+            "query_recent_ad_messages": [
+                "最近24小时广告", "最近广告记录", "广告记录时间",
+                "随机抽取广告", "随机广告时间", "今天的广告记录",
+            ],
+            "delete_recent_ad_messages": [
+                "删除最近24小时的广告", "执行删除最近", "清理最近广告",
             ],
             "delete_ad_message": [
                 "删除一条广告", "删除最近广告", "删除广告消息",
@@ -523,7 +693,7 @@ class AIAgent:
                 best_score = score
                 best_match = name
 
-        if best_match in {"system_query", "detect_advertising", "query_ad_clusters"} and best_score >= 8:
+        if best_match in {"system_query", "detect_advertising", "query_ad_clusters", "query_recent_ad_messages"} and best_score >= 8:
             return best_match
         return best_match if best_score >= 16 else None
 
@@ -554,6 +724,18 @@ class AIAgent:
 
         if tool_name == "query_ad_clusters":
             args = {"status": "pending", "limit": 20, "window_minutes": 60}
+            group_match = re.search(r"(?:group_id|群|群组)\s*[:：=]?\s*(-?\d{5,})", text, re.I)
+            if group_match:
+                args["group_id"] = int(group_match.group(1))
+            return args
+
+        if tool_name == "query_recent_ad_messages":
+            hours_match = re.search(r"(\d{1,3})\s*(?:小时|h)", text, re.I)
+            args = {
+                "hours": max(1, min(int(hours_match.group(1)) if hours_match else 24, 24)),
+                "limit": 20,
+                "sample_size": 5,
+            }
             group_match = re.search(r"(?:group_id|群|群组)\s*[:：=]?\s*(-?\d{5,})", text, re.I)
             if group_match:
                 args["group_id"] = int(group_match.group(1))
@@ -672,7 +854,7 @@ class AIAgent:
             return []
 
         matched_tool_name = self._match_tool_from_text(text, tools)
-        if matched_tool_name not in {"system_query", "query_ad_clusters"}:
+        if matched_tool_name not in {"system_query", "query_ad_clusters", "query_recent_ad_messages"}:
             return []
 
         args = self._build_fallback_args(matched_tool_name, text)
@@ -682,7 +864,7 @@ class AIAgent:
                 "arguments": json.dumps(args, ensure_ascii=False),
             }
         }]
-        if matched_tool_name == "query_ad_clusters":
+        if matched_tool_name in {"query_ad_clusters", "query_recent_ad_messages"}:
             return calls
 
         query_type = args.get("query_type")

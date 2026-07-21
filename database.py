@@ -526,7 +526,9 @@ async def init_db():
                 is_advertising BOOLEAN DEFAULT 0,
                 ad_score INTEGER DEFAULT 0,
                 ad_confidence TEXT DEFAULT 'low',
-                ad_findings TEXT DEFAULT NULL
+                ad_findings TEXT DEFAULT NULL,
+                is_deleted BOOLEAN DEFAULT 0,
+                deleted_at DATETIME DEFAULT NULL
             )
         ''')
         
@@ -561,6 +563,12 @@ async def init_db():
         if 'ad_action_status' not in gm_columns:
             await db.execute("ALTER TABLE group_messages ADD COLUMN ad_action_status TEXT DEFAULT 'none'")
             logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_action_status 字段")
+        if 'is_deleted' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN is_deleted BOOLEAN DEFAULT 0")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 is_deleted 字段")
+        if 'deleted_at' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN deleted_at DATETIME DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 deleted_at 字段")
 
         # 检查并添加缺失的列 (group_members 迁移 - 验证字段)
         cursor = await db.execute("PRAGMA table_info(group_members)")
@@ -702,6 +710,12 @@ async def init_db():
                 if 'ad_action_status' not in gm_columns:
                     logger.info("迁移 group_messages: 新增 ad_action_status 列")
                     await db.execute("ALTER TABLE group_messages ADD COLUMN ad_action_status TEXT DEFAULT 'none'")
+                if 'is_deleted' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 is_deleted 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN is_deleted BOOLEAN DEFAULT 0")
+                if 'deleted_at' not in gm_columns:
+                    logger.info("迁移 group_messages: 新增 deleted_at 列")
+                    await db.execute("ALTER TABLE group_messages ADD COLUMN deleted_at DATETIME DEFAULT NULL")
                 await db.execute("UPDATE group_messages SET message_ts = CAST(strftime('%s', timestamp) AS INTEGER) WHERE message_ts IS NULL OR message_ts = 0")
 
             # 1. 检查 tracked_groups 列

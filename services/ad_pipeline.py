@@ -319,6 +319,9 @@ class AdPipeline:
             gm_cols = {row[1] for row in await cols_cur.fetchall()}
             if "ad_checked_at" not in gm_cols:
                 unchecked_only = False
+                where = [part for part in where if "ad_checked_at" not in part]
+            if "is_deleted" in gm_cols:
+                where.append("COALESCE(gm.is_deleted, 0) = 0")
             join_title = "LEFT JOIN tracked_groups tg ON tg.group_id = gm.group_id"
             cur = await db.execute(
                 f"""

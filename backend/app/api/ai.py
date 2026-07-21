@@ -1,12 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 AI API - AI 聊天、OpenAI 兼容接口
+
+架构说明：
+  本模块采用「结构化意图路由（Structured Intent Router）」架构，替代传统的
+  AgentExecutor 方案。核心思路是将 LLM 的角色从"自由发挥的 Agent"降级为
+  "严格的选择题机器"——强迫大模型输出固定结构的 JSON，由 Python 后端
+  接管工具调用执行逻辑。
+
+  数据流：
+  [Telegram 群聊消息] → [n8n / 前端] → [Python 后端 /api/ai/chat]
+      → [LLM JSON Mode] → 结构化意图解析
+      → 情况 A (need_tool=True)：后端硬编码执行本地广告查询 → LLM 总结 → 返回文本
+      → 情况 B (need_tool=False)：直接返回 LLM 生成的 reply_content
+      → [纯文本回复发送给 TG 用户]
 """
 from aiohttp import web
 import logging
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+from pydantic import BaseModel, Field
 from backend.repositories.ai_usage_repo import save_ai_usage_log, get_global_usage_summary
 from backend.app.services.quota_service import get_quota_service
 
@@ -14,6 +28,85 @@ logger = logging.getLogger(__name__)
 
 AI_ASSISTANT_USER_ID = int(os.getenv("AI_ASSISTANT_USER_ID", "-99999"))
 _ai_agent_sessions: Dict[str, Dict[str, Any]] = {}
+
+
+# =============================================================================
+# 结构化意图路由 - 数据模型
+# =============================================================================
+
+class IntentAnalysis(BaseModel):
+    """LLM 结构化意图识别输出模型
+
+    强制大模型以 JSON 格式输出，Python 后端根据字段做确定性路由。
+    """
+    need_tool: bool = Field(
+        description="如果用户要求查询、检测、聚类群聊内的广告或牛皮癣信息，必须为 True；"
+                    "如果是普通聊天或问候，为 False。"
+    )
+    tool_name: Optional[str] = Field(
+        None,
+        description="固定值：'query_ad_clusters'。当 need_tool=True 时必填。",
+    )
+    group_id: Optional[str] = Field(
+        None,
+        description="从上下文或消息中提取的群组/聊天 ID（仅辅助作用，实际以系统传入为准）",
+    )
+    reply_content: str = Field(
+        description="当 need_tool=False 时的直接回复内容；当 need_tool=True 时，"
+                    "给用户的等待提示语（例如：'正在为您查询群聊广告，请稍候...'）",
+    )
+
+
+# =============================================================================
+# 结构化意图路由 - 本地工具执行
+# =============================================================================
+
+# 意图识别系统提示词（强制 LLM 输出固定结构 JSON）
+INTENT_SYSTEM_PROMPT = """你是一个严格的 Telegram 群聊管理助手。
+分析用户的输入，决定是否需要调用广告检测或聚类工具。
+你必须严格按照 JSON 格式输出，包含以下字段：
+- need_tool: 如果用户要求查询、检测、聚类群聊内的广告或牛皮癣信息，必须为 true；如果是普通聊天或问候，为 false。
+- tool_name: 如果 need_tool 为 true，固定为 "query_ad_clusters"；否则为 null。
+- group_id: 如果 need_tool 为 true 且消息中提到了群组 ID，提取出来；否则为 null。
+- reply_content: 当 need_tool 为 false 时的直接回复内容；当 need_tool 为 true 时，给用户的等待提示语。
+
+示例 1 (普通聊天):
+{"need_tool": false, "tool_name": null, "group_id": null, "reply_content": "你好！有什么我可以帮你的吗？"}
+
+示例 2 (广告查询):
+{"need_tool": true, "tool_name": "query_ad_clusters", "group_id": "-1001234567890", "reply_content": "正在为您查询群聊广告，请稍候..."}
+
+示例 3 (问候):
+{"need_tool": false, "tool_name": null, "group_id": null, "reply_content": "下午好！我是群聊管理助手，有什么需要帮助的吗？"}"""
+
+
+async def execute_local_ad_cluster_query(
+    group_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> dict:
+    """本地执行广告聚类查询，完全跳过 LLM 盲盒执行。
+
+    此函数由结构化意图路由器在 need_tool=True 时硬编码调用，
+    确保工具执行逻辑 100% 在 Python 后端掌控之下。
+    """
+    from services.ad_pipeline import get_ad_pipeline
+
+    try:
+        result = await get_ad_pipeline().query_clusters(
+            tenant_id=tenant_id,
+            group_id=int(group_id) if str(group_id or "").strip() else None,
+            status="pending",
+            limit=20,
+            window_minutes=60,
+        )
+        return result
+    except Exception as e:
+        logger.error(f"本地广告聚类查询失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"广告聚类查询失败: {str(e)[:200]}",
+            "data": {},
+        }
 
 
 def _session_ctx(request: web.Request) -> dict:
@@ -67,6 +160,141 @@ def _agent_response_payload(agent_result) -> dict:
     }
 
 
+async def _run_structured_ad_query(
+    *,
+    request: web.Request,
+    user_id: int,
+    input_text: str,
+    model: str,
+    scope: dict,
+    chat_id: Optional[str] = None,
+):
+    """结构化意图路由 — 替代原有的 AgentExecutor 架构。
+
+    核心思想：
+      1. 强迫 LLM 以 JSON Mode 输出结构化意图（IntentAnalysis）
+      2. Python 后端根据 intent.need_tool 做确定性路由
+      3. 需要工具时，后端硬编码调用本地函数，再将真实结果丢给 LLM 总结
+      4. 不需要工具时，直接返回 LLM 生成的 reply_content
+
+    安全措施：
+      - 输入截断：消息最长 500 字符（防垃圾流撑爆 2G 内存）
+      - 硬超时：每次 LLM 调用最长 15 秒（防 API 悬挂拖死进程）
+      - JSON 解析兜底：解析失败则降级为纯文本回复，拒绝执行工具
+      - Prompt Injection 防御：以系统传入的 real_chat_id 为准，忽略 LLM 返回的 group_id
+    """
+    from backend.app.services.ai_service import get_ai_service
+    from services.ai_agent.schema import AgentResponse
+
+    # ── 安全措施 1：输入截断 ──
+    input_text = (input_text or "").strip()[:500]
+    if not input_text:
+        return AgentResponse(text="请输入有效内容。", confidence=0.0)
+
+    tenant_id = scope.get('tenant_id') or 'default'
+
+    # ── 安全措施 2：以系统传入的真实 chat_id 为准（防 Prompt Injection）──
+    real_group_id = str(chat_id or "").strip() or None
+
+    svc = get_ai_service()
+
+    # ── 第 1 步：强迫模型进行结构化意图识别 ──
+    try:
+        intent_text, _ = await svc.chat_messages(
+            messages=[
+                {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+                {"role": "user", "content": input_text},
+            ],
+            model=model,
+            temperature=0.0,          # 降为 0，追求极端稳定性
+            timeout_seconds=15.0,      # 硬超时，绝不拖死服务器
+            response_format={"type": "json_object"},
+        )
+    except Exception as e:
+        logger.error(f"LLM 意图识别失败: {e}")
+        return AgentResponse(
+            text="抱歉，AI 服务暂时不可用，请稍后再试。",
+            confidence=0.0,
+        )
+
+    # ── 安全措施 3：JSON 解析兜底 ──
+    try:
+        intent = IntentAnalysis.model_validate_json(intent_text)
+    except Exception as e:
+        logger.warning(f"JSON 意图解析失败: {intent_text[:200]}, 错误: {e}")
+        return AgentResponse(
+            text="抱歉，刚刚脑子卡壳了，请再试一次。",
+            confidence=0.3,
+        )
+
+    # ── 第 2 步：确定性路由逻辑 ──
+    if intent.need_tool and intent.tool_name == "query_ad_clusters":
+        # 安全措施 4：以真实 group_id 覆盖 LLM 提取的（防 Prompt Injection）
+        target_group = real_group_id or intent.group_id or None
+
+        # 本地执行广告聚类查询（完全跳过 LLM 盲盒）
+        try:
+            tool_result_data = await execute_local_ad_cluster_query(
+                group_id=target_group,
+                tenant_id=tenant_id,
+            )
+        except Exception as e:
+            logger.error(f"广告聚类查询执行异常: {e}", exc_info=True)
+            return AgentResponse(
+                text="查询广告时出现错误，请稍后重试。",
+                tool_calls_made=["query_ad_clusters"],
+                tool_results={"query_ad_clusters": {"success": False, "message": str(e)}},
+                is_action_taken=False,
+                confidence=0.3,
+            )
+
+        # ── 第 3 步：将真实数据塞给大模型进行人性化总结 ──
+        import json
+        try:
+            summary_text, _ = await svc.chat_messages(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是一个群聊管理员。请根据以下真实的广告查询数据，"
+                            "为用户写一份简明扼要的汇报。"
+                            "只有 analysis_allowed=true 且 evidence_count>0 时，才能判断是否发现广告。"
+                            "如果没有采集证据，请明确说明当前无法判断，不能说群聊正常或没有广告；"
+                            "如果发现广告，说明广告数量、内容和推荐处理方式。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"广告查询结果数据：\n"
+                            f"{json.dumps(tool_result_data, ensure_ascii=False, default=str)[:3000]}"
+                        ),
+                    },
+                ],
+                model=model,
+                temperature=0.3,
+                timeout_seconds=15.0,
+            )
+        except Exception as e:
+            logger.error(f"广告结果总结失败: {e}")
+            summary_text = "查询完成，但总结生成失败，请查看原始数据。"
+
+        return AgentResponse(
+            text=summary_text,
+            tool_calls_made=["query_ad_clusters"],
+            tool_results={"query_ad_clusters": tool_result_data},
+            is_action_taken=False,
+            action_summary="query_ad_clusters",
+            confidence=0.9,
+        )
+
+    # ── 普通对话，直接返回 LLM 生成的内容 ──
+    return AgentResponse(
+        text=intent.reply_content,
+        confidence=0.8,
+    )
+
+
 async def _run_ai_agent_chat(
     *,
     request: web.Request,
@@ -74,7 +302,9 @@ async def _run_ai_agent_chat(
     input_text: str,
     model: str,
     scope: dict,
+    chat_id: Optional[str] = None,
 ):
+    """备用 backend API 与主 web_admin 入口共用同一套 Agent/工具确认链路。"""
     from backend.app.services.ai_service import get_ai_service
     from services.ai_agent.core import get_agent
     from services.ai_agent.schema import AgentContext
@@ -83,6 +313,7 @@ async def _run_ai_agent_chat(
         return await get_ai_service().chat_messages(
             messages=messages,
             model=model or "gemini-2.5-flash-lite",
+            timeout_seconds=110.0,
         )
 
     tenant_id = scope.get('tenant_id') or 'default'
@@ -102,6 +333,8 @@ async def _run_ai_agent_chat(
                     'tenant_id': tenant_id,
                     'merchant_id': scope.get('merchant_id'),
                     'role': scope.get('role'),
+                    'chat_id': chat_id,
+                    'group_id': chat_id,
                 },
                 bot_instance=request.app.get('bot_instance'),
             ),
@@ -114,6 +347,8 @@ async def _run_ai_agent_chat(
         ctx.metadata['tenant_id'] = tenant_id
         ctx.metadata['merchant_id'] = scope.get('merchant_id')
         ctx.metadata['role'] = scope.get('role')
+        ctx.metadata['chat_id'] = chat_id
+        ctx.metadata['group_id'] = chat_id
         ctx.bot_instance = request.app.get('bot_instance')
         session['updated_at'] = time.time()
 
@@ -151,6 +386,17 @@ async def api_ai_chat(request: web.Request) -> web.Response:
             ctx['tenant_id'] = body_tenant_id
         tenant_id = ctx['tenant_id']
         merchant_id = ctx['merchant_id']
+
+        # 提取真实 chat_id / group_id（用于防 Prompt Injection）
+        real_chat_id = str(
+            data.get('chatId')
+            or data.get('chat_id')
+            or data.get('group_id')
+            or body_context.get('chat_id')
+            or body_context.get('group_id')
+            or ''
+        ).strip() or None
+
         use_agent = (
             user_id == AI_ASSISTANT_USER_ID
             or bool(data.get('use_agent'))
@@ -180,6 +426,7 @@ async def api_ai_chat(request: web.Request) -> web.Response:
                     input_text=input_text,
                     model=model,
                     scope=ctx,
+                    chat_id=real_chat_id,
                 )
                 reply = agent_result.text
             except Exception as agent_err:
