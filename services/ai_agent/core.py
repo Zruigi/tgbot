@@ -141,6 +141,8 @@ class AIAgent:
                 try:
                     exec_params = safety_result.sanitized_params or args
                     result = await tool_instance.execute(exec_params, context=ctx)
+                    if tool_name == "query_recent_ad_messages":
+                        ctx.metadata["last_ad_query_group_id"] = exec_params.get("group_id")
                     if result.get("action_taken"):
                         action_taken = True
                     stored_result = dict(result)
@@ -567,6 +569,7 @@ class AIAgent:
 
         try:
             query_result = await query_tool.execute(query_params, context=ctx)
+            ctx.metadata["last_ad_query_group_id"] = query_params.get("group_id")
         except Exception as exc:
             logger.error("生成最近广告删除快照失败: %s", exc, exc_info=True)
             return AgentResponse(
@@ -858,11 +861,28 @@ class AIAgent:
         text = str(user_text or "").strip()
         normalized = re.sub(r"\s+", "", text.lower())
         previous = cls._latest_assistant_text(ctx)
+        metadata = ctx.metadata if isinstance(ctx.metadata, dict) else {}
+
+        explicit_group = re.search(r"(?:group_id|chat_id|群|群组)\s*[:：=]?\s*(-?\d{5,})", text, re.I)
+        if explicit_group:
+            metadata["active_group_id"] = int(explicit_group.group(1))
+
+        active_group_id = metadata.get("active_group_id")
+        refers_to_active_group = any(marker in normalized for marker in ("这个群", "该群", "当前群"))
+        if refers_to_active_group and str(active_group_id or "").strip():
+            if any(word in normalized for word in ("删除", "清理", "删掉")) and "广告" in normalized:
+                return f"删除最近24小时的广告 群 {int(active_group_id)}"
+            if any(word in normalized for word in ("检查", "检测", "查看", "查")) and "广告" in normalized:
+                return f"检查广告 群 {int(active_group_id)}"
+            if any(word in normalized for word in ("消息", "查看", "打开", "看看")):
+                return f"查看群 {int(active_group_id)} 最近群消息"
 
         if normalized in {"删除", "删掉", "执行删除", "清理", "处理掉"} and any(
             marker in previous for marker in ("条合格广告", "具备删除权限", "广告记录")
         ):
-            return "删除最近24小时的广告"
+            last_ad_group_id = metadata.get("last_ad_query_group_id")
+            suffix = f" 群 {int(last_ad_group_id)}" if str(last_ad_group_id or "").strip() else ""
+            return f"删除最近24小时的广告{suffix}"
 
         ordinal_match = re.search(r"第\s*(\d{1,2}|一|二|三|四|五|六|七|八|九|十)\s*个", text)
         terse_ordinal = normalized in {"第一个", "第二个", "第三个", "第四个", "第五个"}
@@ -879,7 +899,9 @@ class AIAgent:
             group_section = previous.split("群组：", 1)[-1].split("频道：", 1)[0]
             group_ids = [int(value) for value in re.findall(r"\((-?\d{5,})\)", group_section)]
             if 1 <= index <= len(group_ids):
-                return f"查看群 {group_ids[index - 1]} 最近群消息"
+                selected_group_id = group_ids[index - 1]
+                metadata["active_group_id"] = selected_group_id
+                return f"查看群 {selected_group_id} 最近群消息"
 
         return text
 

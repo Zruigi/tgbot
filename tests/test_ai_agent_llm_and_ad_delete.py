@@ -151,7 +151,16 @@ def test_numbered_group_followup_resolves_to_verified_chat_id():
     )
 
     assert AIAgent._resolve_contextual_command("查看第二个群消息", ctx) == "查看群 -1002222222222 最近群消息"
-    assert AIAgent._resolve_contextual_command("第一个", ctx) == "查看群 -1001111111111 最近群消息"
+    assert ctx.metadata["active_group_id"] == -1002222222222
+    assert AIAgent._resolve_contextual_command("检查这个群广告", ctx) == "检查广告 群 -1002222222222"
+    assert AIAgent._resolve_contextual_command("查看这个群消息", ctx) == "查看群 -1002222222222 最近群消息"
+
+    ctx.metadata["last_ad_query_group_id"] = -1002222222222
+    ctx.conversation_history.append({
+        "role": "assistant",
+        "content": "最近 24 小时共找到 3 条合格广告，其中 2 条具备删除权限。",
+    })
+    assert AIAgent._resolve_contextual_command("删除", ctx) == "删除最近24小时的广告 群 -1002222222222"
 
     args = AIAgent(llm_call_fn=None)._build_fallback_args(
         "system_query", "查看群 -1002222222222 最近群消息"
