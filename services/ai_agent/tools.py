@@ -236,8 +236,9 @@ class FinanceTool(BaseTool):
     def _build_analysis_text(self, summary, unreconciled) -> str:
         """构建分析文本供 LLM 参考"""
         lines = ["📊 财务分析报告\n" + "="*30]
-        
-        for s in summary or []:
+
+        summary_rows = summary.get("by_currency", []) if isinstance(summary, dict) else (summary or [])
+        for s in summary_rows:
             currency = s.get('currency', '?')
             total_in = float(s.get('total_income', 0) or 0)
             total_out = float(s.get('total_expense', 0) or 0)

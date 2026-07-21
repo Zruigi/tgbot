@@ -178,6 +178,8 @@ class AIAgent:
                 final_text = self._format_recent_ad_result(tool_results["query_recent_ad_messages"])
             elif "system_query" in tool_results:
                 final_text = self._format_system_query_result(tool_results["system_query"])
+            elif "finance_query" in tool_results:
+                final_text = self._format_finance_result(tool_results["finance_query"])
             elif "detect_advertising" in tool_results:
                 final_text = self._format_ad_detection_result(tool_results["detect_advertising"])
             else:
@@ -719,6 +721,28 @@ class AIAgent:
             text += "\n依据：" + "；".join(str(item) for item in findings[:8])
         return text
 
+    @staticmethod
+    def _format_finance_result(result: Dict[str, Any]) -> str:
+        if not result.get("success", True):
+            return f"财务查询失败：{result.get('message') or '未知错误'}"
+        data = result.get("data")
+        if isinstance(data, dict) and "summary" in data:
+            summary = data.get("summary") or {}
+            rows = summary.get("by_currency", []) if isinstance(summary, dict) else []
+            return (
+                f"财务综合查询完成：{len(rows)} 个币种，"
+                f"待核销 {int(data.get('unreconciled_count') or 0)} 条。"
+            )
+        if isinstance(data, dict) and "by_currency" in data:
+            rows = data.get("by_currency") or []
+            return (
+                f"财务摘要：{len(rows)} 个币种，"
+                f"待核销 {int(data.get('total_unreconciled') or 0)} 条。"
+            )
+        if isinstance(data, list):
+            return result.get("message") or f"财务查询完成，共 {len(data)} 条记录。"
+        return result.get("message") or "财务查询完成。"
+
     def _match_tool_from_text(self, text: str, tools: list) -> Optional[str]:
         """根据用户文本做启发式工具匹配（仅作为 LLM 未显式返回 tool_call 时的兜底）"""
         if not text:
@@ -808,7 +832,10 @@ class AIAgent:
                 best_score = score
                 best_match = name
 
-        if best_match in {"system_query", "detect_advertising", "query_ad_clusters", "query_recent_ad_messages"} and best_score >= 8:
+        if best_match in {
+            "finance_query", "system_query", "telegram_sdk_query", "detect_advertising",
+            "query_ad_clusters", "query_recent_ad_messages",
+        } and best_score >= 8:
             return best_match
         return best_match if best_score >= 16 else None
 
@@ -826,6 +853,8 @@ class AIAgent:
             return {"content": content, "target_type": "users"}
 
         if tool_name == "finance_query":
+            if "摘要" in text:
+                return {"action": "summary"}
             if any(k in text for k in ("未核销", "待核销")):
                 return {"action": "unreconciled"}
             if any(k in text for k in ("科目", "分类")):
@@ -1056,9 +1085,10 @@ class AIAgent:
 
             # 尝试从返回文本中解析 function calling（显式标记模式）
             tool_calls = []
-            if isinstance(text, str) and text.startswith("__TOOL_CALL__"):
+            stripped_text = text.strip() if isinstance(text, str) else text
+            if isinstance(stripped_text, str) and stripped_text.startswith("__TOOL_CALL__"):
                 try:
-                    tool_data = json.loads(text[len("__TOOL_CALL__"):])
+                    tool_data = json.loads(stripped_text[len("__TOOL_CALL__"):])
                     tool_calls = tool_data if isinstance(tool_data, list) else [tool_data]
                 except Exception as e:
                     logger.warning(f"Tool call JSON 解析失败，当作纯文本: {e}")

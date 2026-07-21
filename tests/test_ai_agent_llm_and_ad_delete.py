@@ -59,6 +59,38 @@ async def test_agent_detects_advertising_with_tool():
 
 
 @pytest.mark.asyncio
+async def test_agent_prefetches_single_keyword_telegram_permission_request():
+    from services.ai_agent.core import AIAgent
+    from services.ai_agent.tools import get_tools_for_llm
+
+    agent = AIAgent(llm_call_fn=None)
+    matched = agent._match_tool_from_text("检查机器人删除权限", get_tools_for_llm())
+
+    assert matched == "telegram_sdk_query"
+
+
+@pytest.mark.asyncio
+async def test_agent_formats_finance_summary_without_second_llm(monkeypatch):
+    import database
+    from services.ai_agent.core import AIAgent
+    from services.ai_agent.schema import AgentContext
+
+    async def fake_summary(user_id):
+        return {"by_currency": [], "total_unreconciled": 0}
+
+    async def fail_llm(messages, model=""):
+        raise AssertionError("财务摘要不应再交给 LLM 编造总结")
+
+    monkeypatch.setattr(database, "get_finance_summary_by_currency", fake_summary)
+    response = await AIAgent(llm_call_fn=fail_llm).process_message(
+        "查财务摘要", AgentContext(user_id=-99999)
+    )
+
+    assert response.tool_calls_made == ["finance_query"]
+    assert response.text == "财务摘要：0 个币种，待核销 0 条。"
+
+
+@pytest.mark.asyncio
 async def test_agent_deletes_flagged_ad_after_confirmation(tmp_path, monkeypatch):
     import config
     import database
