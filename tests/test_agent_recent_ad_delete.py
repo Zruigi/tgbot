@@ -209,3 +209,5 @@ async def test_recent_ad_delete_is_blocked_when_switch_is_off(tmp_path, monkeypa
     assert executed.is_action_taken is False
     assert executed.tool_results["delete_recent_ad_messages"]["blocked"] is True
     assert bot.deleted == []
+    assert "操作未执行" in executed.text
+    assert "请回复「确认」" not in executed.text

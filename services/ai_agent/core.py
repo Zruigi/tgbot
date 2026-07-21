@@ -446,14 +446,23 @@ class AIAgent:
                         has_failure = True
                         failure_messages.append(f"{tool_name}: {str(e)}")
 
-        # ★ 根据执行结果生成不同的回复文本
-        if has_failure:
-            result_text = f"⚠️ 操作执行完成，但有部分失败:\n" + "\n".join(f"- {msg}" for msg in failure_messages)
+        # 确认后的回复只描述本次执行结果，避免再次拼接旧的“请确认”提示。
+        result_messages = [
+            str(result.get("message") or "").strip()
+            for result in executed_results.values()
+            if isinstance(result, dict) and str(result.get("message") or "").strip()
+        ]
+        if has_failure and action_taken:
+            result_text = "操作已部分执行，但有失败项：\n" + "\n".join(f"- {msg}" for msg in failure_messages)
+        elif has_failure:
+            result_text = "操作未执行：\n" + "\n".join(f"- {msg}" for msg in failure_messages)
         else:
-            result_text = "✅ 操作已执行完毕。"
+            result_text = "操作已执行完毕。"
+            if result_messages:
+                result_text += "\n" + "\n".join(f"- {msg}" for msg in result_messages)
 
         return AgentResponse(
-            text=f"{result_text}\n{pending_response.text}",
+            text=result_text,
             tool_calls_made=pending_response.tool_calls_made,
             tool_results=executed_results,
             is_action_taken=action_taken,
