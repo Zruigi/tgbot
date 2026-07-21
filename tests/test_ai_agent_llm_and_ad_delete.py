@@ -119,6 +119,21 @@ def test_agent_formats_telegram_permissions_without_llm_hallucination():
     assert "1 条数据库绑定记录未通过 Telegram 验证" in text
 
 
+def test_bound_chat_preflight_requests_complete_sdk_verification():
+    import json
+    from services.ai_agent.core import AIAgent
+    from services.ai_agent.tools import get_tools_for_llm
+
+    calls = AIAgent(llm_call_fn=None)._build_preflight_tool_calls(
+        "我有几个群几个频道", get_tools_for_llm()
+    )
+    sdk_call = next(call for call in calls if call["function"]["name"] == "telegram_sdk_query")
+    args = json.loads(sdk_call["function"]["arguments"])
+
+    assert args["operation"] == "bound_chat_capabilities"
+    assert args["limit"] == 50
+
+
 @pytest.mark.asyncio
 async def test_agent_deletes_flagged_ad_after_confirmation(tmp_path, monkeypatch):
     import config

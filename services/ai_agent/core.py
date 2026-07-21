@@ -1124,7 +1124,7 @@ class AIAgent:
         if needs_sdk_visibility and sdk_available:
             sdk_args = {
                 "operation": "bot_visibility_status" if query_type != "bound_chats" else "bound_chat_capabilities",
-                "limit": 10,
+                "limit": 50 if query_type == "bound_chats" else 10,
                 "include_admins": False,
             }
             if args.get("group_id"):
