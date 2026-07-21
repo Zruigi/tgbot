@@ -1064,16 +1064,23 @@ class AIAgent:
 
         if tool_name == "system_query":
             lower = text.lower()
-            group_name = self._extract_group_name(text)
+            group_match = re.search(r"(?:group_id|chat_id|群|群组)\s*[:：=]?\s*(-?\d{5,})", text, re.I)
+            group_id = int(group_match.group(1)) if group_match else None
+            group_name = "" if group_id is not None else self._extract_group_name(text)
+
+            def add_group_scope(args: dict) -> dict:
+                if group_id is not None:
+                    args["group_id"] = group_id
+                elif group_name:
+                    args["group_name"] = group_name
+                return args
+
             if any(k in text for k in (
                 "广告消息", "群广告", "疑似广告", "广告群消息", "有没有广告", "是否有广告",
                 "灰黑产", "推广", "垃圾信息", "打广告", "发广告", "谁在广告",
                 "谁在打广告", "哪些人打广告", "有哪些人打广告",
             )):
-                args = {"query_type": "group_ad_messages", "limit": 20}
-                if group_name:
-                    args["group_name"] = group_name
-                return args
+                return add_group_scope({"query_type": "group_ad_messages", "limit": 20})
             if any(k in text for k in ("最近有谁", "谁给我发", "谁给我发送", "最近发消息", "谁发了消息")):
                 return {"query_type": "recent_senders", "limit": 10}
             if any(k in text for k in (
@@ -1084,20 +1091,12 @@ class AIAgent:
             )):
                 return {"query_type": "bound_chats", "limit": 20}
             if any(k in text for k in ("频道消息", "频道发言", "最近频道", "频道动态")):
-                args = {"query_type": "channel_messages", "limit": 10}
-                if group_name:
-                    args["group_name"] = group_name
-                return args
+                return add_group_scope({"query_type": "channel_messages", "limit": 10})
             if any(k in text for k in ("群消息", "群聊消息", "最近群消息", "群聊动态", "群里消息")):
-                args = {"query_type": "group_messages", "limit": 10}
-                if group_name:
-                    args["group_name"] = group_name
-                return args
+                return add_group_scope({"query_type": "group_messages", "limit": 10})
             if "最近消息" in text:
                 args = {"query_type": "group_messages", "limit": 10} if any(k in text for k in ("群", "群聊")) else {"query_type": "recent_messages", "limit": 10}
-                if group_name and args["query_type"] == "group_messages":
-                    args["group_name"] = group_name
-                return args
+                return add_group_scope(args) if args["query_type"] == "group_messages" else args
             if "潜在用户" in text:
                 return {"query_type": "potential_users", "limit": 10}
             if any(k in text for k in ("监听", "地址列表", "监控地址")):

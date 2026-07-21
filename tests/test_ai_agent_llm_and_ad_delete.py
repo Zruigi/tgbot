@@ -153,6 +153,11 @@ def test_numbered_group_followup_resolves_to_verified_chat_id():
     assert AIAgent._resolve_contextual_command("查看第二个群消息", ctx) == "查看群 -1002222222222 最近群消息"
     assert AIAgent._resolve_contextual_command("第一个", ctx) == "查看群 -1001111111111 最近群消息"
 
+    args = AIAgent(llm_call_fn=None)._build_fallback_args(
+        "system_query", "查看群 -1002222222222 最近群消息"
+    )
+    assert args == {"query_type": "group_messages", "limit": 10, "group_id": -1002222222222}
+
 
 @pytest.mark.asyncio
 async def test_llm_cannot_create_empty_recent_delete_confirmation():
