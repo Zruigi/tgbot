@@ -2618,18 +2618,24 @@ async def api_delete_ad_cluster(request):
             return web.json_response({'status': 'error', 'message': 'bot 未初始化'}, status=500)
 
         from services.ad_pipeline import delete_cluster_messages, get_ad_pipeline
-        refs = data.get('message_refs') or []
+        # Never trust message_refs supplied by n8n/LLM. Resolve the exact cluster
+        # server-side so arbitrary Telegram message IDs cannot be injected.
+        scope = _request_scope_context(request)
+        tenant_id = scope.get('tenant_id') if scope.get('is_merchant') else str(data.get('tenant_id') or '').strip() or None
+        clusters_result = await get_ad_pipeline().query_clusters(
+            tenant_id=tenant_id,
+            status='all',
+            limit=100,
+            window_minutes=max(1, min(int(data.get('window_minutes') or 1440), 1440)),
+        )
+        clusters = (clusters_result.get('data') or {}).get('clusters') or []
+        matched = next((c for c in clusters if str(c.get('cluster_id')) == cluster_id), None)
+        refs = (matched or {}).get('message_refs') or []
         if not refs:
-            scope = _request_scope_context(request)
-            tenant_id = scope.get('tenant_id') if scope.get('is_merchant') else str(data.get('tenant_id') or '').strip() or None
-            clusters_result = await get_ad_pipeline().query_clusters(
-                tenant_id=tenant_id,
-                status='all',
-                limit=100,
+            return web.json_response(
+                {'status': 'error', 'message': '未从后端聚类查询到该 cluster，已拒绝删除'},
+                status=404,
             )
-            clusters = (clusters_result.get('data') or {}).get('clusters') or []
-            matched = next((c for c in clusters if str(c.get('cluster_id')) == cluster_id), None)
-            refs = (matched or {}).get('message_refs') or []
 
         result = await delete_cluster_messages(
             cluster={'cluster_id': cluster_id, 'message_refs': refs},

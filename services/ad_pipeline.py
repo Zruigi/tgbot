@@ -628,6 +628,8 @@ async def delete_cluster_messages(
     if not isinstance(refs, list):
         refs = []
 
+    total_target_count = len(refs)
+    refs = refs[:50]
     delete_enabled = bool(getattr(config, "AD_DELETE_ENABLED", False))
     kick_enabled = bool(getattr(config, "AD_KICK_ENABLED", False))
     effective_dry_run = bool(dry_run or not delete_enabled)
@@ -639,6 +641,17 @@ async def delete_cluster_messages(
     if not bot:
         return {"success": False, "message": "bot 未初始化，无法执行删除", "action_taken": False}
 
+    try:
+        bot_user = await bot.get_me()
+        bot_id = int(getattr(bot_user, "id", 0) or 0)
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": f"无法校验 bot 身份: {str(exc)[:160]}",
+            "action_taken": False,
+        }
+
+    permission_cache: Dict[int, bool] = {}
     for ref in refs:
         try:
             chat_id = int(ref.get("chat_id") or ref.get("group_id"))
@@ -648,6 +661,23 @@ async def delete_cluster_messages(
             errors.append({"ref": ref, "error": "缺少 chat_id/tg_msg_id"})
             continue
 
+        if chat_id not in permission_cache:
+            try:
+                bot_member = await bot.get_chat_member(chat_id, bot_id)
+                status = str(getattr(bot_member, "status", "") or "")
+                permission_cache[chat_id] = status == "creator" or (
+                    status == "administrator"
+                    and bool(getattr(bot_member, "can_delete_messages", False))
+                )
+            except Exception:
+                permission_cache[chat_id] = False
+        if not permission_cache[chat_id]:
+            errors.append({"ref": ref, "error": "bot_missing_delete_permission"})
+            continue
+
+        if not sender_id:
+            errors.append({"ref": ref, "error": "missing_sender_id"})
+            continue
         if sender_id:
             try:
                 member = await bot.get_chat_member(chat_id, sender_id)
@@ -655,7 +685,8 @@ async def delete_cluster_messages(
                     skipped_admins.append(ref)
                     continue
             except Exception as exc:
-                logger.debug("广告删除前检查成员身份失败: %s", exc)
+                errors.append({"ref": ref, "error": f"sender_check_failed:{str(exc)[:160]}"})
+                continue
 
         if not effective_dry_run:
             try:
@@ -679,6 +710,9 @@ async def delete_cluster_messages(
         "action_taken": bool(deleted) and not effective_dry_run,
         "dry_run": effective_dry_run,
         "data": {
+            "total_target_count": total_target_count,
+            "batch_target_count": len(refs),
+            "remaining_count": max(0, total_target_count - len(refs)),
             "deleted_count": len(deleted),
             "skipped_admin_count": len(skipped_admins),
             "banned_sender_ids": banned,
@@ -688,6 +722,7 @@ async def delete_cluster_messages(
         },
         "message": (
             f"{'模拟' if effective_dry_run else '实际'}处理 cluster："
-            f"目标 {len(refs)} 条，处理 {len(deleted)} 条，跳过管理员 {len(skipped_admins)} 条，错误 {len(errors)} 条"
+            f"本批目标 {len(refs)}/{total_target_count} 条，处理 {len(deleted)} 条，"
+            f"跳过管理员 {len(skipped_admins)} 条，错误 {len(errors)} 条"
         ),
     }

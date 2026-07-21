@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+from types import SimpleNamespace
 
 import aiosqlite
 import pytest
@@ -138,3 +139,62 @@ async def test_agent_prefetches_ad_clusters_before_llm_reply(tmp_path, monkeypat
     assert "已检查" in response.text
     assert "疑似广告聚类" in response.text
     assert "请稍等" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cluster_delete_requires_bot_permission(monkeypatch):
+    import config
+    from services.ad_pipeline import delete_cluster_messages
+
+    monkeypatch.setattr(config, "AD_DELETE_ENABLED", True, raising=False)
+
+    class NoPermissionBot:
+        async def get_me(self):
+            return SimpleNamespace(id=999)
+
+        async def get_chat_member(self, chat_id, user_id):
+            if user_id == 999:
+                return SimpleNamespace(status="administrator", can_delete_messages=False)
+            return SimpleNamespace(status="member")
+
+    result = await delete_cluster_messages(
+        cluster={"message_refs": [{"chat_id": -1001, "tg_msg_id": 1, "sender_id": 700}]},
+        bot=NoPermissionBot(),
+        dry_run=False,
+    )
+
+    assert result["action_taken"] is False
+    assert result["data"]["deleted_count"] == 0
+    assert result["data"]["errors"][0]["error"] == "bot_missing_delete_permission"
+
+
+@pytest.mark.asyncio
+async def test_cluster_delete_caps_each_confirmed_batch_at_50(monkeypatch):
+    import config
+    from services.ad_pipeline import delete_cluster_messages
+
+    monkeypatch.setattr(config, "AD_DELETE_ENABLED", True, raising=False)
+
+    class PermissionBot:
+        async def get_me(self):
+            return SimpleNamespace(id=999)
+
+        async def get_chat_member(self, chat_id, user_id):
+            if user_id == 999:
+                return SimpleNamespace(status="administrator", can_delete_messages=True)
+            return SimpleNamespace(status="member")
+
+    refs = [
+        {"chat_id": -1001, "tg_msg_id": i, "sender_id": 700 + i}
+        for i in range(55)
+    ]
+    result = await delete_cluster_messages(
+        cluster={"message_refs": refs},
+        bot=PermissionBot(),
+        dry_run=True,
+    )
+
+    assert result["dry_run"] is True
+    assert result["data"]["total_target_count"] == 55
+    assert result["data"]["batch_target_count"] == 50
+    assert result["data"]["remaining_count"] == 5

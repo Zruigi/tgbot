@@ -1387,7 +1387,7 @@ class DeleteAdClusterTool(BaseTool):
         return {
             "properties": {
                 "cluster_id": {"type": "string", "description": "query_ad_clusters 返回的 cluster_id"},
-                "message_refs": {"type": "array", "items": {"type": "object"}, "description": "可选，cluster 的 message_refs"},
+                "window_minutes": {"type": "integer", "description": "后端重新解析 cluster 的时间窗，默认1440，最大1440"},
                 "dry_run": {"type": "boolean", "description": "是否模拟执行，默认 true"},
                 "ban_senders": {"type": "boolean", "description": "是否同时封禁发送者，默认 false 且受 AD_KICK_ENABLED 控制"},
             },
@@ -1401,19 +1401,18 @@ class DeleteAdClusterTool(BaseTool):
         if not cluster_id:
             return {"success": False, "message": "缺少 cluster_id"}
 
-        refs = params.get("message_refs") or []
-        if not refs:
-            clusters_result = await get_ad_pipeline().query_clusters(
-                tenant_id=_context_scoped_tenant_id(context),
-                status="all",
-                limit=100,
-            )
-            clusters = (clusters_result.get("data") or {}).get("clusters") or []
-            matched = next((c for c in clusters if str(c.get("cluster_id")) == cluster_id), None)
-            refs = (matched or {}).get("message_refs") or []
+        clusters_result = await get_ad_pipeline().query_clusters(
+            tenant_id=_context_scoped_tenant_id(context),
+            status="all",
+            limit=100,
+            window_minutes=max(1, min(int(params.get("window_minutes") or 1440), 1440)),
+        )
+        clusters = (clusters_result.get("data") or {}).get("clusters") or []
+        matched = next((c for c in clusters if str(c.get("cluster_id")) == cluster_id), None)
+        refs = (matched or {}).get("message_refs") or []
 
         if not refs:
-            return {"success": False, "message": "没有找到该 cluster 的 message_refs，无法删除"}
+            return {"success": False, "message": "未从后端聚类查询到该 cluster，已拒绝删除"}
 
         bot = getattr(context, "bot_instance", None) if context is not None else None
         if not bot:
