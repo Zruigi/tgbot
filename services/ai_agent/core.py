@@ -176,8 +176,18 @@ class AIAgent:
                 final_text = self._format_ad_cluster_result(tool_results["query_ad_clusters"])
             elif "query_recent_ad_messages" in tool_results:
                 final_text = self._format_recent_ad_result(tool_results["query_recent_ad_messages"])
+            elif (
+                "system_query" in tool_results
+                and "telegram_sdk_query" in tool_results
+                and ((tool_results["system_query"].get("_params") or {}).get("query_type") == "bound_chats")
+            ):
+                final_text = self._format_verified_bound_chats(
+                    tool_results["system_query"], tool_results["telegram_sdk_query"]
+                )
             elif "system_query" in tool_results:
                 final_text = self._format_system_query_result(tool_results["system_query"])
+            elif "telegram_sdk_query" in tool_results:
+                final_text = self._format_telegram_sdk_result(tool_results["telegram_sdk_query"])
             elif "finance_query" in tool_results:
                 final_text = self._format_finance_result(tool_results["finance_query"])
             elif "detect_advertising" in tool_results:
@@ -742,6 +752,75 @@ class AIAgent:
         if isinstance(data, list):
             return result.get("message") or f"财务查询完成，共 {len(data)} 条记录。"
         return result.get("message") or "财务查询完成。"
+
+    @staticmethod
+    def _telegram_capability_rows(result: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        data = result.get("data") or {}
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = [data] if isinstance(data, dict) and data.get("chat_id") else []
+        verified = [item for item in items if item.get("success") and item.get("chat_type")]
+        unavailable = [item for item in items if item not in verified]
+        return verified, unavailable
+
+    @classmethod
+    def _format_telegram_sdk_result(cls, result: Dict[str, Any]) -> str:
+        if not result.get("success", True):
+            return f"Telegram SDK 查询失败：{result.get('message') or '未知错误'}"
+        verified, unavailable = cls._telegram_capability_rows(result)
+        if not verified:
+            return "Telegram 官方 API 没有验证到当前 Bot 可访问的群或频道。"
+
+        deletable = []
+        non_deletable = []
+        for item in verified:
+            permissions = item.get("bot_permissions") or {}
+            status = str(item.get("bot_status") or permissions.get("status") or "unknown")
+            can_delete = status == "creator" or (
+                status == "administrator" and bool(permissions.get("can_delete_messages"))
+            )
+            label = f"{item.get('title') or '未命名'} ({item.get('chat_id')})"
+            (deletable if can_delete else non_deletable).append(f"{label} [{status}]")
+
+        lines = [
+            f"Telegram 官方 API 已验证 {len(verified)} 个可访问聊天："
+            f"{len(deletable)} 个可删除消息，{len(non_deletable)} 个不可删除。"
+        ]
+        if deletable:
+            lines.append("可删除：" + "、".join(deletable))
+        if non_deletable:
+            lines.append("不可删除：" + "、".join(non_deletable))
+        if unavailable:
+            lines.append(f"另有 {len(unavailable)} 条数据库绑定记录未通过 Telegram 验证，不计入可用聊天。")
+        return "\n".join(lines)
+
+    @classmethod
+    def _format_verified_bound_chats(cls, system_result: Dict[str, Any], sdk_result: Dict[str, Any]) -> str:
+        verified, unavailable = cls._telegram_capability_rows(sdk_result)
+        if not verified and not unavailable:
+            return (
+                cls._format_system_query_result(system_result)
+                + "\nTelegram SDK 本次未返回可核验记录，以上数量仅来自数据库绑定表。"
+            )
+        groups = [item for item in verified if item.get("chat_type") in {"group", "supergroup"}]
+        channels = [item for item in verified if item.get("chat_type") == "channel"]
+        lines = [f"Telegram 官方 API 当前验证到群组 {len(groups)} 个，频道 {len(channels)} 个。"]
+        if groups:
+            lines.append("群组：" + "、".join(
+                f"{item.get('title') or '未命名'} ({item.get('chat_id')})" for item in groups
+            ))
+        if channels:
+            lines.append("频道：" + "、".join(
+                f"{item.get('title') or '未命名'} ({item.get('chat_id')})" for item in channels
+            ))
+        db_data = system_result.get("data") or {}
+        db_total = int(db_data.get("group_count") or 0) + int(db_data.get("channel_count") or 0)
+        if unavailable or db_total > len(verified):
+            lines.append(
+                f"数据库绑定表共有 {db_total} 条群/频道记录，其中 {len(unavailable)} 条未通过官方验证，"
+                "可能是测试、失效或迁移后的旧记录，未计入上述数量。"
+            )
+        return "\n".join(lines)
 
     def _match_tool_from_text(self, text: str, tools: list) -> Optional[str]:
         """根据用户文本做启发式工具匹配（仅作为 LLM 未显式返回 tool_call 时的兜底）"""

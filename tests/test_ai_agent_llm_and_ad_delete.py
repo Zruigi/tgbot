@@ -90,6 +90,35 @@ async def test_agent_formats_finance_summary_without_second_llm(monkeypatch):
     assert response.text == "财务摘要：0 个币种，待核销 0 条。"
 
 
+def test_agent_formats_telegram_permissions_without_llm_hallucination():
+    from services.ai_agent.core import AIAgent
+
+    result = {
+        "success": True,
+        "data": {
+            "items": [
+                {
+                    "chat_id": -1001, "title": "可删群", "chat_type": "supergroup",
+                    "success": True, "bot_status": "administrator",
+                    "bot_permissions": {"can_delete_messages": True},
+                },
+                {
+                    "chat_id": -1002, "title": "受限群", "chat_type": "supergroup",
+                    "success": True, "bot_status": "restricted", "bot_permissions": {},
+                },
+                {"chat_id": -1003, "success": False, "errors": ["Chat not found"]},
+            ]
+        },
+    }
+
+    text = AIAgent._format_telegram_sdk_result(result)
+
+    assert "1 个可删除消息，1 个不可删除" in text
+    assert "可删群 (-1001) [administrator]" in text
+    assert "受限群 (-1002) [restricted]" in text
+    assert "1 条数据库绑定记录未通过 Telegram 验证" in text
+
+
 @pytest.mark.asyncio
 async def test_agent_deletes_flagged_ad_after_confirmation(tmp_path, monkeypatch):
     import config
