@@ -69,6 +69,7 @@ class AIAgent:
         """
         # 构建初始消息
         system_prompt = self._build_system_prompt(ctx)
+        routed_user_message = self._resolve_contextual_command(user_message, ctx)
         
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(ctx.conversation_history)
@@ -77,7 +78,7 @@ class AIAgent:
         from .prompts import build_tool_use_prompt
         messages.append({
             "role": "user",
-            "content": build_tool_use_prompt(user_message[:2000], tool_schemas),
+            "content": build_tool_use_prompt(routed_user_message[:2000], tool_schemas),
         })
 
         # Function Calling 循环
@@ -90,7 +91,7 @@ class AIAgent:
 
         # 删除最近广告是高风险操作：用 Python 确定性生成候选快照，
         # 不让 LLM 自行构造 message_id 或扩大删除范围。
-        prepared_delete = await self._prepare_recent_ad_deletion(user_message, ctx)
+        prepared_delete = await self._prepare_recent_ad_deletion(routed_user_message, ctx)
         if prepared_delete is not None:
             ctx.conversation_history.append({"role": "user", "content": user_message})
             ctx.conversation_history.append({"role": "assistant", "content": prepared_delete.text})
@@ -98,7 +99,7 @@ class AIAgent:
                 ctx.conversation_history = ctx.conversation_history[-40:]
             return prepared_delete
 
-        preflight_tool_calls = self._build_preflight_tool_calls(user_message, tool_schemas)
+        preflight_tool_calls = self._build_preflight_tool_calls(routed_user_message, tool_schemas)
         if preflight_tool_calls:
             all_results = []
             for tc in preflight_tool_calls:
@@ -251,6 +252,24 @@ class AIAgent:
                         continue
 
                     tool_calls_made.append(tool_name)
+
+                    # Recent-ad deletion must only come from the deterministic
+                    # query snapshot prepared above. LLM-generated refs, including
+                    # an empty argument object, are never accepted for confirmation.
+                    if tool_name == "delete_recent_ad_messages":
+                        blocked_message = "必须先由后端查询并锁定精确广告快照，当前删除请求已拒绝"
+                        tool_results[tool_name] = {
+                            "success": False,
+                            "message": blocked_message,
+                            "blocked": True,
+                        }
+                        all_results.append({
+                            "tool_name": tool_name,
+                            "error": blocked_message,
+                            "blocked": True,
+                            "success": False,
+                        })
+                        continue
 
                     # 安全检查
                     safety_result: SafetyCheckResult = await self.safety.check_tool_call(
@@ -806,13 +825,17 @@ class AIAgent:
         channels = [item for item in verified if item.get("chat_type") == "channel"]
         lines = [f"Telegram 官方 API 当前验证到群组 {len(groups)} 个，频道 {len(channels)} 个。"]
         if groups:
-            lines.append("群组：" + "、".join(
-                f"{item.get('title') or '未命名'} ({item.get('chat_id')})" for item in groups
-            ))
+            lines.append("群组：")
+            lines.extend(
+                f"{index}. {item.get('title') or '未命名'} ({item.get('chat_id')})"
+                for index, item in enumerate(groups, 1)
+            )
         if channels:
-            lines.append("频道：" + "、".join(
-                f"{item.get('title') or '未命名'} ({item.get('chat_id')})" for item in channels
-            ))
+            lines.append("频道：")
+            lines.extend(
+                f"{index}. {item.get('title') or '未命名'} ({item.get('chat_id')})"
+                for index, item in enumerate(channels, 1)
+            )
         db_data = system_result.get("data") or {}
         db_total = int(db_data.get("group_count") or 0) + int(db_data.get("channel_count") or 0)
         if unavailable or db_total > len(verified):
@@ -821,6 +844,44 @@ class AIAgent:
                 "可能是测试、失效或迁移后的旧记录，未计入上述数量。"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def _latest_assistant_text(ctx: AgentContext) -> str:
+        for message in reversed(ctx.conversation_history or []):
+            if message.get("role") == "assistant":
+                return str(message.get("content") or "")
+        return ""
+
+    @classmethod
+    def _resolve_contextual_command(cls, user_text: str, ctx: AgentContext) -> str:
+        """Resolve terse follow-ups against the last verified Agent response."""
+        text = str(user_text or "").strip()
+        normalized = re.sub(r"\s+", "", text.lower())
+        previous = cls._latest_assistant_text(ctx)
+
+        if normalized in {"删除", "删掉", "执行删除", "清理", "处理掉"} and any(
+            marker in previous for marker in ("条合格广告", "具备删除权限", "广告记录")
+        ):
+            return "删除最近24小时的广告"
+
+        ordinal_match = re.search(r"第\s*(\d{1,2}|一|二|三|四|五|六|七|八|九|十)\s*个", text)
+        terse_ordinal = normalized in {"第一个", "第二个", "第三个", "第四个", "第五个"}
+        wants_group_messages = bool(ordinal_match) and (
+            terse_ordinal or any(word in normalized for word in ("群", "消息", "查看", "打开", "看看"))
+        )
+        if wants_group_messages and "群组：" in previous:
+            token = ordinal_match.group(1)
+            chinese_numbers = {
+                "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+            }
+            index = chinese_numbers.get(token, int(token) if token.isdigit() else 0)
+            group_section = previous.split("群组：", 1)[-1].split("频道：", 1)[0]
+            group_ids = [int(value) for value in re.findall(r"\((-?\d{5,})\)", group_section)]
+            if 1 <= index <= len(group_ids):
+                return f"查看群 {group_ids[index - 1]} 最近群消息"
+
+        return text
 
     def _match_tool_from_text(self, text: str, tools: list) -> Optional[str]:
         """根据用户文本做启发式工具匹配（仅作为 LLM 未显式返回 tool_call 时的兜底）"""

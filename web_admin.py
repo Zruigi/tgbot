@@ -2190,6 +2190,20 @@ def _is_agent_confirmation_text(text: str) -> bool:
     }
 
 
+def _is_agent_cancellation_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", str(text or "").strip().lower())
+    return normalized in {
+        "取消",
+        "取消操作",
+        "不要了",
+        "停止",
+        "别执行",
+        "不删除",
+        "cancel",
+        "no",
+    }
+
+
 async def _run_ai_agent_chat(
     *,
     user_id: int,
@@ -2270,6 +2284,18 @@ async def _run_ai_agent_chat(
 
     agent = get_agent(llm_call_fn=llm_call)
     pending = session.get('pending')
+    if pending is not None and _is_agent_cancellation_text(input_text):
+        from services.ai_agent.schema import AgentResponse
+        session['pending'] = None
+        return AgentResponse(
+            text='已取消待确认操作，没有执行任何动作。',
+            tool_calls_made=pending.tool_calls_made,
+            tool_results={},
+            is_action_taken=False,
+            requires_confirmation=False,
+            action_summary=pending.action_summary,
+            confidence=1.0,
+        )
     if pending is not None and _is_agent_confirmation_text(input_text):
         result = await agent.confirm_and_execute(pending, ctx)
         session['pending'] = None

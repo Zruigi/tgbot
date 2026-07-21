@@ -134,6 +134,57 @@ def test_bound_chat_preflight_requests_complete_sdk_verification():
     assert args["limit"] == 50
 
 
+def test_numbered_group_followup_resolves_to_verified_chat_id():
+    from services.ai_agent.core import AIAgent
+    from services.ai_agent.schema import AgentContext
+
+    ctx = AgentContext(
+        user_id=-99999,
+        conversation_history=[{
+            "role": "assistant",
+            "content": (
+                "Telegram 官方 API 当前验证到群组 2 个，频道 1 个。\n"
+                "群组：\n1. 甲群 (-1001111111111)\n2. 乙群 (-1002222222222)\n"
+                "频道：\n1. 甲频道 (-1003333333333)"
+            ),
+        }],
+    )
+
+    assert AIAgent._resolve_contextual_command("查看第二个群消息", ctx) == "查看群 -1002222222222 最近群消息"
+    assert AIAgent._resolve_contextual_command("第一个", ctx) == "查看群 -1001111111111 最近群消息"
+
+
+@pytest.mark.asyncio
+async def test_llm_cannot_create_empty_recent_delete_confirmation():
+    from services.ai_agent.core import AIAgent
+    from services.ai_agent.schema import AgentContext
+
+    calls = 0
+
+    async def fake_llm(messages, model=""):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return '__TOOL_CALL__{"function":{"name":"delete_recent_ad_messages","arguments":{}}}', {"total_tokens": 1}
+        return "删除请求因缺少后端快照已拒绝。", {"total_tokens": 1}
+
+    response = await AIAgent(llm_call_fn=fake_llm).process_message(
+        "删除", AgentContext(user_id=-99999)
+    )
+
+    assert response.requires_confirmation is False
+    assert response.tool_results["delete_recent_ad_messages"]["blocked"] is True
+    assert "缺少后端快照" in response.text
+
+
+def test_agent_cancellation_phrases_are_deterministic():
+    from web_admin import _is_agent_cancellation_text
+
+    assert _is_agent_cancellation_text("取消操作") is True
+    assert _is_agent_cancellation_text("不要了") is True
+    assert _is_agent_cancellation_text("继续") is False
+
+
 @pytest.mark.asyncio
 async def test_agent_deletes_flagged_ad_after_confirmation(tmp_path, monkeypatch):
     import config

@@ -239,6 +239,38 @@ async def test_agent_respects_explicit_recent_ad_batch_size(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_terse_delete_inherits_previous_ad_query(tmp_path, monkeypatch):
+    import config
+    import database
+    from services.ai_agent.core import AIAgent
+    from services.ai_agent.schema import AgentContext
+
+    now = int(time.time())
+    db_path = tmp_path / "agent_contextual_ad_delete.sqlite3"
+    await _create_ad_db(db_path, now=now)
+    monkeypatch.setattr(config, "DB_NAME", str(db_path), raising=False)
+    monkeypatch.setattr(database, "DB_NAME", str(db_path), raising=False)
+    monkeypatch.setattr(config, "AD_DELETE_ENABLED", True, raising=False)
+
+    ctx = AgentContext(
+        user_id=-99999,
+        bot_instance=FakeBot(),
+        metadata={"role": "merchant_owner", "tenant_id": "tenant-a"},
+        conversation_history=[
+            {"role": "user", "content": "检查广告"},
+            {"role": "assistant", "content": "最近 24 小时共找到 2 条合格广告，其中 2 条具备删除权限。"},
+        ],
+    )
+    response = await AIAgent(llm_call_fn=None).process_message("删除", ctx)
+
+    assert response.requires_confirmation is True
+    assert response.tool_calls_made == ["query_recent_ad_messages", "delete_recent_ad_messages"]
+    refs = response.tool_results["delete_recent_ad_messages"]["_params"]["message_refs"]
+    assert {ref["tg_msg_id"] for ref in refs} == {101, 102}
+    assert ctx.bot_instance.deleted == []
+
+
+@pytest.mark.asyncio
 async def test_short_ad_check_queries_database_without_llm(tmp_path, monkeypatch):
     import config
     import database
