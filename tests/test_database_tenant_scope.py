@@ -280,3 +280,31 @@ async def test_tenant_id_is_persisted_for_new_records(tenant_db):
             assert (await cursor.fetchone())[0] == "tenant_a"
         async with db.execute("SELECT tenant_id FROM group_messages WHERE content = 'fresh-group-message'") as cursor:
             assert (await cursor.fetchone())[0] == "tenant_a"
+
+
+@pytest.mark.asyncio
+async def test_virtual_agents_never_appear_as_regular_inbox_users(tenant_db):
+    await database.save_message(
+        from_userid=database.AI_ASSISTANT_USER_ID,
+        to_userid=database.ADMIN_ID,
+        content="agent reply",
+        username="Agent助手",
+        is_read=True,
+    )
+
+    async with aiosqlite.connect(database.DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO admin_inbox (from_userid, from_username, tenant_id) VALUES (?, '旧AI助手', 'default')",
+            (900000001,),
+        )
+        await db.execute(
+            "INSERT OR REPLACE INTO admin_inbox (from_userid, from_username, tenant_id) VALUES (?, '真实用户', 'default')",
+            (4321,),
+        )
+        await db.commit()
+
+    inbox = await database.get_inbox_list()
+    user_ids = {int(row["from_userid"]) for row in inbox}
+    assert database.AI_ASSISTANT_USER_ID not in user_ids
+    assert 900000001 not in user_ids
+    assert 4321 in user_ids

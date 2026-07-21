@@ -173,6 +173,8 @@ class AIAgent:
                 final_text = self._format_ad_cluster_result(tool_results["query_ad_clusters"])
             elif "query_recent_ad_messages" in tool_results:
                 final_text = self._format_recent_ad_result(tool_results["query_recent_ad_messages"])
+            elif "system_query" in tool_results:
+                final_text = self._format_system_query_result(tool_results["system_query"])
             else:
                 final_text, _ = await self._call_llm(
                     messages=messages,
@@ -476,8 +478,10 @@ class AIAgent:
         normalized = re.sub(r"\s+", "", str(text or "").lower())
         has_delete = any(word in normalized for word in ("删除", "清理", "移除", "删掉", "执行删除"))
         has_ad = any(word in normalized for word in ("广告", "垃圾信息", "牛皮癣"))
-        has_window = any(word in normalized for word in ("最近", "24小时", "小时内", "今天"))
-        return has_delete and has_ad and has_window
+        is_negated = any(word in normalized for word in ("不要删除", "别删除", "禁止删除", "无需删除", "不需要删除"))
+        is_question = normalized.startswith(("为什么", "为何", "怎么会"))
+        requests_single = "一条" in normalized and not any(word in normalized for word in ("最近", "24小时", "小时内", "今天"))
+        return has_delete and has_ad and not is_negated and not is_question and not requests_single
 
     async def _prepare_recent_ad_deletion(
         self,
@@ -617,6 +621,59 @@ class AIAgent:
             )
         return f"已检查 {evidence_count} 条已落库消息，发现 {len(clusters)} 个疑似广告聚类。"
 
+    @staticmethod
+    def _format_system_query_result(result: Dict[str, Any]) -> str:
+        if not result.get("success", True):
+            return f"系统查询失败：{result.get('message') or '未知错误'}"
+        data = result.get("data")
+        if isinstance(data, dict) and "total_count" in data:
+            groups = data.get("groups") or []
+            channels = data.get("channels") or []
+            broadcast_only = data.get("broadcast_only_groups") or []
+            lines = [
+                f"当前绑定群组 {int(data.get('group_count') or 0)} 个，频道 {int(data.get('channel_count') or 0)} 个。"
+            ]
+            if broadcast_only:
+                lines.append(f"另有仅广播目标群 {int(data.get('broadcast_only_group_count') or 0)} 个。")
+            if groups:
+                lines.append("群组：" + "、".join(
+                    f"{item.get('title') or item.get('chat_title') or '未命名'} ({item.get('chat_id')})"
+                    for item in groups[:20]
+                ))
+            if channels:
+                lines.append("频道：" + "、".join(
+                    f"{item.get('title') or item.get('chat_title') or '未命名'} ({item.get('chat_id')})"
+                    for item in channels[:20]
+                ))
+            if broadcast_only:
+                lines.append("仅广播目标群：" + "、".join(
+                    f"{item.get('title') or item.get('chat_title') or '未命名'} ({item.get('chat_id')})"
+                    for item in broadcast_only[:20]
+                ))
+            return "\n".join(lines)
+
+        if isinstance(data, list):
+            evidence_count = int(result.get("evidence_count") or result.get("count") or len(data))
+            if evidence_count <= 0:
+                return result.get("limitation") or result.get("message") or "当前没有可用的已落库数据。"
+            previews = []
+            for item in data[:10]:
+                if not isinstance(item, dict):
+                    continue
+                title = item.get("group_title") or item.get("title") or item.get("username") or item.get("user_id") or "记录"
+                content = str(item.get("content") or "").strip().replace("\n", " ")[:80]
+                previews.append(f"{title}: {content}" if content else str(title))
+            heading = result.get("message") or f"查询到 {evidence_count} 条记录"
+            return heading + ("\n" + "\n".join(f"- {item}" for item in previews) if previews else "")
+
+        if isinstance(data, dict):
+            summary_items = [
+                f"{key}={value}" for key, value in data.items()
+                if isinstance(value, (str, int, float, bool))
+            ]
+            return (result.get("message") or "系统查询完成") + ("\n" + "，".join(summary_items) if summary_items else "")
+        return result.get("message") or "系统查询完成。"
+
     def _match_tool_from_text(self, text: str, tools: list) -> Optional[str]:
         """根据用户文本做启发式工具匹配（仅作为 LLM 未显式返回 tool_call 时的兜底）"""
         if not text:
@@ -644,7 +701,7 @@ class AIAgent:
                 "清理广告", "处理广告",
             ],
             "query_recent_ad_messages": [
-                "最近24小时广告", "最近广告记录", "广告记录时间",
+                "检查广告", "广告检查", "查看广告", "最近24小时广告", "最近广告记录", "广告记录时间",
                 "随机抽取广告", "随机广告时间", "今天的广告记录",
             ],
             "delete_recent_ad_messages": [
@@ -665,7 +722,7 @@ class AIAgent:
             "system_query": [
                 "系统状态", "系统概览", "有多少群", "群组统计",
                 "有几个群", "几个群", "有多少频道", "有几个频道", "几个频道",
-                "绑定群", "绑定频道", "群列表", "频道列表", "机器人绑定",
+                "绑定群", "绑定频道", "群列表", "频道列表", "机器人绑定", "查看群聊", "查询群聊", "我的群聊",
                 "系统信息", "活跃群组", "群消息", "群聊消息", "频道消息",
                 "最近消息", "最近有谁", "谁给我发", "谁给我发送", "最近发消息",
                 "广告消息", "群广告", "疑似广告", "打广告", "发广告", "灰黑产",
@@ -790,6 +847,7 @@ class AIAgent:
             if any(k in text for k in (
                 "有多少群", "有几个群", "几个群", "有多少频道", "有几个频道", "几个频道",
                 "绑定群", "绑定频道", "绑定群聊", "群列表", "频道列表", "机器人绑定",
+                "查看群聊", "查询群聊", "我的群聊",
                 "我有多少群", "我有几个群", "我有多少频道", "我有几个频道",
             )):
                 return {"query_type": "bound_chats", "limit": 20}

@@ -1695,7 +1695,7 @@ class SystemQueryTool(BaseTool):
             elif query_type == "recent_senders":
                 # 最近给管理员发消息的用户（优先走 inbox，性能更稳）
                 inbox_rows = await database.get_inbox_list(tenant_id=tenant_id, merchant_id=merchant_id)
-                ai_uid = int(os.getenv("AI_ASSISTANT_USER_ID", "900000001"))
+                ai_uid = int(config.AI_ASSISTANT_USER_ID)
 
                 senders = []
                 for row in inbox_rows:
@@ -1743,7 +1743,7 @@ class SystemQueryTool(BaseTool):
                     )
                     rows = [dict(row) for row in await cursor.fetchall()]
 
-                ai_uid = int(os.getenv("AI_ASSISTANT_USER_ID", "900000001"))
+                ai_uid = int(config.AI_ASSISTANT_USER_ID)
                 messages = []
                 for row in rows:
                     from_uid = int(row.get("from_userid", 0) or 0)

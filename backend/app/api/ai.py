@@ -21,12 +21,13 @@ import os
 import time
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
+import config
 from backend.repositories.ai_usage_repo import save_ai_usage_log, get_global_usage_summary
 from backend.app.services.quota_service import get_quota_service
 
 logger = logging.getLogger(__name__)
 
-AI_ASSISTANT_USER_ID = int(os.getenv("AI_ASSISTANT_USER_ID", "-99999"))
+AI_ASSISTANT_USER_ID = config.AI_ASSISTANT_USER_ID
 _ai_agent_sessions: Dict[str, Dict[str, Any]] = {}
 
 

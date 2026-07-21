@@ -550,16 +550,15 @@ async def test_agent_reads_bound_chats_and_group_messages(tmp_path, monkeypatch)
         metadata={"role": "merchant_owner", "tenant_id": "tenant_a"},
     )
     agent = AIAgent(llm_call_fn=fake_llm)
-    response = await agent.process_message("我有几个群几个频道，分别是什么？", ctx)
+    response = await agent.process_message("查看群聊", ctx)
 
     assert "system_query" in response.tool_calls_made
     assert "测试群A" in response.text
     assert "测试频道A" in response.text
     assert "其他租户群" not in response.text
-    assert seen_tool_prompt
-    assert seen_llm_inputs[0].startswith("[工具执行结果]")
-    assert "测试群A" in seen_tool_prompt[0]
-    assert "测试频道A" in seen_tool_prompt[0]
+    assert seen_tool_prompt == []
+    assert seen_llm_inputs == []
+    assert "请稍等" not in response.text
 
     from services.ai_agent.tools import SystemQueryTool
 

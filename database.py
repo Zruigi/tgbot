@@ -10,7 +10,13 @@ import json
 from datetime import datetime, timedelta
 import calendar
 from typing import Optional, List, Dict, Any, Union
-from config import DB_NAME, ADMIN_ID
+from config import (
+    DB_NAME,
+    ADMIN_ID,
+    AI_ASSISTANT_USER_ID,
+    LEGACY_AI_ASSISTANT_USER_IDS,
+    VIRTUAL_AI_ASSISTANT_USER_IDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +259,24 @@ async def init_db():
         if 'avatar_file_id' not in columns:
             await db.execute("ALTER TABLE admin_inbox ADD COLUMN avatar_file_id TEXT DEFAULT NULL")
             logger.info("✅ 数据库迁移：已为 admin_inbox 添加 avatar_file_id 字段")
+
+        # 统一历史虚拟助手 UID。虚拟助手由前端固定展示，不应混入普通用户收件箱。
+        for legacy_assistant_id in LEGACY_AI_ASSISTANT_USER_IDS:
+            await db.execute(
+                "UPDATE messages SET from_userid = ? WHERE from_userid = ?",
+                (AI_ASSISTANT_USER_ID, legacy_assistant_id),
+            )
+            await db.execute(
+                "UPDATE messages SET to_userid = ? WHERE to_userid = ?",
+                (AI_ASSISTANT_USER_ID, legacy_assistant_id),
+            )
+        assistant_ids = tuple(VIRTUAL_AI_ASSISTANT_USER_IDS)
+        if assistant_ids:
+            placeholders = ",".join("?" for _ in assistant_ids)
+            await db.execute(
+                f"DELETE FROM admin_inbox WHERE from_userid IN ({placeholders})",
+                assistant_ids,
+            )
 
         cursor = await db.execute("PRAGMA table_info(address_monitors)")
         monitor_columns = [row[1] for row in await cursor.fetchall()]
@@ -1632,7 +1656,7 @@ async def save_message(
         
         # 2. 如果是用户发给管理员的消息，更新 admin_inbox 收件箱
         import config
-        if to_userid == config.ADMIN_ID:
+        if to_userid == config.ADMIN_ID and int(from_userid) not in VIRTUAL_AI_ASSISTANT_USER_IDS:
             # 获取该用户的所有未读消息
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -1752,6 +1776,8 @@ async def get_inbox_list(tenant_id: Optional[str] = None, merchant_id: Optional[
             users: list[dict] = []
             for row in rows:
                 uid = int(row["uid"])
+                if uid in VIRTUAL_AI_ASSISTANT_USER_IDS:
+                    continue
                 last_active = row["last_active"]
                 async with db.execute(
                     """
@@ -1833,7 +1859,10 @@ async def get_inbox_list(tenant_id: Optional[str] = None, merchant_id: Optional[
         async with db.execute("SELECT * FROM admin_inbox ORDER BY last_active DESC") as cursor:
             rows = await cursor.fetchall()
             if rows:
-                return [dict(row) for row in rows]
+                return [
+                    dict(row) for row in rows
+                    if int(row["from_userid"]) not in VIRTUAL_AI_ASSISTANT_USER_IDS
+                ]
             
             # 如果收件箱为空，尝试从 messages 表重建 (防止更新后数据展示不全)
             logger.info("Admin Inbox 为空，尝试从 messages 表自动重建...")
@@ -1842,7 +1871,10 @@ async def get_inbox_list(tenant_id: Optional[str] = None, merchant_id: Optional[
             # 重新查询
             async with db.execute("SELECT * FROM admin_inbox ORDER BY last_active DESC") as cursor:
                 rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+                return [
+                    dict(row) for row in rows
+                    if int(row["from_userid"]) not in VIRTUAL_AI_ASSISTANT_USER_IDS
+                ]
 
 async def rebuild_inbox_from_messages():
     """从 messages 历史记录中重建 admin_inbox 汇总表"""

@@ -36,7 +36,7 @@ _csrf_token_store: Dict[str, float] = {}
 
 # AI Agent 会话缓存。key = tenant/user/channel，value = {"ctx": AgentContext, "pending": AgentResponse}
 _ai_agent_sessions: Dict[str, Dict[str, Any]] = {}
-AI_ASSISTANT_USER_ID = int(os.getenv("AI_ASSISTANT_USER_ID", "-99999"))
+AI_ASSISTANT_USER_ID = config.AI_ASSISTANT_USER_ID
 
 ENTRY_GRANT_TTL_SECONDS = 30 * 86400
 ENTRY_PROOF_COOKIE = 'entry_proof'

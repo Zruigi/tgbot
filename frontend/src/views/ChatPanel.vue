@@ -293,9 +293,15 @@ const chatStore = useChatStore()
 const themeStore = useThemeStore()
 const router = useRouter()
 const AI_ASSISTANT_USER_ID = -99999
+const LEGACY_AI_ASSISTANT_USER_IDS = new Set([900000001])
 
 function isAiAssistantUserId(userId: unknown): boolean {
   return Number(userId) === AI_ASSISTANT_USER_ID
+}
+
+function isVirtualAssistantUserId(userId: unknown): boolean {
+  const normalized = Number(userId)
+  return normalized === AI_ASSISTANT_USER_ID || LEGACY_AI_ASSISTANT_USER_IDS.has(normalized)
 }
 
 // ★ AI 正在输入/输出状态（独立于消息状态，用于全局UI提示）
@@ -325,13 +331,19 @@ const avatarUrl = computed(() => {
   return resolveMediaUrl(chatStore.fileUrls[aid] || '')
 })
 
-const normalizedUsers = computed(() =>
-  (chatStore.users || []).map((u: any) => ({
-    ...u,
-    from_userid: Number(u.from_userid ?? u.user_id ?? 0),
-    from_username: u.from_username ?? u.username ?? ''
-  }))
-)
+const normalizedUsers = computed(() => {
+  const usersById = new Map<number, any>()
+  for (const rawUser of chatStore.users || []) {
+    const userId = Number(rawUser.from_userid ?? rawUser.user_id ?? 0)
+    if (!userId || isVirtualAssistantUserId(userId) || usersById.has(userId)) continue
+    usersById.set(userId, {
+      ...rawUser,
+      from_userid: userId,
+      from_username: rawUser.from_username ?? rawUser.username ?? ''
+    })
+  }
+  return [...usersById.values()]
+})
 
 // Agent Assistant contact - fixed entry
 const agentAssistantContact = {

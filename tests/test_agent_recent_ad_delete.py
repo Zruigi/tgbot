@@ -152,7 +152,7 @@ async def test_agent_prepares_then_confirms_recent_ad_deletion(tmp_path, monkeyp
     )
     agent = AIAgent(llm_call_fn=fake_llm)
 
-    pending = await agent.process_message("执行删除 最近24小时的广告", ctx)
+    pending = await agent.process_message("删除广告", ctx)
 
     assert pending.requires_confirmation is True
     assert pending.is_action_taken is False
@@ -180,6 +180,40 @@ async def test_agent_prepares_then_confirms_recent_ad_deletion(tmp_path, monkeyp
             "SELECT COUNT(*) FROM tenant_audit_logs WHERE action = 'agent_delete_recent_ads'"
         )
         assert (await audit_cur.fetchone())[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_short_ad_check_queries_database_without_llm(tmp_path, monkeypatch):
+    import config
+    import database
+    from services.ai_agent.core import AIAgent
+    from services.ai_agent.schema import AgentContext
+
+    now = int(time.time())
+    db_path = tmp_path / "agent_short_ad_check.sqlite3"
+    await _create_ad_db(db_path, now=now)
+    monkeypatch.setattr(config, "DB_NAME", str(db_path), raising=False)
+    monkeypatch.setattr(database, "DB_NAME", str(db_path), raising=False)
+
+    llm_calls = []
+
+    async def fake_llm(messages, model=""):
+        llm_calls.append(messages)
+        return "不应由 LLM 生成查询结论", {"total_tokens": 1}
+
+    response = await AIAgent(llm_call_fn=fake_llm).process_message(
+        "检查广告",
+        AgentContext(
+            user_id=-99999,
+            metadata={"role": "merchant_owner", "tenant_id": "tenant-a", "merchant_id": 1},
+        ),
+    )
+
+    assert response.tool_calls_made == ["query_recent_ad_messages"]
+    assert response.tool_results["query_recent_ad_messages"]["data"]["snapshot_count"] == 2
+    assert "最近 24 小时共找到 2 条合格广告" in response.text
+    assert "请稍等" not in response.text
+    assert llm_calls == []
 
 
 @pytest.mark.asyncio

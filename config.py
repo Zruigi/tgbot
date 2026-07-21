@@ -20,6 +20,13 @@ def _first_non_empty_env(*keys: str, default: str = "") -> str:
 # --- Telegram Bot 配置 ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+AI_ASSISTANT_USER_ID = int(os.getenv("AI_ASSISTANT_USER_ID", "-99999"))
+LEGACY_AI_ASSISTANT_USER_IDS = tuple(
+    int(value.strip())
+    for value in os.getenv("LEGACY_AI_ASSISTANT_USER_IDS", "900000001").split(",")
+    if value.strip() and int(value.strip()) != AI_ASSISTANT_USER_ID
+)
+VIRTUAL_AI_ASSISTANT_USER_IDS = frozenset((AI_ASSISTANT_USER_ID, *LEGACY_AI_ASSISTANT_USER_IDS))
 
 # --- 进程内标志（由 /restart_bot 设置，main 在 run_polling 结束后 os.execl 重启）---
 RESTART_REQUESTED = False
