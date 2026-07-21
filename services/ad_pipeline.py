@@ -58,6 +58,8 @@ def _sqlite_row_to_message(row: Dict[str, Any]) -> Dict[str, Any]:
         "msg_ts": int(row.get("message_ts") or 0) or None,
         "is_deleted": False,
         "is_checked": bool(row.get("ad_checked_at")),
+        "is_advertising": bool(row.get("is_advertising")),
+        "ad_score": int(row.get("ad_score") or 0),
         "ad_cluster_id": row.get("ad_cluster_id"),
     }
 
@@ -321,6 +323,8 @@ class AdPipeline:
                 SELECT gm.msg_id, gm.group_id, gm.tg_msg_id, gm.user_id, gm.username,
                        gm.sender_type, gm.content, gm.message_ts, gm.timestamp,
                        gm.tenant_id,
+                       {'gm.is_advertising' if 'is_advertising' in gm_cols else '0 AS is_advertising'},
+                       {'gm.ad_score' if 'ad_score' in gm_cols else '0 AS ad_score'},
                        {'gm.ad_cluster_id' if 'ad_cluster_id' in gm_cols else 'NULL AS ad_cluster_id'},
                        {'gm.ad_checked_at' if 'ad_checked_at' in gm_cols else 'NULL AS ad_checked_at'},
                        tg.group_title AS group_title
@@ -350,11 +354,15 @@ class AdPipeline:
                     "message_refs": [],
                     "chat_ids": [],
                     "llm_status": "pending",
+                    "confirmed_for_deletion": False,
                     "action_status": "none",
                     "source": "sqlite.group_messages",
                 },
             )
             cluster["occurrences"] += 1
+            if row.get("is_advertising"):
+                cluster["llm_status"] = "ad"
+                cluster["confirmed_for_deletion"] = True
             if row.get("sender_id") not in cluster["sender_ids"]:
                 cluster["sender_ids"].append(row.get("sender_id"))
             if row.get("tg_msg_id") not in cluster["message_ids"]:
@@ -384,7 +392,6 @@ class AdPipeline:
 
         clusters.sort(key=lambda c: (int(c.get("risk_score") or 0), int(c.get("occurrences") or 0)), reverse=True)
         return clusters[: max(1, min(int(limit or 20), 100))]
-
     async def query_clusters(
         self,
         *,
@@ -603,6 +610,12 @@ class AdPipeline:
 
         await asyncio.to_thread(_sync)
         return {"success": True, "message": f"cluster {cluster_id} 已标记"}
+
+
+def cluster_is_confirmed_ad(cluster: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(cluster, dict):
+        return False
+    return bool(cluster.get("confirmed_for_deletion")) or str(cluster.get("llm_status") or "") == "ad"
 
 
 _PIPELINE = AdPipeline()

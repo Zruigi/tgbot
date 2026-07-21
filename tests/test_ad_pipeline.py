@@ -78,6 +78,18 @@ async def test_ad_pipeline_sqlite_fallback_clusters_duplicate_messages(tmp_path,
     assert len(clusters) == 1
     assert clusters[0]["occurrences"] == 3
     assert len(clusters[0]["message_refs"]) == 3
+    assert clusters[0]["llm_status"] == "pending"
+    assert clusters[0]["confirmed_for_deletion"] is False
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("UPDATE group_messages SET is_advertising = 1, ad_score = 95 WHERE tg_msg_id = 100")
+        await db.commit()
+    confirmed = await get_ad_pipeline().query_clusters(
+        tenant_id="tenant_a", group_id=-1001, limit=10, window_minutes=10
+    )
+    confirmed_cluster = confirmed["data"]["clusters"][0]
+    assert confirmed_cluster["llm_status"] == "ad"
+    assert confirmed_cluster["confirmed_for_deletion"] is True
 
 
 @pytest.mark.asyncio

@@ -2617,7 +2617,7 @@ async def api_delete_ad_cluster(request):
         if not _bot_instance:
             return web.json_response({'status': 'error', 'message': 'bot 未初始化'}, status=500)
 
-        from services.ad_pipeline import delete_cluster_messages, get_ad_pipeline
+        from services.ad_pipeline import cluster_is_confirmed_ad, delete_cluster_messages, get_ad_pipeline
         # Never trust message_refs supplied by n8n/LLM. Resolve the exact cluster
         # server-side so arbitrary Telegram message IDs cannot be injected.
         scope = _request_scope_context(request)
@@ -2635,6 +2635,11 @@ async def api_delete_ad_cluster(request):
             return web.json_response(
                 {'status': 'error', 'message': '未从后端聚类查询到该 cluster，已拒绝删除'},
                 status=404,
+            )
+        if not cluster_is_confirmed_ad(matched):
+            return web.json_response(
+                {'status': 'error', 'message': '该 cluster 仅为待判定候选，尚未确认是广告，已拒绝删除'},
+                status=409,
             )
 
         result = await delete_cluster_messages(
