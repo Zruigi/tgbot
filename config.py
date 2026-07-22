@@ -120,6 +120,7 @@ AD_SIMILARITY_THRESHOLD = float(os.getenv("AD_SIMILARITY_THRESHOLD", "0.92"))
 AD_MIN_DUPLICATE_COUNT = int(os.getenv("AD_MIN_DUPLICATE_COUNT", "2"))
 AD_DELETE_ENABLED = os.getenv("AD_DELETE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 AD_KICK_ENABLED = os.getenv("AD_KICK_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+AD_AUTO_ENFORCE_ENABLED = os.getenv("AD_AUTO_ENFORCE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 AD_EMBEDDING_DIM = int(os.getenv("AD_EMBEDDING_DIM", "768"))
 
 # --- 安全加固配置 ---

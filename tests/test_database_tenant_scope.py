@@ -41,6 +41,7 @@ async def tenant_db(tmp_path):
                 quoted_file_id TEXT,
                 quoted_type TEXT,
                 status TEXT,
+                agent_ui_json TEXT,
                 is_deleted INTEGER DEFAULT 0,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 tenant_id TEXT DEFAULT 'default'
@@ -111,6 +112,7 @@ async def tenant_db(tmp_path):
                 content TEXT,
                 msg_type TEXT,
                 file_id TEXT,
+                media_unique_id TEXT,
                 quoted_tg_msg_id INTEGER,
                 quoted_text TEXT,
                 message_ts INTEGER,

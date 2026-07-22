@@ -74,6 +74,8 @@ class AgentResponse:
     requires_confirmation: bool = False  # 是否需要用户确认
     confidence: float = 1.0             # 置信度 0-1
     raw_response: Optional[dict] = None # 原始 LLM 响应
+    ui_actions: List[Dict[str, Any]] = field(default_factory=list)
+    job: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> dict:
         return {
@@ -84,4 +86,6 @@ class AgentResponse:
             "action_summary": self.action_summary,
             "requires_confirmation": self.requires_confirmation,
             "confidence": self.confidence,
+            "ui_actions": self.ui_actions,
+            "job": self.job,
         }

@@ -2204,6 +2204,119 @@ def _is_agent_cancellation_text(text: str) -> bool:
     }
 
 
+def _ad_scan_group_actions(groups: list) -> list:
+    return [
+        {
+            'id': 'select_ad_scan_group',
+            'label': str(item.get('title') or item.get('group_id')),
+            'icon': 'groups',
+            'payload': {'group_id': int(item['group_id'])},
+            'description': f"{int(item.get('message_count') or 0)} 条已落库消息",
+        }
+        for item in groups[:20]
+    ]
+
+
+async def _handle_ad_scan_agent_action(*, action: dict, ctx, scope: Dict[str, Any]):
+    from services.ad_governance import get_ad_governance
+    from services.ai_agent.schema import AgentResponse
+
+    service = get_ad_governance()
+    action_id = str(action.get('id') or '').strip()
+    payload = action.get('payload') if isinstance(action.get('payload'), dict) else {}
+    tenant_id = scope.get('tenant_id') if scope.get('is_merchant') else payload.get('tenant_id')
+
+    if action_id == 'select_ad_scan_group':
+        group_id = int(payload.get('group_id'))
+        job = await service.create_job(
+            tenant_id=tenant_id, group_id=group_id, requested_by=str(ctx.user_id),
+            bot=ctx.bot_instance, dry_run=True, activate_policy=False,
+        )
+        ctx.metadata['active_group_id'] = group_id
+        return AgentResponse(
+            text=(
+                f"已选择 {job.get('group_title') or group_id}，共 {int(job.get('total_messages') or 0)} 条待扫描记录。\n"
+                "首次执行为 dry-run：会完成全历史聚类和 LLM 簇级判断，但不会删除、警告或禁言。"
+            ),
+            tool_calls_made=['prepare_ad_scan'],
+            requires_confirmation=True,
+            action_summary=f"准备扫描群 {group_id}",
+            ui_actions=[
+                {'id': 'confirm_ad_scan', 'label': '确认 dry-run', 'icon': 'play_arrow', 'style': 'primary', 'payload': {'job_id': job['job_id']}},
+                {'id': 'cancel_ad_scan', 'label': '取消', 'icon': 'close', 'style': 'secondary', 'payload': {'job_id': job['job_id']}},
+            ],
+            job=job,
+        )
+
+    if action_id == 'confirm_ad_scan':
+        job_id = str(payload.get('job_id') or '')
+        await service.configure_job(job_id=job_id, tenant_id=tenant_id, dry_run=True, activate_policy=False)
+        job = await service.start_job(
+            job_id=job_id, tenant_id=tenant_id, bot=ctx.bot_instance,
+            classifier=_classify_ad_scan_families,
+        )
+        return AgentResponse(
+            text=f"已启动 {job.get('group_title') or job.get('group_id')} 的全历史广告 dry-run。",
+            tool_calls_made=['start_ad_scan'],
+            job=job,
+        )
+
+    if action_id == 'cancel_ad_scan':
+        job = await service.cancel_job(job_id=str(payload.get('job_id') or ''), tenant_id=tenant_id)
+        return AgentResponse(text='已取消广告扫描，没有执行任何动作。', job=job)
+
+    if action_id == 'activate_ad_policy':
+        group_id = int(payload.get('group_id'))
+        job = await service.create_job(
+            tenant_id=tenant_id, group_id=group_id, requested_by=str(ctx.user_id),
+            bot=ctx.bot_instance, dry_run=False, activate_policy=True, source='agent_activation',
+        )
+        await service.start_job(
+            job_id=job['job_id'], tenant_id=tenant_id, bot=ctx.bot_instance,
+            classifier=_classify_ad_scan_families,
+        )
+        return AgentResponse(
+            text='已启动正式治理扫描；本次完成后将同时启用该群的持续自动治理。',
+            tool_calls_made=['activate_ad_policy'], job=job,
+        )
+
+    if action_id == 'view_ad_scan_tier':
+        tier = str(payload.get('tier') or '')
+        rows = await service.get_clusters(
+            job_id=str(payload.get('job_id') or ''), tenant_id=tenant_id, tier=tier, limit=50,
+        )
+        lines = [f"{row.get('action_tier')}: {row.get('recent_count')}条 / {row.get('sender_count')}人 - {str(row.get('representative_text') or '')[:120]}" for row in rows]
+        return AgentResponse(text=("\n".join(lines) if lines else '该层暂无记录。'))
+
+    if action_id == 'get_ad_scan_result':
+        job = await service.get_job(job_id=str(payload.get('job_id') or ''), tenant_id=tenant_id)
+        summary = job.get('summary') or {}
+        text = (
+            f"{job.get('group_title') or job.get('group_id')} 扫描{('完成' if job.get('status') == 'completed' else '部分完成')}。\n"
+            f"总消息：{int(summary.get('total_messages') or 0)}\n"
+            f"候选簇：{int(summary.get('candidate_clusters') or 0)}\n"
+            f"确认广告簇：{int(summary.get('confirmed_clusters') or 0)}\n"
+            f"仅建立历史指纹：{int(summary.get('fingerprint_only_count') or 0)} 条\n"
+            f"计划删除：{int(summary.get('planned_delete_count') or 0)} 条\n"
+            f"警告发送者：{int(summary.get('warning_sender_count') or 0)} 人\n"
+            f"禁言发送者：{int(summary.get('muted_sender_count') or 0)} 人\n"
+            f"失败：{int(summary.get('failure_count') or 0)}"
+        )
+        actions = [
+            {'id': 'view_ad_scan_tier', 'label': '查看删除明细', 'icon': 'delete_sweep', 'payload': {'job_id': job['job_id'], 'tier': 'delete'}},
+            {'id': 'view_ad_scan_tier', 'label': '查看警告明细', 'icon': 'warning', 'payload': {'job_id': job['job_id'], 'tier': 'warn'}},
+            {'id': 'view_ad_scan_tier', 'label': '查看未确认簇', 'icon': 'help', 'payload': {'job_id': job['job_id'], 'tier': 'pending'}},
+        ]
+        if bool(job.get('dry_run')) and job.get('status') in {'completed', 'partial'}:
+            actions.insert(0, {
+                'id': 'activate_ad_policy', 'label': '启用自动治理', 'icon': 'verified_user',
+                'style': 'danger', 'payload': {'group_id': int(job['group_id'])},
+            })
+        return AgentResponse(text=text, ui_actions=actions, job=job)
+
+    raise ValueError('不支持的 Agent 广告扫描操作')
+
+
 async def _run_ai_agent_chat(
     *,
     user_id: int,
@@ -2212,6 +2325,7 @@ async def _run_ai_agent_chat(
     tenant_id: str,
     scope: Dict[str, Any],
     chat_id: Optional[int] = None,
+    agent_action: Optional[dict] = None,
 ):
     from backend.app.services.ai_service import get_ai_service
     from services.ai_agent.core import get_agent
@@ -2283,6 +2397,25 @@ async def _run_ai_agent_chat(
                 _ai_agent_sessions.pop(key, None)
 
     agent = get_agent(llm_call_fn=llm_call)
+    if agent_action:
+        return await _handle_ad_scan_agent_action(action=agent_action, ctx=ctx, scope=scope)
+
+    scan_intent = re.sub(r"\s+", "", input_text.lower())
+    wants_scan = scan_intent in {'扫描历史广告', '全量扫描广告', '全量检查广告'}
+    wants_group_choice = scan_intent == '检查广告' and not ctx.metadata.get('active_group_id')
+    if wants_scan or wants_group_choice:
+        from services.ad_governance import get_ad_governance
+        from services.ai_agent.schema import AgentResponse
+        groups = await get_ad_governance().list_groups(
+            tenant_id=scope.get('tenant_id') if scope.get('is_merchant') else None,
+            bot=ctx.bot_instance,
+        )
+        return AgentResponse(
+            text='请选择要扫描的群。扫描只处理该群已落库消息，不会跨群执行。',
+            tool_calls_made=['list_ad_scan_groups'],
+            ui_actions=_ad_scan_group_actions(groups),
+        )
+
     pending = session.get('pending')
     if pending is not None and _is_agent_cancellation_text(input_text):
         from services.ai_agent.schema import AgentResponse
@@ -2316,6 +2449,7 @@ async def api_ai_chat_bridge(request):
         model = str(data.get('model') or 'gemini-2.5-flash-lite')
         feature_key = str(data.get('feature_key') or 'general')
         idempotency_key = str(data.get('idempotencyKey') or data.get('idempotency_key') or '').strip()
+        agent_action = data.get('agent_action') if isinstance(data.get('agent_action'), dict) else None
         scope = _request_scope_context(request)
         body_tenant_id = str(data.get('tenant_id') or (data.get('context') or {}).get('tenant_id') or '').strip()
         body_context = data.get('context') if isinstance(data.get('context'), dict) else {}
@@ -2358,6 +2492,7 @@ async def api_ai_chat_bridge(request):
                     tenant_id=tenant_id,
                     scope=scope,
                     chat_id=chat_id,
+                    agent_action=agent_action,
                 )
                 reply = agent_result.text
             except Exception as agent_err:
@@ -2399,6 +2534,10 @@ async def api_ai_chat_bridge(request):
                 username='Agent助手',
                 status='received',
                 tenant_id=effective_tenant_id,
+                agent_ui_json=json.dumps({
+                    'ui_actions': agent_result.ui_actions if agent_result else [],
+                    'job': agent_result.job if agent_result else None,
+                }, ensure_ascii=False, default=str) if agent_result else None,
             )
         except Exception as persist_err:
             logger.warning("AI Agent 会话落库失败: %s", persist_err)
@@ -2460,6 +2599,8 @@ async def api_ai_chat_bridge(request):
                 'is_action_taken': agent_result.is_action_taken,
                 'requires_confirmation': agent_result.requires_confirmation,
                 'action_summary': agent_result.action_summary,
+                'ui_actions': agent_result.ui_actions,
+                'job': agent_result.job,
             })
         return web.json_response(payload)
     except ValueError:
@@ -2567,6 +2708,150 @@ async def api_agent_delete_ad_fingerprint(request):
         )
         return web.json_response({'status': 'ok', 'deleted': deleted})
     except Exception as exc:
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=500)
+
+
+async def _classify_ad_scan_families(items: list) -> dict:
+    """Classify cluster representatives only; never expose action parameters to the LLM."""
+    from backend.app.services.ai_service import get_ai_service
+
+    output = {}
+    for offset in range(0, len(items), 20):
+        batch = items[offset:offset + 20]
+        prompt = (
+            "你是Telegram群广告分类器。只判断下列聚类代表文本是否为广告、推广、灰黑产引流或重复刷屏。"
+            "必须只返回JSON数组，不要Markdown。每项格式："
+            '{"family_hash":"原值","is_ad":true,"confidence":0.0,"reason":"简短理由"}。'
+            "不得生成删除、禁言或message_id。\n输入："
+            + json.dumps(batch, ensure_ascii=False)
+        )
+        text, _ = await get_ai_service().chat_messages(
+            messages=[
+                {"role": "system", "content": "仅输出合法JSON数组。"},
+                {"role": "user", "content": prompt[:16000]},
+            ],
+            model="gemini-2.5-flash-lite",
+        )
+        raw = str(text or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+        start, end = raw.find("["), raw.rfind("]")
+        if start < 0 or end < start:
+            raise ValueError("LLM 未返回JSON数组")
+        parsed = json.loads(raw[start:end + 1])
+        if not isinstance(parsed, list):
+            raise ValueError("LLM 分类结果不是数组")
+        allowed = {str(item.get('family_hash')) for item in batch}
+        for row in parsed:
+            if not isinstance(row, dict):
+                continue
+            family_hash = str(row.get('family_hash') or '')
+            if family_hash not in allowed:
+                continue
+            confidence = max(0.0, min(float(row.get('confidence') or 0), 1.0))
+            output[family_hash] = {
+                'is_ad': bool(row.get('is_ad')) and confidence >= 0.65,
+                'confidence': confidence,
+                'reason': str(row.get('reason') or '')[:500],
+            }
+    return output
+
+
+def _agent_scope_tenant(scope: Dict[str, Any], data: Optional[dict] = None) -> Optional[str]:
+    data = data or {}
+    if scope.get('is_merchant'):
+        return scope.get('tenant_id')
+    value = str(data.get('tenant_id') or '').strip()
+    return value or None
+
+
+async def api_agent_ad_scan_groups(request):
+    try:
+        from services.ad_governance import get_ad_governance
+        scope = _request_scope_context(request)
+        groups = await get_ad_governance().list_groups(
+            tenant_id=_agent_scope_tenant(scope), bot=_bot_instance
+        )
+        return web.json_response({'status': 'ok', 'data': groups, 'count': len(groups)})
+    except Exception as exc:
+        logger.error("广告扫描群列表失败: %s", exc, exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=500)
+
+
+async def api_agent_create_ad_scan(request):
+    try:
+        from services.ad_governance import get_ad_governance
+        data = await request.json()
+        scope = _request_scope_context(request)
+        job = await get_ad_governance().create_job(
+            tenant_id=_agent_scope_tenant(scope, data),
+            group_id=int(data.get('group_id')),
+            requested_by=str(data.get('requested_by') or scope.get('role') or 'agent'),
+            bot=_bot_instance,
+            dry_run=bool(data.get('dry_run', True)),
+            activate_policy=bool(data.get('activate_policy', False)),
+            source=str(data.get('source') or 'agent'),
+        )
+        return web.json_response({'status': 'ok', 'job': job})
+    except (TypeError, ValueError) as exc:
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=400)
+    except Exception as exc:
+        logger.error("创建广告扫描任务失败: %s", exc, exc_info=True)
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=500)
+
+
+async def api_agent_get_ad_scan(request):
+    try:
+        from services.ad_governance import get_ad_governance
+        scope = _request_scope_context(request)
+        job = await get_ad_governance().get_job(
+            job_id=request.match_info['job_id'],
+            tenant_id=_agent_scope_tenant(scope, dict(request.query)),
+        )
+        return web.json_response({'status': 'ok', 'job': job})
+    except ValueError as exc:
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=404)
+    except Exception as exc:
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=500)
+
+
+async def api_agent_get_ad_scan_clusters(request):
+    try:
+        from services.ad_governance import get_ad_governance
+        scope = _request_scope_context(request)
+        rows = await get_ad_governance().get_clusters(
+            job_id=request.match_info['job_id'],
+            tenant_id=_agent_scope_tenant(scope, dict(request.query)),
+            tier=str(request.query.get('tier') or '').strip() or None,
+            limit=int(request.query.get('limit') or 100),
+        )
+        return web.json_response({'status': 'ok', 'data': rows, 'count': len(rows)})
+    except ValueError as exc:
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=404)
+    except Exception as exc:
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=500)
+
+
+async def api_agent_confirm_ad_scan(request):
+    try:
+        from services.ad_governance import get_ad_governance
+        data = await request.json()
+        scope = _request_scope_context(request)
+        tenant_id = _agent_scope_tenant(scope, data)
+        service = get_ad_governance()
+        await service.configure_job(
+            job_id=request.match_info['job_id'], tenant_id=tenant_id,
+            dry_run=bool(data.get('dry_run', True)),
+            activate_policy=bool(data.get('activate_policy', False)),
+        )
+        job = await service.start_job(
+            job_id=request.match_info['job_id'], tenant_id=tenant_id,
+            bot=_bot_instance, classifier=_classify_ad_scan_families,
+        )
+        return web.json_response({'status': 'ok', 'job': job})
+    except ValueError as exc:
+        return web.json_response({'status': 'error', 'message': str(exc)}, status=404)
+    except Exception as exc:
+        logger.error("确认广告扫描任务失败: %s", exc, exc_info=True)
         return web.json_response({'status': 'error', 'message': str(exc)}, status=500)
 
 
@@ -4329,6 +4614,14 @@ async def start_web_server(bot):
     """启动 Web Server"""
     global _push_scheduler_task, _push_scheduler_started
     set_bot_instance(bot)
+    from services.ad_governance import classify_families_with_llm, get_ad_governance
+    governance = get_ad_governance()
+    await governance.ensure_schema()
+    resumed_jobs = await governance.resume_pending_jobs(
+        bot=bot, classifier=classify_families_with_llm,
+    )
+    if resumed_jobs:
+        logger.info("恢复 %s 个已确认的广告扫描任务", resumed_jobs)
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_get('/', index_handler)
     app.router.add_get('/admin', index_handler)
@@ -4409,6 +4702,11 @@ async def start_web_server(bot):
     app.router.add_get("/api/agent/ad-fingerprints", api_agent_ad_fingerprints)
     app.router.add_post("/api/agent/ad-fingerprints", api_agent_ad_fingerprints)
     app.router.add_delete("/api/agent/ad-fingerprints/{text_hash}", api_agent_delete_ad_fingerprint)
+    app.router.add_get("/api/agent/ad-scan/groups", api_agent_ad_scan_groups)
+    app.router.add_post("/api/agent/ad-scans", api_agent_create_ad_scan)
+    app.router.add_get("/api/agent/ad-scans/{job_id}", api_agent_get_ad_scan)
+    app.router.add_get("/api/agent/ad-scans/{job_id}/clusters", api_agent_get_ad_scan_clusters)
+    app.router.add_post("/api/agent/ad-scans/{job_id}/confirm", api_agent_confirm_ad_scan)
     app.router.add_post("/api/agent/tools/query-ad-clusters", api_query_ad_clusters)
     app.router.add_post("/api/agent/tools/delete-ad-cluster", api_delete_ad_cluster)
     app.router.add_get("/api/ad-clusters", api_query_ad_clusters)

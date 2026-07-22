@@ -215,6 +215,7 @@ async def init_db():
                 tg_msg_id INTEGER DEFAULT NULL,
                 status TEXT DEFAULT 'sent',
                 auto_translation TEXT DEFAULT NULL,
+                agent_ui_json TEXT DEFAULT NULL,
                 is_deleted BOOLEAN DEFAULT 0
             )
         ''')
@@ -253,6 +254,9 @@ async def init_db():
         if 'original_text' not in msg_columns:
             await db.execute("ALTER TABLE messages ADD COLUMN original_text TEXT DEFAULT NULL")
             logger.info("✅ 数据库迁移：已为 messages 添加 original_text 字段")
+        if 'agent_ui_json' not in msg_columns:
+            await db.execute("ALTER TABLE messages ADD COLUMN agent_ui_json TEXT DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 messages 添加 agent_ui_json 字段")
 
         # 检查并添加缺失的列 (2026 规格迁移)
         cursor = await db.execute("PRAGMA table_info(admin_inbox)")
@@ -396,6 +400,7 @@ async def init_db():
                 content TEXT,
                 msg_type TEXT DEFAULT 'text',
                 file_id TEXT DEFAULT NULL,
+                media_unique_id TEXT DEFAULT NULL,
                 status TEXT DEFAULT 'pending',
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -583,6 +588,9 @@ async def init_db():
         if 'ad_text_hash' not in gm_columns:
             await db.execute("ALTER TABLE group_messages ADD COLUMN ad_text_hash TEXT DEFAULT NULL")
             logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_text_hash 字段")
+        if 'media_unique_id' not in gm_columns:
+            await db.execute("ALTER TABLE group_messages ADD COLUMN media_unique_id TEXT DEFAULT NULL")
+            logger.info("✅ 数据库迁移：已为 group_messages 添加 media_unique_id 字段")
         if 'ad_cluster_id' not in gm_columns:
             await db.execute("ALTER TABLE group_messages ADD COLUMN ad_cluster_id TEXT DEFAULT NULL")
             logger.info("✅ 数据库迁移：已为 group_messages 添加 ad_cluster_id 字段")
@@ -1712,6 +1720,7 @@ async def save_message(
     emoji: Optional[str] = None,
     trace_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
+    agent_ui_json: Optional[str] = None,
 ):
     """统一保存消息，并更新管理员收件箱汇总 (2026 规格：支持多媒体、引用、翻译、实名及头像更新)"""
     import uuid
@@ -1727,9 +1736,9 @@ async def save_message(
         # 1. 存入 messages 主表
         cur = await db.execute(
             """INSERT INTO messages 
-               (trace_id, from_userid, to_userid, content, type, file_id, media_url, is_read, tg_msg_id, auto_translation, translated_text, original_text, admin_userid, quoted_text, quoted_msg_id, quoted_file_id, quoted_type, status, tenant_id) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (trace_id, from_userid, to_userid, content, msg_type, file_id, media_url, 1 if is_read else 0, tg_msg_id, translated_text, translated_text, original_text, admin_userid, quoted_text, quoted_msg_id, quoted_file_id, quoted_type, status, effective_tenant_id)
+               (trace_id, from_userid, to_userid, content, type, file_id, media_url, is_read, tg_msg_id, auto_translation, translated_text, original_text, admin_userid, quoted_text, quoted_msg_id, quoted_file_id, quoted_type, status, tenant_id, agent_ui_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trace_id, from_userid, to_userid, content, msg_type, file_id, media_url, 1 if is_read else 0, tg_msg_id, translated_text, translated_text, original_text, admin_userid, quoted_text, quoted_msg_id, quoted_file_id, quoted_type, status, effective_tenant_id, agent_ui_json)
         )
         msg_db_id = cur.lastrowid
         
@@ -3149,6 +3158,7 @@ async def save_group_message(
     content: str,
     msg_type: str = 'text',
     file_id: Optional[str] = None,
+    media_unique_id: Optional[str] = None,
     tg_msg_id: Optional[int] = None,
     sender_type: str = 'user',
     quoted_tg_msg_id: Optional[int] = None,
@@ -3205,14 +3215,14 @@ async def save_group_message(
         await db.execute(
             """
             INSERT OR IGNORE INTO group_messages (
-                group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, file_id,
+                group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, file_id, media_unique_id,
                 quoted_tg_msg_id, quoted_text, message_ts, avatar_file_id,
                 is_advertising, ad_score, ad_confidence, ad_findings, ad_text_hash, tenant_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, file_id,
+                group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, file_id, media_unique_id,
                 quoted_tg_msg_id, quoted_text, ts, avatar_file_id,
                 1 if is_advertising else 0,
                 int(ad_score or 0),

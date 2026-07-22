@@ -3,6 +3,7 @@
 群组监听模块 - 自动捕捉潜在用户，并写入 [用户标签画像] 便于 Web 端筛选。
 扩展：在 KEYWORD_PROFILE_TAGS 中增加「关键词 → 画像标签」映射即可扩展分类。
 """
+import asyncio
 import logging
 import re
 import httpx
@@ -52,48 +53,61 @@ for k in KEYWORD_PROFILE_TAGS.keys():
 def _message_content_payload(message) -> dict:
     msg_type = 'text'
     media_file_id = None
+    media_unique_id = None
     msg_content = message.text or message.caption or ''
 
     if message.photo:
         msg_type = 'photo'
         media_file_id = message.photo[-1].file_id
+        media_unique_id = message.photo[-1].file_unique_id
         if not msg_content:
             msg_content = '[图片]'
     elif message.animation:
         msg_type = 'animation'
         media_file_id = message.animation.file_id
+        media_unique_id = message.animation.file_unique_id
         if not msg_content:
             msg_content = '[动图]'
     elif message.sticker:
         msg_type = 'sticker'
         media_file_id = message.sticker.file_id
+        media_unique_id = message.sticker.file_unique_id
         if not msg_content:
             msg_content = f"[表情包] {message.sticker.emoji or ''}".strip()
     elif message.video:
         msg_type = 'video'
         media_file_id = message.video.file_id
+        media_unique_id = message.video.file_unique_id
         if not msg_content:
             msg_content = '[视频]'
     elif message.voice:
         msg_type = 'voice'
         media_file_id = message.voice.file_id
+        media_unique_id = message.voice.file_unique_id
         if not msg_content:
             msg_content = '[语音]'
     elif message.audio:
         msg_type = 'audio'
         media_file_id = message.audio.file_id
+        media_unique_id = message.audio.file_unique_id
         if not msg_content:
             msg_content = '[音频]'
     elif message.document:
         msg_type = 'document'
         media_file_id = message.document.file_id
+        media_unique_id = message.document.file_unique_id
         if not msg_content:
             msg_content = f"[文件] {message.document.file_name or ''}".strip()
     elif not msg_content:
         msg_type = 'media'
         msg_content = f"[{message.effective_attachment.__class__.__name__ if message.effective_attachment else '媒体'}]"
 
-    return {"msg_type": msg_type, "file_id": media_file_id, "content": msg_content}
+    return {
+        "msg_type": msg_type,
+        "file_id": media_file_id,
+        "media_unique_id": media_unique_id,
+        "content": msg_content,
+    }
 
 
 async def _emit_n8n_message_hook(*, event_type: str, chat, message, content: str, tenant_id: Optional[str], enabled: bool) -> None:
@@ -525,6 +539,7 @@ async def track_group_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 content=msg_content,
                 msg_type=msg_type,
                 file_id=media_file_id,
+                media_unique_id=payload.get("media_unique_id"),
                 tg_msg_id=message.message_id,
                 sender_type=sender_type,
                 quoted_tg_msg_id=quoted_tg_msg_id,
@@ -546,6 +561,15 @@ async def track_group_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 tenant_id=tenant_id,
                 enabled=bool(group_cfg.get("is_monitored")),
             )
+            try:
+                from services.ad_governance import get_ad_governance
+                asyncio.create_task(get_ad_governance().schedule_realtime_scan(
+                    tenant_id=tenant_id,
+                    group_id=chat.id,
+                    bot=context.bot,
+                ))
+            except Exception as governance_ex:
+                logger.debug("广告持续治理调度失败: %s", governance_ex)
 
         # 始终把发言人写入 group_members（即使未开启监听，也可用于“成员管理”弹窗展示）
         if message.from_user and not message.from_user.is_bot:
@@ -626,6 +650,7 @@ async def track_channel_seen(update: Update, context: ContextTypes.DEFAULT_TYPE)
             content=payload["content"],
             msg_type=payload["msg_type"],
             file_id=payload["file_id"],
+            media_unique_id=payload.get("media_unique_id"),
             tg_msg_id=message.message_id,
             sender_type="channel",
             quoted_tg_msg_id=message.reply_to_message.message_id if message.reply_to_message else None,
