@@ -123,7 +123,7 @@ pub async fn get_summary(
     .bind(&tenant_id)
     .bind(start_ms)
     .bind(end_ms)
-    .fetch_all(&state.pool)
+    .fetch_all(state.db()?)
     .await?;
 
     let by_token: Vec<Value> = rows
@@ -180,7 +180,7 @@ pub async fn get_summary(
     .bind(&tenant_id)
     .bind(today_start.timestamp_millis())
     .bind(today_end.timestamp_millis())
-    .fetch_one(&state.pool)
+    .fetch_one(state.db()?)
     .await?;
 
     let daily_in: f64 = daily_row.try_get("daily_in").unwrap_or(0.0);
@@ -232,7 +232,7 @@ pub async fn reconcile(
     )
     .bind(ledger_uuid)
     .bind(&tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .ok_or_else(|| ApiError::NotFound("ledger_not_found".into()))?;
 
@@ -248,14 +248,14 @@ pub async fn reconcile(
         "SELECT account_id FROM chart_of_accounts WHERE code = $1 AND is_active = true",
     )
     .bind(&body.account_code)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .ok_or_else(|| ApiError::BadRequest("invalid_account_code".into()))?;
 
     let account_id: i64 = account_row.try_get("account_id")?;
 
     // Perform reconciliation in a transaction
-    let mut tx = state.pool.begin().await?;
+    let mut tx = state.db()?.begin().await?;
 
     // Update the ledger
     sqlx::query(
@@ -296,7 +296,7 @@ pub async fn get_categories(
     let rows = sqlx::query(
         "SELECT account_id, code, name, type, parent_id, description, is_active FROM chart_of_accounts WHERE is_active = true ORDER BY code",
     )
-    .fetch_all(&state.pool)
+    .fetch_all(state.db()?)
     .await?;
 
     // Build tree structure

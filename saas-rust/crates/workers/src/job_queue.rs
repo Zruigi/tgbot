@@ -539,7 +539,7 @@ pub async fn count_jobs(
                 .await?
         }
     };
-    Ok(count.unwrap_or(0))
+    Ok(count)
 }
 
 /// List jobs with pagination and optional filters.

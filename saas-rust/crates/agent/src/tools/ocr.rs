@@ -1,8 +1,7 @@
 // OCR Tool - 调用 PaddleOCR HTTP API 进行文字识别
 // 对应 Python: services/ai_agent/tools.py 中的 OCR 功能
 
-use crate::schema::{AgentContext, ToolExecuteResult, ToolDefinition};
-use crate::tools::Tool;
+use crate::schema::{AgentContext, Tool, ToolExecuteResult};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;

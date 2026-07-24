@@ -155,7 +155,7 @@ pub async fn get_stats(
             r#"
             SELECT COUNT(*)::bigint FROM groups.verify_sessions vs
             WHERE vs.status = 'pending'
-              AND vs.group_id IN (SELECT group_id FROM groups.tracked_groups WHERE tenant_id = $1)
+              AND vs.group_id IN (SELECT group_id FROM tracked_groups WHERE tenant_id = $1)
             "#,
         )
         .bind(tenant_id)

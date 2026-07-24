@@ -1,8 +1,7 @@
 // n8n Workflow Tool - 触发 n8n 工作流
 // 对应 Python: services/ai_agent/tools.py 中的 n8n 集成功能
 
-use crate::schema::{AgentContext, ToolExecuteResult};
-use crate::tools::Tool;
+use crate::schema::{AgentContext, Tool, ToolExecuteResult};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;

@@ -1,11 +1,10 @@
 // Skill Manage Tool - 管理 AI 技能
 // 对应 Python: services/ai_agent/tools.py 中的 SkillManageTool
 
-use crate::schema::{AgentContext, ToolExecuteResult};
-use crate::tools::Tool;
+use crate::schema::{AgentContext, Tool, ToolExecuteResult};
 use async_trait::async_trait;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -149,14 +148,14 @@ impl SkillManageTool {
             .iter()
             .map(|row| {
                 serde_json::json!({
-                    "id": row.get::<i64, _>("id"),
-                    "name": row.get::<String, _>("name"),
-                    "description": row.get::<Option<String>, _>("description").unwrap_or_default(),
-                    "prompt_template": row.get::<Option<String>, _>("prompt_template").unwrap_or_default(),
-                    "source": row.get::<Option<String>, _>("source").unwrap_or_default(),
-                    "is_enabled": row.get::<Option<bool>, _>("is_enabled").unwrap_or(true),
-                    "created_at": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("created_at"),
-                    "updated_at": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("updated_at"),
+                    "id": row.try_get::<i64, _>("id").unwrap_or(0),
+                    "name": row.try_get::<String, _>("name").unwrap_or_default(),
+                    "description": row.try_get::<Option<String>, _>("description").unwrap_or_default(),
+                    "prompt_template": row.try_get::<Option<String>, _>("prompt_template").unwrap_or_default(),
+                    "source": row.try_get::<Option<String>, _>("source").unwrap_or_default(),
+                    "is_enabled": row.try_get::<Option<bool>, _>("is_enabled").unwrap_or(Some(true)),
+                    "created_at": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("created_at").unwrap_or(None),
+                    "updated_at": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("updated_at").unwrap_or(None),
                 })
             })
             .collect();

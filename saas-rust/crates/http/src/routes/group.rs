@@ -74,7 +74,7 @@ pub async fn list_groups(
         if let Some(is_monitored) = q.is_monitored {
             sqlx::query(
                 r#"
-                SELECT * FROM groups.tracked_groups
+                SELECT * FROM tracked_groups
                 WHERE is_monitored = $1
                 ORDER BY updated_at DESC
                 LIMIT $2 OFFSET $3
@@ -83,19 +83,19 @@ pub async fn list_groups(
             .bind(is_monitored)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&state.pool)
+            .fetch_all(state.db()?)
             .await?
         } else {
             sqlx::query(
                 r#"
-                SELECT * FROM groups.tracked_groups
+                SELECT * FROM tracked_groups
                 ORDER BY updated_at DESC
                 LIMIT $1 OFFSET $2
                 "#,
             )
             .bind(limit)
             .bind(offset)
-            .fetch_all(&state.pool)
+            .fetch_all(state.db()?)
             .await?
         }
     } else {
@@ -103,7 +103,7 @@ pub async fn list_groups(
         if let Some(is_monitored) = q.is_monitored {
             sqlx::query(
                 r#"
-                SELECT * FROM groups.tracked_groups
+                SELECT * FROM tracked_groups
                 WHERE tenant_id = $1 AND is_monitored = $2
                 ORDER BY updated_at DESC
                 LIMIT $3 OFFSET $4
@@ -113,12 +113,12 @@ pub async fn list_groups(
             .bind(is_monitored)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&state.pool)
+            .fetch_all(state.db()?)
             .await?
         } else {
             sqlx::query(
                 r#"
-                SELECT * FROM groups.tracked_groups
+                SELECT * FROM tracked_groups
                 WHERE tenant_id = $1
                 ORDER BY updated_at DESC
                 LIMIT $2 OFFSET $3
@@ -127,7 +127,7 @@ pub async fn list_groups(
             .bind(tenant_id)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&state.pool)
+            .fetch_all(state.db()?)
             .await?
         }
     };
@@ -187,7 +187,7 @@ pub async fn update_group_config(
         // Platform admin: no tenant filter
         sqlx::query(
             r#"
-            UPDATE groups.tracked_groups SET
+            UPDATE tracked_groups SET
                 is_monitored       = COALESCE($2, is_monitored),
                 custom_keywords    = COALESCE($3, custom_keywords),
                 delete_on_revoke   = COALESCE($4, delete_on_revoke),
@@ -214,13 +214,13 @@ pub async fn update_group_config(
         .bind(body.verify_channel_id)
         .bind(body.verify_questions)
         .bind(body.verify_msg_template)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?
     } else {
         // Merchant-scoped: must match tenant_id
         sqlx::query(
             r#"
-            UPDATE groups.tracked_groups SET
+            UPDATE tracked_groups SET
                 is_monitored       = COALESCE($3, is_monitored),
                 custom_keywords    = COALESCE($4, custom_keywords),
                 delete_on_revoke   = COALESCE($5, delete_on_revoke),
@@ -248,7 +248,7 @@ pub async fn update_group_config(
         .bind(body.verify_channel_id)
         .bind(body.verify_questions)
         .bind(body.verify_msg_template)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?
     };
 

@@ -35,7 +35,7 @@ pub async fn profile(State(state): State<AppState>, headers: HeaderMap) -> ApiRe
     let row = sqlx::query("SELECT *, EXISTS(SELECT 1 FROM tenant_secret_refs WHERE tenant_id = $1 AND secret_key = 'TELEGRAM_BOT_TOKEN') AS has_bot_token FROM merchants WHERE id = $2 AND tenant_id = $1")
         .bind(&tenant_id)
         .bind(merchant_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?
         .ok_or_else(|| ApiError::NotFound("merchant_not_found".into()))?;
     Ok(Json(json!({"status": "ok", "data": row_to_json(row)})))
@@ -55,7 +55,7 @@ pub async fn update_status(
     .bind(merchant_id)
     .bind(body.status)
     .bind(body.onboarding_completed)
-    .fetch_one(&state.pool)
+    .fetch_one(state.db()?)
     .await?;
     Ok(Json(json!({"status": "ok", "data": row_to_json(row)})))
 }
@@ -83,7 +83,7 @@ pub async fn save_bot_token_ref(
     )
     .bind(&tenant_id)
     .bind(encrypted_ref)
-    .execute(&state.pool)
+    .execute(state.db()?)
     .await?;
     Ok(Json(
         json!({"status": "ok", "data": {"bot_token": "encrypted"}}),
@@ -135,7 +135,7 @@ pub async fn subscription(
     let row = sqlx::query("SELECT * FROM merchant_subscriptions WHERE tenant_id = $1 AND merchant_id = $2 ORDER BY created_at DESC LIMIT 1")
         .bind(tenant_id)
         .bind(merchant_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?;
     Ok(Json(json!({"status": "ok", "data": row.map(row_to_json)})))
 }
@@ -153,7 +153,7 @@ pub async fn create_payment_order(
     let (tenant_id, merchant_id) = scope.require_merchant()?;
     let plan = sqlx::query("SELECT price_usdt::float8 AS price_usdt FROM subscription_plans WHERE plan_code = $1 AND status = 'active'")
         .bind(&body.plan_code)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?
         .ok_or_else(|| ApiError::NotFound("subscription_plan_not_found".into()))?;
     let amount: f64 = plan.try_get("price_usdt")?;
@@ -164,7 +164,7 @@ pub async fn create_payment_order(
     .bind(merchant_id)
     .bind(body.plan_code)
     .bind(amount)
-    .fetch_one(&state.pool)
+    .fetch_one(state.db()?)
     .await?;
     Ok(Json(json!({"status": "ok", "data": row_to_json(row)})))
 }
@@ -178,7 +178,7 @@ pub async fn latest_payment_order(
     let row = sqlx::query("SELECT * FROM payment_orders WHERE tenant_id = $1 AND merchant_id = $2 ORDER BY created_at DESC LIMIT 1")
         .bind(tenant_id)
         .bind(merchant_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?;
     Ok(Json(json!({"status": "ok", "data": row.map(row_to_json)})))
 }
@@ -212,7 +212,7 @@ pub async fn submit_payment_tx(
         .bind(merchant_id)
         .bind(order_id)
         .bind(tx_hash)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?
         .ok_or_else(|| ApiError::NotFound("payment_order_not_found".into()))?;
     Ok(Json(json!({"status": "ok", "data": row_to_json(row)})))
@@ -223,7 +223,7 @@ pub async fn features(State(state): State<AppState>, headers: HeaderMap) -> ApiR
     let (tenant_id, _merchant_id) = scope.require_merchant()?;
     let rows = sqlx::query("SELECT feature_key, enabled, limits_json FROM merchant_features WHERE tenant_id = $1 ORDER BY feature_key")
         .bind(tenant_id)
-        .fetch_all(&state.pool)
+        .fetch_all(state.db()?)
         .await?;
     let total = rows.len();
     Ok(Json(
@@ -236,7 +236,7 @@ pub async fn ai_quota(State(state): State<AppState>, headers: HeaderMap) -> ApiR
     let (tenant_id, _merchant_id) = scope.require_merchant()?;
     let row = sqlx::query("SELECT * FROM merchant_ai_quota WHERE tenant_id = $1")
         .bind(tenant_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?;
     Ok(Json(json!({"status": "ok", "data": row.map(row_to_json)})))
 }
@@ -267,7 +267,7 @@ pub async fn ai_usage(
     )
     .bind(&tenant_id)
     .bind(days)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     // Get daily breakdown
@@ -288,7 +288,7 @@ pub async fn ai_usage(
     )
     .bind(&tenant_id)
     .bind(days)
-    .fetch_all(&state.pool)
+    .fetch_all(state.db()?)
     .await?;
 
     // Get by model
@@ -309,7 +309,7 @@ pub async fn ai_usage(
     )
     .bind(&tenant_id)
     .bind(days)
-    .fetch_all(&state.pool)
+    .fetch_all(state.db()?)
     .await?;
 
     // Build response
@@ -392,7 +392,7 @@ pub async fn audit_logs(
     )
     .bind(tenant_id)
     .bind(limit)
-    .fetch_all(&state.pool)
+    .fetch_all(state.db()?)
     .await?;
     let total = rows.len();
     Ok(Json(
@@ -414,7 +414,7 @@ async fn update_own_order_status(
         .bind(merchant_id)
         .bind(order_id)
         .bind(status)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?
         .ok_or_else(|| ApiError::NotFound("payment_order_not_found".into()))?;
     Ok(Json(json!({"status": "ok", "data": row_to_json(row)})))

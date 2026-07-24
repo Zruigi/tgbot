@@ -17,7 +17,7 @@ use tracing::{debug, instrument, warn};
 // ---------------------------------------------------------------------------
 
 /// Configuration for connecting to an n8n instance.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct N8NConfig {
     /// Base URL of the n8n instance, e.g. `http://127.0.0.1:5678`.
     pub base_url: String,

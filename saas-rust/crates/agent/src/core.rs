@@ -6,18 +6,18 @@ use crate::prompts::build_system_prompt;
 use crate::safety::SafetyGuardrail;
 use crate::schema::{
     AgentContext, AgentResponse, ChatMessage, LlmCallResult, SingleToolResult, ToolCall,
-    ToolCallFunction, ToolDefinition, ToolExecuteResult, Tool as ToolTrait,
+    ToolCallFunction, ToolExecuteResult, Tool,
 };
-use crate::tools::{
-    BroadcastMessageTool, DetectAdvertisingTool, FinanceQueryTool,
-    N8NWorkflowTool, OcrTool, SkillManageTool, SystemQueryTool,
-};
+use crate::tools::broadcast_message::BroadcastMessageTool;
+use crate::tools::detect_advertising::DetectAdvertisingTool;
+use crate::tools::finance_query::FinanceQueryTool;
+use crate::tools::n8n_workflow::N8NWorkflowTool;
+use crate::tools::ocr::OcrTool;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info, warn};
-use uuid::Uuid;
+use tracing::{error, warn};
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -66,17 +66,17 @@ impl ToolRegistry {
     }
 
     /// 注册工具
-    pub fn register(&mut self, tool: Arc<dyn ToolTrait>) {
+    pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
     /// 按名称获取工具
-    pub fn get(&self, name: &str) -> Option<&Arc<dyn ToolTrait>> {
+    pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
     }
 
     /// 获取所有已注册的工具
-    pub fn all(&self) -> Vec<&Arc<dyn ToolTrait>> {
+    pub fn all(&self) -> Vec<&Arc<dyn Tool>> {
         self.tools.values().collect()
     }
 
@@ -395,12 +395,14 @@ impl AIAgent {
 
         let confidence = if needs_confirmation { 0.6 } else { 0.9 };
 
+        let tcm_summary = tool_calls_made.join(", ");
+
         AgentResponse {
             text: final_text,
             tool_calls_made,
             tool_results,
             is_action_taken: action_taken,
-            action_summary: tool_calls_made.join(", "),
+            action_summary: tcm_summary,
             requires_confirmation: needs_confirmation,
             confidence,
             raw_response: None,
@@ -729,7 +731,7 @@ impl AIAgent {
                 })
             }
             "system_query" => {
-                let lower = text.to_lowercase();
+                let _lower = text.to_lowercase();
                 if text.contains("最近有谁")
                     || text.contains("谁给我发")
                     || text.contains("谁给我发送")
@@ -1097,7 +1099,7 @@ pub fn default_tool_registry_with_telegram(telegram_client: Option<Arc<tgbot_int
         let config = tgbot_integrations::paddleocr::PaddleOCRConfig::default();
         let client = tgbot_integrations::paddleocr::PaddleOCRClient::new(config).unwrap();
         OcrTool::new(Arc::new(client))
-    }))));
+    })));
     registry.register(Arc::new(N8NWorkflowTool::with_default_config().unwrap_or_else(|_| {
         let config = tgbot_integrations::n8n::N8NConfig::default();
         let client = tgbot_integrations::n8n::N8NClient::new(config).unwrap();

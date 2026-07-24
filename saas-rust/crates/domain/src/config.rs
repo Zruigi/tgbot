@@ -5,10 +5,13 @@ pub struct Config {
     pub bind_addr: String,
     pub database_url: String,
     pub database_max_connections: u32,
+    pub supabase_url: String,
+    pub supabase_service_role_key: String,
     pub supabase_jwt_secret: String,
     pub internal_saas_secret: String,
     pub web_admin_token: String,
     pub bot_token: String,
+    pub cors_allowed_origin: String,
 }
 
 impl Config {
@@ -32,10 +35,16 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(8),
+            supabase_url: std::env::var("SUPABASE_URL").unwrap_or_default(),
+            supabase_service_role_key: std::env::var("SUPABASE_SERVICE_ROLE_KEY")
+                .or_else(|_| std::env::var("SUPABASE_SECRET_KEY"))
+                .unwrap_or_default(),
             supabase_jwt_secret,
             internal_saas_secret,
             web_admin_token: std::env::var("WEB_ADMIN_TOKEN").unwrap_or_default(),
             bot_token: std::env::var("BOT_TOKEN").unwrap_or_default(),
+            cors_allowed_origin: std::env::var("CORS_ALLOWED_ORIGIN")
+                .unwrap_or_else(|_| "*".to_string()),
         })
     }
 }

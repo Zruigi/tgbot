@@ -3,7 +3,7 @@
 //! for migration to PostgreSQL/Supabase.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -30,7 +30,7 @@ pub struct SqliteReader {
 impl SqliteReader {
     /// Open a SQLite database connection
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let conn = Connection::open(path)
+        let conn = Connection::open(&path)
             .with_context(|| format!("Failed to open SQLite database: {:?}", path.as_ref()))?;
 
         // Enable foreign keys

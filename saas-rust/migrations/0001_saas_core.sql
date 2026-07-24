@@ -1,6 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-CREATE TABLE IF NOT EXISTS saas_user_roles (
+CREATE TABLE IF NOT EXISTS auth.saas_user_roles (
     user_id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
     role text NOT NULL CHECK (role IN ('platform_admin')),
     created_at timestamptz NOT NULL DEFAULT now()

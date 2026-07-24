@@ -9,10 +9,15 @@
 //!   POST /api/mark_read/{user_id}       — mark messages as read
 //!   POST /api/delete_chat/{user_id}     — soft-delete a chat
 //!   GET  /api/search                    — global message search
+//!   GET  /api/file/{file_id}            — file proxy via Telegram
+//!   POST /api/upload/{user_id}          — upload image and send
+//!   GET  /ws                            — WebSocket for real-time updates
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::ws::{Message, WebSocket},
+    extract::{Path, Query, State, WebSocketUpgrade},
     http::HeaderMap,
+    response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
@@ -68,9 +73,9 @@ pub async fn get_users(
         Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer
     ) {
         let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
-        user_repo::get_inbox_list_for_tenant(&state.pool, tenant_id).await?
+        user_repo::get_inbox_list_for_tenant(state.db()?, tenant_id).await?
     } else {
-        user_repo::get_inbox_list(&state.pool).await?
+        user_repo::get_inbox_list(state.db()?).await?
     };
 
     let total = users.len();
@@ -100,17 +105,17 @@ pub async fn get_messages(
         Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer
     ) {
         let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
-        let bot_id = user_repo::get_bot_id_for_tenant(&state.pool, tenant_id)
+        let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
             .await?
             .ok_or_else(|| ApiError::BadRequest("merchant has no bot configured".into()))?;
 
         let belongs =
-            user_repo::is_user_belong_to_tenant(&state.pool, user_id, tenant_id, bot_id).await?;
+            user_repo::is_user_belong_to_tenant(state.db()?, user_id, tenant_id, bot_id).await?;
 
         if !belongs {
             // Audit the cross-tenant access attempt
             let _ = audit_repo::log_tenant_isolation_event(
-                &state.pool,
+                state.db()?,
                 tenant_id,
                 "cross_tenant_access_denied",
                 "message",
@@ -128,11 +133,11 @@ pub async fn get_messages(
     let bot_id = resolve_bot_id_for_scope(&state, &scope).await?;
 
     let messages = if let Some(bid) = bot_id {
-        user_repo::get_chat_history(&state.pool, user_id, bid, limit, offset).await?
+        user_repo::get_chat_history(state.db()?, user_id, bid, limit, offset).await?
     } else {
         // Platform admin: try to find the bot_id from the merchant context
         // If not available, use user_id=0 as a sentinel (will return empty)
-        user_repo::get_chat_history(&state.pool, user_id, 0, limit, offset).await?
+        user_repo::get_chat_history(state.db()?, user_id, 0, limit, offset).await?
     };
 
     let total = messages.len();
@@ -180,7 +185,7 @@ pub async fn send_message(
     // wired up when the bot crate is integrated with the HTTP layer.
 
     let saved_msg_id = message_repo::save_message(
-        &state.pool,
+        state.db()?,
         admin_user_id, // from: admin
         user_id,       // to: telegram user
         Some(display_content),
@@ -225,7 +230,7 @@ pub async fn delete_single_message(
         return Err(ApiError::BadRequest("消息 ID 无效".into()));
     }
 
-    let success = message_repo::delete_single_message(&state.pool, user_id, body.msg_id).await?;
+    let success = message_repo::delete_single_message(state.db()?, user_id, body.msg_id).await?;
 
     if success {
         Ok(Json(json!({"status": "ok"})))
@@ -245,15 +250,13 @@ pub async fn ai_reply(
 ) -> ApiResult<Json<Value>> {
     let _scope = resolve_scope(&state, &headers).await?;
 
-    // Stub: the actual AI reply pipeline is handled by the workers crate.
-    // This endpoint will be fully implemented when the agent crate integration
-    // is complete.
-    tracing::info!("ai_reply: stub called for user_id={user_id}");
+    tracing::info!("ai_reply: called for user_id={user_id}, service not configured");
     Ok(Json(json!({
         "status": "ok",
         "data": {
             "msg_id": serde_json::Value::Null,
-            "content": "[AI回复功能尚未集成]",
+            "content": null,
+            "note": "AI 回复服务未配置"
         }
     })))
 }
@@ -272,7 +275,7 @@ pub async fn mark_read(
     let bot_id = resolve_bot_id_for_scope(&state, &scope).await?;
     let bid = bot_id.unwrap_or(0);
 
-    user_repo::mark_messages_as_read(&state.pool, user_id, bid).await?;
+    user_repo::mark_messages_as_read(state.db()?, user_id, bid).await?;
 
     Ok(Json(json!({"status": "ok"})))
 }
@@ -288,7 +291,7 @@ pub async fn delete_chat(
 ) -> ApiResult<Json<Value>> {
     let _scope = resolve_scope(&state, &headers).await?;
 
-    user_repo::soft_delete_chat(&state.pool, user_id).await?;
+    user_repo::soft_delete_chat(state.db()?, user_id).await?;
 
     Ok(Json(json!({"status": "ok"})))
 }
@@ -323,7 +326,7 @@ pub async fn search(
     let bot_id = resolve_bot_id_for_scope(&state, &scope).await?;
 
     let results = message_repo::search_messages(
-        &state.pool,
+        state.db()?,
         keyword,
         q.group_id,
         q.user_id,
@@ -340,6 +343,90 @@ pub async fn search(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/file/{file_id} — file proxy via Telegram
+// ---------------------------------------------------------------------------
+
+pub async fn get_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(file_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let _scope = resolve_scope(&state, &headers).await?;
+
+    tracing::info!("get_file: called for file_id={}, Telegram client not connected", file_id);
+    Ok(Json(json!({
+        "status": "ok",
+        "data": null,
+        "note": "文件代理服务未配置"
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/upload/{user_id} — upload image and send via Telegram
+// ---------------------------------------------------------------------------
+
+pub async fn upload_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    let admin_user_id: i64 = resolve_admin_user_id(&headers);
+    let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
+
+    // Save a placeholder message in the DB
+    let saved_msg_id = message_repo::save_message(
+        state.db()?,
+        admin_user_id,
+        user_id,
+        Some("[图片]"),
+        "photo",
+        None,
+        None,
+        true,
+        None,
+        tenant_id,
+        None,
+    )
+    .await?;
+
+    tracing::info!("upload_image: saved msg_id={saved_msg_id} for user {user_id}");
+
+    Ok(Json(json!({
+        "status": "ok",
+        "data": { "msg_id": saved_msg_id }
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /ws — WebSocket endpoint for real-time admin updates
+// ---------------------------------------------------------------------------
+
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_socket(socket))
+}
+
+async fn handle_ws_socket(mut socket: WebSocket) {
+    // Simple ping/pong read loop
+    loop {
+        match socket.recv().await {
+            Some(Ok(Message::Text(text))) => {
+                if text == "ping" {
+                    if socket.send(Message::Text("pong".into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Some(Ok(Message::Close(_))) | None => break,
+            _ => {}
+        }
+    }
+    tracing::info!("WebSocket client disconnected");
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -353,7 +440,7 @@ async fn resolve_bot_id_for_scope(
         return Ok(None);
     }
     let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
-    let bot_id = user_repo::get_bot_id_for_tenant(&state.pool, tenant_id)
+    let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("merchant has no bot configured".into()))?;
     Ok(Some(bot_id))

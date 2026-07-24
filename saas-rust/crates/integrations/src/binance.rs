@@ -9,7 +9,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::Duration;
 use tracing::{debug, instrument, warn};
 

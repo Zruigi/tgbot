@@ -3,7 +3,6 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -189,7 +188,7 @@ impl SafetyGuardrail {
         &self,
         tool_name: &str,
         params: &serde_json::Value,
-        context_user_id: i64,
+        _context_user_id: i64,
     ) -> SafetyCheckResult {
         // 1. 检查输入参数中是否有危险模式
         let params_str = params.to_string();

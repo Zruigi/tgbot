@@ -32,73 +32,64 @@ pub async fn list_merchants(
     scope.require_platform()?;
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
-    let rows = if let Some(status) = q.status {
-        sqlx::query(
-            r#"
-            SELECT
-                m.id,
-                m.owner_tg_user_id AS user_id,
+
+    // PG direct mode
+    if let Some(ref pool) = state.pool {
+        let rows = if let Some(status) = q.status {
+            sqlx::query(
+                r#"
+                SELECT
+                    m.id, m.owner_tg_user_id AS user_id,
+                    COALESCE(NULLIF(m.owner_username, ''), NULLIF(m.merchant_name, ''), 'User ' || m.owner_tg_user_id::text) AS username,
+                    m.created_at AS registered_at,
+                    COALESCE(s.plan_code, m.plan_type, 'free') AS paid_option,
+                    COALESCE(s.end_at, m.subscription_expires_at) AS expires_at,
+                    (COALESCE(s.plan_code, m.plan_type, 'free') <> 'free'
+                     OR COALESCE(s.status, m.subscription_status, '') IN ('active', 'active_subscription', 'paid', 'confirmed')
+                    ) AS "isPaid"
+                FROM merchants m
+                LEFT JOIN LATERAL (
+                    SELECT * FROM merchant_subscriptions s
+                    WHERE s.merchant_id = m.id
+                    ORDER BY COALESCE(s.end_at, s.created_at) DESC, s.created_at DESC
+                    LIMIT 1
+                ) s ON true
+                WHERE m.status = $1
+                ORDER BY m.updated_at DESC LIMIT $2 OFFSET $3
+                "#,
+            ).bind(status).bind(limit).bind(offset).fetch_all(pool).await?
+        } else {
+            sqlx::query(
+                r#"SELECT m.id, m.owner_tg_user_id AS user_id,
                 COALESCE(NULLIF(m.owner_username, ''), NULLIF(m.merchant_name, ''), 'User ' || m.owner_tg_user_id::text) AS username,
                 m.created_at AS registered_at,
                 COALESCE(s.plan_code, m.plan_type, 'free') AS paid_option,
                 COALESCE(s.end_at, m.subscription_expires_at) AS expires_at,
-                (
-                    COALESCE(s.plan_code, m.plan_type, 'free') <> 'free'
-                    OR COALESCE(s.status, m.subscription_status, '') IN ('active', 'active_subscription', 'paid', 'confirmed')
+                (COALESCE(s.plan_code, m.plan_type, 'free') <> 'free'
+                 OR COALESCE(s.status, m.subscription_status, '') IN ('active', 'active_subscription', 'paid', 'confirmed')
                 ) AS "isPaid"
-            FROM merchants m
-            LEFT JOIN LATERAL (
-                SELECT *
-                FROM merchant_subscriptions s
-                WHERE s.merchant_id = m.id
-                ORDER BY COALESCE(s.end_at, s.created_at) DESC, s.created_at DESC
-                LIMIT 1
-            ) s ON true
-            WHERE m.status = $1
-            ORDER BY m.updated_at DESC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
-        .bind(status)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&state.pool)
-        .await?
-    } else {
-        sqlx::query(
-            r#"
-            SELECT
-                m.id,
-                m.owner_tg_user_id AS user_id,
-                COALESCE(NULLIF(m.owner_username, ''), NULLIF(m.merchant_name, ''), 'User ' || m.owner_tg_user_id::text) AS username,
-                m.created_at AS registered_at,
-                COALESCE(s.plan_code, m.plan_type, 'free') AS paid_option,
-                COALESCE(s.end_at, m.subscription_expires_at) AS expires_at,
-                (
-                    COALESCE(s.plan_code, m.plan_type, 'free') <> 'free'
-                    OR COALESCE(s.status, m.subscription_status, '') IN ('active', 'active_subscription', 'paid', 'confirmed')
-                ) AS "isPaid"
-            FROM merchants m
-            LEFT JOIN LATERAL (
-                SELECT *
-                FROM merchant_subscriptions s
-                WHERE s.merchant_id = m.id
-                ORDER BY COALESCE(s.end_at, s.created_at) DESC, s.created_at DESC
-                LIMIT 1
-            ) s ON true
-            ORDER BY m.updated_at DESC
-            LIMIT $1 OFFSET $2
-            "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&state.pool)
-        .await?
-    };
-    let total = rows.len();
-    Ok(Json(
-        json!({"status": "ok", "data": rows_to_json(rows), "total": total}),
-    ))
+                FROM merchants m
+                LEFT JOIN LATERAL (SELECT * FROM merchant_subscriptions s WHERE s.merchant_id = m.id
+                ORDER BY COALESCE(s.end_at, s.created_at) DESC, s.created_at DESC LIMIT 1) s ON true
+                ORDER BY m.updated_at DESC LIMIT $1 OFFSET $2"#,
+            ).bind(limit).bind(offset).fetch_all(pool).await?
+        };
+        let total = rows.len();
+        return Ok(Json(json!({"status": "ok", "data": rows_to_json(rows), "total": total})));
+    }
+
+    // REST fallback — simplified (no JOINs via REST)
+    let mut filters = vec![];
+    if let Some(ref s) = q.status {
+        filters.push(("status", s.as_str()));
+    }
+    match state.supabase.select("merchants", "id,tenant_id,merchant_name,owner_username,status,plan_type,subscription_status,created_at", &filters, Some(limit)).await {
+        Ok(merchants) => {
+            let total = merchants.len();
+            Ok(Json(json!({"status": "ok", "data": merchants, "total": total})))
+        }
+        Err(e) => Err(ApiError::BadRequest(format!("REST error: {e}"))),
+    }
 }
 
 pub async fn create_merchant(
@@ -114,7 +105,7 @@ pub async fn create_merchant(
     let tenant_id = body
         .tenant_id
         .unwrap_or_else(|| format!("tenant_{}", Uuid::new_v4().simple()));
-    let mut tx = state.pool.begin().await?;
+    let mut tx = state.db()?.begin().await?;
     let merchant = sqlx::query_as::<_, Merchant>(
         r#"
         INSERT INTO merchants (tenant_id, owner_user_id, owner_tg_user_id, owner_username, merchant_name, status)
@@ -152,7 +143,7 @@ pub async fn delete_merchant(
     scope.require_platform()?;
     let result = sqlx::query("DELETE FROM merchants WHERE id = $1")
         .bind(merchant_id)
-        .execute(&state.pool)
+        .execute(state.db()?)
         .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("merchant_not_found".into()));
@@ -172,7 +163,7 @@ pub async fn confirm_onboarding(
         "UPDATE merchants SET onboarding_completed = true, status = 'active_free', updated_at = now() WHERE id = $1 RETURNING *",
     )
     .bind(merchant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .ok_or_else(|| ApiError::NotFound("merchant_not_found".into()))?;
     Ok(Json(json!({"status": "ok", "data": merchant})))
@@ -186,15 +177,31 @@ pub async fn list_plans(
     if scope.role.as_str() != "platform_admin" && scope.tenant_id.is_none() {
         return Err(ApiError::Forbidden);
     }
-    let plans = sqlx::query(
-        "SELECT * FROM subscription_plans WHERE status = 'active' ORDER BY price_usdt ASC",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    let total = plans.len();
-    Ok(Json(
-        json!({"status": "ok", "data": rows_to_json(plans), "total": total}),
-    ))
+
+    // PG + REST dual-transport
+    if let Some(ref pool) = state.pool {
+        let plans = sqlx::query(
+            "SELECT * FROM subscription_plans WHERE status = 'active' ORDER BY price_usdt ASC",
+        )
+        .fetch_all(pool)
+        .await?;
+        let total = plans.len();
+        return Ok(Json(json!({"status": "ok", "data": rows_to_json(plans), "total": total})));
+    }
+
+    // REST fallback
+    match state.supabase.select(
+        "subscription_plans",
+        "plan_code,plan_name,price_usdt,duration_days,features_json,status",
+        &[("status", "active")],
+        Some(100),
+    ).await {
+        Ok(plans) => {
+            let total = plans.len();
+            Ok(Json(json!({"status": "ok", "data": plans, "total": total})))
+        }
+        Err(e) => Err(ApiError::BadRequest(format!("REST error: {e}"))),
+    }
 }
 
 pub async fn upsert_plan(
@@ -224,7 +231,7 @@ pub async fn upsert_plan(
     .bind(body.duration_days)
     .bind(body.features_json)
     .bind(body.status.unwrap_or_else(|| "active".into()))
-    .fetch_one(&state.pool)
+    .fetch_one(state.db()?)
     .await?;
     Ok(Json(json!({"status": "ok", "data": row_to_json(plan)})))
 }
@@ -251,7 +258,7 @@ pub async fn list_subscriptions(
     .bind(q.status)
     .bind(q.merchant_id)
     .bind(limit)
-    .fetch_all(&state.pool)
+    .fetch_all(state.db()?)
     .await?;
     let total = rows.len();
     Ok(Json(
@@ -281,7 +288,7 @@ pub async fn list_payment_orders(
     .bind(q.status)
     .bind(q.merchant_id)
     .bind(limit)
-    .fetch_all(&state.pool)
+    .fetch_all(state.db()?)
     .await?;
     let total = rows.len();
     Ok(Json(
@@ -298,7 +305,7 @@ pub async fn confirm_payment_order(
     scope.require_platform()?;
     let row = sqlx::query("UPDATE payment_orders SET status = 'confirmed', updated_at = now() WHERE id = $1 RETURNING *")
         .bind(body.order_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?
         .ok_or_else(|| ApiError::NotFound("payment_order_not_found".into()))?;
     Ok(Json(json!({"status": "ok", "data": row_to_json(row)})))
@@ -313,7 +320,7 @@ pub async fn reject_payment_order(
     scope.require_platform()?;
     sqlx::query("UPDATE payment_orders SET status = 'rejected', updated_at = now() WHERE id = $1")
         .bind(body.order_id)
-        .execute(&state.pool)
+        .execute(state.db()?)
         .await?;
     Ok(Json(json!({"status": "ok"})))
 }
@@ -324,7 +331,7 @@ pub async fn get_payment_config(
 ) -> ApiResult<Json<Value>> {
     let _scope = resolve_scope(&state, &headers).await?;
     let row = sqlx::query("SELECT * FROM platform_payment_configs WHERE id = 1")
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?;
     Ok(Json(json!({"status": "ok", "data": row.map(row_to_json)})))
 }
@@ -359,7 +366,7 @@ pub async fn save_payment_config(
     .bind(payment_address)
     .bind(qr_image_path)
     .bind(enabled)
-    .fetch_one(&state.pool)
+    .fetch_one(state.db()?)
     .await?;
     Ok(Json(json!({"status": "ok", "data": row_to_json(row)})))
 }
@@ -391,7 +398,7 @@ pub async fn run_subscription_downgrade(
         RETURNING *
         "#,
     )
-    .fetch_all(&state.pool)
+    .fetch_all(state.db()?)
     .await?;
 
     let total = rows.len();
@@ -413,7 +420,7 @@ pub async fn run_subscription_downgrade(
         RETURNING *
         "#,
     )
-    .fetch_all(&state.pool)
+    .fetch_all(state.db()?)
     .await?;
 
     let merchant_count = merchant_updates.len();

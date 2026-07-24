@@ -18,7 +18,7 @@ use tracing::{debug, instrument, warn};
 // ---------------------------------------------------------------------------
 
 /// Configuration for connecting to a PaddleOCR HTTP service.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PaddleOCRConfig {
     /// Base URL of the PaddleOCR service, e.g. `http://127.0.0.1:8868`.
     pub base_url: String,

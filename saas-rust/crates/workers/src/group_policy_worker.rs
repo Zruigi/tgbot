@@ -1,7 +1,7 @@
 //! Group policy worker – processes group_policy_sync jobs from the queue.
 //!
 //! For each group policy sync job:
-//! 1. Reads the group's current config from `groups.tracked_groups`.
+//! 1. Reads the group's current config from `tracked_groups`.
 //! 2. Evaluates and applies policy rules (verify settings, keyword filters, etc.).
 //! 3. Updates the group config in the database.
 //! 4. Optionally enqueues sub-jobs (e.g. AI content analysis of recent messages).

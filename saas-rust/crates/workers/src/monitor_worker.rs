@@ -270,7 +270,7 @@ impl MonitorWorker {
             .and_then(|v| v.as_str())
             .unwrap_or("tron");
 
-        let mut alerts = Vec::new();
+        let mut alerts: Vec<Value> = Vec::new();
 
         if chain == "tron" {
             match self.trongrid.get_account_transactions(address, 5).await {
@@ -311,8 +311,7 @@ impl MonitorWorker {
         )
         .bind(group_id)
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
 
         let mut alerts = Vec::new();
 

@@ -29,10 +29,10 @@ tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "trace", "limit", "compression-gzip"] }
 
 # Telegram Bot
-teloxide = { version = "0.14", features = ["webhooks-axum"] }
+teloxide = { version = "0.14", features = ["webhooks-axum", "macros"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -47,7 +47,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 # Auth / Crypto
-jsonwebtoken = "10"
+jsonwebtoken = "9"
 bcrypt = "0.16"
 hmac = "0.12"
 sha2 = "0.10"

@@ -5,7 +5,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::PgPool;
-use uuid::Uuid;
 
 use crate::sqlite_reader::{SqliteConfig, SqliteMerchant, SqliteReader};
 
@@ -210,22 +209,20 @@ pub async fn verify_merchant_migration(
     let source_count = source_merchants.len() as i64;
 
     // Get target count from PostgreSQL
-    let target_count: i64 = sqlx::query_scalar(
+    let target_count: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::bigint FROM merchants"
     )
     .fetch_one(pg_pool)
     .await
-    .context("Failed to count merchants in PostgreSQL")?
-    .unwrap_or(0);
+    .context("Failed to count merchants in PostgreSQL")?;
 
     // Get count of merchants with legacy_id (successfully migrated)
-    let migrated_count: i64 = sqlx::query_scalar(
+    let migrated_count: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::bigint FROM merchants WHERE legacy_merchant_id IS NOT NULL"
     )
     .fetch_one(pg_pool)
     .await
-    .context("Failed to count migrated merchants in PostgreSQL")?
-    .unwrap_or(0);
+    .context("Failed to count migrated merchants in PostgreSQL")?;
 
     let result = MerchantVerificationResult {
         source_count,

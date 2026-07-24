@@ -1,11 +1,10 @@
 // System Query Tool - 查询系统状态和数据统计
 // 对应 Python: services/ai_agent/tools.py 中的 SystemQueryTool
 
-use crate::schema::{AgentContext, ToolExecuteResult};
-use crate::tools::Tool;
+use crate::schema::{AgentContext, Tool, ToolExecuteResult};
 use async_trait::async_trait;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -28,8 +27,7 @@ impl Tool for SystemQueryTool {
     }
 
     fn description(&self) -> &str {
-        "查询系统状态和数据统计。支持：统计概览、活跃群组、监听地址列表、"
-        "最近发消息用户、最近消息、广告消息列表、潜在用户等。"
+        "查询系统状态和数据统计。支持：统计概览、活跃群组、监听地址列表、最近发消息用户、最近消息、广告消息列表、潜在用户等。"
     }
 
     fn category(&self) -> &str {
@@ -126,30 +124,27 @@ impl SystemQueryTool {
         tenant_id: &str,
     ) -> Result<(Value, String), anyhow::Error> {
         // 获取群组数量
-        let group_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM groups.tracked_groups WHERE tenant_id = $1",
+        let group_count: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM tracked_groups WHERE tenant_id = $1",
         )
         .bind(tenant_id)
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
 
         // 获取用户数量（来自 admin_inbox）
-        let user_count: i64 = sqlx::query_scalar(
+        let user_count: i64 = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM chat.admin_inbox WHERE tenant_id = $1",
         )
         .bind(tenant_id)
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
 
         // 获取活跃监听地址数量
-        let monitor_count: i64 = sqlx::query_scalar(
+        let monitor_count: i64 = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM address_monitors WHERE is_active = true",
         )
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
 
         let data = serde_json::json!({
             "group_count": group_count,
@@ -170,7 +165,7 @@ impl SystemQueryTool {
     ) -> Result<(Value, String), anyhow::Error> {
         let rows = sqlx::query(
             "SELECT group_id, group_title, is_monitored, member_count, updated_at \
-             FROM groups.tracked_groups \
+             FROM tracked_groups \
              WHERE tenant_id = $1 \
              ORDER BY updated_at DESC \
              LIMIT $2",
@@ -300,7 +295,7 @@ impl SystemQueryTool {
     ) -> Result<(Value, String), anyhow::Error> {
         let rows = sqlx::query(
             "SELECT id as msg_id, from_userid, to_userid, content, msg_type, timestamp \
-             FROM chat.messages \
+             FROM chat_messages \
              WHERE is_deleted = false AND tenant_id = $1 \
              ORDER BY timestamp DESC \
              LIMIT $2",
@@ -338,13 +333,12 @@ impl SystemQueryTool {
         limit: i32,
     ) -> Result<(Value, String), anyhow::Error> {
         // 先检查表结构是否有 is_advertising 字段
-        let has_ad_field: bool = sqlx::query_scalar(
+        let has_ad_field: bool = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
              WHERE table_name = 'group_messages' AND column_name = 'is_advertising')",
         )
         .fetch_one(pool)
-        .await?
-        .unwrap_or(false);
+        .await?;
 
         if !has_ad_field {
             return Ok((
@@ -398,13 +392,12 @@ impl SystemQueryTool {
         limit: i32,
     ) -> Result<(Value, String), anyhow::Error> {
         // 先检查表是否存在
-        let table_exists: bool = sqlx::query_scalar(
+        let table_exists: bool = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
              WHERE table_name = 'potential_users')",
         )
         .fetch_one(pool)
-        .await?
-        .unwrap_or(false);
+        .await?;
 
         if !table_exists {
             return Ok((

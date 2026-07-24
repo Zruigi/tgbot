@@ -113,7 +113,7 @@ async fn migrate_single_group(
 
     sqlx::query(
         r#"
-        INSERT INTO groups.tracked_groups (
+        INSERT INTO tracked_groups (
             group_id,
             group_title,
             tenant_id,
@@ -130,18 +130,18 @@ async fn migrate_single_group(
             verify_questions
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         ON CONFLICT (group_id) DO UPDATE SET
-            group_title = COALESCE(EXCLUDED.group_title, groups.tracked_groups.group_title),
-            tenant_id = COALESCE(EXCLUDED.tenant_id, groups.tracked_groups.tenant_id),
-            is_monitored = COALESCE(EXCLUDED.is_monitored, groups.tracked_groups.is_monitored),
-            custom_keywords = COALESCE(EXCLUDED.custom_keywords, groups.tracked_groups.custom_keywords),
+            group_title = COALESCE(EXCLUDED.group_title, tracked_groups.group_title),
+            tenant_id = COALESCE(EXCLUDED.tenant_id, tracked_groups.tenant_id),
+            is_monitored = COALESCE(EXCLUDED.is_monitored, tracked_groups.is_monitored),
+            custom_keywords = COALESCE(EXCLUDED.custom_keywords, tracked_groups.custom_keywords),
             updated_at = EXCLUDED.updated_at,
-            delete_on_revoke = COALESCE(EXCLUDED.delete_on_revoke, groups.tracked_groups.delete_on_revoke),
-            revoke_sync_chat_id = COALESCE(EXCLUDED.revoke_sync_chat_id, groups.tracked_groups.revoke_sync_chat_id),
-            verify_enabled = COALESCE(EXCLUDED.verify_enabled, groups.tracked_groups.verify_enabled),
-            verify_type = COALESCE(EXCLUDED.verify_type, groups.tracked_groups.verify_type),
-            verify_timeout = COALESCE(EXCLUDED.verify_timeout, groups.tracked_groups.verify_timeout),
-            verify_channel_id = COALESCE(EXCLUDED.verify_channel_id, groups.tracked_groups.verify_channel_id),
-            verify_questions = COALESCE(EXCLUDED.verify_questions, groups.tracked_groups.verify_questions)
+            delete_on_revoke = COALESCE(EXCLUDED.delete_on_revoke, tracked_groups.delete_on_revoke),
+            revoke_sync_chat_id = COALESCE(EXCLUDED.revoke_sync_chat_id, tracked_groups.revoke_sync_chat_id),
+            verify_enabled = COALESCE(EXCLUDED.verify_enabled, tracked_groups.verify_enabled),
+            verify_type = COALESCE(EXCLUDED.verify_type, tracked_groups.verify_type),
+            verify_timeout = COALESCE(EXCLUDED.verify_timeout, tracked_groups.verify_timeout),
+            verify_channel_id = COALESCE(EXCLUDED.verify_channel_id, tracked_groups.verify_channel_id),
+            verify_questions = COALESCE(EXCLUDED.verify_questions, tracked_groups.verify_questions)
         "#
     )
     .bind(sqlite_group.group_id)
@@ -286,21 +286,19 @@ pub async fn verify_group_migration(
     let source_groups = sqlite_reader.read_groups()?.len() as i64;
     let source_members = sqlite_reader.read_all_group_members()?.len() as i64;
 
-    let target_groups: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM groups.tracked_groups"
+    let target_groups: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM tracked_groups"
     )
     .fetch_one(pg_pool)
     .await
-    .context("Failed to count groups in PostgreSQL")?
-    .unwrap_or(0);
+    .context("Failed to count groups in PostgreSQL")?;
 
-    let target_members: i64 = sqlx::query_scalar(
+    let target_members: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::bigint FROM groups.group_members"
     )
     .fetch_one(pg_pool)
     .await
-    .context("Failed to count group members in PostgreSQL")?
-    .unwrap_or(0);
+    .context("Failed to count group members in PostgreSQL")?;
 
     let result = GroupVerificationResult {
         source_groups,

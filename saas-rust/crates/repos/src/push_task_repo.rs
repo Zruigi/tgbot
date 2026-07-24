@@ -1,7 +1,7 @@
 use sqlx::Row;
 // Push task repository – CRUD for push_tasks table.
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 

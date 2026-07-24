@@ -1,15 +1,19 @@
+pub mod agent_tools;
+pub mod ai;
 pub mod auth;
 pub mod broadcast;
 pub mod chat;
 pub mod config;
 pub mod finance;
 pub mod group;
+pub mod group_listen;
 pub mod group_members;
 pub mod group_verify;
 pub mod merchant;
 pub mod miniapp;
 pub mod monitor;
 pub mod platform;
+pub mod potential_users;
 pub mod session;
 pub mod telegram_webhook;
 
@@ -35,7 +39,9 @@ pub fn router() -> Router<AppState> {
         // System Config routes
         .route("/api/config", get(config::get_config).post(config::save_config))
         .route("/api/config/vertex", post(config::vertex_oneclick_config))
+        .route("/api/config/vertex/oneclick", post(config::vertex_oneclick_config)) // alias for frontend
         .route("/api/config/gemini_models", get(config::get_gemini_models))
+        .route("/api/config/gemini-models", get(config::get_gemini_models)) // alias for frontend
 
         // Session context
         .route("/api/session/context", get(session::session_context_get).post(session::session_context_post))
@@ -133,6 +139,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/mark_read/{user_id}", post(chat::mark_read))
         .route("/api/delete_chat/{user_id}", post(chat::delete_chat))
         .route("/api/search", get(chat::search))
+        .route("/api/file/{file_id}", get(chat::get_file))
+        .route("/api/upload/{user_id}", post(chat::upload_image))
+        .route("/ws", get(chat::ws_handler))
 
         // Group routes
         .route("/api/groups", get(group::list_groups))
@@ -157,6 +166,33 @@ pub fn router() -> Router<AppState> {
         .route("/api/group_verify_config", get(group_verify::get_verify_config).post(group_verify::update_verify_config))
         .route("/api/verify/stats", get(group_verify::verify_stats))
         .route("/api/verify/growth", get(group_verify::verify_growth))
+        // Aliases for frontend compatibility
+        .route("/api/group_stats/verify_stats", get(group_verify::verify_stats))
+        .route("/api/group_stats/verify_growth", get(group_verify::verify_growth))
+
+        // Group Listen API — frontend compatibility aliases
+        .route("/api/group_listen/list", get(group::list_groups))
+        .route("/api/group_listen/stats", get(group_listen::get_monitor_stats))
+        .route("/api/group_listen/toggle", post(group_listen::toggle_group_listen))
+        .route("/api/group_listen/revoke_sync", post(group_listen::toggle_revoke_sync))
+        .route("/api/group_listen/create_sync_chat", post(group_listen::create_revoke_sync_chat))
+        .route("/api/group_listen/sync_chat_info", get(group_listen::get_revoke_sync_chat))
+
+        // Group photo & member count
+        .route("/api/group_photo", get(group_listen::get_group_photo))
+        .route("/api/group_member_count", get(group_listen::get_group_member_count))
+
+        // Group Listen extended endpoints
+        .route("/api/group_listen/verified_users", get(group_listen::get_verified_users))
+        .route("/api/group_listen/unverified_users", get(group_listen::get_unverified_users))
+        .route("/api/group_listen/send_channel_reminder", post(group_listen::send_channel_reminder))
+        .route("/api/group_listen/sync_chat_assignments", get(group_listen::get_sync_chat_assignments))
+
+        // Potential Users (leads) API
+        .route("/api/potential_users", get(potential_users::list_potential_users))
+        .route("/api/potential_users/tags", get(potential_users::get_available_tags))
+        .route("/api/potential_users/sync", post(potential_users::sync_potential_users))
+        .route("/api/potential_users/{user_id}/promote", post(potential_users::promote_user))
 
         // Broadcast / Push Task routes
         .route(
@@ -214,6 +250,26 @@ pub fn router() -> Router<AppState> {
             "/api/monitors/year_summary",
             get(monitor::year_summary),
         )
+        .route(
+            "/api/monitors/{monitor_id}/claim",
+            post(monitor::claim_monitor),
+        )
+        .route(
+            "/api/monitors/tx_meta/batch",
+            post(monitor::batch_update_tx_meta),
+        )
+        .route(
+            "/api/monitors/counterparty_aliases",
+            get(monitor::list_counterparty_aliases).post(monitor::upsert_counterparty_alias),
+        )
+        .route(
+            "/api/monitors/counterparty_aliases/{alias_id}",
+            delete(monitor::delete_counterparty_alias),
+        )
+        .route(
+            "/api/monitors/user_queries",
+            get(monitor::list_user_query_monitors),
+        )
 
         // Finance routes - Financial summary, reconciliation
         .route(
@@ -236,6 +292,35 @@ pub fn router() -> Router<AppState> {
             "/api/finance/report",
             post(finance::generate_report),
         )
+
+        // AI / Agent routes
+        .route("/api/ai/chat", post(ai::ai_chat))
+        .route("/api/ai/detect_ad", post(ai::detect_ad))
+        .route("/api/ai/pipeline_mode", get(ai::get_pipeline_mode).post(ai::set_pipeline_mode))
+        .route("/api/openai/models", get(ai::list_openai_models))
+        .route("/api/openai/chat/completions", post(ai::openai_chat_completions))
+        .route("/api/openai/exec", post(ai::openai_exec))
+
+        // AI Skills routes — frontend & n8n compatibility
+        .route("/api/ai/skills", get(ai::list_skills).post(ai::upsert_skill))
+        .route("/api/ai/skills/toggle", post(ai::toggle_skill))
+        .route("/api/ai/skills/import_builtin", post(ai::import_builtin_skills))
+        .route("/api/ai/skills/discovered", get(ai::list_discovered_skills))
+
+        // Ad pipeline routes — n8n AdCluster compatibility
+        .route("/api/ad-pipeline/events/group-message", post(ai::ad_pipeline_group_message))
+        .route("/api/ad-pipeline/backfill", post(ai::ad_pipeline_backfill))
+
+        // Agent tool endpoints (for n8n integration)
+        .route("/api/agent/tools/finance-query", post(agent_tools::tool_finance_query))
+        .route("/api/agent/tools/system-query", post(agent_tools::tool_system_query))
+        .route("/api/agent/tools/telegram-sdk-query", post(agent_tools::tool_telegram_sdk_query))
+        .route("/api/agent/tools/query-ad-clusters", post(agent_tools::tool_query_ad_clusters))
+        .route("/api/agent/tools/delete-ad-cluster", post(agent_tools::tool_delete_ad_cluster))
+
+        // n8n advertisement compatibility
+        .route("/api/advertisements", get(ai::list_advertisements))
+        .route("/api/advertisements/{ad_id}", get(ai::get_advertisement))
 
         // Telegram Webhook routes — multi-tenant bot webhook endpoint
         .route(

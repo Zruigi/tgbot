@@ -101,7 +101,7 @@ impl Tool for BroadcastMessageTool {
         })
     }
 
-    async fn execute(&self, params: &Value, context: &AgentContext) -> ToolExecuteResult {
+    async fn execute(&self, params: &Value, _context: &AgentContext) -> ToolExecuteResult {
         let content = params
             .get("content")
             .and_then(|v| v.as_str())
@@ -163,6 +163,9 @@ impl Tool for BroadcastMessageTool {
         }
     }
 
+    }
+
+impl BroadcastMessageTool {
     /// 执行实际的广播逻辑
     async fn execute_broadcast(
         &self,

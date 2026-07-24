@@ -108,7 +108,7 @@ pub async fn get_chat_history(
             m.admin_userid,
             m.is_deleted,
             e.emoji
-        FROM chat.messages m
+        FROM chat_messages m
         LEFT JOIN chat.emoji_messages e ON e.msg_id = m.id
         WHERE ((m.from_userid = $1 AND m.to_userid = $2)
             OR (m.from_userid = $2 AND m.to_userid = $1))
@@ -139,7 +139,7 @@ pub async fn get_chat_history(
 pub async fn mark_messages_as_read(pool: &PgPool, user_id: i64, bot_id: i64) -> Result<()> {
     sqlx::query(
         r#"
-        UPDATE chat.messages
+        UPDATE chat_messages
         SET is_read = true
         WHERE from_userid = $1
           AND to_userid = $2
@@ -202,7 +202,7 @@ pub async fn rebuild_inbox_for_tenant(
         SELECT
             CASE WHEN from_userid = $1 THEN to_userid ELSE from_userid END AS uid,
             MAX(timestamp) AS last_ts
-        FROM chat.messages
+        FROM chat_messages
         WHERE (from_userid = $1 OR to_userid = $1)
           AND tenant_id = $2
         GROUP BY uid
@@ -225,7 +225,7 @@ pub async fn rebuild_inbox_for_tenant(
         let unread: i64 = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)::bigint
-            FROM chat.messages
+            FROM chat_messages
             WHERE from_userid = $1 AND to_userid = $2 AND is_read = false AND is_deleted = false
             "#,
         )
@@ -238,7 +238,7 @@ pub async fn rebuild_inbox_for_tenant(
         let summary: Option<String> = sqlx::query_scalar::<_, String>(
             r#"
             SELECT content
-            FROM chat.messages
+            FROM chat_messages
             WHERE ((from_userid = $1 AND to_userid = $2) OR (from_userid = $2 AND to_userid = $1))
               AND is_deleted = false
             ORDER BY timestamp DESC
@@ -319,7 +319,7 @@ pub async fn is_user_belong_to_tenant(
     let found: bool = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT EXISTS(
-            SELECT 1 FROM chat.messages
+            SELECT 1 FROM chat_messages
             WHERE tenant_id = $1
               AND ((from_userid = $2 AND to_userid = $3)
                 OR (from_userid = $3 AND to_userid = $2))

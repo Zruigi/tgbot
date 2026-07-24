@@ -7,6 +7,9 @@ BEGIN;
 -- =====================================================
 -- SCHEMA: chat - 聊天相关核心表
 -- =====================================================
+CREATE SCHEMA IF NOT EXISTS chat;
+CREATE SCHEMA IF NOT EXISTS groups;
+CREATE SCHEMA IF NOT EXISTS broadcast;
 
 -- chat.users 表 (用户基础信息)
 CREATE TABLE IF NOT EXISTS chat.users (

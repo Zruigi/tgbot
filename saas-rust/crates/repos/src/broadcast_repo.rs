@@ -1,6 +1,6 @@
 // Broadcast target repository – CRUD for broadcast_targets table.
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::row_to_json;

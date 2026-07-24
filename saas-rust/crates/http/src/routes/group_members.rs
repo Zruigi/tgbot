@@ -149,7 +149,7 @@ pub async fn list_members(
     .bind(q.is_verified)
     .bind(limit)
     .bind(offset)
-    .fetch_all(&state.pool)
+    .fetch_all(state.db()?)
     .await?;
 
     let total = rows.len();
@@ -174,11 +174,11 @@ pub async fn get_permissions(
 
     // Verify the group belongs to this tenant
     let group_owned = sqlx::query(
-        "SELECT 1 FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
     )
     .bind(q.group_id)
     .bind(tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     if group_owned.is_none() {
@@ -197,7 +197,7 @@ pub async fn get_permissions(
         .bind(q.group_id)
         .bind(user_id)
         .bind(tenant_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?;
 
         return Ok(Json(json!({
@@ -212,7 +212,7 @@ pub async fn get_permissions(
     )
     .bind(q.group_id)
     .bind(tenant_id)
-    .fetch_one(&state.pool)
+    .fetch_one(state.db()?)
     .await?;
 
     let verified = sqlx::query_scalar::<_, i64>(
@@ -220,7 +220,7 @@ pub async fn get_permissions(
     )
     .bind(q.group_id)
     .bind(tenant_id)
-    .fetch_one(&state.pool)
+    .fetch_one(state.db()?)
     .await?;
 
     Ok(Json(json!({
@@ -259,11 +259,11 @@ pub async fn member_action(
 
     // Verify the group belongs to this tenant
     let group_owned = sqlx::query(
-        "SELECT 1 FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
     )
     .bind(body.group_id)
     .bind(tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     if group_owned.is_none() {
@@ -289,7 +289,7 @@ pub async fn member_action(
             .bind(body.group_id)
             .bind(body.user_id)
             .bind(tenant_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(state.db()?)
             .await?;
 
             if row.is_none() {
@@ -310,7 +310,7 @@ pub async fn member_action(
             .bind(body.group_id)
             .bind(body.user_id)
             .bind(tenant_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(state.db()?)
             .await?;
 
             if row.is_none() {
@@ -331,7 +331,7 @@ pub async fn member_action(
             .bind(body.group_id)
             .bind(body.user_id)
             .bind(tenant_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(state.db()?)
             .await?;
 
             if row.is_none() {
@@ -352,7 +352,7 @@ pub async fn member_action(
             .bind(body.group_id)
             .bind(body.user_id)
             .bind(tenant_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(state.db()?)
             .await?;
 
             if row.is_none() {
@@ -372,7 +372,7 @@ pub async fn member_action(
             .bind(body.group_id)
             .bind(body.user_id)
             .bind(tenant_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(state.db()?)
             .await?;
 
             if row.is_none() {
@@ -425,11 +425,11 @@ pub async fn member_action_batch(
 
     // Verify the group belongs to this tenant
     let group_owned = sqlx::query(
-        "SELECT 1 FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
     )
     .bind(body.group_id)
     .bind(tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     if group_owned.is_none() {
@@ -456,7 +456,7 @@ pub async fn member_action_batch(
         .bind(body.group_id)
         .bind(tenant_id)
         .bind(&body.user_ids)
-        .execute(&state.pool)
+        .execute(state.db()?)
         .await?;
         result.rows_affected() as i64
     } else if body.action == "verify" {
@@ -470,7 +470,7 @@ pub async fn member_action_batch(
         .bind(body.group_id)
         .bind(tenant_id)
         .bind(&body.user_ids)
-        .execute(&state.pool)
+        .execute(state.db()?)
         .await?;
         result.rows_affected() as i64
     } else {
@@ -485,7 +485,7 @@ pub async fn member_action_batch(
         .bind(body.group_id)
         .bind(tenant_id)
         .bind(&body.user_ids)
-        .execute(&state.pool)
+        .execute(state.db()?)
         .await?;
         result.rows_affected() as i64
     };
@@ -528,11 +528,11 @@ pub async fn admin_batch(
 
     // Verify the group belongs to this tenant
     let group_owned = sqlx::query(
-        "SELECT 1 FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
     )
     .bind(body.group_id)
     .bind(tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     if group_owned.is_none() {
@@ -558,7 +558,7 @@ pub async fn admin_batch(
     .bind(body.group_id)
     .bind(tenant_id)
     .bind(&body.user_ids)
-    .execute(&state.pool)
+    .execute(state.db()?)
     .await?;
 
     Ok(Json(json!({
@@ -587,11 +587,11 @@ pub async fn promote_admin(
 
     // Verify the group belongs to this tenant
     let group_owned = sqlx::query(
-        "SELECT 1 FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
     )
     .bind(body.group_id)
     .bind(tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     if group_owned.is_none() {
@@ -609,7 +609,7 @@ pub async fn promote_admin(
     .bind(body.group_id)
     .bind(body.user_id)
     .bind(tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     if row.is_none() {
@@ -641,11 +641,11 @@ pub async fn demote_admin(
 
     // Verify the group belongs to this tenant
     let group_owned = sqlx::query(
-        "SELECT 1 FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
     )
     .bind(body.group_id)
     .bind(tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     if group_owned.is_none() {
@@ -663,7 +663,7 @@ pub async fn demote_admin(
     .bind(body.group_id)
     .bind(body.user_id)
     .bind(tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     if row.is_none() {
@@ -721,7 +721,7 @@ pub async fn list_group_messages(
         .bind(q.is_advertising)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&state.pool)
+        .fetch_all(state.db()?)
         .await?
     } else {
         // Merchant-scoped: filter by tenant_id
@@ -743,7 +743,7 @@ pub async fn list_group_messages(
         .bind(q.is_advertising)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&state.pool)
+        .fetch_all(state.db()?)
         .await?
     };
 
@@ -771,11 +771,11 @@ pub async fn send_group_message(
 
     // Verify the group belongs to this tenant
     let group_owned = sqlx::query(
-        "SELECT 1 FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
     )
     .bind(body.group_id)
     .bind(tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     if group_owned.is_none() {
@@ -814,7 +814,7 @@ pub async fn send_group_message(
     .bind(msg_type)
     .bind(body.file_id.as_deref().unwrap_or("").trim())
     .bind(tenant_id)
-    .fetch_one(&state.pool)
+    .fetch_one(state.db()?)
     .await?;
 
     let msg_id: i64 = row.try_get("id")?;
@@ -850,7 +850,7 @@ pub async fn reply_group_message(
     )
     .bind(body.tg_msg_id)
     .bind(tenant_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
 
     let orig = orig.ok_or_else(|| ApiError::NotFound("original_message_not_found".into()))?;
@@ -941,7 +941,7 @@ pub async fn reply_group_message(
     .bind(body.tg_msg_id)  // Store the message being replied to
     .bind(quoted_text_ref)
     .bind(tenant_id)
-    .fetch_one(&state.pool)
+    .fetch_one(state.db()?)
     .await?;
 
     let msg_id: i64 = row.try_get("id")?;
@@ -978,7 +978,7 @@ pub async fn delete_group_message(
     .bind(body.msg_id)
     .bind(body.group_id)
     .bind(tenant_id)
-    .execute(&state.pool)
+    .execute(state.db()?)
     .await?;
 
     if result.rows_affected() == 0 {

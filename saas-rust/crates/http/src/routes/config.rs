@@ -77,7 +77,7 @@ pub async fn get_config(
     let llm_base_url = sqlx::query_scalar::<_, Option<String>>(
         "SELECT value FROM admin_settings WHERE key = 'llm_base_url'",
     )
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .flatten()
     .unwrap_or_else(|| std::env::var("LLM_BASE_URL").unwrap_or_default());
@@ -85,7 +85,7 @@ pub async fn get_config(
     let llm_api_key = sqlx::query_scalar::<_, Option<String>>(
         "SELECT value FROM admin_settings WHERE key = 'llm_api_key'",
     )
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .flatten()
     .unwrap_or_else(|| std::env::var("LLM_API_KEY").unwrap_or_default());
@@ -93,7 +93,7 @@ pub async fn get_config(
     let llm_model = sqlx::query_scalar::<_, Option<String>>(
         "SELECT value FROM admin_settings WHERE key = 'llm_model'",
     )
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .flatten()
     .unwrap_or_default();
@@ -101,7 +101,7 @@ pub async fn get_config(
     let llm_model_lock_enabled = sqlx::query_scalar::<_, Option<String>>(
         "SELECT value FROM admin_settings WHERE key = 'llm_model_lock_enabled'",
     )
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .flatten()
     .map(|v| is_truthy(&v))
@@ -110,7 +110,7 @@ pub async fn get_config(
     let llm_model_lock_target = sqlx::query_scalar::<_, Option<String>>(
         "SELECT value FROM admin_settings WHERE key = 'llm_model_lock_target'",
     )
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .flatten()
     .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
@@ -118,7 +118,7 @@ pub async fn get_config(
     let global_auto_translate = sqlx::query_scalar::<_, Option<String>>(
         "SELECT value FROM admin_settings WHERE key = 'global_auto_translate'",
     )
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .flatten()
     .map(|v| is_truthy(&v))
@@ -127,7 +127,7 @@ pub async fn get_config(
     let translation_engine = sqlx::query_scalar::<_, Option<String>>(
         "SELECT value FROM admin_settings WHERE key = 'translation_engine'",
     )
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .flatten()
     .unwrap_or_else(|| "llm".to_string());
@@ -177,7 +177,7 @@ pub async fn save_config(
             "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_base_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
         )
         .bind(llm_base_url)
-        .execute(&state.pool)
+        .execute(state.db()?)
         .await?;
     }
 
@@ -186,7 +186,7 @@ pub async fn save_config(
             "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
         )
         .bind(llm_api_key)
-        .execute(&state.pool)
+        .execute(state.db()?)
         .await?;
     }
 
@@ -196,7 +196,7 @@ pub async fn save_config(
                 "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_model', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
             )
             .bind(llm_model.trim())
-            .execute(&state.pool)
+            .execute(state.db()?)
             .await?;
         }
     }
@@ -207,7 +207,7 @@ pub async fn save_config(
                 "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_model_lock_target', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
             )
             .bind(llm_model_lock_target.trim())
-            .execute(&state.pool)
+            .execute(state.db()?)
             .await?;
         }
     }
@@ -218,7 +218,7 @@ pub async fn save_config(
             "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_model_lock_enabled', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
         )
         .bind(lock_enabled_str)
-        .execute(&state.pool)
+        .execute(state.db()?)
         .await?;
 
         // If lock is enabled, also update llm_model to the lock target
@@ -226,7 +226,7 @@ pub async fn save_config(
             let lock_target = sqlx::query_scalar::<_, Option<String>>(
                 "SELECT value FROM admin_settings WHERE key = 'llm_model_lock_target'",
             )
-            .fetch_optional(&state.pool)
+            .fetch_optional(state.db()?)
             .await?
             .flatten()
             .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
@@ -235,7 +235,7 @@ pub async fn save_config(
                 "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_model', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
             )
             .bind(lock_target)
-            .execute(&state.pool)
+            .execute(state.db()?)
             .await?;
         }
     }
@@ -246,7 +246,7 @@ pub async fn save_config(
             "INSERT INTO admin_settings (key, value, updated_at) VALUES ('global_auto_translate', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
         )
         .bind(flag_str)
-        .execute(&state.pool)
+        .execute(state.db()?)
         .await?;
     }
 
@@ -255,7 +255,7 @@ pub async fn save_config(
             "INSERT INTO admin_settings (key, value, updated_at) VALUES ('translation_engine', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
         )
         .bind(translation_engine)
-        .execute(&state.pool)
+        .execute(state.db()?)
         .await?;
     }
 
@@ -307,42 +307,42 @@ pub async fn vertex_oneclick_config(
         "INSERT INTO admin_settings (key, value, updated_at) VALUES ('vertex_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&body.vertex_api_key)
-    .execute(&state.pool)
+    .execute(state.db()?)
     .await?;
 
     sqlx::query(
         "INSERT INTO admin_settings (key, value, updated_at) VALUES ('oneapi_base_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&oneapi_base_url)
-    .execute(&state.pool)
+    .execute(state.db()?)
     .await?;
 
     sqlx::query(
         "INSERT INTO admin_settings (key, value, updated_at) VALUES ('relay_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&relay_api_key)
-    .execute(&state.pool)
+    .execute(state.db()?)
     .await?;
 
     sqlx::query(
         "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_model', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&model)
-    .execute(&state.pool)
+    .execute(state.db()?)
     .await?;
 
     sqlx::query(
         "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_base_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&openai_chat_url)
-    .execute(&state.pool)
+    .execute(state.db()?)
     .await?;
 
     sqlx::query(
         "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&relay_api_key)
-    .execute(&state.pool)
+    .execute(state.db()?)
     .await?;
 
     // Mask keys for response

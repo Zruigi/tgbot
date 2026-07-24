@@ -4,7 +4,7 @@
 use crate::schema::{AgentContext, Tool, ToolExecuteResult};
 use async_trait::async_trait;
 use serde_json::Value;
-use tracing::{error, info};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // FinanceQueryTool
@@ -105,7 +105,7 @@ impl FinanceQueryTool {
     }
 
     /// 获取科目树
-    async fn exec_categories(&self) -> ToolExecuteResult {
+    async fn exec_categories(&self, _params: &Value) -> ToolExecuteResult {
         // TODO: 接入 tgbot-services 后替换
         info!("FinanceQueryTool::exec_categories — 占位实现");
 
@@ -393,7 +393,7 @@ fn build_analysis_text(
         .sum();
 
     lines.push(format!(
-        "\n待核销金额: ${:,.2} ({}笔)",
+        "\n待核销金额: ${:.2} ({}笔)",
         total_unreconciled,
         unreconciled.len()
     ));

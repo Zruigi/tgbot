@@ -49,7 +49,7 @@ pub async fn list_broadcast_targets(
     let enabled_only = q.enabled_only.unwrap_or(true);
 
     let targets = broadcast_repo::list_broadcast_targets(
-        &state.pool,
+        state.db()?,
         &tenant_id,
         chat_types.as_deref(),
         enabled_only,
@@ -74,7 +74,7 @@ pub async fn sync_broadcast_targets(
     // For now, we return the current list of targets.
 
     let targets = broadcast_repo::list_broadcast_targets(
-        &state.pool,
+        state.db()?,
         &tenant_id,
         None,
         true,
@@ -121,7 +121,7 @@ pub async fn send_broadcast(
     // Send to users
     if !user_ids.is_empty() {
         let result = broadcast_service::send_broadcast_to_users(
-            &state.pool,
+            state.db()?,
             &user_ids,
             &content,
             do_translate,
@@ -142,7 +142,7 @@ pub async fn send_broadcast(
     // Send to chats
     let chat_summary = if !chat_ids.is_empty() {
         let result = broadcast_service::send_broadcast_to_chats(
-            &state.pool,
+            state.db()?,
             &chat_ids,
             &content,
             do_translate,
@@ -190,7 +190,7 @@ pub async fn broadcast_chats(
     use tgbot_services::broadcast_service;
 
     let summary = broadcast_service::send_broadcast_to_chats(
-        &state.pool,
+        state.db()?,
         &chat_ids,
         &content,
         do_translate,
@@ -238,7 +238,7 @@ pub async fn list_push_tasks(
     let offset = q.offset.unwrap_or(0).max(0);
 
     let tasks =
-        push_task_repo::list_push_tasks(&state.pool, Some(&tenant_id), q.status.as_deref(), limit, offset)
+        push_task_repo::list_push_tasks(state.db()?, Some(&tenant_id), q.status.as_deref(), limit, offset)
             .await
             .map_err(ApiError::Anyhow)?;
 
@@ -289,7 +289,7 @@ pub async fn create_push_task(
     let next_run_at = start_dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let task_id = push_task_repo::create_push_task(
-        &state.pool,
+        state.db()?,
         &tenant_id,
         Some(merchant_id),
         &task_name,
@@ -323,7 +323,7 @@ pub async fn update_push_task_status(
         ));
     }
 
-    let ok = push_task_repo::update_push_task_status(&state.pool, body.task_id, status)
+    let ok = push_task_repo::update_push_task_status(state.db()?, body.task_id, status)
         .await
         .map_err(ApiError::Anyhow)?;
 
@@ -343,7 +343,7 @@ pub async fn run_push_task_now(
     let _scope = resolve_scope(&state, &headers).await?;
 
     // Get the task
-    let task = push_task_repo::get_push_task(&state.pool, body.task_id)
+    let task = push_task_repo::get_push_task(state.db()?, body.task_id)
         .await
         .map_err(ApiError::Anyhow)?
         .ok_or_else(|| ApiError::NotFound("task not found".into()))?;
@@ -369,7 +369,7 @@ pub async fn run_push_task_now(
         .unwrap_or_default();
 
     let summary = broadcast_service::send_broadcast_to_chats(
-        &state.pool,
+        state.db()?,
         &target_chat_ids,
         &content,
         do_translate,
@@ -394,7 +394,7 @@ pub async fn run_push_task_now(
         .unwrap_or(0) as i32;
 
     push_task_repo::update_push_task_run_result(
-        &state.pool,
+        state.db()?,
         body.task_id,
         &last_run_at,
         &next_run_at,

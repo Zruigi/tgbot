@@ -365,7 +365,7 @@ pub async fn schedule_group_policy_syncs(pool: &PgPool) -> Result<usize> {
     // a batch job periodically.
     let rows = sqlx::query(
         r#"
-        SELECT group_id, tenant_id FROM groups.tracked_groups
+        SELECT group_id, tenant_id FROM tracked_groups
         WHERE verify_enabled = true
           AND is_monitored = true
         ORDER BY updated_at ASC
@@ -391,8 +391,7 @@ pub async fn schedule_group_policy_syncs(pool: &PgPool) -> Result<usize> {
         )
         .bind(group_id.to_string())
         .fetch_one(pool)
-        .await?
-        .unwrap_or(0);
+        .await?;
 
         if existing > 0 {
             continue;

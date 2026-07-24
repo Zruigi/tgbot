@@ -1,6 +1,6 @@
 //! Message Migration - Migrate message data from SQLite to PostgreSQL
 //! This module handles the migration of private chat messages from the legacy
-//! SQLite database to the chat.messages table in PostgreSQL/Supabase.
+//! SQLite database to the chat_messages table in PostgreSQL/Supabase.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -76,13 +76,12 @@ pub async fn migrate_messages(
     }
 
     // Get skipped count (already migrated)
-    let target_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM chat.messages"
+    let target_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM chat_messages"
     )
     .fetch_one(pg_pool)
     .await
-    .context("Failed to count messages in PostgreSQL")?
-    .unwrap_or(0);
+    .context("Failed to count messages in PostgreSQL")?;
 
     // If target count is close to source, consider the rest as skipped (already migrated)
     if target_count < stats.total_source {
@@ -137,7 +136,7 @@ async fn migrate_single_message(
     // Insert message into PostgreSQL
     sqlx::query(
         r#"
-        INSERT INTO chat.messages (
+        INSERT INTO chat_messages (
             trace_id,
             from_userid,
             to_userid,
@@ -163,9 +162,9 @@ async fn migrate_single_message(
         ON CONFLICT (trace_id) DO UPDATE SET
             from_userid = EXCLUDED.from_userid,
             to_userid = EXCLUDED.to_userid,
-            content = COALESCE(EXCLUDED.content, chat.messages.content),
+            content = COALESCE(EXCLUDED.content, chat_messages.content),
             is_read = EXCLUDED.is_read,
-            tg_msg_id = COALESCE(EXCLUDED.tg_msg_id, chat.messages.tg_msg_id),
+            tg_msg_id = COALESCE(EXCLUDED.tg_msg_id, chat_messages.tg_msg_id),
             status = EXCLUDED.status
         "#
     )
@@ -234,13 +233,12 @@ pub async fn verify_message_migration(
     let sqlite_reader = SqliteReader::new(sqlite_config)?;
     let source_count = sqlite_reader.count_messages()?;
 
-    let target_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM chat.messages"
+    let target_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM chat_messages"
     )
     .fetch_one(pg_pool)
     .await
-    .context("Failed to count messages in PostgreSQL")?
-    .unwrap_or(0);
+    .context("Failed to count messages in PostgreSQL")?;
 
     let result = MessageVerificationResult {
         source_count,

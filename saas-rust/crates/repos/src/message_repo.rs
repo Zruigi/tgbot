@@ -13,7 +13,7 @@ use super::row_to_json;
 // Save a message
 // ---------------------------------------------------------------------------
 
-/// Insert a new message into `chat.messages` and update the admin inbox
+/// Insert a new message into `chat_messages` and update the admin inbox
 /// summary if the message is directed to the bot (inbox notification).
 pub async fn save_message(
     pool: &PgPool,
@@ -34,7 +34,7 @@ pub async fn save_message(
     let (quoted_text, quoted_file_id, quoted_type): (Option<String>, Option<String>, Option<String>) =
         if let Some(qid) = reply_to_msg_id {
             let row = sqlx::query(
-                "SELECT content, file_id, msg_type FROM chat.messages WHERE id = $1",
+                "SELECT content, file_id, msg_type FROM chat_messages WHERE id = $1",
             )
             .bind(qid)
             .fetch_optional(pool)
@@ -53,7 +53,7 @@ pub async fn save_message(
 
     let row = sqlx::query(
         r#"
-        INSERT INTO chat.messages (
+        INSERT INTO chat_messages (
             trace_id, from_userid, to_userid, content, msg_type,
             file_id, media_url, is_read, tg_msg_id,
             quoted_text, quoted_msg_id, quoted_file_id, quoted_type,
@@ -126,7 +126,7 @@ async fn update_inbox_on_new_message(
     let unread: i64 = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)::bigint
-        FROM chat.messages
+        FROM chat_messages
         WHERE from_userid = $1 AND is_read = false AND is_deleted = false
         "#,
     )
@@ -163,7 +163,7 @@ async fn update_inbox_on_new_message(
 pub async fn delete_single_message(pool: &PgPool, user_id: i64, msg_id: i64) -> Result<bool> {
     let result = sqlx::query(
         r#"
-        UPDATE chat.messages
+        UPDATE chat_messages
         SET is_deleted = true
         WHERE id = $1
           AND (from_userid = $2 OR to_userid = $2)
@@ -222,7 +222,7 @@ async fn search_in_group(
             LEFT JOIN groups.group_members u ON gm.user_id = u.user_id AND gm.group_id = u.group_id
             WHERE gm.group_id = $1
               AND gm.content LIKE $2
-              AND gm.group_id IN (SELECT group_id FROM groups.tracked_groups WHERE tenant_id = $3)
+              AND gm.group_id IN (SELECT group_id FROM tracked_groups WHERE tenant_id = $3)
             ORDER BY gm.timestamp DESC
             LIMIT $4
             "#,
@@ -266,7 +266,7 @@ async fn search_in_user_messages(
         sqlx::query(
             r#"
             SELECT m.*, 'private' AS source_type
-            FROM chat.messages m
+            FROM chat_messages m
             WHERE (m.from_userid = $1 OR m.to_userid = $1)
               AND m.content LIKE $2
               AND m.is_deleted = false
@@ -285,7 +285,7 @@ async fn search_in_user_messages(
         sqlx::query(
             r#"
             SELECT m.*, 'private' AS source_type
-            FROM chat.messages m
+            FROM chat_messages m
             WHERE (m.from_userid = $1 OR m.to_userid = $1)
               AND m.content LIKE $2
               AND m.is_deleted = false
@@ -316,7 +316,7 @@ async fn search_all(
         sqlx::query(
             r#"
             SELECT m.*, 'private' AS source_type
-            FROM chat.messages m
+            FROM chat_messages m
             WHERE m.content LIKE $1
               AND m.is_deleted = false
               AND (m.from_userid = $2 OR m.to_userid = $2)
@@ -333,7 +333,7 @@ async fn search_all(
         sqlx::query(
             r#"
             SELECT m.*, 'private' AS source_type
-            FROM chat.messages m
+            FROM chat_messages m
             WHERE m.content LIKE $1
               AND m.is_deleted = false
             ORDER BY m.timestamp DESC
@@ -362,7 +362,7 @@ async fn search_all(
             FROM groups.group_messages gm
             LEFT JOIN groups.group_members u ON gm.user_id = u.user_id AND gm.group_id = u.group_id
             WHERE gm.content LIKE $1
-              AND gm.group_id IN (SELECT group_id FROM groups.tracked_groups WHERE tenant_id = $2)
+              AND gm.group_id IN (SELECT group_id FROM tracked_groups WHERE tenant_id = $2)
             ORDER BY gm.timestamp DESC
             LIMIT $3
             "#,

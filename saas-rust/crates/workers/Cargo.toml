@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 tgbot-domain = { workspace = true }
+tgbot-repos = { workspace = true }
 tgbot-services = { workspace = true }
 tgbot-integrations = { workspace = true }
 

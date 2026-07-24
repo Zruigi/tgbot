@@ -80,12 +80,12 @@ pub async fn get_verify_config(
                 SELECT group_id, group_title, verify_enabled, verify_type,
                        verify_timeout, verify_channel_id, verify_questions,
                        verify_msg_template, tenant_id
-                FROM groups.tracked_groups
+                FROM tracked_groups
                 WHERE group_id = $1
                 "#,
             )
             .bind(group_id)
-            .fetch_all(&state.pool)
+            .fetch_all(state.db()?)
             .await?
         } else {
             sqlx::query(
@@ -93,13 +93,13 @@ pub async fn get_verify_config(
                 SELECT group_id, group_title, verify_enabled, verify_type,
                        verify_timeout, verify_channel_id, verify_questions,
                        verify_msg_template, tenant_id
-                FROM groups.tracked_groups
+                FROM tracked_groups
                 WHERE group_id = $1 AND tenant_id = $2
                 "#,
             )
             .bind(group_id)
             .bind(tenant_id)
-            .fetch_all(&state.pool)
+            .fetch_all(state.db()?)
             .await?
         }
     } else if tenant_id.is_empty() {
@@ -109,12 +109,12 @@ pub async fn get_verify_config(
             SELECT group_id, group_title, verify_enabled, verify_type,
                    verify_timeout, verify_channel_id, verify_questions,
                    verify_msg_template, tenant_id
-            FROM groups.tracked_groups
+            FROM tracked_groups
             WHERE verify_enabled = true
             ORDER BY group_title
             "#,
         )
-        .fetch_all(&state.pool)
+        .fetch_all(state.db()?)
         .await?
     } else {
         // Merchant-scoped: all groups with verify_enabled for this tenant
@@ -123,13 +123,13 @@ pub async fn get_verify_config(
             SELECT group_id, group_title, verify_enabled, verify_type,
                    verify_timeout, verify_channel_id, verify_questions,
                    verify_msg_template, tenant_id
-            FROM groups.tracked_groups
+            FROM tracked_groups
             WHERE tenant_id = $1 AND verify_enabled = true
             ORDER BY group_title
             "#,
         )
         .bind(tenant_id)
-        .fetch_all(&state.pool)
+        .fetch_all(state.db()?)
         .await?
     };
 
@@ -189,7 +189,7 @@ pub async fn update_verify_config(
         // Platform admin
         sqlx::query(
             r#"
-            UPDATE groups.tracked_groups SET
+            UPDATE tracked_groups SET
                 verify_enabled     = COALESCE($2, verify_enabled),
                 verify_type        = COALESCE($3, verify_type),
                 verify_timeout     = COALESCE($4, verify_timeout),
@@ -208,13 +208,13 @@ pub async fn update_verify_config(
         .bind(body.verify_channel_id)
         .bind(body.verify_questions)
         .bind(body.verify_msg_template)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?
     } else {
         // Merchant-scoped
         sqlx::query(
             r#"
-            UPDATE groups.tracked_groups SET
+            UPDATE tracked_groups SET
                 verify_enabled     = COALESCE($3, verify_enabled),
                 verify_type        = COALESCE($4, verify_type),
                 verify_timeout     = COALESCE($5, verify_timeout),
@@ -234,7 +234,7 @@ pub async fn update_verify_config(
         .bind(body.verify_channel_id)
         .bind(body.verify_questions)
         .bind(body.verify_msg_template)
-        .fetch_optional(&state.pool)
+        .fetch_optional(state.db()?)
         .await?
     };
 
@@ -275,7 +275,7 @@ pub async fn verify_stats(
                 "SELECT COUNT(*)::bigint FROM groups.group_members WHERE group_id = $1 AND is_verified = true",
             )
             .bind(group_id)
-            .fetch_one(&state.pool)
+            .fetch_one(state.db()?)
             .await?
         } else {
             sqlx::query_scalar::<_, i64>(
@@ -283,21 +283,21 @@ pub async fn verify_stats(
             )
             .bind(group_id)
             .bind(tenant_id)
-            .fetch_one(&state.pool)
+            .fetch_one(state.db()?)
             .await?
         }
     } else if tenant_id.is_empty() {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE is_verified = true",
         )
-        .fetch_one(&state.pool)
+        .fetch_one(state.db()?)
         .await?
     } else {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE tenant_id = $1 AND is_verified = true",
         )
         .bind(tenant_id)
-        .fetch_one(&state.pool)
+        .fetch_one(state.db()?)
         .await?
     };
 
@@ -308,7 +308,7 @@ pub async fn verify_stats(
                 "SELECT COUNT(*)::bigint FROM groups.group_members WHERE group_id = $1 AND is_verified = false AND status = 'active'",
             )
             .bind(group_id)
-            .fetch_one(&state.pool)
+            .fetch_one(state.db()?)
             .await?
         } else {
             sqlx::query_scalar::<_, i64>(
@@ -316,21 +316,21 @@ pub async fn verify_stats(
             )
             .bind(group_id)
             .bind(tenant_id)
-            .fetch_one(&state.pool)
+            .fetch_one(state.db()?)
             .await?
         }
     } else if tenant_id.is_empty() {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE is_verified = false AND status = 'active'",
         )
-        .fetch_one(&state.pool)
+        .fetch_one(state.db()?)
         .await?
     } else {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.group_members WHERE tenant_id = $1 AND is_verified = false AND status = 'active'",
         )
         .bind(tenant_id)
-        .fetch_one(&state.pool)
+        .fetch_one(state.db()?)
         .await?
     };
 
@@ -346,7 +346,7 @@ pub async fn verify_stats(
             )
             .bind(group_id)
             .bind(days)
-            .fetch_one(&state.pool)
+            .fetch_one(state.db()?)
             .await?
         } else {
             sqlx::query_scalar::<_, i64>(
@@ -359,7 +359,7 @@ pub async fn verify_stats(
             .bind(group_id)
             .bind(tenant_id)
             .bind(days)
-            .fetch_one(&state.pool)
+            .fetch_one(state.db()?)
             .await?
         }
     } else if tenant_id.is_empty() {
@@ -371,7 +371,7 @@ pub async fn verify_stats(
             "#,
         )
         .bind(days)
-        .fetch_one(&state.pool)
+        .fetch_one(state.db()?)
         .await?
     } else {
         sqlx::query_scalar::<_, i64>(
@@ -383,7 +383,7 @@ pub async fn verify_stats(
         )
         .bind(tenant_id)
         .bind(days)
-        .fetch_one(&state.pool)
+        .fetch_one(state.db()?)
         .await?
     };
 
@@ -394,37 +394,37 @@ pub async fn verify_stats(
                 "SELECT COUNT(*)::bigint FROM groups.verify_sessions WHERE group_id = $1 AND status = 'pending'",
             )
             .bind(group_id)
-            .fetch_one(&state.pool)
+            .fetch_one(state.db()?)
             .await?
         } else {
             sqlx::query_scalar::<_, i64>(
                 r#"
                 SELECT COUNT(*)::bigint FROM groups.verify_sessions vs
                 WHERE vs.group_id = $1 AND vs.status = 'pending'
-                  AND vs.group_id IN (SELECT group_id FROM groups.tracked_groups WHERE tenant_id = $2)
+                  AND vs.group_id IN (SELECT group_id FROM tracked_groups WHERE tenant_id = $2)
                 "#,
             )
             .bind(group_id)
             .bind(tenant_id)
-            .fetch_one(&state.pool)
+            .fetch_one(state.db()?)
             .await?
         }
     } else if tenant_id.is_empty() {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::bigint FROM groups.verify_sessions WHERE status = 'pending'",
         )
-        .fetch_one(&state.pool)
+        .fetch_one(state.db()?)
         .await?
     } else {
         sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)::bigint FROM groups.verify_sessions vs
             WHERE vs.status = 'pending'
-              AND vs.group_id IN (SELECT group_id FROM groups.tracked_groups WHERE tenant_id = $1)
+              AND vs.group_id IN (SELECT group_id FROM tracked_groups WHERE tenant_id = $1)
             "#,
         )
         .bind(tenant_id)
-        .fetch_one(&state.pool)
+        .fetch_one(state.db()?)
         .await?
     };
 
@@ -485,7 +485,7 @@ pub async fn verify_growth(
             )
             .bind(group_id)
             .bind(days)
-            .fetch_all(&state.pool)
+            .fetch_all(state.db()?)
             .await?
         } else {
             sqlx::query(
@@ -505,7 +505,7 @@ pub async fn verify_growth(
             .bind(group_id)
             .bind(tenant_id)
             .bind(days)
-            .fetch_all(&state.pool)
+            .fetch_all(state.db()?)
             .await?
         }
     } else if tenant_id.is_empty() {
@@ -522,7 +522,7 @@ pub async fn verify_growth(
             "#,
         )
         .bind(days)
-        .fetch_all(&state.pool)
+        .fetch_all(state.db()?)
         .await?
     } else {
         sqlx::query(
@@ -540,7 +540,7 @@ pub async fn verify_growth(
         )
         .bind(tenant_id)
         .bind(days)
-        .fetch_all(&state.pool)
+        .fetch_all(state.db()?)
         .await?
     };
 

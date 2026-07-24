@@ -24,4 +24,4 @@ lazy_static = "1.4"
 cachet = "0.3"
 once_cell = "1.19"
 sqlx = { workspace = true }
-lru = "0.16"
+lru = "0.10"

@@ -17,20 +17,20 @@ struct SupabaseClaims {
 }
 
 pub async fn resolve_scope(state: &AppState, headers: &HeaderMap) -> ApiResult<Scope> {
-    if let Some(scope) = resolve_internal_scope(state, headers)? {
+    if let Some(scope) = resolve_internal_scope(state, headers).await? {
         return Ok(scope);
     }
     resolve_supabase_scope(state, headers).await
 }
 
-fn resolve_internal_scope(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<Scope>> {
+async fn resolve_internal_scope(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<Scope>> {
     if state.config.internal_saas_secret.is_empty() {
         return Ok(None);
     }
     let Some(secret) = header_str(headers, "x-saas-internal-secret") else {
         return Ok(None);
     };
-    // ============== FIXED: 恒定时间比较防止时序攻击 ==============
+    // 恒定时间比较防止时序攻击
     if !constant_time_compare(&secret, &state.config.internal_saas_secret) {
         return Err(ApiError::Unauthorized);
     }
@@ -44,7 +44,31 @@ fn resolve_internal_scope(state: &AppState, headers: &HeaderMap) -> ApiResult<Op
     };
     let user_id = header_str(headers, "x-user-id").and_then(|v| Uuid::parse_str(&v).ok());
     let tenant_id = header_str(headers, "x-tenant-id").filter(|v| !v.is_empty());
-    let merchant_id = header_str(headers, "x-merchant-id").and_then(|v| Uuid::parse_str(&v).ok());
+
+    // Resolve merchant_id — supports 3 formats:
+    // 1. x-merchant-id as UUID (e.g. "550e8400-...")
+    // 2. x-merchant-id as legacy integer (e.g. "42") — Python proxy sends this
+    // 3. x-legacy-merchant-id as integer (e.g. "42") — explicit fallback header
+    let merchant_id = if let Some(mid) = header_str(headers, "x-merchant-id")
+        .and_then(|v| Uuid::parse_str(&v).ok())
+    {
+        // Format 1: UUID
+        Some(mid)
+    } else if let Some(legacy_id_str) = header_str(headers, "x-merchant-id")
+        .or_else(|| header_str(headers, "x-legacy-merchant-id"))
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        // Format 2/3: legacy integer → look up UUID via DB
+        sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM merchants WHERE legacy_merchant_id = $1"
+        )
+        .bind(legacy_id_str)
+        .fetch_optional(state.db()?)
+        .await?
+    } else {
+        None
+    };
+
     if role != Role::PlatformAdmin && (tenant_id.is_none() || merchant_id.is_none()) {
         return Err(ApiError::Forbidden);
     }
@@ -78,7 +102,7 @@ async fn resolve_supabase_scope(state: &AppState, headers: &HeaderMap) -> ApiRes
         "SELECT role FROM saas_user_roles WHERE user_id = $1 AND role = 'platform_admin'",
     )
     .bind(user_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?;
     if platform_role.is_some() {
         return Ok(Scope {
@@ -95,7 +119,7 @@ async fn resolve_supabase_scope(state: &AppState, headers: &HeaderMap) -> ApiRes
         "SELECT tenant_id, merchant_id, role FROM tenant_memberships WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
     )
     .bind(user_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.db()?)
     .await?
     .ok_or(ApiError::Forbidden)?;
 

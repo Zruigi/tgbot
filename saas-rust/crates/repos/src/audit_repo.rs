@@ -12,7 +12,7 @@ pub async fn log_tenant_isolation_event(
     action: &str,
     resource_type: &str,
     resource_id: &str,
-    operator_role: &str,
+    _operator_role: &str,
     request_path: &str,
 ) -> Result<()> {
     let payload = serde_json::json!({

@@ -125,7 +125,7 @@ pub async fn verify_all_counts(
         overall,
     };
 
-    tracing::info!("Verification complete: {}", overall.summary);
+    tracing::info!("Verification complete: {}", report.overall.summary);
 
     Ok(report)
 }
@@ -139,19 +139,17 @@ async fn verify_merchants(
     let source_merchants = sqlite_reader.read_merchants()?;
     let source_count = source_merchants.len() as i64;
 
-    let target_count: i64 = sqlx::query_scalar(
+    let target_count: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::bigint FROM merchants"
     )
     .fetch_one(pg_pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
-    let migrated_count: i64 = sqlx::query_scalar(
+    let migrated_count: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::bigint FROM merchants WHERE legacy_merchant_id IS NOT NULL"
     )
     .fetch_one(pg_pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
     let is_valid = source_count == target_count || migrated_count == source_count;
 
@@ -186,12 +184,11 @@ async fn verify_messages(
     let sqlite_reader = SqliteReader::new(sqlite_config)?;
     let source_count = sqlite_reader.count_messages()?;
 
-    let target_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM chat.messages"
+    let target_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM chat_messages"
     )
     .fetch_one(pg_pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
     // Allow some tolerance for messages (they may have been partially migrated before)
     let is_valid = target_count >= source_count - (source_count / 10); // Allow 10% difference
@@ -228,19 +225,17 @@ async fn verify_groups(
     let source_groups = sqlite_reader.read_groups()?.len() as i64;
     let source_members = sqlite_reader.read_all_group_members()?.len() as i64;
 
-    let target_groups: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM groups.tracked_groups"
+    let target_groups: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM tracked_groups"
     )
     .fetch_one(pg_pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
-    let target_members: i64 = sqlx::query_scalar(
+    let target_members: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::bigint FROM groups.group_members"
     )
     .fetch_one(pg_pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
     let is_valid = source_groups == target_groups && source_members == target_members;
 
@@ -277,33 +272,29 @@ pub async fn quick_verify(
 
     let sqlite_counts = sqlite_reader.get_table_counts()?;
 
-    let merchants: i64 = sqlx::query_scalar(
+    let merchants: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::bigint FROM merchants"
     )
     .fetch_one(pg_pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
-    let messages: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM chat.messages"
+    let messages: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM chat_messages"
     )
     .fetch_one(pg_pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
-    let groups: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM groups.tracked_groups"
+    let groups: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM tracked_groups"
     )
     .fetch_one(pg_pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
-    let group_members: i64 = sqlx::query_scalar(
+    let group_members: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::bigint FROM groups.group_members"
     )
     .fetch_one(pg_pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
     Ok(QuickVerifyResult {
         source_merchants: sqlite_counts.merchants,

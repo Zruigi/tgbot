@@ -1,11 +1,3 @@
-[build]
-# Disable parallel compilation to avoid race conditions
-jobs = 1
-
-[profile.dev]
-opt-level = 0
-debug = false
-
-[profile.release]
-opt-level = "s"
-lto = false
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "link-args=-Wl,--no-insert-timestamp"]
