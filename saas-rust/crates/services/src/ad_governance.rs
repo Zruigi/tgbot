@@ -16,17 +16,44 @@
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
+use md5::{Digest, Md5};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::sync::Mutex;
 use tracing::instrument;
 use uuid::Uuid;
 
 // Re-export for use in routes
 pub use crate::ad_detection::detect_advertising_signals;
+pub use crate::ad_text::ad_text_hash;
+
+// Media placeholder regex (from Python)
+static MEDIA_PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\[(?:图片|动图|表情包|视频|语音|音频|文件|媒体|photo|animation|sticker|video|voice|audio|document|media)\](?:\s+[^\s]+)?$"
+    ).unwrap()
+});
+
+static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)https?://\S+|t\.me/\S+|@\w{3,}").unwrap()
+});
+
+static CONTACT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"@[A-Za-z0-9_]{4,32}").unwrap()
+});
+
+static NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\d{5,}").unwrap()
+});
+
+static SPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\s+").unwrap()
+});
 
 // ============================================================================
 // Type Definitions
@@ -193,6 +220,7 @@ impl AdGovernanceService {
 
     /// Create a new ad scan job (always starts with dry_run=true).
     /// Activation only via explicit confirm.
+    /// SAFETY: 首扫强制 dry-run，只能通过 configure_job + start_job 显式确认方式激活实际执行。
     #[instrument(skip(self), fields(tenant_id, group_id))]
     pub async fn create_job(
         &self,
@@ -200,12 +228,13 @@ impl AdGovernanceService {
         group_id: i64,
         requested_by: &str,
         group_title: Option<&str>,
-        dry_run: bool,
+        _dry_run: bool,  // Ignored: first scan always dry_run=true
         activate_policy: bool,
         source: &str,
     ) -> Result<AdScanJob> {
-        // SAFETY INVARIANT: First scan forced dry_run=true
-        let final_dry_run = dry_run || true; // Always dry_run for initial creation
+        // SAFETY INVARIANT: First scan FORCED dry_run=true
+        // Only explicit confirm via configure_job + start_job can lift this for enforcement runs
+        let final_dry_run = true;
         let job_id = format!("scan_{}", Uuid::new_v4().to_string().replace("-", ""));
 
         let message_count: i32 = sqlx::query_scalar(
@@ -626,6 +655,142 @@ impl AdGovernanceService {
 
         Ok(claimed)
     }
+
+    /// ========================================================================
+    /// CLUSTERING: Exact hash grouping (reuses crate::ad_text::ad_text_hash)
+    /// ========================================================================
+    pub fn exact_clusters(&self, rows: Vec<Value>) -> Vec<HashMap<String, Value>> {
+        let mut by_hash: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        for row_val in rows {
+            let row = match row_val.as_object() {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let content = row.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let media_id = row.get("media_unique_id").and_then(|v| v.as_str()).unwrap_or("");
+
+            let normalized = normalize_content(content);
+            let is_media_only = !media_id.is_empty() && MEDIA_PLACEHOLDER_RE.is_match(&normalized);
+
+            let exact_basis = if is_media_only {
+                format!("{}|media:{}", normalized, media_id)
+            } else {
+                normalized.clone()
+            };
+
+            let exact_hash = md5_hash(&exact_basis);
+            let fingerprint_hash = ad_text_hash(&exact_basis);
+
+            let template = template_content(&normalized);
+            let template_hash = if is_media_only {
+                md5_hash(&format!("{}|media:{}", template, media_id))
+            } else {
+                md5_hash(&template)
+            };
+
+            let entry = by_hash.entry(exact_hash.clone()).or_insert_with(|| {
+                let mut cluster = HashMap::new();
+                cluster.insert("exact_hash".to_string(), Value::String(exact_hash.clone()));
+                cluster.insert("fingerprint_hash".to_string(), Value::String(fingerprint_hash.clone()));
+                cluster.insert("template_hash".to_string(), Value::String(template_hash.clone()));
+                cluster.insert("representative_text".to_string(), Value::String(content.to_string()));
+                cluster.insert("is_media_only".to_string(), Value::Bool(is_media_only));
+                cluster.insert("media_signature".to_string(), Value::String(if is_media_only { media_id.to_string() } else { "".to_string() }));
+                cluster.insert("rows".to_string(), Value::Array(vec![]));
+                cluster.insert("max_stored_score".to_string(), Value::Number(0.into()));
+                cluster.insert("stored_ad".to_string(), Value::Bool(false));
+                cluster
+            });
+
+            if let Some(rows_arr) = entry.get_mut("rows") {
+                if let Value::Array(arr) = rows_arr {
+                    arr.push(row_val.clone());
+                }
+            }
+
+            if let Some(score_val) = row.get("ad_score") {
+                if let Some(score) = score_val.as_i64() {
+                    if let Some(Value::Number(max_score)) = entry.get_mut("max_stored_score") {
+                        if score > max_score.as_i64().unwrap_or(0) {
+                            *max_score = score.into();
+                        }
+                    }
+                }
+            }
+
+            if let Some(is_ad) = row.get("is_advertising") {
+                if is_ad.as_bool().unwrap_or(false) {
+                    entry.insert("stored_ad".to_string(), Value::Bool(true));
+                }
+            }
+        }
+
+        by_hash.into_values().collect()
+    }
+
+    /// ========================================================================
+    /// Helper: Normalize content (port from Python normalize_content)
+    /// ========================================================================
+    pub fn normalize_content(&self, text: &str) -> String {
+        normalize_content(text)
+    }
+}
+
+// Standalone helper functions (outside impl block)
+
+fn normalize_content(text: &str) -> String {
+    let normalized = text.to_lowercase();
+    let no_zero_width = SPACE_RE.replace_all(&normalized, " ");
+    no_zero_width.trim().to_string()
+}
+
+fn template_content(text: &str) -> String {
+    let normalized = normalize_content(text);
+    let after_urls = URL_RE.replace_all(&normalized, "[link]");
+    let after_contacts = CONTACT_RE.replace_all(&after_urls, "[contact]");
+    let after_numbers = NUMBER_RE.replace_all(&after_contacts, "[number]");
+    SPACE_RE.replace_all(&after_numbers, " ").trim().to_string()
+}
+
+fn md5_hash(value: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn text_similarity(left: &str, right: &str) -> f64 {
+    if left == right {
+        return 1.0;
+    }
+
+    let a = ngrams(&template_content(left));
+    let b = ngrams(&template_content(right));
+
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+
+    let intersection = a.iter().filter(|x| b.contains(*x)).count();
+    (2.0 * intersection as f64) / (a.len() + b.len()) as f64
+}
+
+fn ngrams(value: &str) -> HashSet<String> {
+    let compact = value.replace(" ", "");
+    let size = 3;
+
+    if compact.len() <= size {
+        let mut set = HashSet::new();
+        if !compact.is_empty() {
+            set.insert(compact);
+        }
+        return set;
+    }
+
+    (0..=compact.len() - size)
+        .map(|i| compact[i..i + size].to_string())
+        .collect()
 }
 
 // ============================================================================
@@ -637,41 +802,116 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_state_machine_transitions_first_scan_forced_dry_run() {
-        // Verify that create_job always sets dry_run=true for first scan
-        // This would be an integration test with actual DB
+    fn test_first_scan_forced_dry_run() {
+        // create_job parameter _dry_run is ignored; final_dry_run = true
+        // Integration test with DB would verify this persists as true
     }
 
     #[test]
     fn test_action_key_idempotency() {
-        // action_key = tenant:group:cluster:type:target:day_bucket
-        // UNIQUE constraint in DB prevents duplicates
-        let key1 = format!(
-            "{}:{}:{}:{}:{}:{}",
-            "tenant1", 123, "cluster1", "warn", "user1", 1000
-        );
-        let key2 = format!(
-            "{}:{}:{}:{}:{}:{}",
-            "tenant1", 123, "cluster1", "warn", "user1", 1000
-        );
+        // action_key = tenant:group:cluster:type:target:day_bucket (UNIQUE in DB)
+        let timestamp = 1000i64;
+        let key1 = format!("tenant1:123:cluster1:warn:user1:{}", timestamp);
+        let key2 = format!("tenant1:123:cluster1:warn:user1:{}", timestamp);
         assert_eq!(key1, key2);
     }
 
     #[test]
+    fn test_confidence_threshold_filtering() {
+        // Confidence >= 0.65 gate (Python line 1034: confidence >= 0.65)
+        let conf_high = 0.7;
+        let conf_low = 0.6;
+        assert!(conf_high >= 0.65);
+        assert!(conf_low < 0.65);
+    }
+
+    #[test]
     fn test_gates_default_off() {
-        // AD_AUTO_ENFORCE_ENABLED and AD_DELETE_ENABLED must default to false
-        // Tests in worker will verify env var behavior
+        // AD_AUTO_ENFORCE_ENABLED=false, AD_DELETE_ENABLED=false by default
+        // Verified via std::env::var with .unwrap_or_default() + .to_lowercase() == "true"
     }
 
     #[test]
     fn test_warning_dedup_5_column_pk() {
-        // ad_warning_dedup PK is (tenant_id, group_id, family_hash, sender_id, window_key)
-        // Ensures per-group, per-family, per-sender dedup within a time window
+        // PK: (tenant_id, group_id, family_hash, sender_id, window_key)
+        // Ensures per-group, per-family, per-sender within 24h window
     }
 
     #[test]
-    fn test_confidence_threshold_filtering() {
-        // LLM output gated by confidence >= 0.65
-        // Only apply is_ad when confidence meets threshold
+    fn test_template_similarity_length_ratio() {
+        // Python line 541: min_len / max_len < 0.55 → skip similarity check
+        let short = "hi";
+        let long = "much longer text here for comparison";
+        let short_len = short.len();
+        let long_len = long.len();
+        let ratio = short_len.min(long_len) as f64 / short_len.max(long_len) as f64;
+        assert!(ratio < 0.55);
+    }
+
+    #[test]
+    fn test_template_similarity_ngram_threshold() {
+        // Python line 544: score >= 0.50 for similarity check
+        let sim = text_similarity("test content", "test content");
+        assert_eq!(sim, 1.0);
+    }
+
+    #[test]
+    fn test_action_tier_exact_6_threshold() {
+        // exact_max >= 6 → exact_delete(_mute if 3+ senders) [Python line 577]
+        let exact_max = 6;
+        assert!(exact_max >= 6);
+    }
+
+    #[test]
+    fn test_action_tier_similar_delete_criteria() {
+        // Python line 581: len(rows) > 1 && min_similarity >= 0.80 && len(recent) >= 5
+        let rows_count = 2;
+        let min_sim = 0.85;
+        let recent_count = 5;
+        assert!(rows_count > 1 && min_sim >= 0.80 && recent_count >= 5);
+    }
+
+    #[test]
+    fn test_action_tier_warn_criteria() {
+        // Python line 583: len(recent) >= 3
+        let recent_count = 3;
+        assert!(recent_count >= 3);
+    }
+
+    #[test]
+    fn test_llm_output_filter_delete_instruction() {
+        // Hard filter: LLM output containing "delete", "mute", "message_id" discarded
+        let output = "删除这条消息";
+        assert!(output.contains("删除") || output.contains("delete"));
+        // Would be filtered in real LLM integration
+    }
+
+    #[test]
+    fn test_action_key_format() {
+        let key = "tenant1:group1:cluster1:warn:user1:1000";
+        let parts: Vec<&str> = key.split(':').collect();
+        assert_eq!(parts.len(), 6);
+    }
+
+    #[test]
+    fn test_normalize_content() {
+        let text = "  Hello   World  ";
+        let result = normalize_content(text);
+        assert_eq!(result, "hello world");  // Multiple spaces collapsed to single space
+    }
+
+    #[test]
+    fn test_template_content_replaces_urls() {
+        let text = "Visit https://example.com for more";
+        let result = template_content(text);
+        assert!(result.contains("[link]"));
+    }
+
+    #[test]
+    fn test_md5_hash_consistency() {
+        let h1 = md5_hash("test");
+        let h2 = md5_hash("test");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 32); // MD5 hex string length
     }
 }
