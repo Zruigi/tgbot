@@ -570,9 +570,11 @@ impl AIAgent {
         match self.llm_caller.call(messages, model, tools).await {
             Ok(mut result) => {
                 // 尝试从返回文本中解析 function calling（显式标记模式）
+                // 2.2d: 先 trim 再检查前缀（容忍前导/尾随空白，deb8eaf）
                 let mut tool_calls: Vec<ToolCall> = Vec::new();
-                if result.text.starts_with("__TOOL_CALL__") {
-                    let json_str = &result.text["__TOOL_CALL__".len()..];
+                let stripped_text = result.text.trim();
+                if stripped_text.starts_with("__TOOL_CALL__") {
+                    let json_str = &stripped_text["__TOOL_CALL__".len()..];
                     match serde_json::from_str::<Value>(json_str) {
                         Ok(parsed) => {
                             if let Some(arr) = parsed.as_array() {
@@ -685,6 +687,23 @@ impl AIAgent {
                     "垃圾信息检测",
                     "是否广告",
                     "鉴别广告",
+                    "这条是不是广告",
+                    "这段是不是广告",
+                    "鉴别这条",
+                    "检测这条消息",
+                ],
+            );
+            m.insert(
+                "telegram_sdk_query",
+                vec![
+                    "机器人权限",
+                    "bot权限",
+                    "删除权限",
+                    "群权限",
+                    "频道权限",
+                    "机器人能不能删除",
+                    "为什么删除失败",
+                    "telegram sdk",
                 ],
             );
             m.insert(
@@ -780,8 +799,18 @@ impl AIAgent {
             }
         }
 
-        match best_match {
-            Some(_) if best_score >= 8 => best_match,
+        // 白名单工具 >= 8 即匹配,其他工具需 >= 16（deb8eaf 确定性路由）
+        const WHITELIST: &[&str] = &[
+            "finance_query",
+            "system_query",
+            "telegram_sdk_query",
+            "detect_advertising",
+            "query_ad_clusters",
+            "query_recent_ad_messages",
+        ];
+        match &best_match {
+            Some(name) if WHITELIST.contains(&name.as_str()) && best_score >= 8 => best_match,
+            Some(_) if best_score >= 16 => best_match,
             _ => None,
         }
     }
@@ -813,7 +842,9 @@ impl AIAgent {
                 serde_json::json!({"content": content, "target_type": "users"})
             }
             "finance_query" => {
-                if text.contains("未核销") || text.contains("待核销") {
+                if text.contains("摘要") {
+                    serde_json::json!({"action": "summary"})
+                } else if text.contains("未核销") || text.contains("待核销") {
                     serde_json::json!({"action": "unreconciled"})
                 } else if text.contains("科目") || text.contains("分类") {
                     serde_json::json!({"action": "categories"})
@@ -828,6 +859,28 @@ impl AIAgent {
             }
             "detect_advertising" => {
                 serde_json::json!({"text": text, "context_type": "private_message"})
+            }
+            "telegram_sdk_query" => {
+                // 4c3f1dc: 数字 group_id 优先于群名解析
+                if let Ok(re) = regex::Regex::new(r"(?i)(?:group_id|chat_id|群|群组)\s*[:：=]?\s*(-?\d{5,})") {
+                    if let Some(caps) = re.captures(text) {
+                        if let Some(id_str) = caps.get(1) {
+                            if let Ok(chat_id) = id_str.as_str().parse::<i64>() {
+                                return serde_json::json!({
+                                    "operation": "chat_capabilities",
+                                    "chat_id": chat_id,
+                                    "include_admins": false,
+                                });
+                            }
+                        }
+                    }
+                }
+                // 42bafb0: bound_chats SDK 验证 limit 50
+                serde_json::json!({
+                    "operation": "bound_chat_capabilities",
+                    "limit": 50,
+                    "include_admins": false,
+                })
             }
             "generate_content" => {
                 serde_json::json!({
@@ -1512,5 +1565,70 @@ mod tests {
         let registry = default_tool_registry();
         assert!(registry.get("detect_advertising").is_some());
         assert!(registry.get("generate_content").is_some());
+    }
+
+    // === 2.2d 确定性路由测试 ===
+
+    #[test]
+    fn test_tool_call_trim_leading_whitespace() {
+        // __TOOL_CALL__ 前导空白应被容忍（deb8eaf）
+        let input = "  \n__TOOL_CALL__[{\"name\":\"system_query\",\"arguments\":{}}]";
+        let stripped = input.trim();
+        assert!(stripped.starts_with("__TOOL_CALL__"));
+        let json_str = &stripped["__TOOL_CALL__".len()..];
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(json_str);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_whitelist_threshold_finance_at_8() {
+        let llm = Arc::new(MockLlmCaller);
+        let tools = Arc::new(default_tool_registry());
+        let agent = AIAgent::new(llm, tools);
+        let tool_schemas: Vec<serde_json::Value> = agent.tools.schemas_for_llm();
+        // "查财务" 命中一个关键词 = score 8, 白名单工具应匹配
+        let result = agent.match_tool_from_text("查财务", &tool_schemas);
+        assert_eq!(result, Some("finance_query".to_string()));
+    }
+
+    #[test]
+    fn test_whitelist_threshold_non_whitelist_needs_16() {
+        let llm = Arc::new(MockLlmCaller);
+        let tools = Arc::new(default_tool_registry());
+        let agent = AIAgent::new(llm, tools);
+        let tool_schemas: Vec<serde_json::Value> = agent.tools.schemas_for_llm();
+        // "群发消息" 命中 broadcast_message 一个关键词 = score 8, 非白名单需 >= 16 → 不匹配
+        let result = agent.match_tool_from_text("群发消息", &tool_schemas);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_finance_summary_priority() {
+        let llm = Arc::new(MockLlmCaller);
+        let tools = Arc::new(default_tool_registry());
+        let agent = AIAgent::new(llm, tools);
+        // "摘要" 应优先于 "未核销"
+        let args = agent.build_fallback_args("finance_query", "财务摘要和未核销");
+        assert_eq!(args["action"], "summary");
+    }
+
+    #[test]
+    fn test_telegram_sdk_fallback_with_group_id() {
+        let llm = Arc::new(MockLlmCaller);
+        let tools = Arc::new(default_tool_registry());
+        let agent = AIAgent::new(llm, tools);
+        let args = agent.build_fallback_args("telegram_sdk_query", "查看群 -1002222222222 的权限");
+        assert_eq!(args["operation"], "chat_capabilities");
+        assert_eq!(args["chat_id"], -1002222222222i64);
+    }
+
+    #[test]
+    fn test_telegram_sdk_fallback_bound_chats_limit_50() {
+        let llm = Arc::new(MockLlmCaller);
+        let tools = Arc::new(default_tool_registry());
+        let agent = AIAgent::new(llm, tools);
+        let args = agent.build_fallback_args("telegram_sdk_query", "查看机器人权限");
+        assert_eq!(args["operation"], "bound_chat_capabilities");
+        assert_eq!(args["limit"], 50);
     }
 }
