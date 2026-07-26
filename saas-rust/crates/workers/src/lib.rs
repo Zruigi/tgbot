@@ -56,6 +56,7 @@ pub mod telegram_auto_reply_worker;
 pub mod telegram_command_worker;
 
 // Re-export commonly used types
+pub use ad_governance_worker::AdGovernanceWorker;
 pub use ai_worker::{AiWorker, AnalysisType};
 pub use channel_reminder_worker::{
     cleanup_expired_channel_reminders, ChannelReminderCleanupSummary,

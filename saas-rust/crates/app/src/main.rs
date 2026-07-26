@@ -16,7 +16,7 @@ use tgbot_integrations::supabase_rest::SupabaseRestClient;
 use tgbot_integrations::telegram::{TelegramClient, TelegramConfig};
 use tgbot_repos::user_repo;
 use tgbot_workers::{
-    Dispatcher as WorkerDispatcher, GroupMessagePolicyWorker, PushTaskWorker, Scheduler,
+    AdGovernanceWorker, Dispatcher as WorkerDispatcher, GroupMessagePolicyWorker, PushTaskWorker, Scheduler,
     SchedulerConfig, TelegramAutoReplyWorker, TelegramClientResolver, TelegramCommandWorker,
     Worker, WorkerHandle,
 };
@@ -120,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(PushTaskWorker::new(resolver.clone(), Arc::new(llm.clone())))
                 as Arc<dyn Worker>,
             Arc::new(GroupMessagePolicyWorker::new()) as Arc<dyn Worker>,
+            Arc::new(AdGovernanceWorker::new(resolver.clone(), Arc::new(llm.clone())))
+                as Arc<dyn Worker>,
         ];
         if config.telegram_commands_enabled {
             workers.push(Arc::new(TelegramCommandWorker::new(resolver.clone())) as Arc<dyn Worker>);
@@ -135,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
             Scheduler::new(pg.clone(), scheduler_config, WorkerDispatcher::new(workers))
                 .with_job_type_filter("push_task")
                 .with_job_type_filter("group_message_policy")
+                .with_job_type_filter("ad_scan_job")
                 .with_push_task_cron();
         if config.telegram_commands_enabled {
             scheduler = scheduler.with_job_type_filter("telegram_command_reply");
