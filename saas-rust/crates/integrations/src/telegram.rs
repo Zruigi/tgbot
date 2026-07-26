@@ -351,6 +351,29 @@ impl TelegramClient {
             .await
     }
 
+    pub async fn get_chat_administrators(&self, chat_id: i64) -> Result<Vec<Value>> {
+        self.request("getChatAdministrators", json!({ "chat_id": chat_id }))
+            .await
+    }
+
+    /// Forward a message to another chat (used e.g. for message-existence probes).
+    pub async fn forward_message(
+        &self,
+        chat_id: i64,
+        from_chat_id: i64,
+        message_id: i64,
+    ) -> Result<Message> {
+        self.request(
+            "forwardMessage",
+            json!({
+                "chat_id": chat_id,
+                "from_chat_id": from_chat_id,
+                "message_id": message_id,
+            }),
+        )
+        .await
+    }
+
     pub async fn ban_chat_member(&self, chat_id: i64, user_id: i64) -> Result<bool> {
         self.request(
             "banChatMember",

@@ -14,6 +14,9 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = "1"
+# 广告文本归一化哈希 — 必须与 Python services/ad_text.py 的 MD5 位级一致
+md-5 = "0.10"
+hex = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }

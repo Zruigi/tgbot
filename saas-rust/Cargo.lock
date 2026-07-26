@@ -3448,6 +3448,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "hex",
+ "md-5",
  "regex",
  "serde",
  "serde_json",
