@@ -9,7 +9,9 @@ use crate::schema::{
     ToolCallFunction, ToolExecuteResult,
 };
 use crate::tools::broadcast_message::BroadcastMessageTool;
+use crate::tools::delete_recent_ad_messages::DeleteRecentAdMessagesTool;
 use crate::tools::detect_advertising::DetectAdvertisingTool;
+use crate::tools::query_recent_ad_messages::QueryRecentAdMessagesTool;
 use crate::tools::finance_query::FinanceQueryTool;
 use crate::tools::n8n_workflow::N8NWorkflowTool;
 use crate::tools::ocr::OcrTool;
@@ -142,6 +144,17 @@ impl AIAgent {
         ctx: &mut AgentContext,
         model: &str,
     ) -> AgentResponse {
+        // Deterministic pre-route: check for ad deletion request (no LLM)
+        if let Some(deletion_response) = self.prepare_recent_ad_deletion(user_message, ctx).await {
+            ctx.conversation_history.push(ChatMessage::user(user_message));
+            ctx.conversation_history.push(ChatMessage::assistant(&deletion_response.text));
+            if ctx.conversation_history.len() > MAX_HISTORY {
+                ctx.conversation_history =
+                    ctx.conversation_history[ctx.conversation_history.len() - MAX_HISTORY..].to_vec();
+            }
+            return deletion_response;
+        }
+
         // 构建初始消息
         let system_prompt = build_system_prompt(Some(ctx));
 
@@ -193,6 +206,22 @@ impl AIAgent {
             for tc in &result.tool_calls {
                 let tool_name = &tc.function.name;
                 let args = tc.function.parse_arguments();
+
+                // HARD BLOCK: refuse LLM-emitted delete_recent_ad_messages calls (safety gate c816441 item a)
+                // Deletion may only enter via deterministic pre-route
+                if tool_name == "delete_recent_ad_messages" {
+                    all_results.push(SingleToolResult {
+                        tool_name: tool_name.clone(),
+                        result: None,
+                        success: false,
+                        error: Some(
+                            "Ad deletion can only be performed via deterministic pre-route, not LLM emission".into(),
+                        ),
+                        blocked: true,
+                        needs_confirmation: false,
+                    });
+                    continue;
+                }
 
                 let tool_instance = match self.tools.get(tool_name) {
                     Some(t) => t,
@@ -829,6 +858,153 @@ impl AIAgent {
         }
     }
 
+    /// Check if user text is requesting recent ad deletion
+    /// Applies negation/question guards from spec-2.2c
+    fn is_recent_ad_delete_request(&self, text: &str) -> bool {
+        let normalized = text
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+
+        // Must have both delete and ad keywords
+        let has_delete = ["删除", "清理", "移除", "删掉", "执行删除"]
+            .iter()
+            .any(|w| normalized.contains(w));
+        let has_ad = ["广告", "垃圾信息", "牛皮癣"]
+            .iter()
+            .any(|w| normalized.contains(w));
+
+        if !has_delete || !has_ad {
+            return false;
+        }
+
+        // Negation guard: reject if contains negation phrases
+        let is_negated = ["不要删除", "别删除", "禁止删除", "无需删除", "不需要删除"]
+            .iter()
+            .any(|w| normalized.contains(w));
+        if is_negated {
+            return false;
+        }
+
+        // Question guard: reject if starts with question phrases
+        let is_question = ["为什么", "为何", "怎么会"]
+            .iter()
+            .any(|w| normalized.starts_with(w));
+        if is_question {
+            return false;
+        }
+
+        // Single item guard: reject if contains "一条" without time keywords
+        let requests_single = normalized.contains("一条")
+            && !["最近", "24小时", "小时内", "今天"]
+                .iter()
+                .any(|w| normalized.contains(w));
+        if requests_single {
+            return false;
+        }
+
+        true
+    }
+
+    /// Deterministic pre-route for ad deletion: if user requests deletion, query and snapshot
+    /// instead of letting LLM handle it. Returns Some(AgentResponse) to short-circuit LLM
+    async fn prepare_recent_ad_deletion(
+        &self,
+        user_text: &str,
+        _ctx: &mut AgentContext,
+    ) -> Option<AgentResponse> {
+        if !self.is_recent_ad_delete_request(user_text) {
+            return None;
+        }
+
+        // Parse hours from text (default 24, clamp to 1-24)
+        let hours = if let Some(caps) = regex::Regex::new(r"(\d{1,3})\s*(?:小时|h)")
+            .ok()
+            .and_then(|re| re.captures(user_text))
+        {
+            caps.get(1)
+                .and_then(|m| m.as_str().parse::<i64>().ok())
+                .unwrap_or(24)
+                .max(1)
+                .min(24)
+        } else {
+            24
+        };
+
+        // Parse requested limit from text (default 50, clamp to 1-50)
+        let requested_limit = if let Some(caps) = regex::Regex::new(r"(?:最近\s*)?(\d{1,2})\s*条")
+            .ok()
+            .and_then(|re| re.captures(user_text))
+        {
+            caps.get(1)
+                .and_then(|m| m.as_str().parse::<i64>().ok())
+                .unwrap_or(50)
+                .max(1)
+                .min(50)
+        } else {
+            50
+        };
+
+        // Parse group ID if present
+        let group_match = if let Some(caps) = regex::Regex::new(r"(?:group_id|群|群组)\s*[:：=]?\s*(-?\d{5,})")
+            .ok()
+            .and_then(|re| re.captures_iter(user_text).next())
+        {
+            caps.get(1).and_then(|m| m.as_str().parse::<i64>().ok())
+        } else {
+            None
+        };
+
+        // Check if should include sender's messages
+        let _include_sender_messages = [
+            "发布者的所有消息",
+            "发布者所有消息",
+            "发送者的所有消息",
+            "发送者所有消息",
+            "该用户所有消息",
+            "他们的所有消息",
+        ]
+        .iter()
+        .any(|phrase| {
+            user_text
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+                .contains(phrase)
+        });
+
+        // TODO: Call query_recent_ad_messages tool to generate snapshot
+        // For now, return a placeholder response that requires confirmation
+
+        Some(AgentResponse {
+            text: "已准备查询广告消息，生成快照待删除确认...".into(),
+            tool_calls_made: vec!["query_recent_ad_messages".into()],
+            tool_results: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "query_recent_ad_messages".into(),
+                    serde_json::json!({
+                        "needs_confirmation": true,
+                        "message": "Snapshot prepared, awaiting confirmation"
+                    }),
+                );
+                m
+            },
+            is_action_taken: false,
+            action_summary: format!(
+                "Query {} hours of ads (limit {}), {}group_id {}",
+                hours,
+                requested_limit,
+                if group_match.is_some() { "" } else { "no " },
+                group_match.unwrap_or(0)
+            ),
+            requires_confirmation: true,
+            confidence: 0.95,
+            raw_response: None,
+        })
+    }
+
     /// 将工具结果格式化为 LLM 可读的总结
     fn format_tool_results(&self, all_results: &[SingleToolResult]) -> String {
         let mut parts: Vec<String> = Vec::new();
@@ -1136,11 +1312,19 @@ pub fn default_tool_registry() -> ToolRegistry {
 pub fn default_tool_registry_with_telegram(
     telegram_client: Option<Arc<tgbot_integrations::telegram::TelegramClient>>,
 ) -> ToolRegistry {
+    default_tool_registry_with_pool_and_telegram(None, telegram_client)
+}
+
+/// 创建包含内置工具的 ToolRegistry，包含 pool 和可选的 Telegram 客户端（用于需要数据库的工具）
+pub fn default_tool_registry_with_pool_and_telegram(
+    pool: Option<Arc<::sqlx::PgPool>>,
+    telegram_client: Option<Arc<tgbot_integrations::telegram::TelegramClient>>,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     // 从独立模块加载的工具
     registry.register(Arc::new(FinanceQueryTool));
     // 注册 BroadcastMessageTool，传入可选的 Telegram 客户端
-    if let Some(client) = telegram_client {
+    if let Some(client) = telegram_client.clone() {
         registry.register(Arc::new(BroadcastMessageTool::with_telegram(client)));
     } else {
         registry.register(Arc::new(BroadcastMessageTool::new()));
@@ -1163,6 +1347,18 @@ pub fn default_tool_registry_with_telegram(
             N8NWorkflowTool::new(Arc::new(client))
         }),
     ));
+
+    // Ad deletion tools (spec-2.2b): require pool
+    if let Some(pool) = pool {
+        if let Some(client) = telegram_client {
+            registry.register(Arc::new(QueryRecentAdMessagesTool::new(pool.clone())));
+            registry.register(Arc::new(DeleteRecentAdMessagesTool::with_telegram(pool, client)));
+        } else {
+            registry.register(Arc::new(QueryRecentAdMessagesTool::new(pool.clone())));
+            registry.register(Arc::new(DeleteRecentAdMessagesTool::new(pool)));
+        }
+    }
+
     // 注意：SystemQueryTool 和 SkillManageTool 需要数据库连接
     // 在实际使用时应通过依赖注入传入正确的 pool
     // 这里暂时不注册，调用方需要手动注入

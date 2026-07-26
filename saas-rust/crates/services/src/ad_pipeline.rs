@@ -200,6 +200,7 @@ pub async fn fetch_recent_group_messages(
         WHERE COALESCE(content, '') != ''
           AND COALESCE(sender_type, 'user') IN ('user', 'channel', 'bot')
           AND COALESCE(message_ts::bigint, EXTRACT(EPOCH FROM timestamp)::bigint) >= $1
+          AND NOT COALESCE(is_deleted, false)
           AND ($2::bigint IS NULL OR group_id = $2)
           AND ($3::text IS NULL OR tenant_id = $3)
         ORDER BY COALESCE(message_ts::bigint, EXTRACT(EPOCH FROM timestamp)::bigint) DESC, id DESC

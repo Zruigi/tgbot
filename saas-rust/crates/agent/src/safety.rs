@@ -20,6 +20,8 @@ const DANGEROUS_ACTIONS: &[&str] = &[
     "reconcile_ledger",
     "skill_manage",
     "ban_user",
+    "query_recent_ad_messages",
+    "delete_recent_ad_messages",
 ];
 
 // ---------------------------------------------------------------------------

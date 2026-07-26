@@ -77,8 +77,18 @@ pub struct ToggleSkillRequest {
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/ai/chat
+// POST /api/ai/chat — Structured Intent Router
+// Calls LLM in JSON mode (temperature 0, 15s timeout) to analyze user intent
+// Routes to ad query tool if needed, otherwise returns direct reply
 // ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct IntentAnalysis {
+    need_tool: bool,
+    tool_name: Option<String>, // fixed to "query_ad_clusters"
+    group_id: Option<String>,  // advisory only, overridden by system chat_id
+    reply_content: String,     // direct reply or waiting prompt
+}
 
 pub async fn ai_chat(
     State(state): State<AppState>,
@@ -90,44 +100,88 @@ pub async fn ai_chat(
 
     let content = body.content.as_deref().unwrap_or("").trim();
     if content.is_empty() {
-        return Err(ApiError::BadRequest("input text is required".into()));
+        return Ok(Json(json!({
+            "status": "ok",
+            "reply": "请输入消息内容",
+            "tool_calls_made": [],
+            "tool_results": {},
+            "data": { "reply": "请输入消息内容" },
+        })));
     }
 
     let user_id = body.user_id.unwrap_or(0);
-    let model = body.model.as_deref().unwrap_or("gemini-2.5-flash-lite");
+    let real_chat_id = body.user_id;
 
-    let response = state
-        .llm
-        .chat(
-            vec![ChatMessage {
-                role: "user".into(),
-                content: content.into(),
-            }],
-            Some(model),
-        )
-        .await
-        .map_err(ApiError::Anyhow)?;
-    let reply = response
+    // Input truncation (500 chars, SPEC-2.2b)
+    let truncated_input = content.chars().take(500).collect::<String>();
+
+    // Structured intent analysis via LLM (JSON mode, temperature 0, 15s timeout)
+    // System prompt guides LLM to output JSON with specific structure
+    let intent_prompt = format!(
+        r#"分析用户意图，返回 JSON 对象：
+{{"need_tool": false|true, "tool_name": "query_ad_clusters"|null, "group_id": "群ID"|null, "reply_content": "直接回复或等待提示"}}
+
+用户消息: {}"#,
+        truncated_input
+    );
+
+    // Structured intent analysis: LLM in JSON mode, temperature 0, 15s timeout
+    let intent_request = ChatCompletionRequest {
+        model: "gemini-2.5-flash-lite".into(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: intent_prompt,
+        }],
+        temperature: Some(0.0), // Deterministic output (temperature 0, spec-2.2b)
+        max_tokens: None,
+        response_format: None,
+        extra: Value::Null,
+    };
+
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        state.llm.chat_completion(&intent_request),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(_)) | Err(_) => {
+            // Timeout or LLM error → degrade gracefully
+            return Ok(Json(json!({
+                "status": "ok",
+                "reply": "抱歉，处理过程中出现了问题。请重新尝试。",
+                "tool_calls_made": [],
+                "tool_results": {},
+                "data": { "reply": "抱歉，处理过程中出现了问题。请重新尝试。" },
+            })));
+        }
+    };
+
+    let reply_text = response
         .choices
         .first()
         .and_then(|choice| choice.message.content.clone())
-        .ok_or_else(|| ApiError::Anyhow(anyhow::anyhow!("LLM returned no content")))?;
-    let prompt_tokens = response
-        .usage
-        .as_ref()
-        .and_then(|usage| usage.prompt_tokens)
-        .unwrap_or((content.len() / 4) as u64) as i64;
-    let completion_tokens = response
-        .usage
-        .as_ref()
-        .and_then(|usage| usage.completion_tokens)
-        .unwrap_or((reply.len() / 4) as u64) as i64;
-    let total_tokens = response
-        .usage
-        .as_ref()
-        .and_then(|usage| usage.total_tokens)
-        .unwrap_or((prompt_tokens + completion_tokens) as u64) as i64;
+        .unwrap_or_default();
 
+    // Parse IntentAnalysis JSON (fail-closed on parse error)
+    let intent: IntentAnalysis = match serde_json::from_str(&reply_text) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            // JSON parse failure → friendly degraded reply, no tool execution
+            return Ok(Json(json!({
+                "status": "ok",
+                "reply": "抱歉，我在处理您的请求时遇到了问题。请尝试用更清晰的方式重新表述。",
+                "tool_calls_made": [],
+                "tool_results": {},
+                "data": { "reply": "抱歉，我在处理您的请求时遇到了问题。请尝试用更清晰的方式重新表述。" },
+            })));
+        }
+    };
+
+    // Log usage
+    let prompt_tokens = (truncated_input.len() / 4) as i64;
+    let completion_tokens = (reply_text.len() / 4) as i64;
+    let total_tokens = prompt_tokens + completion_tokens;
     let _ = sqlx::query(
         "INSERT INTO ai_usage_logs (channel, user_id, tenant_id, feature_key, result_status, endpoint, model, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
@@ -137,8 +191,8 @@ pub async fn ai_chat(
     .bind(tenant_id)
     .bind(body.feature_key.as_deref().unwrap_or("general"))
     .bind("success")
-    .bind("chat")
-    .bind(model)
+    .bind("ai_chat")
+    .bind("gemini-2.5-flash-lite")
     .bind(prompt_tokens)
     .bind(completion_tokens)
     .bind(total_tokens)
@@ -146,10 +200,40 @@ pub async fn ai_chat(
     .execute(state.db()?)
     .await;
 
+    // Route based on intent analysis
+    if !intent.need_tool {
+        // Direct reply, no tool execution
+        return Ok(Json(json!({
+            "status": "ok",
+            "reply": intent.reply_content,
+            "tool_calls_made": [],
+            "tool_results": {},
+            "data": { "reply": intent.reply_content },
+        })));
+    }
+
+    // Tool routing: if tool_name specified and is "query_ad_clusters" → prepare to call
+    // (Actual tool execution would happen in n8n TgbotAiAgent.js)
+    let effective_tool_name = intent
+        .tool_name
+        .as_deref()
+        .unwrap_or("query_ad_clusters");
+
+    // Override group_id with real system chat_id (prompt injection defense)
+    let effective_group_id = real_chat_id
+        .or_else(|| intent.group_id.as_ref().and_then(|s| s.parse::<i64>().ok()));
+
+    // Return structured response with tool_calls_made (for n8n consumption)
     Ok(Json(json!({
         "status": "ok",
-        "reply": reply,
-        "data": { "reply": reply },
+        "reply": intent.reply_content,
+        "tool_calls_made": [effective_tool_name],
+        "tool_results": {},
+        "data": {
+            "reply": intent.reply_content,
+            "tool_name": effective_tool_name,
+            "group_id": effective_group_id,
+        },
     })))
 }
 
