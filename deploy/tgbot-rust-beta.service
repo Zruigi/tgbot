@@ -1,0 +1,18 @@
+[Unit]
+Description=tgbot Rust Beta Backend
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tgbot-rust-beta/saas-rust
+EnvironmentFile=/home/ubuntu/tgbot-rust-beta/saas-rust/.env.production
+ExecStart=/home/ubuntu/tgbot-rust-beta/saas-rust/target/release/tgbot-app
+Restart=always
+RestartSec=10
+Nice=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
