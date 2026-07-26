@@ -488,9 +488,22 @@ impl AIAgent {
             }
         }
 
-        let result_text = if has_failure {
+        // Build result text based on execution status
+        // Behavior 1: Only return THIS execution's result, never re-append old confirmation prompt
+        let result_text = if has_failure && action_taken {
+            // Partial execution: some actions succeeded but some failed
             format!(
-                "⚠️ 操作执行完成，但有部分失败:\n{}",
+                "操作已部分执行，但有失败项：\n{}",
+                failure_messages
+                    .iter()
+                    .map(|msg| format!("- {}", msg))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        } else if has_failure {
+            // All failed: no actions executed
+            format!(
+                "操作未执行：\n{}",
                 failure_messages
                     .iter()
                     .map(|msg| format!("- {}", msg))
@@ -498,13 +511,36 @@ impl AIAgent {
                     .join("\n")
             )
         } else {
-            "✅ 操作已执行完毕。".into()
+            // All succeeded
+            let mut text = "操作已执行完毕。".to_string();
+
+            // Append individual tool result messages if any
+            let result_messages: Vec<String> = executed_results
+                .values()
+                .filter_map(|result| {
+                    result
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .collect();
+
+            if !result_messages.is_empty() {
+                text.push('\n');
+                for msg in result_messages {
+                    text.push_str(&format!("- {}\n", msg));
+                }
+                text.pop(); // Remove trailing newline
+            }
+
+            text
         };
 
         let confidence = if has_failure { 0.7 } else { 1.0 };
 
         AgentResponse {
-            text: format!("{}\n{}", result_text, pending_response.text),
+            text: result_text,  // ← 关键：仅返回执行结果，不拼接 pending_response.text
             tool_calls_made: pending_response.tool_calls_made.clone(),
             tool_results: executed_results,
             is_action_taken: action_taken,

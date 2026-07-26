@@ -3280,6 +3280,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "lazy_static",
  "regex",
  "reqwest",
  "serde",
