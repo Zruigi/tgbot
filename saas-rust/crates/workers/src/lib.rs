@@ -41,6 +41,7 @@
 //! let handle = scheduler.start();
 //! ```
 
+pub mod ad_governance_worker;
 pub mod ai_worker;
 pub mod channel_reminder_worker;
 pub mod group_message_policy_worker;

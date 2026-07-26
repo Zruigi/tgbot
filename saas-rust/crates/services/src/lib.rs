@@ -1,4 +1,7 @@
 pub mod ad_detection;
+pub mod ad_governance;
+pub mod ad_pipeline;
+pub mod ad_text;
 pub mod audit_service;
 pub mod auth_service;
 pub mod broadcast_service;

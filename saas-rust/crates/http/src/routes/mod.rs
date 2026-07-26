@@ -1,3 +1,4 @@
+pub mod ad_scan;
 pub mod agent_tools;
 pub mod ai;
 pub mod auth;
@@ -453,6 +454,21 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/agent/tools/delete-ad-cluster",
             post(agent_tools::tool_delete_ad_cluster),
+        )
+        // Ad governance scan routes
+        .route("/api/agent/ad-scan/groups", get(ad_scan::list_ad_scan_groups))
+        .route("/api/agent/ad-scans", post(ad_scan::create_ad_scan))
+        .route(
+            "/api/agent/ad-scans/:job_id",
+            get(ad_scan::get_ad_scan),
+        )
+        .route(
+            "/api/agent/ad-scans/:job_id/clusters",
+            get(ad_scan::get_ad_scan_clusters),
+        )
+        .route(
+            "/api/agent/ad-scans/:job_id/confirm",
+            post(ad_scan::confirm_ad_scan),
         )
         // n8n advertisement compatibility
         .route("/api/advertisements", get(ai::list_advertisements))
