@@ -10,6 +10,7 @@ use tgbot_migration::{
     migrate_groups::migrate_groups,
     migrate_group_messages::migrate_group_messages,
     migrate_users::migrate_users,
+    migrate_small_tables::migrate_small_tables,
     verify_counts::verify_all_counts,
 };
 
@@ -24,16 +25,24 @@ async fn main() -> Result<()> {
     let sqlite_path = env::var("SQLITE_DB_PATH")
         .unwrap_or_else(|_| "/home/ubuntu/tgbot-rust-beta/../tgbot/crypto_bot.sqlite3".to_string());
 
-    let pg_url = env::var("DATABASE_URL")
-        .context("DATABASE_URL environment variable not set")?;
+    // Use MIGRATOR_DATABASE_URL (with BYPASSRLS) if available, otherwise fall back to DATABASE_URL
+    let pg_url = env::var("MIGRATOR_DATABASE_URL")
+        .or_else(|_| env::var("DATABASE_URL"))
+        .context("Neither MIGRATOR_DATABASE_URL nor DATABASE_URL environment variable set")?;
+
+    let is_migrator_role = env::var("MIGRATOR_DATABASE_URL").is_ok();
 
     // Create SQLite config
     let sqlite_config = SqliteConfig::new(&sqlite_path);
 
     tracing::info!("SQLite database: {}", sqlite_path);
-    tracing::info!("PostgreSQL connection: configured");
+    if is_migrator_role {
+        tracing::info!("PostgreSQL connection: using MIGRATOR_DATABASE_URL (BYPASSRLS role)");
+    } else {
+        tracing::info!("PostgreSQL connection: using DATABASE_URL (RLS-subject role)");
+    }
 
-    // Create PostgreSQL connection pool
+    // Create PostgreSQL connection pool with higher timeout for large migrations
     let pg_pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&pg_url)
@@ -89,6 +98,18 @@ async fn main() -> Result<()> {
     tracing::info!("Admin Inbox: {} migrated, {} skipped, {} errors, {} virtual_assistant_excluded",
         user_stats.admin_inbox.migrated, user_stats.admin_inbox.skipped,
         user_stats.admin_inbox.errors, user_stats.admin_inbox.virtual_assistant_excluded);
+
+    // 6. Migrate small tables (plans, address_monitors, monitor_transactions)
+    tracing::info!("\n=== Phase 6: Small Tables ===");
+    let small_stats = migrate_small_tables(&sqlite_config, &pg_pool)
+        .await
+        .context("Failed to migrate small tables")?;
+    tracing::info!("Plans: {} migrated, {} skipped, {} errors",
+        small_stats.plans.migrated, small_stats.plans.skipped, small_stats.plans.errors);
+    tracing::info!("Address Monitors: {} migrated, {} skipped, {} errors",
+        small_stats.address_monitors.migrated, small_stats.address_monitors.skipped, small_stats.address_monitors.errors);
+    tracing::info!("Monitor Transactions: {} migrated, {} skipped, {} errors",
+        small_stats.monitor_transactions.migrated, small_stats.monitor_transactions.skipped, small_stats.monitor_transactions.errors);
 
     // Verify data integrity
     tracing::info!("\n=== Verification Phase ===");
