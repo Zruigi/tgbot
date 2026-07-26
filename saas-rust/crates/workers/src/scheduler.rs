@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, instrument, warn};
 
 use crate::job_queue::{self, ClaimedJob, JobType};
+use crate::push_task_worker::TelegramClientResolver;
 use crate::WorkerHandle;
 
 // ---------------------------------------------------------------------------
@@ -129,7 +130,10 @@ impl Dispatcher {
                 }
             }
             None => {
-                warn!(job_id, job_type, "no worker registered for job type, marking dead");
+                warn!(
+                    job_id,
+                    job_type, "no worker registered for job type, marking dead"
+                );
                 if let Err(e) =
                     job_queue::fail_job(pool, job_id, "no worker registered for job type").await
                 {
@@ -149,6 +153,9 @@ pub struct Scheduler {
     pool: PgPool,
     config: SchedulerConfig,
     dispatcher: Arc<Dispatcher>,
+    job_type_filters: Vec<String>,
+    push_task_cron: bool,
+    channel_reminder_cleanup: Option<(Arc<dyn TelegramClientResolver>, Duration)>,
 }
 
 impl Scheduler {
@@ -157,7 +164,32 @@ impl Scheduler {
             pool,
             config,
             dispatcher: Arc::new(dispatcher),
+            job_type_filters: Vec::new(),
+            push_task_cron: false,
+            channel_reminder_cleanup: None,
         }
+    }
+
+    pub fn with_job_type_filter(mut self, job_type: impl Into<String>) -> Self {
+        let job_type = job_type.into();
+        if !self.job_type_filters.contains(&job_type) {
+            self.job_type_filters.push(job_type);
+        }
+        self
+    }
+
+    pub fn with_push_task_cron(mut self) -> Self {
+        self.push_task_cron = true;
+        self
+    }
+
+    pub fn with_channel_reminder_cleanup(
+        mut self,
+        telegram_resolver: Arc<dyn TelegramClientResolver>,
+        interval: Duration,
+    ) -> Self {
+        self.channel_reminder_cleanup = Some((telegram_resolver, interval));
+        self
     }
 
     /// Start the scheduler as a set of background tokio tasks.
@@ -170,12 +202,12 @@ impl Scheduler {
 
         let pool = self.pool.clone();
         let config = self.config.clone();
-        let dispatcher = self.dispatcher.clone();
+        let job_type_filters = self.job_type_filters.clone();
 
         // --- Poller task ---
         let poller_shutdown = shutdown_rx.clone();
         let poller_handle = tokio::spawn(async move {
-            Self::run_poller(pool, config, job_tx, poller_shutdown).await;
+            Self::run_poller(pool, config, job_type_filters, job_tx, poller_shutdown).await;
         });
 
         // --- Worker pool tasks ---
@@ -189,25 +221,49 @@ impl Scheduler {
         // --- Maintenance task ---
         let maint_pool = self.pool.clone();
         let maint_config = self.config.clone();
-        let maint_shutdown = shutdown_rx;
+        let maint_shutdown = shutdown_rx.clone();
         let maint_handle = tokio::spawn(async move {
             Self::run_maintenance(maint_pool, maint_config, maint_shutdown).await;
         });
 
-        WorkerHandle {
-            shutdown_tx,
-            tasks: vec![poller_handle, worker_handle, maint_handle],
+        let mut tasks = vec![poller_handle, worker_handle, maint_handle];
+        if self.push_task_cron {
+            let cron_pool = self.pool.clone();
+            let cron_interval = self.config.cron_check_interval;
+            let cron_shutdown = shutdown_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                Self::run_push_task_cron(cron_pool, cron_interval, cron_shutdown).await;
+            }));
         }
+        if let Some((telegram_resolver, cleanup_interval)) = self.channel_reminder_cleanup {
+            let cleanup_pool = self.pool.clone();
+            let cleanup_shutdown = shutdown_rx;
+            tasks.push(tokio::spawn(async move {
+                Self::run_channel_reminder_cleanup(
+                    cleanup_pool,
+                    telegram_resolver,
+                    cleanup_interval,
+                    cleanup_shutdown,
+                )
+                .await;
+            }));
+        }
+
+        WorkerHandle { shutdown_tx, tasks }
     }
 
     /// Poller loop: periodically claim pending jobs and send them to workers.
     async fn run_poller(
         pool: PgPool,
         config: SchedulerConfig,
+        job_type_filters: Vec<String>,
         job_tx: mpsc::Sender<ClaimedJob>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
-        info!("scheduler poller started, interval={:?}", config.poll_interval);
+        info!(
+            "scheduler poller started, interval={:?}",
+            config.poll_interval
+        );
         let mut interval = tokio::time::interval(config.poll_interval);
 
         loop {
@@ -219,7 +275,11 @@ impl Scheduler {
                     }
                 }
                 _ = interval.tick() => {
-                    match job_queue::claim_jobs(&pool, None, config.claim_batch_size).await {
+                    match job_queue::claim_jobs(
+                        &pool,
+                        &job_type_filters,
+                        config.claim_batch_size,
+                    ).await {
                         Ok(jobs) => {
                             for job in jobs {
                                 if job_tx.send(job).await.is_err() {
@@ -231,6 +291,59 @@ impl Scheduler {
                         Err(e) => {
                             error!(error = %e, "failed to claim jobs from queue");
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_push_task_cron(
+        pool: PgPool,
+        check_interval: Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        info!(?check_interval, "push task cron started");
+        let mut interval = tokio::time::interval(check_interval);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("push task cron shutting down");
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = schedule_push_tasks(&pool).await {
+                        error!(%error, "failed to schedule push tasks");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_channel_reminder_cleanup(
+        pool: PgPool,
+        telegram_resolver: Arc<dyn TelegramClientResolver>,
+        cleanup_interval: Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        info!(?cleanup_interval, "channel reminder cleanup started");
+        let mut interval = tokio::time::interval(cleanup_interval);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("channel reminder cleanup shutting down");
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = crate::channel_reminder_worker::cleanup_expired_channel_reminders(
+                        &pool,
+                        telegram_resolver.clone(),
+                        100,
+                    ).await {
+                        error!(%error, "failed to clean expired channel reminders");
                     }
                 }
             }
@@ -282,7 +395,10 @@ impl Scheduler {
         config: SchedulerConfig,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
-        info!("scheduler maintenance started, interval={:?}", config.maintenance_interval);
+        info!(
+            "scheduler maintenance started, interval={:?}",
+            config.maintenance_interval
+        );
         let mut interval = tokio::time::interval(config.maintenance_interval);
 
         loop {
@@ -318,9 +434,16 @@ impl Scheduler {
 pub async fn schedule_push_tasks(pool: &PgPool) -> Result<usize> {
     let rows = sqlx::query(
         r#"
-        SELECT id, tenant_id, task_name FROM push_tasks
+        SELECT id, tenant_id, task_name FROM broadcast.push_tasks
         WHERE status = 'running'
           AND next_run_at <= now()
+          AND NOT EXISTS (
+              SELECT 1
+              FROM job_queue queued
+              WHERE queued.job_type = 'push_task'
+                AND queued.payload ->> 'push_task_id' = broadcast.push_tasks.id::text
+                AND queued.status IN ('pending', 'running')
+          )
         ORDER BY next_run_at ASC
         "#,
     )

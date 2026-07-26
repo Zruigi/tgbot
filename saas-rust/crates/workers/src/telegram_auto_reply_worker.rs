@@ -1,0 +1,204 @@
+use anyhow::{anyhow, bail, Context, Result};
+use async_trait::async_trait;
+use serde_json::Value;
+use sqlx::{PgPool, Row};
+use std::sync::Arc;
+use tgbot_integrations::telegram::SendMessageParams;
+use tgbot_repos::message_repo;
+use tgbot_services::telegram_auto_replies::{
+    normalize_auto_reply_config, select_auto_reply, TelegramAutoReplyConfig,
+    TELEGRAM_AUTO_REPLY_CONFIG_KEY,
+};
+use tracing::{info, instrument};
+
+use crate::job_queue::ClaimedJob;
+use crate::push_task_worker::TelegramClientResolver;
+use crate::scheduler::Worker;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramAutoReplyJobKey {
+    tenant_id: String,
+    inbound_message_id: i64,
+}
+
+pub struct TelegramAutoReplyWorker {
+    telegram_resolver: Arc<dyn TelegramClientResolver>,
+}
+
+impl TelegramAutoReplyWorker {
+    pub fn new(telegram_resolver: Arc<dyn TelegramClientResolver>) -> Self {
+        Self { telegram_resolver }
+    }
+}
+
+#[async_trait]
+impl Worker for TelegramAutoReplyWorker {
+    fn job_type(&self) -> &str {
+        "telegram_auto_reply"
+    }
+
+    #[instrument(skip(self, pool, claimed), fields(job_id = claimed.job.id))]
+    async fn process(&self, pool: &PgPool, claimed: &ClaimedJob) -> Result<()> {
+        let key = parse_job_key(&claimed.job.payload)?;
+        if claimed.job.tenant_id != key.tenant_id {
+            bail!("telegram auto-reply job tenant mismatch");
+        }
+
+        let row = sqlx::query(
+            r#"
+            SELECT inbound.from_userid AS user_id,
+                   inbound.to_userid AS bot_id,
+                   inbound.content,
+                   inbound.tg_msg_id
+            FROM chat.messages inbound
+            JOIN merchants merchant
+              ON merchant.tenant_id = inbound.tenant_id
+             AND merchant.bot_id = inbound.to_userid
+             AND merchant.status IN ('active', 'active_free')
+            WHERE inbound.id = $2
+              AND inbound.tenant_id = $1
+              AND inbound.is_read = false
+              AND inbound.is_deleted = false
+              AND inbound.from_userid > 0
+              AND inbound.to_userid > 0
+              AND inbound.from_userid <> inbound.to_userid
+              AND inbound.msg_type = 'text'
+              AND inbound.tg_msg_id IS NOT NULL
+              AND NULLIF(btrim(inbound.content), '') IS NOT NULL
+              AND left(btrim(inbound.content), 1) <> '/'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM chat.messages outbound
+                  WHERE outbound.tenant_id = inbound.tenant_id
+                    AND outbound.from_userid = inbound.to_userid
+                    AND outbound.to_userid = inbound.from_userid
+                    AND outbound.quoted_msg_id = inbound.tg_msg_id
+                    AND outbound.is_read = true
+                    AND outbound.is_deleted = false
+              )
+            "#,
+        )
+        .bind(&key.tenant_id)
+        .bind(key.inbound_message_id)
+        .fetch_optional(pool)
+        .await?;
+
+        let Some(row) = row else {
+            info!(
+                tenant_id = key.tenant_id,
+                inbound_message_id = key.inbound_message_id,
+                "telegram auto-reply job is stale or already delivered"
+            );
+            return Ok(());
+        };
+
+        let config_json = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT config_value FROM tenant_saas.tenant_configs \
+             WHERE tenant_id = $1 AND config_key = $2",
+        )
+        .bind(&key.tenant_id)
+        .bind(TELEGRAM_AUTO_REPLY_CONFIG_KEY)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+        let Some(config_json) = config_json else {
+            return Ok(());
+        };
+        let config: TelegramAutoReplyConfig = serde_json::from_str(&config_json)
+            .context("stored Telegram auto-reply config is invalid")?;
+        let config = normalize_auto_reply_config(config)
+            .map_err(|error| anyhow!("stored Telegram auto-reply config is invalid: {error}"))?;
+        let content: String = row.try_get("content")?;
+        let Some(reply_text) = select_auto_reply(&config, &content).map(str::to_string) else {
+            return Ok(());
+        };
+
+        let user_id: i64 = row.try_get("user_id")?;
+        let bot_id: i64 = row.try_get("bot_id")?;
+        let telegram_message_id: i64 = row.try_get("tg_msg_id")?;
+        let telegram = self
+            .telegram_resolver
+            .resolve(pool, &key.tenant_id)
+            .await
+            .context("failed to resolve Telegram auto-reply client")?;
+        let sent = telegram
+            .send_message(SendMessageParams {
+                chat_id: user_id,
+                text: reply_text.clone(),
+                parse_mode: None,
+                reply_markup: None,
+                reply_to_message_id: Some(telegram_message_id),
+            })
+            .await
+            .context("failed to deliver Telegram auto-reply")?;
+
+        message_repo::save_message(
+            pool,
+            bot_id,
+            user_id,
+            Some(&reply_text),
+            "text",
+            None,
+            None,
+            true,
+            Some(sent.message_id),
+            &key.tenant_id,
+            Some(telegram_message_id),
+        )
+        .await
+        .context("failed to persist Telegram auto-reply")?;
+
+        info!(
+            tenant_id = key.tenant_id,
+            inbound_message_id = key.inbound_message_id,
+            "telegram auto-reply delivered"
+        );
+        Ok(())
+    }
+}
+
+fn parse_job_key(payload: &Value) -> Result<TelegramAutoReplyJobKey> {
+    let tenant_id = payload
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("missing tenant_id in Telegram auto-reply payload"))?;
+    let inbound_message_id = payload
+        .get("inbound_message_id")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow!("missing inbound_message_id in Telegram auto-reply payload"))?;
+
+    Ok(TelegramAutoReplyJobKey {
+        tenant_id: tenant_id.to_string(),
+        inbound_message_id,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_tenant_scoped_job_key() {
+        assert_eq!(
+            parse_job_key(&json!({
+                "tenant_id": "tenant-a",
+                "inbound_message_id": 42
+            }))
+            .unwrap(),
+            TelegramAutoReplyJobKey {
+                tenant_id: "tenant-a".into(),
+                inbound_message_id: 42,
+            }
+        );
+        assert!(parse_job_key(&json!({
+            "tenant_id": "tenant-a",
+            "inbound_message_id": 0
+        }))
+        .is_err());
+        assert!(parse_job_key(&json!({"inbound_message_id": 42})).is_err());
+    }
+}

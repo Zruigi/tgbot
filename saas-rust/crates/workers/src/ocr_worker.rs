@@ -86,15 +86,9 @@ impl Worker for OcrWorker {
         info!(task_type = task_type.as_str(), "processing OCR job");
 
         let result = match task_type {
-            OcrTaskType::ImageExtraction => {
-                self.process_image_extraction(pool, payload).await
-            }
-            OcrTaskType::AddressDetection => {
-                self.process_address_detection(pool, payload).await
-            }
-            OcrTaskType::DocumentScan => {
-                self.process_document_scan(pool, payload).await
-            }
+            OcrTaskType::ImageExtraction => self.process_image_extraction(pool, payload).await,
+            OcrTaskType::AddressDetection => self.process_address_detection(pool, payload).await,
+            OcrTaskType::DocumentScan => self.process_document_scan(pool, payload).await,
             OcrTaskType::Custom(ref t) => {
                 warn!(custom_type = t, "unknown OCR task type, skipping");
                 Ok(json!({"status": "skipped", "reason": "unknown_task_type"}))
@@ -270,7 +264,8 @@ fn extract_crypto_addresses(text: &str) -> Vec<Value> {
         }
 
         // Bitcoin address: starts with 1, 3, or bc1
-        if (word.starts_with('1') || word.starts_with('3')) && word.len() >= 26 && word.len() <= 35 {
+        if (word.starts_with('1') || word.starts_with('3')) && word.len() >= 26 && word.len() <= 35
+        {
             addresses.push(json!({
                 "address": word,
                 "chain": "bitcoin",

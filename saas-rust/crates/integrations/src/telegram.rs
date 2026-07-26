@@ -6,9 +6,9 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::Duration;
-use tracing::{debug, instrument, warn};
+use tracing::{instrument, warn};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -178,6 +178,8 @@ pub struct SendPhotoParams {
     pub caption: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parse_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<i64>,
 }
 
 /// Parameters for `sendDocument`.
@@ -271,15 +273,13 @@ impl TelegramClient {
             "{}/bot{}/{}",
             self.config.api_base_url, self.config.bot_token, method
         );
-        debug!(url, "calling Telegram Bot API");
-
         let resp = self
             .http
             .post(&url)
             .json(&params)
             .send()
             .await
-            .context("Telegram API request failed")?;
+            .map_err(|_| anyhow!("Telegram API {method} request failed"))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -334,6 +334,145 @@ impl TelegramClient {
         self.request("sendPhoto", params).await
     }
 
+    pub async fn get_chat(&self, chat_id: i64) -> Result<Value> {
+        self.request("getChat", json!({ "chat_id": chat_id })).await
+    }
+
+    pub async fn get_chat_member(&self, chat_id: i64, user_id: i64) -> Result<Value> {
+        self.request(
+            "getChatMember",
+            json!({ "chat_id": chat_id, "user_id": user_id }),
+        )
+        .await
+    }
+
+    pub async fn get_chat_member_count(&self, chat_id: i64) -> Result<i64> {
+        self.request("getChatMemberCount", json!({ "chat_id": chat_id }))
+            .await
+    }
+
+    pub async fn ban_chat_member(&self, chat_id: i64, user_id: i64) -> Result<bool> {
+        self.request(
+            "banChatMember",
+            json!({ "chat_id": chat_id, "user_id": user_id }),
+        )
+        .await
+    }
+
+    pub async fn unban_chat_member(&self, chat_id: i64, user_id: i64) -> Result<bool> {
+        self.request(
+            "unbanChatMember",
+            json!({
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "only_if_banned": true,
+            }),
+        )
+        .await
+    }
+
+    pub async fn restrict_chat_member(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        permissions: Value,
+        until_date: Option<i64>,
+    ) -> Result<bool> {
+        let mut params = json!({
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "permissions": permissions,
+        });
+        if let Some(until_date) = until_date {
+            params["until_date"] = until_date.into();
+        }
+        self.request("restrictChatMember", params).await
+    }
+
+    pub async fn promote_chat_member(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        permissions: Value,
+    ) -> Result<bool> {
+        let mut params = permissions.as_object().cloned().unwrap_or_default();
+        params.insert("chat_id".into(), chat_id.into());
+        params.insert("user_id".into(), user_id.into());
+        self.request("promoteChatMember", Value::Object(params))
+            .await
+    }
+
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<bool> {
+        self.request(
+            "deleteMessage",
+            json!({ "chat_id": chat_id, "message_id": message_id }),
+        )
+        .await
+    }
+
+    pub async fn send_photo_bytes(
+        &self,
+        chat_id: i64,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime_type: &str,
+        caption: Option<&str>,
+        reply_to_message_id: Option<i64>,
+        reply_markup: Option<&Value>,
+    ) -> Result<Message> {
+        let url = format!(
+            "{}/bot{}/sendPhoto",
+            self.config.api_base_url, self.config.bot_token
+        );
+        let photo = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str(mime_type)
+            .context("invalid photo MIME type")?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("photo", photo);
+        if let Some(caption) = caption.filter(|value| !value.is_empty()) {
+            form = form.text("caption", caption.to_string());
+        }
+        if let Some(reply_to_message_id) = reply_to_message_id {
+            form = form.text("reply_to_message_id", reply_to_message_id.to_string());
+        }
+        if let Some(reply_markup) = reply_markup {
+            form = form.text("reply_markup", reply_markup.to_string());
+        }
+
+        let response = self
+            .http
+            .post(url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|_| anyhow!("Telegram photo upload failed"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Telegram photo upload failed (HTTP {}): {}",
+                status,
+                body.chars().take(500).collect::<String>()
+            ));
+        }
+        let response: BotResponse<Message> = response
+            .json()
+            .await
+            .context("failed to parse Telegram photo response")?;
+        if !response.ok {
+            return Err(anyhow!(
+                "Telegram API error (code {}): {}",
+                response.error_code.unwrap_or(0),
+                response.description.unwrap_or_else(|| "unknown".into())
+            ));
+        }
+        response
+            .result
+            .ok_or_else(|| anyhow!("Telegram API returned no result"))
+    }
+
     /// Send a document.
     pub async fn send_document(&self, params: SendDocumentParams) -> Result<Message> {
         self.request("sendDocument", params).await
@@ -364,48 +503,77 @@ impl TelegramClient {
             "{}/file/bot{}/{}",
             self.config.api_base_url, self.config.bot_token, file_path
         );
-        debug!(url, "downloading file from Telegram");
-
         let resp = self
             .http
             .get(&url)
             .send()
             .await
-            .context("Telegram file download request failed")?;
+            .map_err(|_| anyhow!("Telegram file download request failed"))?;
 
         let status = resp.status();
         if !status.is_success() {
-            return Err(anyhow!(
-                "Telegram file download failed (HTTP {})",
-                status
-            ));
+            return Err(anyhow!("Telegram file download failed (HTTP {})", status));
         }
 
-        let bytes = resp
-            .bytes()
-            .await
-            .context("failed to read file content")?;
+        let bytes = resp.bytes().await.context("failed to read file content")?;
 
         std::fs::write(dest_path, bytes).context("failed to write file to disk")?;
         Ok(())
     }
 
+    pub async fn download_file_bytes(&self, file: &File, max_bytes: usize) -> Result<Vec<u8>> {
+        let file_path = file
+            .file_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("File path not available"))?;
+        if file
+            .file_size
+            .is_some_and(|size| size < 0 || size as usize > max_bytes)
+        {
+            return Err(anyhow!("Telegram file exceeds download limit"));
+        }
+        let url = format!(
+            "{}/file/bot{}/{}",
+            self.config.api_base_url, self.config.bot_token, file_path
+        );
+        let mut response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|_| anyhow!("Telegram file download request failed"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow!("Telegram file download failed (HTTP {})", status));
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > max_bytes as u64)
+        {
+            return Err(anyhow!("Telegram file exceeds download limit"));
+        }
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("failed to read Telegram file content")?
+        {
+            if bytes.len() + chunk.len() > max_bytes {
+                return Err(anyhow!("Telegram file exceeds download limit"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
     /// Set a webhook.
     pub async fn set_webhook(&self, params: SetWebhookParams) -> Result<()> {
-        #[derive(Deserialize)]
-        struct WebhookResponse {
-            ok: bool,
-            result: bool,
-            description: Option<String>,
-        }
-        let resp: WebhookResponse = self.request("setWebhook", params).await?;
-        if resp.result {
+        let result: bool = self.request("setWebhook", params).await?;
+        if result {
             Ok(())
         } else {
-            Err(anyhow!(
-                "setWebhook failed: {}",
-                resp.description.unwrap_or_else(|| "unknown".into())
-            ))
+            Err(anyhow!("setWebhook returned false"))
         }
     }
 
@@ -413,13 +581,8 @@ impl TelegramClient {
     pub async fn delete_webhook(&self) -> Result<()> {
         #[derive(Serialize, Debug)]
         struct Empty {}
-        #[derive(Deserialize)]
-        struct WebhookResponse {
-            ok: bool,
-            result: bool,
-        }
-        let resp: WebhookResponse = self.request("deleteWebhook", Empty {}).await?;
-        if resp.result {
+        let result: bool = self.request("deleteWebhook", Empty {}).await?;
+        if result {
             Ok(())
         } else {
             Err(anyhow!("deleteWebhook failed"))

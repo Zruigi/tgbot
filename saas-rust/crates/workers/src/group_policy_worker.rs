@@ -78,13 +78,16 @@ impl Worker for GroupPolicyWorker {
             group_repo::upsert_group_config(
                 pool,
                 group_id,
-                group.get("group_title").and_then(|v| v.as_str()).unwrap_or("Unknown"),
+                group
+                    .get("group_title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown"),
                 &tenant_id,
-                Some(true),           // is_monitored
+                Some(true), // is_monitored
                 custom_keywords.as_deref(),
-                Some(true),           // verify_enabled
-                None,                 // verify_type (keep current)
-                None,                 // verify_timeout (keep current)
+                Some(true), // verify_enabled
+                None,       // verify_type (keep current)
+                None,       // verify_timeout (keep current)
             )
             .await?;
         }
@@ -96,10 +99,13 @@ impl Worker for GroupPolicyWorker {
                 group_repo::upsert_group_config(
                     pool,
                     group_id,
-                    group.get("group_title").and_then(|v| v.as_str()).unwrap_or("Unknown"),
+                    group
+                        .get("group_title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown"),
                     &tenant_id,
                     None,
-                    None,             // clear keywords
+                    None, // clear keywords
                     None,
                     None,
                     None,

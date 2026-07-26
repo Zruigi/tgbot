@@ -174,13 +174,11 @@ impl FinanceQueryTool {
                 Ok(status) => {
                     trc20_result["ok"] = serde_json::json!(status.ok);
                     trc20_result["http_status"] = serde_json::json!(status.http_status);
-                    trc20_result["detail"] = serde_json::json!(
-                        if status.ok {
-                            "TronGrid 连通正常"
-                        } else {
-                            &status.detail
-                        }
-                    );
+                    trc20_result["detail"] = serde_json::json!(if status.ok {
+                        "TronGrid 连通正常"
+                    } else {
+                        &status.detail
+                    });
                 }
                 Err(e) => {
                     trc20_result["ok"] = serde_json::json!(false);
@@ -201,13 +199,11 @@ impl FinanceQueryTool {
                     if status.ok {
                         bsc_result["latest_block"] = serde_json::json!(status.latest_block);
                     }
-                    bsc_result["detail"] = serde_json::json!(
-                        if status.ok {
-                            "BscScan 连通正常"
-                        } else {
-                            &status.detail
-                        }
-                    );
+                    bsc_result["detail"] = serde_json::json!(if status.ok {
+                        "BscScan 连通正常"
+                    } else {
+                        &status.detail
+                    });
                 }
                 Err(e) => {
                     bsc_result["ok"] = serde_json::json!(false);
@@ -248,7 +244,8 @@ struct ApiTestStatus {
 }
 
 async fn test_trc20_api(api_key: &str) -> Result<ApiTestStatus, anyhow::Error> {
-    let url = "https://api.trongrid.io/v1/contracts/TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t/events?limit=1";
+    let url =
+        "https://api.trongrid.io/v1/contracts/TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t/events?limit=1";
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
@@ -274,7 +271,11 @@ async fn test_trc20_api(api_key: &str) -> Result<ApiTestStatus, anyhow::Error> {
         Value::Null
     };
 
-    let ok = http_status == 200 && body.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+    let ok = http_status == 200
+        && body
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
     let detail = if ok {
         "TronGrid 连通正常".to_string()
@@ -326,9 +327,7 @@ async fn test_bsc_api(api_key: &str) -> Result<ApiTestStatus, anyhow::Error> {
         .unwrap_or("")
         .to_lowercase();
     let bsc_result = body.get("result").and_then(|v| v.as_str());
-    let ok = http_status == 200
-        && bsc_result.is_some()
-        && !bsc_msg.contains("invalid");
+    let ok = http_status == 200 && bsc_result.is_some() && !bsc_msg.contains("invalid");
 
     let detail = if ok {
         "BscScan 连通正常".to_string()
@@ -354,10 +353,7 @@ async fn test_bsc_api(api_key: &str) -> Result<ApiTestStatus, anyhow::Error> {
 // ---------------------------------------------------------------------------
 
 /// 构建分析文本供 LLM 参考（对齐 Python 版 _build_analysis_text）
-fn build_analysis_text(
-    summary: &[Value],
-    unreconciled: &[Value],
-) -> String {
+fn build_analysis_text(summary: &[Value], unreconciled: &[Value]) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push("财务分析报告\n".to_string());
     lines.push("=".repeat(30));
@@ -372,10 +368,7 @@ fn build_analysis_text(
             .get("total_expense")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
-        let balance = s
-            .get("balance")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+        let balance = s.get("balance").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
         lines.push(format!(
             "\n{}: 收入={:.2} | 支出={:.2} | 净额={:.2}",
@@ -412,8 +405,7 @@ fn build_analysis_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Tool;
-    use crate::schema::AgentContext;
+    use crate::schema::{AgentContext, Tool};
 
     #[test]
     fn test_name_and_category() {

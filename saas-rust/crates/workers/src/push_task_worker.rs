@@ -10,12 +10,14 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{error, info, instrument, warn};
+use tracing::{info, instrument, warn};
 
 use crate::job_queue::ClaimedJob;
 use crate::scheduler::Worker;
 
+use tgbot_integrations::litellm::LiteLLMClient;
 use tgbot_integrations::telegram::{SendMessageParams, TelegramClient};
 use tgbot_repos::push_task_repo;
 
@@ -23,13 +25,25 @@ use tgbot_repos::push_task_repo;
 // Push task worker
 // ---------------------------------------------------------------------------
 
+#[async_trait]
+pub trait TelegramClientResolver: Send + Sync {
+    async fn resolve(&self, pool: &PgPool, tenant_id: &str) -> Result<TelegramClient>;
+}
+
 pub struct PushTaskWorker {
-    telegram: Arc<TelegramClient>,
+    telegram_resolver: Arc<dyn TelegramClientResolver>,
+    llm: Arc<LiteLLMClient>,
 }
 
 impl PushTaskWorker {
-    pub fn new(telegram: Arc<TelegramClient>) -> Self {
-        Self { telegram }
+    pub fn new(
+        telegram_resolver: Arc<dyn TelegramClientResolver>,
+        llm: Arc<LiteLLMClient>,
+    ) -> Self {
+        Self {
+            telegram_resolver,
+            llm,
+        }
     }
 }
 
@@ -47,15 +61,23 @@ impl Worker for PushTaskWorker {
             .get("push_task_id")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| anyhow!("missing push_task_id in payload"))?;
+        let tenant_id = payload
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("missing tenant_id in payload"))?;
+        if claimed.job.tenant_id != tenant_id {
+            return Err(anyhow!("push task job tenant mismatch"));
+        }
 
         info!(push_task_id, "processing push task job");
 
         // Fetch the push task
-        let task = push_task_repo::get_push_task(pool, push_task_id)
+        let task = push_task_repo::get_push_task(pool, tenant_id, push_task_id)
             .await?
             .ok_or_else(|| anyhow!("push task {} not found", push_task_id))?;
 
-        let content: String = task
+        let mut content: String = task
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -64,6 +86,15 @@ impl Worker for PushTaskWorker {
             .get("do_translate")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        if do_translate && !content.is_empty() {
+            content = self
+                .llm
+                .simple_chat(
+                    "Translate the message into English when it is not English, otherwise into Simplified Chinese. Preserve Telegram HTML tags and return only the translation.",
+                    &content,
+                )
+                .await?;
+        }
         let target_chat_ids: Vec<i64> = task
             .get("target_chat_ids")
             .and_then(|v| v.as_array())
@@ -77,6 +108,26 @@ impl Worker for PushTaskWorker {
             .get("image_file_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let telegram = self.telegram_resolver.resolve(pool, tenant_id).await?;
+        let allowed_chat_ids: HashSet<i64> = if target_chat_ids.is_empty() {
+            HashSet::new()
+        } else {
+            sqlx::query_scalar(
+                r#"
+                SELECT chat_id
+                FROM broadcast.broadcast_targets
+                WHERE tenant_id = $1
+                  AND can_broadcast = true
+                  AND chat_id = ANY($2)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(&target_chat_ids)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect()
+        };
 
         let total = target_chat_ids.len();
         let mut success = 0usize;
@@ -85,19 +136,25 @@ impl Worker for PushTaskWorker {
 
         // Send message to each target chat
         for chat_id in &target_chat_ids {
+            if !allowed_chat_ids.contains(chat_id) {
+                failed += 1;
+                failed_ids.push(*chat_id);
+                continue;
+            }
             let result = if let Some(ref file_id) = image_file_id {
                 // Send photo with caption
-                self.telegram
+                telegram
                     .send_photo(tgbot_integrations::telegram::SendPhotoParams {
                         chat_id: *chat_id,
                         photo: file_id.clone(),
                         caption: Some(content.clone()),
                         parse_mode: None,
+                        reply_to_message_id: None,
                     })
                     .await
             } else {
                 // Send text message
-                self.telegram
+                telegram
                     .send_message(SendMessageParams {
                         chat_id: *chat_id,
                         text: content.clone(),
@@ -132,16 +189,13 @@ impl Worker for PushTaskWorker {
 
         info!(
             push_task_id,
-            total,
-            success,
-            failed,
-            "push task execution completed"
+            total, success, failed, "push task execution completed"
         );
 
         // Update push task run result
         let now = chrono::Utc::now().to_rfc3339();
-        let next_run = (chrono::Utc::now() + chrono::Duration::hours(interval_hours as i64))
-            .to_rfc3339();
+        let next_run =
+            (chrono::Utc::now() + chrono::Duration::hours(interval_hours as i64)).to_rfc3339();
         let retry_count: i32 = task
             .get("retry_count")
             .and_then(|v| v.as_i64())
@@ -149,6 +203,7 @@ impl Worker for PushTaskWorker {
 
         push_task_repo::update_push_task_run_result(
             pool,
+            tenant_id,
             push_task_id,
             &now,
             &next_run,

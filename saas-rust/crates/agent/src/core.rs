@@ -5,8 +5,8 @@ use crate::ad_detection::detect_advertising_signals;
 use crate::prompts::build_system_prompt;
 use crate::safety::SafetyGuardrail;
 use crate::schema::{
-    AgentContext, AgentResponse, ChatMessage, LlmCallResult, SingleToolResult, ToolCall,
-    ToolCallFunction, ToolExecuteResult, Tool,
+    AgentContext, AgentResponse, ChatMessage, LlmCallResult, SingleToolResult, Tool, ToolCall,
+    ToolCallFunction, ToolExecuteResult,
 };
 use crate::tools::broadcast_message::BroadcastMessageTool;
 use crate::tools::detect_advertising::DetectAdvertisingTool;
@@ -170,7 +170,10 @@ impl AIAgent {
                 Ok(r) => r,
                 Err(e) => {
                     error!("AIAgent process_message 第{}轮异常: {}", round_num, e);
-                    final_text = format!("抱歉，处理过程中出现了问题：{}", &format!("{}", e).chars().take(200).collect::<String>());
+                    final_text = format!(
+                        "抱歉，处理过程中出现了问题：{}",
+                        &format!("{}", e).chars().take(200).collect::<String>()
+                    );
                     break;
                 }
             };
@@ -289,7 +292,9 @@ impl AIAgent {
                 let mut result_value = exec_result.to_json_value();
                 if exec_result.requires_llm_generation {
                     if let Some(data) = exec_result.data.as_ref() {
-                        if let Some(gen_prompt) = data.get("generate_prompt").and_then(|v| v.as_str()) {
+                        if let Some(gen_prompt) =
+                            data.get("generate_prompt").and_then(|v| v.as_str())
+                        {
                             if !gen_prompt.is_empty() {
                                 match self
                                     .call_llm(
@@ -301,15 +306,13 @@ impl AIAgent {
                                     .await
                                 {
                                     Ok(gen_result) => {
-                                        result_value
-                                            .as_object_mut()
-                                            .map(|obj| {
-                                                obj.insert(
-                                                    "generated_content".into(),
-                                                    Value::String(gen_result.text),
-                                                );
-                                                obj.remove("requires_llm_generation");
-                                            });
+                                        result_value.as_object_mut().map(|obj| {
+                                            obj.insert(
+                                                "generated_content".into(),
+                                                Value::String(gen_result.text),
+                                            );
+                                            obj.remove("requires_llm_generation");
+                                        });
                                     }
                                     Err(e) => {
                                         warn!("LLM generation for tool failed: {}", e);
@@ -336,20 +339,13 @@ impl AIAgent {
                 let mut stored_result = result_value.clone();
                 if let Some(obj) = stored_result.as_object_mut() {
                     obj.insert("_params".into(), exec_params.clone());
-                    obj.insert(
-                        "needs_confirmation".into(),
-                        Value::Bool(tool_needs_confirm),
-                    );
+                    obj.insert("needs_confirmation".into(), Value::Bool(tool_needs_confirm));
                 }
                 tool_results.insert(tool_name.clone(), stored_result);
 
                 // 记录审计日志
-                self.safety.log_action(
-                    tool_name,
-                    &args,
-                    &result_value,
-                    ctx.user_id,
-                );
+                self.safety
+                    .log_action(tool_name, &args, &result_value, ctx.user_id);
             }
 
             // 将工具结果加入 messages，让 LLM 总结回复
@@ -547,8 +543,7 @@ impl AIAgent {
                     let stripped = latest_user_text.trim();
                     if stripped.len() >= 4 {
                         if let Some(matched_name) = self.match_tool_from_text(stripped, tools) {
-                            let fallback_args =
-                                self.build_fallback_args(&matched_name, stripped);
+                            let fallback_args = self.build_fallback_args(&matched_name, stripped);
                             tool_calls.push(ToolCall {
                                 function: ToolCallFunction {
                                     name: matched_name,
@@ -589,48 +584,88 @@ impl AIAgent {
             m.insert(
                 "finance_query",
                 vec![
-                    "查财务", "财务摘要", "财务查询", "财务报表", "财务分析",
-                    "查账目", "查流水", "看账目", "看流水",
-                    "未核销", "待核销", "核销流水",
-                    "对账单", "对个账",
+                    "查财务",
+                    "财务摘要",
+                    "财务查询",
+                    "财务报表",
+                    "财务分析",
+                    "查账目",
+                    "查流水",
+                    "看账目",
+                    "看流水",
+                    "未核销",
+                    "待核销",
+                    "核销流水",
+                    "对账单",
+                    "对个账",
                 ],
             );
             m.insert(
                 "broadcast_message",
                 vec![
-                    "群发消息", "群发通知", "发送广播", "给所有人发",
-                    "群发公告", "批量发送",
+                    "群发消息",
+                    "群发通知",
+                    "发送广播",
+                    "给所有人发",
+                    "群发公告",
+                    "批量发送",
                 ],
             );
             m.insert(
                 "detect_advertising",
                 vec![
-                    "检测广告", "是不是广告", "广告检测", "垃圾信息检测",
-                    "是否广告", "鉴别广告",
+                    "检测广告",
+                    "是不是广告",
+                    "广告检测",
+                    "垃圾信息检测",
+                    "是否广告",
+                    "鉴别广告",
                 ],
             );
             m.insert(
                 "generate_content",
                 vec![
-                    "帮我写", "生成文案", "写一段", "生成内容",
-                    "帮我生成", "写个文案", "写公告",
+                    "帮我写",
+                    "生成文案",
+                    "写一段",
+                    "生成内容",
+                    "帮我生成",
+                    "写个文案",
+                    "写公告",
                 ],
             );
             m.insert(
                 "system_query",
                 vec![
-                    "系统状态", "系统概览", "有多少群", "群组统计",
-                    "系统信息", "活跃群组",
-                    "最近消息", "最近有谁", "谁给我发", "谁给我发送", "最近发消息",
-                    "广告消息", "群广告", "疑似广告",
+                    "系统状态",
+                    "系统概览",
+                    "有多少群",
+                    "群组统计",
+                    "系统信息",
+                    "活跃群组",
+                    "最近消息",
+                    "最近有谁",
+                    "谁给我发",
+                    "谁给我发送",
+                    "最近发消息",
+                    "广告消息",
+                    "群广告",
+                    "疑似广告",
                 ],
             );
             m.insert(
                 "skill_manage",
                 vec![
-                    "新增skill", "增加skill", "添加skill", "技能管理",
-                    "列出技能", "查看技能", "更新技能", "导入技能",
-                    "新增技能", "添加技能",
+                    "新增skill",
+                    "增加skill",
+                    "添加skill",
+                    "技能管理",
+                    "列出技能",
+                    "查看技能",
+                    "更新技能",
+                    "导入技能",
+                    "新增技能",
+                    "添加技能",
                 ],
             );
             m
@@ -681,8 +716,7 @@ impl AIAgent {
         }
 
         match best_match {
-            Some(ref name) if name == "system_query" && best_score >= 8 => best_match,
-            Some(_) if best_score >= 16 => best_match,
+            Some(_) if best_score >= 8 => best_match,
             _ => None,
         }
     }
@@ -698,11 +732,18 @@ impl AIAgent {
             "broadcast_message" => {
                 let mut content = text.to_string();
                 for kw in &[
-                    "群发消息", "群发通知", "发送广播", "给所有人发", "群发公告", "批量发送", "测试",
+                    "群发消息",
+                    "群发通知",
+                    "发送广播",
+                    "给所有人发",
+                    "群发公告",
+                    "批量发送",
+                    "测试",
                 ] {
                     content = content.replace(kw, "");
                 }
-                let content = content.trim_matches(|c: char| c.is_whitespace() || "：:，,。.!！？?".contains(c));
+                let content = content
+                    .trim_matches(|c: char| c.is_whitespace() || "：:，,。.!！？?".contains(c));
                 let content = if content.is_empty() { text } else { content };
                 serde_json::json!({"content": content, "target_type": "users"})
             }
@@ -711,7 +752,8 @@ impl AIAgent {
                     serde_json::json!({"action": "unreconciled"})
                 } else if text.contains("科目") || text.contains("分类") {
                     serde_json::json!({"action": "categories"})
-                } else if (text.to_lowercase().contains("trc20") || text.to_lowercase().contains("bsc"))
+                } else if (text.to_lowercase().contains("trc20")
+                    || text.to_lowercase().contains("bsc"))
                     && text.contains("测试")
                 {
                     serde_json::json!({"action": "onchain_api_test"})
@@ -756,7 +798,8 @@ impl AIAgent {
                     serde_json::json!({"query_type": "monitors_list", "limit": 10})
                 } else if text.contains("群") || text.contains("群组") {
                     serde_json::json!({"query_type": "active_groups", "limit": 10})
-                } else if text.contains("统计") || text.contains("概览") || text.contains("状态") {
+                } else if text.contains("统计") || text.contains("概览") || text.contains("状态")
+                {
                     serde_json::json!({"query_type": "stats_overview"})
                 } else {
                     serde_json::json!({"query_type": "stats_overview"})
@@ -766,7 +809,9 @@ impl AIAgent {
                 let lower = text.to_lowercase();
                 if text.contains("导入") {
                     serde_json::json!({"action": "import_builtin"})
-                } else if (lower.contains("新增") || lower.contains("添加") || lower.contains("增加"))
+                } else if (lower.contains("新增")
+                    || lower.contains("添加")
+                    || lower.contains("增加"))
                     && lower.contains("skill")
                 {
                     serde_json::json!({"action": "add"})
@@ -940,9 +985,15 @@ impl Tool for AdDetectorTool {
         let confidence = &result.confidence;
 
         let message = if is_ad {
-            format!("⚠️ 检测到广告内容 (得分: {}/100, 置信度: {})", ad_score, confidence)
+            format!(
+                "⚠️ 检测到广告内容 (得分: {}/100, 置信度: {})",
+                ad_score, confidence
+            )
         } else {
-            format!("✅ 未检出广告 (得分: {}/100, 置信度: {})", ad_score, confidence)
+            format!(
+                "✅ 未检出广告 (得分: {}/100, 置信度: {})",
+                ad_score, confidence
+            )
         };
 
         ToolExecuteResult::ok_with_data(serde_json::to_value(&result).unwrap_or_default(), &message)
@@ -1082,7 +1133,9 @@ pub fn default_tool_registry() -> ToolRegistry {
 }
 
 /// 创建包含内置工具的 ToolRegistry，可选传入 Telegram 客户端
-pub fn default_tool_registry_with_telegram(telegram_client: Option<Arc<tgbot_integrations::telegram::TelegramClient>>) -> ToolRegistry {
+pub fn default_tool_registry_with_telegram(
+    telegram_client: Option<Arc<tgbot_integrations::telegram::TelegramClient>>,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     // 从独立模块加载的工具
     registry.register(Arc::new(FinanceQueryTool));
@@ -1093,18 +1146,23 @@ pub fn default_tool_registry_with_telegram(telegram_client: Option<Arc<tgbot_int
         registry.register(Arc::new(BroadcastMessageTool::new()));
     }
     registry.register(Arc::new(DetectAdvertisingTool));
+    registry.register(Arc::new(ContentGeneratorTool));
     // SUB-015: AI Tools - ocr/n8n/system_query/skill_manage
-    registry.register(Arc::new(OcrTool::with_default_config().unwrap_or_else(|_| {
-        // 如果配置失败，创建一个使用默认配置的 client
-        let config = tgbot_integrations::paddleocr::PaddleOCRConfig::default();
-        let client = tgbot_integrations::paddleocr::PaddleOCRClient::new(config).unwrap();
-        OcrTool::new(Arc::new(client))
-    })));
-    registry.register(Arc::new(N8NWorkflowTool::with_default_config().unwrap_or_else(|_| {
-        let config = tgbot_integrations::n8n::N8NConfig::default();
-        let client = tgbot_integrations::n8n::N8NClient::new(config).unwrap();
-        N8NWorkflowTool::new(Arc::new(client))
-    })));
+    registry.register(Arc::new(OcrTool::with_default_config().unwrap_or_else(
+        |_| {
+            // 如果配置失败，创建一个使用默认配置的 client
+            let config = tgbot_integrations::paddleocr::PaddleOCRConfig::default();
+            let client = tgbot_integrations::paddleocr::PaddleOCRClient::new(config).unwrap();
+            OcrTool::new(Arc::new(client))
+        },
+    )));
+    registry.register(Arc::new(
+        N8NWorkflowTool::with_default_config().unwrap_or_else(|_| {
+            let config = tgbot_integrations::n8n::N8NConfig::default();
+            let client = tgbot_integrations::n8n::N8NClient::new(config).unwrap();
+            N8NWorkflowTool::new(Arc::new(client))
+        }),
+    ));
     // 注意：SystemQueryTool 和 SkillManageTool 需要数据库连接
     // 在实际使用时应通过依赖注入传入正确的 pool
     // 这里暂时不注册，调用方需要手动注入
@@ -1140,9 +1198,7 @@ mod tests {
         let agent = AIAgent::new(llm, tools);
 
         let mut ctx = AgentContext::new(1);
-        let response = agent
-            .process_message("你好", &mut ctx, DEFAULT_MODEL)
-            .await;
+        let response = agent.process_message("你好", &mut ctx, DEFAULT_MODEL).await;
 
         assert!(!response.text.is_empty());
         assert!(!response.requires_confirmation);

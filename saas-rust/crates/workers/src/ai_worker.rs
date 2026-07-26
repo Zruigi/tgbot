@@ -90,24 +90,17 @@ impl Worker for AiWorker {
             .and_then(|v| v.as_str())
             .unwrap_or("default");
 
-        info!(analysis_type = analysis_type.as_str(), tenant_id, "processing AI job");
+        info!(
+            analysis_type = analysis_type.as_str(),
+            tenant_id, "processing AI job"
+        );
 
         let result = match analysis_type {
-            AnalysisType::KeywordMonitoring => {
-                self.process_keyword_monitoring(pool, payload).await
-            }
-            AnalysisType::SpamDetection => {
-                self.process_spam_detection(pool, payload).await
-            }
-            AnalysisType::Translation => {
-                self.process_translation(pool, payload).await
-            }
-            AnalysisType::Summarization => {
-                self.process_summarization(pool, payload).await
-            }
-            AnalysisType::AdDetection => {
-                self.process_ad_detection(pool, payload).await
-            }
+            AnalysisType::KeywordMonitoring => self.process_keyword_monitoring(pool, payload).await,
+            AnalysisType::SpamDetection => self.process_spam_detection(pool, payload).await,
+            AnalysisType::Translation => self.process_translation(pool, payload).await,
+            AnalysisType::Summarization => self.process_summarization(pool, payload).await,
+            AnalysisType::AdDetection => self.process_ad_detection(pool, payload).await,
             AnalysisType::Custom(ref t) => {
                 warn!(custom_type = t, "unknown AI analysis type, skipping");
                 Ok(json!({"status": "skipped", "reason": "unknown_analysis_type"}))
@@ -116,9 +109,15 @@ impl Worker for AiWorker {
 
         match result {
             Ok(output) => {
-                info!(analysis_type = analysis_type.as_str(), "AI processing completed");
+                info!(
+                    analysis_type = analysis_type.as_str(),
+                    "AI processing completed"
+                );
                 // Record AI usage (non-blocking)
-                if let Err(e) = self.record_usage(pool, tenant_id, analysis_type.as_str(), &output).await {
+                if let Err(e) = self
+                    .record_usage(pool, tenant_id, analysis_type.as_str(), &output)
+                    .await
+                {
                     warn!(error = %e, "failed to record AI usage");
                 }
                 Ok(())
@@ -222,10 +221,7 @@ impl AiWorker {
 
     /// Process translation: translate message content.
     async fn process_translation(&self, pool: &PgPool, payload: &Value) -> Result<Value> {
-        let text = payload
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let target_lang = payload
             .get("target_lang")
             .and_then(|v| v.as_str())
@@ -286,11 +282,15 @@ impl AiWorker {
         }
 
         let messages_text = msg_texts.join("\n");
-        let system_prompt = "You are a summarization assistant. Summarize the following group chat messages \
+        let system_prompt =
+            "You are a summarization assistant. Summarize the following group chat messages \
                               into a concise summary highlighting key topics and decisions. \
                               Respond in a structured format.";
 
-        let summary = self.litellm.simple_chat(system_prompt, &messages_text).await?;
+        let summary = self
+            .litellm
+            .simple_chat(system_prompt, &messages_text)
+            .await?;
 
         Ok(json!({
             "group_id": group_id,
@@ -315,7 +315,10 @@ impl AiWorker {
                               Respond in JSON format with fields: is_ad (boolean), confidence (0.0-1.0), \
                               ad_type (string: commercial/self-promo/affiliate/spam/none).";
 
-        let response = self.litellm.simple_chat(system_prompt, message_text).await?;
+        let response = self
+            .litellm
+            .simple_chat(system_prompt, message_text)
+            .await?;
 
         Ok(json!({
             "llm_response": response,

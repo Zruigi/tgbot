@@ -100,21 +100,18 @@ impl Worker for MonitorWorker {
             .unwrap_or("wallet_balance");
         let task_type = MonitorTaskType::from_str(task_type_str);
 
-        info!(task_type = task_type.as_str(), "processing monitor check job");
+        info!(
+            task_type = task_type.as_str(),
+            "processing monitor check job"
+        );
 
         let result = match task_type {
-            MonitorTaskType::WalletBalance => {
-                self.process_wallet_balance(pool, payload).await
-            }
-            MonitorTaskType::PriceAlert => {
-                self.process_price_alert(pool, payload).await
-            }
+            MonitorTaskType::WalletBalance => self.process_wallet_balance(pool, payload).await,
+            MonitorTaskType::PriceAlert => self.process_price_alert(pool, payload).await,
             MonitorTaskType::TransactionMonitor => {
                 self.process_transaction_monitor(pool, payload).await
             }
-            MonitorTaskType::GroupActivity => {
-                self.process_group_activity(pool, payload).await
-            }
+            MonitorTaskType::GroupActivity => self.process_group_activity(pool, payload).await,
             MonitorTaskType::Custom(ref t) => {
                 warn!(custom_type = t, "unknown monitor task type, skipping");
                 Ok(json!({"status": "skipped", "reason": "unknown_task_type"}))
@@ -337,7 +334,10 @@ impl MonitorWorker {
         for alert in alerts {
             let alert_text = format!(
                 "**Monitor Alert**\nType: {}\n{}",
-                alert.get("type").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                alert
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
                 serde_json::to_string_pretty(alert)?
             );
 

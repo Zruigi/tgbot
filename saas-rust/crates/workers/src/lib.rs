@@ -41,29 +41,37 @@
 //! let handle = scheduler.start();
 //! ```
 
-pub mod job_queue;
-pub mod scheduler;
-pub mod push_task_worker;
-pub mod group_policy_worker;
 pub mod ai_worker;
-pub mod ocr_worker;
+pub mod channel_reminder_worker;
+pub mod group_message_policy_worker;
+pub mod group_policy_worker;
+pub mod job_queue;
 pub mod monitor_worker;
+pub mod ocr_worker;
 pub mod payment_worker;
+pub mod push_task_worker;
+pub mod scheduler;
+pub mod telegram_auto_reply_worker;
+pub mod telegram_command_worker;
 
 // Re-export commonly used types
-pub use job_queue::{
-    ClaimedJob, EnqueueOpts, Job, JobStatus, JobType,
-};
-pub use scheduler::{
-    run_cron_checks, schedule_group_policy_syncs, schedule_monitor_checks,
-    schedule_push_tasks, Dispatcher, Scheduler, SchedulerConfig, Worker,
-};
-pub use push_task_worker::PushTaskWorker;
-pub use group_policy_worker::GroupPolicyWorker;
 pub use ai_worker::{AiWorker, AnalysisType};
-pub use ocr_worker::{OcrWorker, OcrTaskType};
-pub use monitor_worker::{MonitorWorker, MonitorTaskType};
-pub use payment_worker::{PaymentWorker, PaymentTaskType};
+pub use channel_reminder_worker::{
+    cleanup_expired_channel_reminders, ChannelReminderCleanupSummary,
+};
+pub use group_message_policy_worker::GroupMessagePolicyWorker;
+pub use group_policy_worker::GroupPolicyWorker;
+pub use job_queue::{ClaimedJob, EnqueueOpts, Job, JobStatus, JobType};
+pub use monitor_worker::{MonitorTaskType, MonitorWorker};
+pub use ocr_worker::{OcrTaskType, OcrWorker};
+pub use payment_worker::{PaymentTaskType, PaymentWorker};
+pub use push_task_worker::{PushTaskWorker, TelegramClientResolver};
+pub use scheduler::{
+    run_cron_checks, schedule_group_policy_syncs, schedule_monitor_checks, schedule_push_tasks,
+    Dispatcher, Scheduler, SchedulerConfig, Worker,
+};
+pub use telegram_auto_reply_worker::TelegramAutoReplyWorker;
+pub use telegram_command_worker::TelegramCommandWorker;
 
 use std::sync::Arc;
 use tokio::sync::watch;

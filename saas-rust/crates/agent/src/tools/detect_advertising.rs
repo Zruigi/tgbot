@@ -87,10 +87,7 @@ impl Tool for DetectAdvertisingTool {
             )
         };
 
-        ToolExecuteResult::ok_with_data(
-            serde_json::to_value(&result).unwrap_or_default(),
-            &message,
-        )
+        ToolExecuteResult::ok_with_data(serde_json::to_value(&result).unwrap_or_default(), &message)
     }
 }
 
@@ -101,8 +98,7 @@ impl Tool for DetectAdvertisingTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Tool;
-    use crate::schema::AgentContext;
+    use crate::schema::{AgentContext, Tool};
 
     #[test]
     fn test_name_and_category() {
@@ -169,6 +165,8 @@ mod tests {
         assert!(result.success);
         let data = result.data.unwrap();
         let findings = data.get("findings").unwrap().as_array().unwrap();
-        assert!(findings.iter().any(|f| f.as_str().unwrap().contains("可疑链接")));
+        assert!(findings
+            .iter()
+            .any(|f| f.as_str().unwrap().contains("可疑链接")));
     }
 }

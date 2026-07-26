@@ -12,7 +12,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 15;
 /// Thin wrapper around Supabase's REST/PostgREST API.
 #[derive(Clone, Debug)]
 pub struct SupabaseRestClient {
-    pub base_url: String,   // e.g. https://xttdylrgdldzmvnbeqoc.supabase.co
+    pub base_url: String, // e.g. https://xttdylrgdldzmvnbeqoc.supabase.co
     pub service_role_key: String,
     client: reqwest::Client,
 }
@@ -37,7 +37,10 @@ impl SupabaseRestClient {
 
     fn auth_headers(&self) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert("apikey", HeaderValue::from_str(&self.service_role_key).unwrap());
+        h.insert(
+            "apikey",
+            HeaderValue::from_str(&self.service_role_key).unwrap(),
+        );
         h.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", self.service_role_key)).unwrap(),
@@ -79,10 +82,7 @@ impl SupabaseRestClient {
             .map_err(|e| format!("REST request failed: {e}"))?;
 
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("read body: {e}"))?;
+        let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
 
         if !status.is_success() {
             return Err(format!("REST {status}: {body}"));
@@ -234,7 +234,9 @@ impl SupabaseRestClient {
             if let Some(range) = resp.headers().get("content-range") {
                 if let Ok(s) = range.to_str() {
                     if let Some(count_str) = s.split('/').last() {
-                        return count_str.parse::<i64>().map_err(|e| format!("parse count: {e}"));
+                        return count_str
+                            .parse::<i64>()
+                            .map_err(|e| format!("parse count: {e}"));
                     }
                 }
             }
@@ -252,42 +254,82 @@ impl SupabaseRestClient {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Quick integration test (not compiled by default, use `cargo test`)
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
 
-    /// These tests require SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY env vars.
-    fn test_client() -> SupabaseRestClient {
-        let url = std::env::var("SUPABASE_URL").unwrap_or_else(|_| {
-            "https://xttdylrgdldzmvnbeqoc.supabase.co".into()
+    fn mock_server(body: &str) -> (String, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let response_body = body.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+
+            loop {
+                let bytes_read = stream.read(&mut buffer).unwrap();
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
         });
-        let key = std::env::var("SUPABASE_SERVICE_ROLE_KEY").unwrap_or_default();
-        SupabaseRestClient::new(&url, &key)
+
+        (format!("http://{address}"), handle)
     }
 
     #[tokio::test]
     async fn test_select_plans() {
-        let c = test_client();
-        let rows = c
+        let (base_url, request_handle) =
+            mock_server(r#"[{"plan_code":"beta","plan_name":"Beta"}]"#);
+        let client = SupabaseRestClient::new(&base_url, "test-service-key");
+        let rows = client
             .select("subscription_plans", "plan_code,plan_name", &[], None)
-            .await;
-        assert!(rows.is_ok(), "{rows:?}");
-        let rows = rows.unwrap();
-        assert!(!rows.is_empty(), "Expected at least one plan");
-        println!("plans: {rows:#?}");
+            .await
+            .unwrap();
+        let request = request_handle.join().unwrap();
+
+        assert_eq!(rows[0]["plan_code"], "beta");
+        assert!(request
+            .starts_with("GET /rest/v1/subscription_plans?select=plan_code,plan_name HTTP/1.1"));
+        assert!(request.to_lowercase().contains("apikey: test-service-key"));
     }
 
     #[tokio::test]
     async fn test_select_merchants() {
-        let c = test_client();
-        let rows = c
-            .select("merchants", "id,tenant_id,merchant_name,status", &[], None)
-            .await;
-        assert!(rows.is_ok(), "{rows:?}");
-        println!("merchants: {:#?}", rows.unwrap());
+        let (base_url, request_handle) =
+            mock_server(r#"[{"id":7,"tenant_id":"tenant-beta","status":"active"}]"#);
+        let client = SupabaseRestClient::new(&base_url, "test-service-key");
+        let rows = client
+            .select(
+                "merchants",
+                "id,tenant_id,status",
+                &[("tenant_id", "tenant-beta")],
+                Some(1),
+            )
+            .await
+            .unwrap();
+        let request = request_handle.join().unwrap();
+
+        assert_eq!(rows[0]["id"], 7);
+        assert!(request.starts_with(
+            "GET /rest/v1/merchants?select=id,tenant_id,status&tenant_id=eq.tenant-beta&limit=1 HTTP/1.1"
+        ));
     }
 }

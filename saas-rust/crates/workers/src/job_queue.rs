@@ -44,6 +44,9 @@ use uuid::Uuid;
 pub enum JobType {
     PushTask,
     GroupPolicySync,
+    GroupMessagePolicy,
+    TelegramAutoReply,
+    TelegramCommandReply,
     AiProcess,
     OcrProcess,
     MonitorCheck,
@@ -56,6 +59,9 @@ impl JobType {
         match self {
             JobType::PushTask => "push_task",
             JobType::GroupPolicySync => "group_policy_sync",
+            JobType::GroupMessagePolicy => "group_message_policy",
+            JobType::TelegramAutoReply => "telegram_auto_reply",
+            JobType::TelegramCommandReply => "telegram_command_reply",
             JobType::AiProcess => "ai_process",
             JobType::OcrProcess => "ocr_process",
             JobType::MonitorCheck => "monitor_check",
@@ -68,6 +74,9 @@ impl JobType {
         match s {
             "push_task" => JobType::PushTask,
             "group_policy_sync" => JobType::GroupPolicySync,
+            "group_message_policy" => JobType::GroupMessagePolicy,
+            "telegram_auto_reply" => JobType::TelegramAutoReply,
+            "telegram_command_reply" => JobType::TelegramCommandReply,
             "ai_process" => JobType::AiProcess,
             "ocr_process" => JobType::OcrProcess,
             "monitor_check" => JobType::MonitorCheck,
@@ -104,6 +113,7 @@ impl JobStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: i64,
+    pub tenant_id: String,
     pub job_type: String,
     pub payload: Value,
     pub priority: i16,
@@ -175,6 +185,11 @@ pub struct ClaimedJob {
 #[instrument(skip(pool), fields(job_type = %opts.job_type.as_str()))]
 pub async fn enqueue(pool: &PgPool, opts: EnqueueOpts) -> Result<i64> {
     let job_type = opts.job_type.as_str();
+    let tenant_id = opts
+        .payload
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
     let priority = opts.priority.unwrap_or(0);
     let max_attempts = opts.max_attempts.unwrap_or(3);
     let run_at = opts
@@ -186,11 +201,12 @@ pub async fn enqueue(pool: &PgPool, opts: EnqueueOpts) -> Result<i64> {
     let row = if opts.run_at.is_none() {
         sqlx::query(
             r#"
-            INSERT INTO job_queue (job_type, payload, priority, max_attempts, run_at, status)
-            VALUES ($1, $2, $3, $4, now(), 'pending')
+            INSERT INTO job_queue (tenant_id, job_type, payload, priority, max_attempts, run_at, status)
+            VALUES ($1, $2, $3, $4, $5, now(), 'pending')
             RETURNING id
             "#,
         )
+        .bind(tenant_id)
         .bind(job_type)
         .bind(&opts.payload)
         .bind(priority)
@@ -200,11 +216,12 @@ pub async fn enqueue(pool: &PgPool, opts: EnqueueOpts) -> Result<i64> {
     } else {
         sqlx::query(
             r#"
-            INSERT INTO job_queue (job_type, payload, priority, max_attempts, run_at, status)
-            VALUES ($1, $2, $3, $4, $5::timestamptz, 'pending')
+            INSERT INTO job_queue (tenant_id, job_type, payload, priority, max_attempts, run_at, status)
+            VALUES ($1, $2, $3, $4, $5, $6::timestamptz, 'pending')
             RETURNING id
             "#,
         )
+        .bind(tenant_id)
         .bind(job_type)
         .bind(&opts.payload)
         .bind(priority)
@@ -227,17 +244,23 @@ pub async fn enqueue_batch(pool: &PgPool, opts_list: Vec<EnqueueOpts>) -> Result
 
     for opts in opts_list {
         let job_type = opts.job_type.as_str();
+        let tenant_id = opts
+            .payload
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
         let priority = opts.priority.unwrap_or(0);
         let max_attempts = opts.max_attempts.unwrap_or(3);
 
         let row = if opts.run_at.is_none() {
             sqlx::query(
                 r#"
-                INSERT INTO job_queue (job_type, payload, priority, max_attempts, run_at, status)
-                VALUES ($1, $2, $3, $4, now(), 'pending')
+                INSERT INTO job_queue (tenant_id, job_type, payload, priority, max_attempts, run_at, status)
+                VALUES ($1, $2, $3, $4, $5, now(), 'pending')
                 RETURNING id
                 "#,
             )
+            .bind(tenant_id)
             .bind(job_type)
             .bind(&opts.payload)
             .bind(priority)
@@ -248,11 +271,12 @@ pub async fn enqueue_batch(pool: &PgPool, opts_list: Vec<EnqueueOpts>) -> Result
             let run_at = opts.run_at.unwrap().to_rfc3339();
             sqlx::query(
                 r#"
-                INSERT INTO job_queue (job_type, payload, priority, max_attempts, run_at, status)
-                VALUES ($1, $2, $3, $4, $5::timestamptz, 'pending')
+                INSERT INTO job_queue (tenant_id, job_type, payload, priority, max_attempts, run_at, status)
+                VALUES ($1, $2, $3, $4, $5, $6::timestamptz, 'pending')
                 RETURNING id
                 "#,
             )
+            .bind(tenant_id)
             .bind(job_type)
             .bind(&opts.payload)
             .bind(priority)
@@ -278,34 +302,12 @@ pub async fn enqueue_batch(pool: &PgPool, opts_list: Vec<EnqueueOpts>) -> Result
 /// stored in `started_at` row slot as a simple ownership marker; the
 /// `complete_job` / `fail_job` functions verify this token before updating.
 #[instrument(skip(pool))]
-pub async fn claim_jobs(pool: &PgPool, job_type: Option<&str>, limit: i32) -> Result<Vec<ClaimedJob>> {
-    let rows = if let Some(jt) = job_type {
-        sqlx::query(
-            r#"
-            UPDATE job_queue
-            SET status = 'running',
-                attempts = attempts + 1,
-                started_at = now(),
-                updated_at = now()
-            WHERE id IN (
-                SELECT id FROM job_queue
-                WHERE status = 'pending'
-                  AND run_at <= now()
-                  AND job_type = $1
-                ORDER BY priority DESC, run_at ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING id, job_type, payload, priority, status, attempts,
-                      max_attempts, run_at, started_at, completed_at,
-                      last_error, created_at, updated_at
-            "#,
-        )
-        .bind(jt)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    } else {
+pub async fn claim_jobs(
+    pool: &PgPool,
+    job_types: &[String],
+    limit: i32,
+) -> Result<Vec<ClaimedJob>> {
+    let rows = if job_types.is_empty() {
         sqlx::query(
             r#"
             UPDATE job_queue
@@ -321,11 +323,37 @@ pub async fn claim_jobs(pool: &PgPool, job_type: Option<&str>, limit: i32) -> Re
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, job_type, payload, priority, status, attempts,
+            RETURNING id, tenant_id, job_type, payload, priority, status, attempts,
                       max_attempts, run_at, started_at, completed_at,
                       last_error, created_at, updated_at
             "#,
         )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE job_queue
+            SET status = 'running',
+                attempts = attempts + 1,
+                started_at = now(),
+                updated_at = now()
+            WHERE id IN (
+                SELECT id FROM job_queue
+                WHERE status = 'pending'
+                  AND run_at <= now()
+                  AND job_type = ANY($1)
+                ORDER BY priority DESC, run_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, tenant_id, job_type, payload, priority, status, attempts,
+                      max_attempts, run_at, started_at, completed_at,
+                      last_error, created_at, updated_at
+            "#,
+        )
+        .bind(job_types)
         .bind(limit)
         .fetch_all(pool)
         .await?
@@ -334,6 +362,7 @@ pub async fn claim_jobs(pool: &PgPool, job_type: Option<&str>, limit: i32) -> Re
     let mut claimed = Vec::with_capacity(rows.len());
     for row in rows {
         let id: i64 = row.try_get("id")?;
+        let tenant_id: String = row.try_get("tenant_id")?;
         let job_type: String = row.try_get("job_type")?;
         let payload: Value = row.try_get("payload")?;
         let priority: i16 = row.try_get("priority")?;
@@ -349,6 +378,7 @@ pub async fn claim_jobs(pool: &PgPool, job_type: Option<&str>, limit: i32) -> Re
 
         let job = Job {
             id,
+            tenant_id,
             job_type,
             payload,
             priority,
@@ -398,12 +428,10 @@ pub async fn complete_job(pool: &PgPool, job_id: i64) -> Result<()> {
 #[instrument(skip(pool))]
 pub async fn fail_job(pool: &PgPool, job_id: i64, error: &str) -> Result<()> {
     // Read current attempts
-    let row = sqlx::query(
-        "SELECT attempts, max_attempts FROM job_queue WHERE id = $1",
-    )
-    .bind(job_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query("SELECT attempts, max_attempts FROM job_queue WHERE id = $1")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?;
 
     let (attempts, max_attempts): (i16, i16) = match row {
         Some(r) => (r.try_get("attempts")?, r.try_get("max_attempts")?),
@@ -431,7 +459,10 @@ pub async fn fail_job(pool: &PgPool, job_id: i64, error: &str) -> Result<()> {
         .bind(error)
         .execute(pool)
         .await?;
-        debug!(job_id, attempts, backoff_secs, "job failed, scheduled retry");
+        debug!(
+            job_id,
+            attempts, backoff_secs, "job failed, scheduled retry"
+        );
     } else {
         // Max attempts reached: mark dead
         sqlx::query(
@@ -518,20 +549,16 @@ pub async fn count_jobs(
             .await?
         }
         (Some(jt), None) => {
-            sqlx::query_scalar(
-                "SELECT COUNT(*)::bigint FROM job_queue WHERE job_type = $1",
-            )
-            .bind(jt)
-            .fetch_one(pool)
-            .await?
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM job_queue WHERE job_type = $1")
+                .bind(jt)
+                .fetch_one(pool)
+                .await?
         }
         (None, Some(st)) => {
-            sqlx::query_scalar(
-                "SELECT COUNT(*)::bigint FROM job_queue WHERE status = $1",
-            )
-            .bind(st)
-            .fetch_one(pool)
-            .await?
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM job_queue WHERE status = $1")
+                .bind(st)
+                .fetch_one(pool)
+                .await?
         }
         (None, None) => {
             sqlx::query_scalar("SELECT COUNT(*)::bigint FROM job_queue")
@@ -554,7 +581,7 @@ pub async fn list_jobs(
         (Some(jt), Some(st)) => {
             sqlx::query(
                 r#"
-                SELECT id, job_type, payload, priority, status, attempts,
+                SELECT id, tenant_id, job_type, payload, priority, status, attempts,
                        max_attempts, run_at, started_at, completed_at,
                        last_error, created_at, updated_at
                 FROM job_queue
@@ -573,7 +600,7 @@ pub async fn list_jobs(
         (Some(jt), None) => {
             sqlx::query(
                 r#"
-                SELECT id, job_type, payload, priority, status, attempts,
+                SELECT id, tenant_id, job_type, payload, priority, status, attempts,
                        max_attempts, run_at, started_at, completed_at,
                        last_error, created_at, updated_at
                 FROM job_queue
@@ -591,7 +618,7 @@ pub async fn list_jobs(
         (None, Some(st)) => {
             sqlx::query(
                 r#"
-                SELECT id, job_type, payload, priority, status, attempts,
+                SELECT id, tenant_id, job_type, payload, priority, status, attempts,
                        max_attempts, run_at, started_at, completed_at,
                        last_error, created_at, updated_at
                 FROM job_queue
@@ -609,7 +636,7 @@ pub async fn list_jobs(
         (None, None) => {
             sqlx::query(
                 r#"
-                SELECT id, job_type, payload, priority, status, attempts,
+                SELECT id, tenant_id, job_type, payload, priority, status, attempts,
                        max_attempts, run_at, started_at, completed_at,
                        last_error, created_at, updated_at
                 FROM job_queue
@@ -629,6 +656,7 @@ pub async fn list_jobs(
         .map(|row| {
             Ok(Job {
                 id: row.try_get("id")?,
+                tenant_id: row.try_get("tenant_id")?,
                 job_type: row.try_get("job_type")?,
                 payload: row.try_get("payload")?,
                 priority: row.try_get("priority")?,
@@ -660,6 +688,9 @@ mod tests {
         let types = vec![
             JobType::PushTask,
             JobType::GroupPolicySync,
+            JobType::GroupMessagePolicy,
+            JobType::TelegramAutoReply,
+            JobType::TelegramCommandReply,
             JobType::AiProcess,
             JobType::OcrProcess,
             JobType::MonitorCheck,

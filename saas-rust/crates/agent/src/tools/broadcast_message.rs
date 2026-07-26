@@ -114,7 +114,10 @@ impl Tool for BroadcastMessageTool {
 
         info!(
             "BroadcastMessageTool: 准备向 {:?} 发送广播",
-            params.get("target_type").and_then(|v| v.as_str()).unwrap_or("users")
+            params
+                .get("target_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("users")
         );
 
         // 获取目标列表
@@ -126,11 +129,7 @@ impl Tool for BroadcastMessageTool {
         let target_ids = params
             .get("target_ids")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_i64())
-                    .collect::<Vec<i64>>()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>())
             .unwrap_or_default();
 
         let buttons = params
@@ -145,16 +144,22 @@ impl Tool for BroadcastMessageTool {
             .unwrap_or(false);
 
         // 执行广播
-        match self.execute_broadcast(target_type, &target_ids, content, &buttons).await {
+        match self
+            .execute_broadcast(target_type, &target_ids, content, &buttons)
+            .await
+        {
             Ok(result) => {
                 let total = result.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                 let success = result.get("success").and_then(|v| v.as_u64()).unwrap_or(0);
                 let failed = result.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
 
-                ToolExecuteResult::ok_with_data(result, &format!(
-                    "广播完成: 总计{}个目标, 成功{}个, 失败{}个",
-                    total, success, failed
-                ))
+                ToolExecuteResult::ok_with_data(
+                    result,
+                    &format!(
+                        "广播完成: 总计{}个目标, 成功{}个, 失败{}个",
+                        total, success, failed
+                    ),
+                )
             }
             Err(e) => {
                 error!("BroadcastTool 执行失败: {}", e);
@@ -162,8 +167,7 @@ impl Tool for BroadcastMessageTool {
             }
         }
     }
-
-    }
+}
 
 impl BroadcastMessageTool {
     /// 执行实际的广播逻辑
@@ -283,7 +287,10 @@ impl BroadcastMessageTool {
         // TODO: 接入 database 模块获取真实目标列表
         // 参考 Python: database.get_inbox_list() / database.get_broadcast_targets()
 
-        info!("BroadcastMessageTool::get_target_lists — 占位实现, target_type={}", target_type);
+        info!(
+            "BroadcastMessageTool::get_target_lists — 占位实现, target_type={}",
+            target_type
+        );
 
         // 返回空列表（实际需从数据库查询）
         (vec![], vec![])
@@ -297,19 +304,18 @@ impl BroadcastMessageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Tool;
-    use crate::schema::AgentContext;
+    use crate::schema::{AgentContext, Tool};
 
     #[test]
     fn test_name_and_category() {
-        let tool = BroadcastMessageTool;
+        let tool = BroadcastMessageTool::new();
         assert_eq!(tool.name(), "broadcast_message");
         assert_eq!(tool.category(), "broadcast");
     }
 
     #[test]
     fn test_parameters_schema() {
-        let tool = BroadcastMessageTool;
+        let tool = BroadcastMessageTool::new();
         let schema = tool.parameters_schema();
         let props = schema.get("properties").unwrap();
         assert!(props.get("content").is_some());
@@ -318,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_empty_content() {
-        let tool = BroadcastMessageTool;
+        let tool = BroadcastMessageTool::new();
         let ctx = AgentContext::new(1);
         let params = serde_json::json!({"content": ""});
         let result = tool.execute(&params, &ctx).await;
@@ -328,21 +334,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_with_content() {
-        let tool = BroadcastMessageTool;
+        let tool = BroadcastMessageTool::new();
         let ctx = AgentContext::new(1);
         let params = serde_json::json!({
             "content": "测试广播",
             "target_type": "users"
         });
         let result = tool.execute(&params, &ctx).await;
-        // 当前返回模拟结果，实际接入 Bot 后应返回真实发送结果
-        assert!(result.success || !result.success); // 占位实现
+        assert!(!result.success);
         info!("广播结果: {:?}", result);
     }
 
     #[tokio::test]
     async fn test_execute_no_targets() {
-        let tool = BroadcastMessageTool;
+        let tool = BroadcastMessageTool::new();
         let ctx = AgentContext::new(1);
         let params = serde_json::json!({
             "content": "测试广播",
@@ -350,7 +355,6 @@ mod tests {
             "target_ids": []
         });
         let result = tool.execute(&params, &ctx).await;
-        // 无目标时返回错误（模拟环境）
-        info!("广播结果: {:?}", result);
+        assert!(!result.success);
     }
 }

@@ -87,18 +87,12 @@ impl Worker for PaymentWorker {
         info!(task_type = task_type.as_str(), "processing payment job");
 
         let result = match task_type {
-            PaymentTaskType::VerifyDeposit => {
-                self.process_verify_deposit(pool, payload).await
-            }
+            PaymentTaskType::VerifyDeposit => self.process_verify_deposit(pool, payload).await,
             PaymentTaskType::SubscriptionRenewal => {
                 self.process_subscription_renewal(pool, payload).await
             }
-            PaymentTaskType::Webhook => {
-                self.process_webhook(pool, payload).await
-            }
-            PaymentTaskType::Refund => {
-                self.process_refund(pool, payload).await
-            }
+            PaymentTaskType::Webhook => self.process_webhook(pool, payload).await,
+            PaymentTaskType::Refund => self.process_refund(pool, payload).await,
             PaymentTaskType::Custom(ref t) => {
                 warn!(custom_type = t, "unknown payment task type, skipping");
                 Ok(json!({"status": "skipped", "reason": "unknown_task_type"}))
@@ -107,7 +101,10 @@ impl Worker for PaymentWorker {
 
         match result {
             Ok(output) => {
-                info!(task_type = task_type.as_str(), "payment processing completed");
+                info!(
+                    task_type = task_type.as_str(),
+                    "payment processing completed"
+                );
                 Ok(())
             }
             Err(e) => {
@@ -145,11 +142,7 @@ impl PaymentWorker {
 
         let amount_usdt = amount as f64 / 1_000_000.0; // USDT uses 6 decimals
 
-        info!(
-            tx_hash,
-            amount_usdt,
-            "verified USDT deposit"
-        );
+        info!(tx_hash, amount_usdt, "verified USDT deposit");
 
         let mut verified = false;
         let mut message = "Transaction not found or invalid".to_string();
@@ -277,8 +270,14 @@ impl PaymentWorker {
             "payment_succeeded" => {
                 // Find the merchant and update their subscription
                 if let Some(merchant_id) = event_data.get("merchant_id").and_then(|v| v.as_str()) {
-                    let amount = event_data.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let plan_code = event_data.get("plan_code").and_then(|v| v.as_str()).unwrap_or("free");
+                    let amount = event_data
+                        .get("amount")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let plan_code = event_data
+                        .get("plan_code")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("free");
 
                     // Update merchant subscription
                     sqlx::query(
