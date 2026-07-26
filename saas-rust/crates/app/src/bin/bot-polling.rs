@@ -1,19 +1,38 @@
-//! Standalone Telegram bot — polling mode using teloxide 0.14.
+//! Standalone Telegram bot — polling mode (development/testing only).
+//!
+//! # Security
+//!
+//! This binary uses a single BOT_TOKEN from environment. It has NO tenant
+//! isolation and NO webhook security. It is intended ONLY for local
+//! development and integration testing.
+//!
+//! # Gate
+//!
+//! This binary refuses to start unless TELEGRAM_COMMANDS_ENABLED=true is set
+//! explicitly. This prevents accidental use with a production bot token.
 
-use teloxide::{prelude::*, utils::command::BotCommands};
+use teloxide::prelude::*;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase")]
+use tgbot_services::telegram_commands::{build_command_reply, parse_telegram_command};
+
+/// Commands recognised by the polling binary.
+///
+/// Only `/start` and `/help` are supported — matching the shared
+/// `tgbot_services::telegram_commands::parse_telegram_command` parser.
+#[derive(Debug, Clone, PartialEq)]
 enum Command {
-    #[command(description = "Welcome & bot info")]
     Start,
-    #[command(description = "Command list")]
     Help,
-    #[command(description = "System status")]
-    Status,
-    #[command(description = "Echo your message")]
-    Echo(String),
+}
+
+fn parse_commands(text: &str) -> Option<Command> {
+    let bot_username = std::env::var("BOT_USERNAME").unwrap_or_default();
+    match parse_telegram_command(text, &bot_username) {
+        Some(tgbot_services::telegram_commands::TelegramCommand::Start(_)) => Some(Command::Start),
+        Some(tgbot_services::telegram_commands::TelegramCommand::Help) => Some(Command::Help),
+        None => None,
+    }
 }
 
 #[tokio::main]
@@ -26,6 +45,26 @@ async fn main() -> anyhow::Result<()> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    // === Fail-closed gate ===
+    // This polling binary has no tenant isolation.  It MUST NOT be run against
+    // a production bot token unless the operator explicitly opts in.
+    let enabled = std::env::var("TELEGRAM_COMMANDS_ENABLED")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+    if !enabled {
+        tracing::error!(
+            "TELEGRAM_COMMANDS_ENABLED is not set to true. \
+             The polling binary has no tenant isolation and must be explicitly enabled. \
+             Set TELEGRAM_COMMANDS_ENABLED=true to proceed."
+        );
+        std::process::exit(1);
+    }
 
     let token = std::env::var("BOT_TOKEN")
         .or_else(|_| std::env::var("TELOXIDE_TOKEN"))
@@ -41,7 +80,11 @@ async fn main() -> anyhow::Result<()> {
     let handler = dptree::entry()
         .branch(
             Update::filter_message()
-                .filter_command::<Command>()
+                .filter(|msg: Message| {
+                    msg.text()
+                        .and_then(|text| parse_commands(text))
+                        .is_some()
+                })
                 .endpoint(command_handler),
         )
         .branch(
@@ -60,56 +103,36 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn command_handler(bot: Bot, msg: Message, cmd: Command) -> Result<(), teloxide::RequestError> {
-    match cmd {
-        Command::Start => {
-            let name = msg.from()
-                .map(|u| u.first_name.clone())
-                .unwrap_or_else(|| "friend".into());
-            bot.send_message(msg.chat.id, format!(
-                "Hello, {}!\n\nI'm your SaaS Telegram Bot (Rust + Supabase).\n\n/help — commands\n/status — system status\n/echo <text> — echo\n\nBuilt with: Rust | teloxide | axum | Supabase",
-                name
-            )).send().await?;
-        }
-        Command::Help => {
-            bot.send_message(msg.chat.id,
-                "Available Commands:\n\n/start — Welcome & bot info\n/help — This menu\n/status — System status\n/echo <text> — Echo back\n\nMore coming soon..."
-            ).send().await?;
-        }
-        Command::Status => {
-            let supabase_url = std::env::var("SUPABASE_URL").unwrap_or_default();
-            let pg_url = std::env::var("SUPABASE_DATABASE_URL").unwrap_or_default();
-            let pg_status = if pg_url.is_empty() { "Not configured" } else { "Blocked by proxy" };
+async fn command_handler(bot: Bot, msg: Message) -> Result<(), teloxide::RequestError> {
+    let Some(text) = msg.text() else {
+        return Ok(());
+    };
+    let Some(command) = parse_commands(text) else {
+        return Ok(());
+    };
+    let first_name = msg
+        .from()
+        .map(|u| u.first_name.clone())
+        .unwrap_or_else(|| "朋友".into());
 
-            let text = format!(
-                "System Status\n\nBot: Online\nSupabase REST: Connected\nPostgreSQL direct: {}\nSupabase URL: {}\nMode: REST-only",
-                pg_status,
-                if supabase_url.is_empty() { "Not set" } else { "Set" }
-            );
-            bot.send_message(msg.chat.id, text).send().await?;
-        }
-        Command::Echo(ref text) => {
-            let echo_text = text.trim();
-            if echo_text.is_empty() {
-                bot.send_message(msg.chat.id, "Usage: /echo <your message>").send().await?;
-            } else {
-                bot.send_message(msg.chat.id, format!("{}", echo_text)).send().await?;
-            }
-        }
-    }
+    let shared_cmd = match command {
+        Command::Start => tgbot_services::telegram_commands::TelegramCommand::Start(None),
+        Command::Help => tgbot_services::telegram_commands::TelegramCommand::Help,
+    };
+    let reply = build_command_reply(&shared_cmd, &first_name);
+
+    bot.send_message(msg.chat.id, reply.text).send().await?;
     Ok(())
 }
 
 async fn fallback_message(bot: Bot, msg: Message) -> Result<(), teloxide::RequestError> {
     if let Some(text) = msg.text() {
         if text.starts_with('/') {
-            bot.send_message(msg.chat.id, "Unknown command. Try /help").send().await?;
-        } else {
-            bot.send_message(
-                msg.chat.id,
-                format!("Received: \"{}\"\n\nUse /help to see commands.", text),
-            ).send().await?;
+            bot.send_message(msg.chat.id, "未知命令。请输入 /help 查看可用命令。")
+                .send()
+                .await?;
         }
+        // Non-command text is silently ignored in polling mode.
     }
     Ok(())
 }

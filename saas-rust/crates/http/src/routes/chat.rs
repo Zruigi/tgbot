@@ -5,7 +5,7 @@
 //!   GET  /api/messages/{user_id}        — chat history
 //!   POST /api/messages/{user_id}        — send message (text or image)
 //!   POST /api/messages/{user_id}/delete — delete single message
-//!   POST /api/messages/{user_id}/ai     — AI reply (stub)
+//!   POST /api/messages/{user_id}/ai     — AI reply compatibility alias
 //!   POST /api/mark_read/{user_id}       — mark messages as read
 //!   POST /api/delete_chat/{user_id}     — soft-delete a chat
 //!   GET  /api/search                    — global message search
@@ -15,15 +15,19 @@
 
 use axum::{
     extract::ws::{Message, WebSocket},
-    extract::{Path, Query, State, WebSocketUpgrade},
+    extract::{FromRequest, Multipart, Path, Query, Request, State, WebSocketUpgrade},
     http::HeaderMap,
     response::IntoResponse,
     Json,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_domain::models::Role;
+use tgbot_integrations::telegram::{
+    GetFileParams, SendMessageParams, SendPhotoParams, TelegramClient, TelegramConfig,
+};
 use tgbot_repos::{audit_repo, message_repo, user_repo};
 
 use crate::auth::resolve_scope;
@@ -56,6 +60,19 @@ pub struct SendMessageRequest {
 #[derive(Debug, Deserialize)]
 pub struct DeleteMessageRequest {
     pub msg_id: i64,
+}
+
+struct UploadedImage {
+    bytes: Vec<u8>,
+    filename: String,
+    mime_type: String,
+    content: String,
+    reply_to_msg_id: Option<i64>,
+}
+
+enum OutgoingMessage {
+    Json(SendMessageRequest),
+    Image(UploadedImage),
 }
 
 // ---------------------------------------------------------------------------
@@ -133,11 +150,19 @@ pub async fn get_messages(
     let bot_id = resolve_bot_id_for_scope(&state, &scope).await?;
 
     let messages = if let Some(bid) = bot_id {
-        user_repo::get_chat_history(state.db()?, user_id, bid, limit, offset).await?
+        user_repo::get_chat_history(
+            state.db()?,
+            user_id,
+            bid,
+            scope.tenant_id.as_deref(),
+            limit,
+            offset,
+        )
+        .await?
     } else {
         // Platform admin: try to find the bot_id from the merchant context
         // If not available, use user_id=0 as a sentinel (will return empty)
-        user_repo::get_chat_history(state.db()?, user_id, 0, limit, offset).await?
+        user_repo::get_chat_history(state.db()?, user_id, 0, None, limit, offset).await?
     };
 
     let total = messages.len();
@@ -152,54 +177,123 @@ pub async fn get_messages(
 
 pub async fn send_message(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(user_id): Path<i64>,
-    Json(body): Json<SendMessageRequest>,
+    request: Request,
 ) -> ApiResult<Json<Value>> {
+    let headers = request.headers().clone();
     let scope = resolve_scope(&state, &headers).await?;
+    require_write_access(&scope)?;
+    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
+    let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("merchant has no bot configured".into()))?;
+    ensure_tenant_user(&state, user_id, tenant_id, bot_id).await?;
+    let telegram = telegram_for_tenant_bot(&state, tenant_id, bot_id).await?;
+    let outgoing = parse_outgoing_message(request, &state).await?;
 
-    let content = body.content.as_deref().unwrap_or("").trim();
-    let file_id = body.file_id.as_deref().unwrap_or("");
-
-    if content.is_empty() && file_id.is_empty() {
-        return Err(ApiError::BadRequest("消息内容不能为空".into()));
-    }
-
-    // Resolve tenant_id and bot_id for this scope
-    let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
-
-    let bot_id = resolve_bot_id_for_scope(&state, &scope).await?;
-    let admin_user_id: i64 = resolve_admin_user_id(&headers);
-
-    // Determine message type
-    let msg_type = if !file_id.is_empty() { "photo" } else { "text" };
+    let (sent, content, msg_type, file_id, reply_to_msg_id) = match outgoing {
+        OutgoingMessage::Json(body) => {
+            let content = body.content.unwrap_or_default().trim().to_string();
+            let file_id = body.file_id.unwrap_or_default().trim().to_string();
+            if content.is_empty() && file_id.is_empty() {
+                return Err(ApiError::BadRequest("消息内容不能为空".into()));
+            }
+            if file_id.len() > 512 {
+                return Err(ApiError::BadRequest("file_id is too long".into()));
+            }
+            let content_limit = if file_id.is_empty() { 4096 } else { 1024 };
+            if content.chars().count() > content_limit {
+                return Err(ApiError::BadRequest(format!(
+                    "message exceeds {content_limit} characters"
+                )));
+            }
+            let sent = if file_id.is_empty() {
+                telegram
+                    .send_message(SendMessageParams {
+                        chat_id: user_id,
+                        text: content.clone(),
+                        parse_mode: None,
+                        reply_markup: None,
+                        reply_to_message_id: body.reply_to_msg_id,
+                    })
+                    .await
+            } else {
+                telegram
+                    .send_photo(SendPhotoParams {
+                        chat_id: user_id,
+                        photo: file_id.clone(),
+                        caption: (!content.is_empty()).then(|| content.clone()),
+                        parse_mode: None,
+                        reply_to_message_id: body.reply_to_msg_id,
+                    })
+                    .await
+            }
+            .map_err(ApiError::Anyhow)?;
+            let returned_file_id = sent
+                .photo
+                .as_ref()
+                .and_then(|photos| photos.last())
+                .map(|photo| photo.file_id.clone())
+                .or((!file_id.is_empty()).then_some(file_id));
+            let msg_type = if returned_file_id.is_some() {
+                "photo"
+            } else {
+                "text"
+            };
+            (
+                sent,
+                content,
+                msg_type,
+                returned_file_id,
+                body.reply_to_msg_id,
+            )
+        }
+        OutgoingMessage::Image(image) => {
+            let sent = telegram
+                .send_photo_bytes(
+                    user_id,
+                    image.bytes,
+                    &image.filename,
+                    &image.mime_type,
+                    Some(&image.content),
+                    image.reply_to_msg_id,
+                    None,
+                )
+                .await
+                .map_err(ApiError::Anyhow)?;
+            let file_id = sent
+                .photo
+                .as_ref()
+                .and_then(|photos| photos.last())
+                .map(|photo| photo.file_id.clone())
+                .ok_or_else(|| ApiError::Anyhow(anyhow::anyhow!("Telegram returned no photo")))?;
+            (
+                sent,
+                image.content,
+                "photo",
+                Some(file_id),
+                image.reply_to_msg_id,
+            )
+        }
+    };
     let display_content = if content.is_empty() && msg_type == "photo" {
         "[图片]"
     } else {
-        content
+        &content
     };
-
-    // TODO: In a full implementation, the message would be sent to Telegram
-    // via the bot engine first. For now, we save it directly to the database
-    // with a placeholder tg_msg_id. The actual Telegram sending will be
-    // wired up when the bot crate is integrated with the HTTP layer.
 
     let saved_msg_id = message_repo::save_message(
         state.db()?,
-        admin_user_id, // from: admin
-        user_id,       // to: telegram user
+        bot_id,
+        user_id,
         Some(display_content),
         msg_type,
-        if file_id.is_empty() {
-            None
-        } else {
-            Some(file_id)
-        },
-        None, // media_url
-        true, // is_read
-        None, // tg_msg_id (placeholder)
+        file_id.as_deref(),
+        None,
+        true,
+        Some(sent.message_id),
         tenant_id,
-        body.reply_to_msg_id,
+        reply_to_msg_id,
     )
     .await?;
 
@@ -207,9 +301,11 @@ pub async fn send_message(
 
     Ok(Json(json!({
         "status": "ok",
+        "msg_id": saved_msg_id,
         "data": {
             "msg_id": saved_msg_id,
-            "tg_msg_id": serde_json::Value::Null,
+            "tg_msg_id": sent.message_id,
+            "file_id": file_id,
         }
     })))
 }
@@ -224,13 +320,21 @@ pub async fn delete_single_message(
     Path(user_id): Path<i64>,
     Json(body): Json<DeleteMessageRequest>,
 ) -> ApiResult<Json<Value>> {
-    let _scope = resolve_scope(&state, &headers).await?;
+    let scope = resolve_scope(&state, &headers).await?;
+    require_write_access(&scope)?;
+    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
+    let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("merchant has no bot configured".into()))?;
+    ensure_tenant_user(&state, user_id, tenant_id, bot_id).await?;
 
     if body.msg_id <= 0 {
         return Err(ApiError::BadRequest("消息 ID 无效".into()));
     }
 
-    let success = message_repo::delete_single_message(state.db()?, user_id, body.msg_id).await?;
+    let success =
+        message_repo::delete_single_message(state.db()?, tenant_id, bot_id, user_id, body.msg_id)
+            .await?;
 
     if success {
         Ok(Json(json!({"status": "ok"})))
@@ -240,25 +344,17 @@ pub async fn delete_single_message(
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/messages/{user_id}/ai  (stub)
+// POST /api/messages/{user_id}/ai
 // ---------------------------------------------------------------------------
 
 pub async fn ai_reply(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(user_id): Path<i64>,
+    Json(mut body): Json<super::ai::AiChatRequest>,
 ) -> ApiResult<Json<Value>> {
-    let _scope = resolve_scope(&state, &headers).await?;
-
-    tracing::info!("ai_reply: called for user_id={user_id}, service not configured");
-    Ok(Json(json!({
-        "status": "ok",
-        "data": {
-            "msg_id": serde_json::Value::Null,
-            "content": null,
-            "note": "AI 回复服务未配置"
-        }
-    })))
+    body.user_id = Some(user_id);
+    super::ai::ai_chat(State(state), headers, Json(body)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -271,11 +367,13 @@ pub async fn mark_read(
     Path(user_id): Path<i64>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
+    require_write_access(&scope)?;
 
     let bot_id = resolve_bot_id_for_scope(&state, &scope).await?;
-    let bid = bot_id.unwrap_or(0);
-
-    user_repo::mark_messages_as_read(state.db()?, user_id, bid).await?;
+    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
+    let bid = bot_id.ok_or(ApiError::Forbidden)?;
+    ensure_tenant_user(&state, user_id, tenant_id, bid).await?;
+    user_repo::mark_messages_as_read(state.db()?, user_id, bid, tenant_id).await?;
 
     Ok(Json(json!({"status": "ok"})))
 }
@@ -289,9 +387,14 @@ pub async fn delete_chat(
     headers: HeaderMap,
     Path(user_id): Path<i64>,
 ) -> ApiResult<Json<Value>> {
-    let _scope = resolve_scope(&state, &headers).await?;
-
-    user_repo::soft_delete_chat(state.db()?, user_id).await?;
+    let scope = resolve_scope(&state, &headers).await?;
+    require_write_access(&scope)?;
+    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
+    let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("merchant has no bot configured".into()))?;
+    ensure_tenant_user(&state, user_id, tenant_id, bot_id).await?;
+    user_repo::soft_delete_chat(state.db()?, user_id, tenant_id).await?;
 
     Ok(Json(json!({"status": "ok"})))
 }
@@ -351,50 +454,32 @@ pub async fn get_file(
     headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let _scope = resolve_scope(&state, &headers).await?;
-
-    tracing::info!("get_file: called for file_id={}, Telegram client not connected", file_id);
-    Ok(Json(json!({
-        "status": "ok",
-        "data": null,
-        "note": "文件代理服务未配置"
-    })))
-}
-
-// ---------------------------------------------------------------------------
-// POST /api/upload/{user_id} — upload image and send via Telegram
-// ---------------------------------------------------------------------------
-
-pub async fn upload_image(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(user_id): Path<i64>,
-) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let admin_user_id: i64 = resolve_admin_user_id(&headers);
-    let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
-
-    // Save a placeholder message in the DB
-    let saved_msg_id = message_repo::save_message(
-        state.db()?,
-        admin_user_id,
-        user_id,
-        Some("[图片]"),
-        "photo",
-        None,
-        None,
-        true,
-        None,
-        tenant_id,
-        None,
-    )
-    .await?;
-
-    tracing::info!("upload_image: saved msg_id={saved_msg_id} for user {user_id}");
+    if file_id.is_empty() || file_id.len() > 512 {
+        return Err(ApiError::BadRequest("invalid file_id".into()));
+    }
+    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
+    let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("merchant has no bot configured".into()))?;
+    let telegram = telegram_for_tenant_bot(&state, tenant_id, bot_id).await?;
+    let file = telegram
+        .get_file(GetFileParams {
+            file_id: file_id.clone(),
+        })
+        .await
+        .map_err(ApiError::Anyhow)?;
+    let bytes = telegram
+        .download_file_bytes(&file, 10 * 1024 * 1024)
+        .await
+        .map_err(ApiError::Anyhow)?;
+    let mime_type = mime_type_for_path(file.file_path.as_deref());
+    let url = format!("data:{mime_type};base64,{}", BASE64.encode(bytes));
 
     Ok(Json(json!({
         "status": "ok",
-        "data": { "msg_id": saved_msg_id }
+        "url": url.clone(),
+        "data": { "url": url, "mime_type": mime_type }
     })))
 }
 
@@ -402,9 +487,7 @@ pub async fn upload_image(
 // GET /ws — WebSocket endpoint for real-time admin updates
 // ---------------------------------------------------------------------------
 
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws_socket(socket))
 }
 
@@ -446,12 +529,159 @@ async fn resolve_bot_id_for_scope(
     Ok(Some(bot_id))
 }
 
-/// Extract the admin user id from the X-Admin-User-Id header.
-/// Falls back to 0 if not present (used as from_userid when saving messages).
-fn resolve_admin_user_id(headers: &HeaderMap) -> i64 {
-    headers
-        .get("x-admin-user-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+fn require_write_access(scope: &tgbot_domain::scope::Scope) -> ApiResult<()> {
+    if matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+async fn ensure_tenant_user(
+    state: &AppState,
+    user_id: i64,
+    tenant_id: &str,
+    bot_id: i64,
+) -> ApiResult<()> {
+    if user_repo::is_user_belong_to_tenant(state.db()?, user_id, tenant_id, bot_id).await? {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+async fn telegram_for_tenant_bot(
+    state: &AppState,
+    tenant_id: &str,
+    bot_id: i64,
+) -> ApiResult<TelegramClient> {
+    let entry = state
+        .bot_registry
+        .get(bot_id)
+        .await
+        .filter(|entry| entry.tenant_id == tenant_id)
+        .ok_or_else(|| ApiError::BadRequest("merchant bot is not active".into()))?;
+    TelegramClient::new(TelegramConfig {
+        bot_token: entry.bot_token,
+        api_base_url: std::env::var("TELEGRAM_API_BASE_URL")
+            .unwrap_or_else(|_| "https://api.telegram.org".into()),
+        timeout_secs: 30,
+    })
+    .map_err(ApiError::Anyhow)
+}
+
+async fn parse_outgoing_message(request: Request, state: &AppState) -> ApiResult<OutgoingMessage> {
+    let is_multipart = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        });
+    if !is_multipart {
+        let Json(body) = Json::<SendMessageRequest>::from_request(request, state)
+            .await
+            .map_err(|error| ApiError::BadRequest(format!("invalid JSON body: {error}")))?;
+        return Ok(OutgoingMessage::Json(body));
+    }
+
+    let multipart = Multipart::from_request(request, state)
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("invalid multipart body: {error}")))?;
+    parse_uploaded_image(multipart)
+        .await
+        .map(OutgoingMessage::Image)
+}
+
+async fn parse_uploaded_image(mut multipart: Multipart) -> ApiResult<UploadedImage> {
+    let mut image = None;
+    let mut content = String::new();
+    let mut reply_to_msg_id = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("invalid multipart field: {error}")))?
+    {
+        match field.name().unwrap_or_default() {
+            "image" => {
+                let filename = field.file_name().unwrap_or("image.jpg").to_string();
+                let mime_type = field
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                if !mime_type.starts_with("image/") {
+                    return Err(ApiError::BadRequest(
+                        "only image uploads are supported".into(),
+                    ));
+                }
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|error| ApiError::BadRequest(format!("invalid image: {error}")))?;
+                if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+                    return Err(ApiError::BadRequest(
+                        "image must be between 1 byte and 10 MiB".into(),
+                    ));
+                }
+                image = Some((bytes.to_vec(), filename, mime_type));
+            }
+            "content" => {
+                content = field
+                    .text()
+                    .await
+                    .map_err(|error| ApiError::BadRequest(format!("invalid caption: {error}")))?
+                    .trim()
+                    .to_string();
+                if content.chars().count() > 1024 {
+                    return Err(ApiError::BadRequest(
+                        "image caption exceeds 1024 characters".into(),
+                    ));
+                }
+            }
+            "reply_to_msg_id" => {
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|error| ApiError::BadRequest(format!("invalid reply id: {error}")))?;
+                reply_to_msg_id = Some(
+                    value
+                        .trim()
+                        .parse::<i64>()
+                        .map_err(|_| ApiError::BadRequest("invalid reply_to_msg_id".into()))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    let (bytes, filename, mime_type) =
+        image.ok_or_else(|| ApiError::BadRequest("未找到图片文件".into()))?;
+    Ok(UploadedImage {
+        bytes,
+        filename,
+        mime_type,
+        content,
+        reply_to_msg_id,
+    })
+}
+
+fn mime_type_for_path(path: Option<&str>) -> &'static str {
+    match path
+        .and_then(|value| value.rsplit_once('.').map(|(_, extension)| extension))
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "ogg" | "oga" => "audio/ogg",
+        "mp3" => "audio/mpeg",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
 }

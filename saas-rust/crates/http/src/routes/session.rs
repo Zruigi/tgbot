@@ -1,13 +1,9 @@
-use axum::{
-    extract::State,
-    http::HeaderMap,
-    Json,
-};
+use axum::{extract::State, http::HeaderMap, Json};
 use serde_json::json;
 
 use crate::auth::resolve_scope;
 use crate::state::AppState;
-use tgbot_domain::error::{ApiResult, ApiError};
+use tgbot_domain::error::{ApiError, ApiResult};
 
 pub async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok", "service": "tgbot-rust"}))

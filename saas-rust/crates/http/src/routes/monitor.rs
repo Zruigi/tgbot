@@ -4,7 +4,7 @@ use axum::{
     http::HeaderMap,
     Json,
 };
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Column, Row, TypeInfo};
@@ -50,12 +50,19 @@ pub struct UpdateMonitorRemarkRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct DeleteMonitorRequest {
+    pub monitor_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct TxMetaRequest {
     pub income_reason: Option<String>,
     pub expense_reason: Option<String>,
     pub payer: Option<String>,
     pub payee: Option<String>,
     pub counterparty: Option<String>,
+    pub counterparty_label: Option<String>,
+    pub network: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,11 +84,18 @@ pub struct ListTransactionsQuery {
     pub period: Option<String>,
     pub start_ms: Option<i64>,
     pub end_ms: Option<i64>,
+    pub start: Option<String>,
+    pub end: Option<String>,
     pub monitor_id: Option<i64>,
     pub direction: Option<String>,
+    pub token_symbol: Option<String>,
+    pub network: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub annotated_only: Option<bool>,
+    pub exclude_dust: Option<bool>,
+    pub dust_threshold: Option<f64>,
+    pub sync_chain: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,7 +120,10 @@ pub fn row_to_json(row: sqlx::postgres::PgRow) -> Value {
             "INT4" => row.try_get::<i32, _>(name).map(|v| json!(v)),
             "INT8" => row.try_get::<i64, _>(name).map(|v| json!(v)),
             "FLOAT4" => row.try_get::<f32, _>(name).map(|v| json!(v)),
-            "FLOAT8" | "NUMERIC" => row.try_get::<f64, _>(name).map(|v| json!(v)),
+            "FLOAT8" => row.try_get::<f64, _>(name).map(|v| json!(v)),
+            "NUMERIC" => row
+                .try_get::<rust_decimal::Decimal, _>(name)
+                .map(|v| json!(v.to_string().parse::<f64>().unwrap_or_default())),
             "BOOL" => row.try_get::<bool, _>(name).map(|v| json!(v)),
             "TIMESTAMPTZ" => row
                 .try_get::<DateTime<Utc>, _>(name)
@@ -144,9 +161,19 @@ pub fn get_period_boundaries(period: &str, days: Option<i32>) -> (i64, i64) {
             (start.timestamp_millis(), end.timestamp_millis())
         }
         "month" => {
-            let start = now.date_naive().with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+            let start = now
+                .date_naive()
+                .with_day(1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap();
             let start = DateTime::<Utc>::from_naive_utc_and_offset(start, Utc);
-            let end = (now + chrono::Duration::days(32)).date_naive().with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+            let end = (now + chrono::Duration::days(32))
+                .date_naive()
+                .with_day(1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap();
             let end = DateTime::<Utc>::from_naive_utc_and_offset(end, Utc);
             (start.timestamp_millis(), end.timestamp_millis())
         }
@@ -158,6 +185,30 @@ pub fn get_period_boundaries(period: &str, days: Option<i32>) -> (i64, i64) {
         }
     };
     (start, end)
+}
+
+fn parse_timestamp(value: &str) -> Option<i64> {
+    value
+        .parse::<i64>()
+        .ok()
+        .or_else(|| {
+            DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|date| date.timestamp_millis())
+        })
+        .or_else(|| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|date| date.and_utc().timestamp_millis())
+        })
+}
+
+fn clean_filter(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|item| !item.is_empty() && !item.eq_ignore_ascii_case("all"))
+        .map(str::to_string)
 }
 
 // ============================================================================
@@ -223,7 +274,9 @@ pub async fn list_monitors(
     .await?;
 
     let total = rows.len();
-    Ok(Json(json!({ "status": "ok", "data": rows_to_json(rows), "total": total })))
+    Ok(Json(
+        json!({ "status": "ok", "data": rows_to_json(rows), "total": total }),
+    ))
 }
 
 // POST /api/monitors - Create a new monitor
@@ -294,6 +347,27 @@ pub async fn delete_monitor(
     Ok(Json(json!({ "status": "ok" })))
 }
 
+pub async fn delete_monitor_body(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DeleteMonitorRequest>,
+) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
+    let result = sqlx::query(
+        "UPDATE address_monitors SET is_active = false, updated_at = now() \
+         WHERE monitor_id = $1 AND tenant_id = $2",
+    )
+    .bind(body.monitor_id)
+    .bind(tenant_id)
+    .execute(state.db()?)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("monitor_not_found".into()));
+    }
+    Ok(Json(json!({"status": "ok"})))
+}
+
 // POST /api/monitors/{monitor_id}/remark - Update monitor remark
 pub async fn update_monitor_remark(
     State(state): State<AppState>,
@@ -334,8 +408,8 @@ pub async fn pnl_summary(
     let row = sqlx::query(
         r#"
         SELECT
-            COALESCE(SUM(CASE WHEN direction = 'in' THEN amount ELSE 0 END), 0) AS inflow,
-            COALESCE(SUM(CASE WHEN direction = 'out' THEN amount ELSE 0 END), 0) AS outflow,
+            COALESCE(SUM(CASE WHEN direction = 'in' THEN amount ELSE 0 END), 0)::double precision AS inflow,
+            COALESCE(SUM(CASE WHEN direction = 'out' THEN amount ELSE 0 END), 0)::double precision AS outflow,
             COUNT(*) AS tx_count
         FROM monitor_transactions
         WHERE tenant_id = $1
@@ -395,10 +469,30 @@ pub async fn update_tx_meta(
             WHERE tx_id = $5 AND tenant_id = $6
             "#,
         )
-        .bind(item.income_reason.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()))
-        .bind(item.expense_reason.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()))
-        .bind(item.payer.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()))
-        .bind(item.payee.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()))
+        .bind(
+            item.income_reason
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty()),
+        )
+        .bind(
+            item.expense_reason
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty()),
+        )
+        .bind(
+            item.payer
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty()),
+        )
+        .bind(
+            item.payee
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty()),
+        )
         .bind(tx_id)
         .bind(&tenant_id)
         .execute(state.db()?)
@@ -412,6 +506,86 @@ pub async fn update_tx_meta(
     Ok(Json(json!({ "status": "ok", "updated": updated })))
 }
 
+pub async fn update_transaction_meta(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(tx_id): Path<String>,
+    Json(body): Json<TxMetaRequest>,
+) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
+    let tx_id = tx_id.trim();
+    if tx_id.is_empty() {
+        return Err(ApiError::BadRequest("tx_id is required".into()));
+    }
+
+    let clean = |value: Option<String>| {
+        value
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+    };
+    let income_reason = clean(body.income_reason);
+    let expense_reason = clean(body.expense_reason);
+    let payer = clean(body.payer);
+    let payee = clean(body.payee);
+    let counterparty = clean(body.counterparty);
+    let network = clean(body.network).map(|item| item.to_uppercase());
+    let counterparty_label = clean(body.counterparty_label);
+
+    let mut transaction = state.db()?.begin().await?;
+    let row = sqlx::query(
+        r#"
+        UPDATE monitor_transactions
+        SET income_reason = COALESCE($1, income_reason),
+            expense_reason = COALESCE($2, expense_reason),
+            payer = COALESCE($3, payer),
+            payee = COALESCE($4, payee),
+            counterparty = COALESCE($5, counterparty),
+            network = COALESCE($6, network),
+            updated_at = now()
+        WHERE tx_id = $7 AND tenant_id = $8
+        RETURNING counterparty, network
+        "#,
+    )
+    .bind(income_reason)
+    .bind(expense_reason)
+    .bind(payer)
+    .bind(payee)
+    .bind(counterparty)
+    .bind(network)
+    .bind(tx_id)
+    .bind(&tenant_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("transaction_not_found".into()))?;
+
+    if let Some(label) = counterparty_label {
+        let row_counterparty: Option<String> = row.try_get("counterparty")?;
+        let row_network: String = row.try_get("network")?;
+        let row_counterparty = row_counterparty
+            .filter(|item| !item.trim().is_empty())
+            .ok_or_else(|| ApiError::BadRequest("counterparty is required for label".into()))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO monitor_counterparty_labels (tenant_id, counterparty, network, label)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (tenant_id, counterparty, network)
+            DO UPDATE SET label = EXCLUDED.label, updated_at = now()
+            "#,
+        )
+        .bind(&tenant_id)
+        .bind(row_counterparty)
+        .bind(row_network)
+        .bind(label)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    transaction.commit().await?;
+    Ok(Json(json!({ "status": "ok", "updated": 1 })))
+}
+
 // GET /api/monitors/export - Export transactions
 pub async fn export_transactions(
     State(state): State<AppState>,
@@ -421,7 +595,13 @@ pub async fn export_transactions(
     let scope = resolve_scope(&state, &headers).await?;
     let (tenant_id, merchant_id) = scope.require_merchant()?;
 
-    let (start_ms, end_ms) = if let (Some(start), Some(end)) = (q.start_ms, q.end_ms) {
+    let parsed_start = q
+        .start_ms
+        .or_else(|| q.start.as_deref().and_then(parse_timestamp));
+    let parsed_end = q
+        .end_ms
+        .or_else(|| q.end.as_deref().and_then(parse_timestamp));
+    let (start_ms, end_ms) = if let (Some(start), Some(end)) = (parsed_start, parsed_end) {
         (start, end)
     } else {
         let period = q.period.as_deref().unwrap_or("month");
@@ -430,40 +610,67 @@ pub async fn export_transactions(
 
     let limit = q.limit.unwrap_or(1000).clamp(1, 5000);
     let offset = q.offset.unwrap_or(0).max(0);
+    let direction = clean_filter(q.direction.as_deref());
+    if direction
+        .as_deref()
+        .is_some_and(|value| value != "in" && value != "out")
+    {
+        return Err(ApiError::BadRequest("direction must be in or out".into()));
+    }
+    let token_symbol = clean_filter(q.token_symbol.as_deref());
+    let network = clean_filter(q.network.as_deref());
+    let annotated_only = q.annotated_only.unwrap_or(false);
+    let exclude_dust = q.exclude_dust.unwrap_or(false);
+    let dust_threshold = q.dust_threshold.unwrap_or(1.0).max(0.0);
 
-    let mut sql = String::from(
+    let rows = sqlx::query(
         r#"
-        SELECT t.*, m.address, m.network, m.remark AS monitor_remark
+        SELECT t.*, m.remark AS monitor_remark,
+               labels.label AS counterparty_label,
+               COALESCE((
+                   SELECT COUNT(*) FROM monitor_transactions related
+                   WHERE related.tenant_id = t.tenant_id
+                     AND related.counterparty = t.counterparty
+                     AND related.network = t.network
+               ), 0) AS counterparty_tx_count
         FROM monitor_transactions t
         JOIN address_monitors m ON m.monitor_id = t.monitor_id
+        LEFT JOIN monitor_counterparty_labels labels
+          ON labels.tenant_id = t.tenant_id
+         AND labels.counterparty = t.counterparty
+         AND labels.network = t.network
         WHERE t.tenant_id = $1
           AND t.tx_timestamp >= $2
           AND t.tx_timestamp < $3
+          AND ($4::bigint IS NULL OR t.monitor_id = $4)
+          AND ($5::text IS NULL OR t.direction = $5)
+          AND ($6::text IS NULL OR UPPER(t.token_symbol) = UPPER($6))
+          AND ($7::text IS NULL OR UPPER(t.network) = UPPER($7))
+          AND (NOT $8 OR t.income_reason IS NOT NULL OR t.expense_reason IS NOT NULL OR t.payer IS NOT NULL OR t.payee IS NOT NULL)
+          AND (NOT $9 OR ABS(t.amount) >= $10)
+        ORDER BY t.tx_timestamp DESC, t.tx_id DESC
+        LIMIT $11 OFFSET $12
         "#,
-    );
-
-    if let Some(ref monitor_id) = q.monitor_id {
-        sql.push_str(&format!(" AND t.monitor_id = {}", monitor_id));
-    }
-    if let Some(ref direction) = q.direction {
-        sql.push_str(&format!(" AND t.direction = '{}'", direction));
-    }
-    if q.annotated_only.unwrap_or(false) {
-        sql.push_str(" AND (t.income_reason IS NOT NULL OR t.expense_reason IS NOT NULL OR t.payer IS NOT NULL OR t.payee IS NOT NULL)");
-    }
-
-    sql.push_str(" ORDER BY t.tx_timestamp DESC, t.tx_id DESC");
-    sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
-
-    let rows = sqlx::query(&sql)
-        .bind(&tenant_id)
-        .bind(start_ms)
-        .bind(end_ms)
-        .fetch_all(state.db()?)
-        .await?;
+    )
+    .bind(&tenant_id)
+    .bind(start_ms)
+    .bind(end_ms)
+    .bind(q.monitor_id)
+    .bind(direction)
+    .bind(token_symbol)
+    .bind(network)
+    .bind(annotated_only)
+    .bind(exclude_dust)
+    .bind(dust_threshold)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(state.db()?)
+    .await?;
 
     let count = rows.len();
-    Ok(Json(json!({ "status": "ok", "data": rows_to_json(rows), "count": count })))
+    Ok(Json(
+        json!({ "status": "ok", "data": rows_to_json(rows), "count": count }),
+    ))
 }
 
 // GET /api/monitors/transactions - List transactions
@@ -486,7 +693,11 @@ pub async fn year_summary(
 
     let now = chrono::Utc::now();
     let year_start = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-        now.date_naive().with_ordinal(1).unwrap().and_hms_opt(0, 0, 0).unwrap(),
+        now.date_naive()
+            .with_ordinal(1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
         Utc,
     );
     let start_ms = year_start.timestamp_millis();
@@ -497,8 +708,8 @@ pub async fn year_summary(
         r#"
         SELECT
             date_trunc('month', to_timestamp(tx_timestamp / 1000)) AS month,
-            COALESCE(SUM(CASE WHEN direction = 'in' THEN amount ELSE 0 END), 0) AS inflow,
-            COALESCE(SUM(CASE WHEN direction = 'out' THEN amount ELSE 0 END), 0) AS outflow,
+            COALESCE(SUM(CASE WHEN direction = 'in' THEN amount ELSE 0 END), 0)::double precision AS inflow,
+            COALESCE(SUM(CASE WHEN direction = 'out' THEN amount ELSE 0 END), 0)::double precision AS outflow,
             COUNT(*) AS tx_count
         FROM monitor_transactions
         WHERE tenant_id = $1
@@ -549,7 +760,7 @@ pub async fn claim_monitor(
     let result = sqlx::query(
         "UPDATE address_monitors SET is_active = true, updated_at = now() \
          WHERE monitor_id = $1 AND is_active = false \
-         RETURNING monitor_id"
+         RETURNING monitor_id",
     )
     .bind(monitor_id)
     .fetch_optional(state.db()?)
@@ -567,7 +778,8 @@ pub async fn batch_update_tx_meta(
     headers: HeaderMap,
     Json(body): Json<BatchTxMetaRequest>,
 ) -> ApiResult<Json<Value>> {
-    let _scope = resolve_scope(&state, &headers).await?;
+    let scope = resolve_scope(&state, &headers).await?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     let mut updated = 0usize;
     for tx in &body.transactions {
@@ -578,13 +790,14 @@ pub async fn batch_update_tx_meta(
              payer = COALESCE($4, payer), \
              payee = COALESCE($5, payee), \
              updated_at = now() \
-             WHERE tx_id = $1"
+             WHERE tx_id = $1 AND tenant_id = $6",
         )
         .bind(&tx.tx_id)
         .bind(&tx.income_reason)
         .bind(&tx.expense_reason)
         .bind(&tx.payer)
         .bind(&tx.payee)
+        .bind(&tenant_id)
         .execute(state.db()?)
         .await?;
 
@@ -606,20 +819,23 @@ pub async fn list_counterparty_aliases(
 
     let rows = sqlx::query(
         "SELECT id, counterparty, network, label, created_at, updated_at \
-         FROM monitor_counterparty_labels WHERE tenant_id = $1 ORDER BY label ASC"
+         FROM monitor_counterparty_labels WHERE tenant_id = $1 ORDER BY label ASC",
     )
     .bind(&tenant_id)
     .fetch_all(state.db()?)
     .await?;
 
-    let aliases: Vec<Value> = rows.iter().map(|r| {
-        json!({
-            "id": r.try_get::<i64, _>("id").unwrap_or(0),
-            "counterparty": r.try_get::<String, _>("counterparty").unwrap_or_default(),
-            "network": r.try_get::<String, _>("network").unwrap_or_default(),
-            "label": r.try_get::<String, _>("label").unwrap_or_default(),
+    let aliases: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<i64, _>("id").unwrap_or(0),
+                "counterparty": r.try_get::<String, _>("counterparty").unwrap_or_default(),
+                "network": r.try_get::<String, _>("network").unwrap_or_default(),
+                "label": r.try_get::<String, _>("label").unwrap_or_default(),
+            })
         })
-    }).collect();
+        .collect();
 
     Ok(Json(json!({"status": "ok", "data": aliases})))
 }
@@ -633,13 +849,16 @@ pub async fn upsert_counterparty_alias(
     let scope = resolve_scope(&state, &headers).await?;
     let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
-    let counterparty = body.get("counterparty")
+    let counterparty = body
+        .get("counterparty")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError::BadRequest("counterparty is required".into()))?;
-    let label = body.get("label")
+    let label = body
+        .get("label")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError::BadRequest("label is required".into()))?;
-    let network = body.get("network")
+    let network = body
+        .get("network")
         .and_then(|v| v.as_str())
         .unwrap_or("TRC20");
 
@@ -647,7 +866,7 @@ pub async fn upsert_counterparty_alias(
         "INSERT INTO monitor_counterparty_labels (tenant_id, counterparty, network, label) \
          VALUES ($1, $2, $3, $4) \
          ON CONFLICT (tenant_id, counterparty, network) \
-         DO UPDATE SET label = EXCLUDED.label, updated_at = now()"
+         DO UPDATE SET label = EXCLUDED.label, updated_at = now()",
     )
     .bind(&tenant_id)
     .bind(counterparty)
@@ -668,13 +887,12 @@ pub async fn delete_counterparty_alias(
     let scope = resolve_scope(&state, &headers).await?;
     let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
-    let result = sqlx::query(
-        "DELETE FROM monitor_counterparty_labels WHERE id = $1 AND tenant_id = $2"
-    )
-    .bind(alias_id)
-    .bind(&tenant_id)
-    .execute(state.db()?)
-    .await?;
+    let result =
+        sqlx::query("DELETE FROM monitor_counterparty_labels WHERE id = $1 AND tenant_id = $2")
+            .bind(alias_id)
+            .bind(&tenant_id)
+            .execute(state.db()?)
+            .await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("alias_not_found".into()));
@@ -697,23 +915,26 @@ pub async fn list_user_query_monitors(
                 COALESCE(m.profit_20, 0) as profit_20 \
          FROM address_monitors m \
          WHERE m.tenant_id = $1 AND m.is_active = true \
-         ORDER BY m.updated_at DESC"
+         ORDER BY m.updated_at DESC",
     )
     .bind(&tenant_id)
     .fetch_all(state.db()?)
     .await?;
 
-    let monitors: Vec<Value> = rows.iter().map(|r| {
-        json!({
-            "monitor_id": r.try_get::<i64, _>("monitor_id").unwrap_or(0),
-            "address": r.try_get::<String, _>("address").unwrap_or_default(),
-            "network": r.try_get::<String, _>("network").unwrap_or_default(),
-            "remark": r.try_get::<Option<String>, _>("remark").unwrap_or(None),
-            "inflow_20": r.try_get::<f64, _>("inflow_20").unwrap_or(0.0),
-            "outflow_20": r.try_get::<f64, _>("outflow_20").unwrap_or(0.0),
-            "profit_20": r.try_get::<f64, _>("profit_20").unwrap_or(0.0),
+    let monitors: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "monitor_id": r.try_get::<i64, _>("monitor_id").unwrap_or(0),
+                "address": r.try_get::<String, _>("address").unwrap_or_default(),
+                "network": r.try_get::<String, _>("network").unwrap_or_default(),
+                "remark": r.try_get::<Option<String>, _>("remark").unwrap_or(None),
+                "inflow_20": r.try_get::<f64, _>("inflow_20").unwrap_or(0.0),
+                "outflow_20": r.try_get::<f64, _>("outflow_20").unwrap_or(0.0),
+                "profit_20": r.try_get::<f64, _>("profit_20").unwrap_or(0.0),
+            })
         })
-    }).collect();
+        .collect();
 
     Ok(Json(json!({"status": "ok", "data": monitors})))
 }

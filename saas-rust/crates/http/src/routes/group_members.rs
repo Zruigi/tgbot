@@ -18,12 +18,14 @@ use axum::{
     http::HeaderMap,
     Json,
 };
+use chrono::{Duration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
+use std::collections::HashSet;
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_domain::models::Role;
-use tgbot_integrations::telegram::{SendMessageParams, TelegramClient, TelegramConfig};
+use tgbot_integrations::telegram::{SendMessageParams, SendPhotoParams, TelegramClient};
 
 use crate::auth::resolve_scope;
 use crate::state::AppState;
@@ -64,6 +66,7 @@ pub struct BatchActionRequest {
     pub user_ids: Vec<i64>,
     pub action: String,
     pub reason: Option<String>,
+    pub duration: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +80,7 @@ pub struct AdminBatchRequest {
 pub struct PromoteAdminRequest {
     pub group_id: i64,
     pub user_id: i64,
+    pub permissions: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +105,8 @@ pub struct GroupMessageSendRequest {
     pub content: String,
     pub msg_type: Option<String>,
     pub file_id: Option<String>,
+    pub reply_to_tg_msg_id: Option<i64>,
+    pub quoted_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,7 +119,9 @@ pub struct GroupMessageReplyRequest {
 #[derive(Debug, Deserialize)]
 pub struct GroupMessageDeleteRequest {
     pub group_id: i64,
-    pub msg_id: i64,
+    pub msg_id: Option<i64>,
+    pub tg_msg_id: Option<i64>,
+    pub user_id: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,13 +181,12 @@ pub async fn get_permissions(
     let tenant_id = resolve_tenant_id(&scope)?;
 
     // Verify the group belongs to this tenant
-    let group_owned = sqlx::query(
-        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
-    )
-    .bind(q.group_id)
-    .bind(tenant_id)
-    .fetch_optional(state.db()?)
-    .await?;
+    let group_owned =
+        sqlx::query("SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2")
+            .bind(q.group_id)
+            .bind(tenant_id)
+            .fetch_optional(state.db()?)
+            .await?;
 
     if group_owned.is_none() {
         return Err(ApiError::NotFound("group_not_found".into()));
@@ -245,10 +252,7 @@ pub async fn member_action(
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
-
     let tenant_id = resolve_tenant_id(&scope)?;
-
-    // Validate action
     let valid_actions = ["kick", "ban", "mute", "unmute", "verify", "unverify"];
     if !valid_actions.contains(&body.action.as_str()) {
         return Err(ApiError::BadRequest(format!(
@@ -256,131 +260,64 @@ pub async fn member_action(
             valid_actions.join(", ")
         )));
     }
+    ensure_group_owned(&state, tenant_id, body.group_id).await?;
+    ensure_member_exists(&state, tenant_id, body.group_id, body.user_id).await?;
 
-    // Verify the group belongs to this tenant
-    let group_owned = sqlx::query(
-        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
-    )
-    .bind(body.group_id)
-    .bind(tenant_id)
-    .fetch_optional(state.db()?)
-    .await?;
-
-    if group_owned.is_none() {
-        return Err(ApiError::NotFound("group_not_found".into()));
+    if matches!(body.action.as_str(), "kick" | "ban" | "mute" | "unmute") {
+        let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+        ensure_regular_telegram_member(&telegram, body.group_id, body.user_id).await?;
+        execute_telegram_member_action(
+            &telegram,
+            body.group_id,
+            body.user_id,
+            &body.action,
+            body.duration,
+        )
+        .await?;
     }
 
-    match body.action.as_str() {
-        "kick" | "ban" => {
-            let new_status = if body.action == "kick" {
-                "kicked"
-            } else {
-                "banned"
+    let updated = match body.action.as_str() {
+        "verify" => sqlx::query(
+            "UPDATE groups.group_members SET is_verified = true, verified_at = now(), status = 'active', updated_at = now() WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3",
+        )
+        .bind(body.group_id)
+        .bind(body.user_id)
+        .bind(tenant_id)
+        .execute(state.db()?)
+        .await?
+        .rows_affected(),
+        "unverify" => sqlx::query(
+            "UPDATE groups.group_members SET is_verified = false, verified_at = NULL, updated_at = now() WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3",
+        )
+        .bind(body.group_id)
+        .bind(body.user_id)
+        .bind(tenant_id)
+        .execute(state.db()?)
+        .await?
+        .rows_affected(),
+        action => {
+            let status = match action {
+                "kick" => "kicked",
+                "ban" => "banned",
+                "mute" => "muted",
+                "unmute" => "active",
+                _ => unreachable!(),
             };
-            let row = sqlx::query(
-                r#"
-                UPDATE groups.group_members
-                SET status = $1, updated_at = now()
-                WHERE group_id = $2 AND user_id = $3 AND tenant_id = $4
-                RETURNING *
-                "#,
+            sqlx::query(
+                "UPDATE groups.group_members SET status = $1, updated_at = now() WHERE group_id = $2 AND user_id = $3 AND tenant_id = $4",
             )
-            .bind(new_status)
+            .bind(status)
             .bind(body.group_id)
             .bind(body.user_id)
             .bind(tenant_id)
-            .fetch_optional(state.db()?)
-            .await?;
-
-            if row.is_none() {
-                return Err(ApiError::NotFound("member_not_found".into()));
-            }
-            // TODO: send kick/ban command to Telegram bot
-            tracing::info!("member_action: {} user {} in group {}", body.action, body.user_id, body.group_id);
+            .execute(state.db()?)
+            .await?
+            .rows_affected()
         }
-        "mute" => {
-            let row = sqlx::query(
-                r#"
-                UPDATE groups.group_members
-                SET status = 'muted', updated_at = now()
-                WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3
-                RETURNING *
-                "#,
-            )
-            .bind(body.group_id)
-            .bind(body.user_id)
-            .bind(tenant_id)
-            .fetch_optional(state.db()?)
-            .await?;
+    };
 
-            if row.is_none() {
-                return Err(ApiError::NotFound("member_not_found".into()));
-            }
-            // TODO: send mute command to Telegram bot
-            tracing::info!("member_action: mute user {} in group {} for {:?}s", body.user_id, body.group_id, body.duration);
-        }
-        "unmute" => {
-            let row = sqlx::query(
-                r#"
-                UPDATE groups.group_members
-                SET status = 'active', updated_at = now()
-                WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3
-                RETURNING *
-                "#,
-            )
-            .bind(body.group_id)
-            .bind(body.user_id)
-            .bind(tenant_id)
-            .fetch_optional(state.db()?)
-            .await?;
-
-            if row.is_none() {
-                return Err(ApiError::NotFound("member_not_found".into()));
-            }
-            // TODO: send unmute command to Telegram bot
-            tracing::info!("member_action: unmute user {} in group {}", body.user_id, body.group_id);
-        }
-        "verify" => {
-            let row = sqlx::query(
-                r#"
-                UPDATE groups.group_members
-                SET is_verified = true, verified_at = now(), status = 'active', updated_at = now()
-                WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3
-                RETURNING *
-                "#,
-            )
-            .bind(body.group_id)
-            .bind(body.user_id)
-            .bind(tenant_id)
-            .fetch_optional(state.db()?)
-            .await?;
-
-            if row.is_none() {
-                return Err(ApiError::NotFound("member_not_found".into()));
-            }
-            tracing::info!("member_action: verify user {} in group {}", body.user_id, body.group_id);
-        }
-        "unverify" => {
-            let row = sqlx::query(
-                r#"
-                UPDATE groups.group_members
-                SET is_verified = false, verified_at = NULL, updated_at = now()
-                WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3
-                RETURNING *
-                "#,
-            )
-            .bind(body.group_id)
-            .bind(body.user_id)
-            .bind(tenant_id)
-            .fetch_optional(state.db()?)
-            .await?;
-
-            if row.is_none() {
-                return Err(ApiError::NotFound("member_not_found".into()));
-            }
-            tracing::info!("member_action: unverify user {} in group {}", body.user_id, body.group_id);
-        }
-        _ => unreachable!(),
+    if updated == 0 {
+        return Err(ApiError::NotFound("member_not_found".into()));
     }
 
     Ok(Json(json!({
@@ -389,6 +326,7 @@ pub async fn member_action(
             "group_id": body.group_id,
             "user_id": body.user_id,
             "action": body.action,
+            "reason": body.reason,
         }
     })))
 }
@@ -418,82 +356,132 @@ pub async fn member_action_batch(
     if body.user_ids.is_empty() {
         return Err(ApiError::BadRequest("user_ids cannot be empty".into()));
     }
-
     if body.user_ids.len() > 100 {
         return Err(ApiError::BadRequest("batch size cannot exceed 100".into()));
     }
 
-    // Verify the group belongs to this tenant
-    let group_owned = sqlx::query(
-        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+    ensure_group_owned(&state, tenant_id, body.group_id).await?;
+
+    let requested_ids: Vec<i64> = body
+        .user_ids
+        .iter()
+        .copied()
+        .filter(|user_id| *user_id > 0)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if requested_ids.is_empty() {
+        return Err(ApiError::BadRequest("user_ids must contain a user".into()));
+    }
+    let existing_ids: HashSet<i64> = sqlx::query_scalar(
+        "SELECT user_id FROM groups.group_members WHERE group_id = $1 AND tenant_id = $2 AND user_id = ANY($3)",
     )
     .bind(body.group_id)
     .bind(tenant_id)
-    .fetch_optional(state.db()?)
-    .await?;
+    .bind(&requested_ids)
+    .fetch_all(state.db()?)
+    .await?
+    .into_iter()
+    .collect();
+    let mut success_ids = Vec::new();
+    let mut failed = Vec::new();
 
-    if group_owned.is_none() {
-        return Err(ApiError::NotFound("group_not_found".into()));
+    if matches!(body.action.as_str(), "kick" | "ban" | "mute" | "unmute") {
+        let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+        for user_id in &requested_ids {
+            if !existing_ids.contains(user_id) {
+                failed.push(json!({ "user_id": user_id, "reason": "member_not_found" }));
+                continue;
+            }
+            let result = async {
+                ensure_regular_telegram_member(&telegram, body.group_id, *user_id).await?;
+                execute_telegram_member_action(
+                    &telegram,
+                    body.group_id,
+                    *user_id,
+                    &body.action,
+                    body.duration,
+                )
+                .await
+            }
+            .await;
+            match result {
+                Ok(()) => success_ids.push(*user_id),
+                Err(error) => failed.push(json!({
+                    "user_id": user_id,
+                    "reason": error.to_string(),
+                })),
+            }
+        }
+    } else {
+        success_ids.extend(
+            requested_ids
+                .iter()
+                .filter(|id| existing_ids.contains(id))
+                .copied(),
+        );
+        failed.extend(
+            requested_ids
+                .iter()
+                .filter(|id| !existing_ids.contains(id))
+                .map(|user_id| json!({ "user_id": user_id, "reason": "member_not_found" })),
+        );
     }
 
-    let new_status = match body.action.as_str() {
-        "kick" => Some("kicked"),
-        "ban" => Some("banned"),
-        "mute" => Some("muted"),
-        "unmute" => Some("active"),
-        _ => None,
-    };
-
-    let affected = if let Some(status) = new_status {
-        let result = sqlx::query(
-            r#"
-            UPDATE groups.group_members
-            SET status = $1, updated_at = now()
-            WHERE group_id = $2 AND tenant_id = $3 AND user_id = ANY($4)
-            "#,
+    let affected = if success_ids.is_empty() {
+        0
+    } else if body.action == "verify" {
+        sqlx::query(
+            "UPDATE groups.group_members SET is_verified = true, verified_at = now(), status = 'active', updated_at = now() WHERE group_id = $1 AND tenant_id = $2 AND user_id = ANY($3)",
+        )
+        .bind(body.group_id)
+        .bind(tenant_id)
+        .bind(&success_ids)
+        .execute(state.db()?)
+        .await?
+        .rows_affected()
+    } else if body.action == "unverify" {
+        sqlx::query(
+            "UPDATE groups.group_members SET is_verified = false, verified_at = NULL, updated_at = now() WHERE group_id = $1 AND tenant_id = $2 AND user_id = ANY($3)",
+        )
+        .bind(body.group_id)
+        .bind(tenant_id)
+        .bind(&success_ids)
+        .execute(state.db()?)
+        .await?
+        .rows_affected()
+    } else {
+        let status = match body.action.as_str() {
+            "kick" => "kicked",
+            "ban" => "banned",
+            "mute" => "muted",
+            "unmute" => "active",
+            _ => unreachable!(),
+        };
+        sqlx::query(
+            "UPDATE groups.group_members SET status = $1, updated_at = now() WHERE group_id = $2 AND tenant_id = $3 AND user_id = ANY($4)",
         )
         .bind(status)
         .bind(body.group_id)
         .bind(tenant_id)
-        .bind(&body.user_ids)
+        .bind(&success_ids)
         .execute(state.db()?)
-        .await?;
-        result.rows_affected() as i64
-    } else if body.action == "verify" {
-        let result = sqlx::query(
-            r#"
-            UPDATE groups.group_members
-            SET is_verified = true, verified_at = now(), status = 'active', updated_at = now()
-            WHERE group_id = $1 AND tenant_id = $2 AND user_id = ANY($3)
-            "#,
-        )
-        .bind(body.group_id)
-        .bind(tenant_id)
-        .bind(&body.user_ids)
-        .execute(state.db()?)
-        .await?;
-        result.rows_affected() as i64
-    } else {
-        // unverify
-        let result = sqlx::query(
-            r#"
-            UPDATE groups.group_members
-            SET is_verified = false, verified_at = NULL, updated_at = now()
-            WHERE group_id = $1 AND tenant_id = $2 AND user_id = ANY($3)
-            "#,
-        )
-        .bind(body.group_id)
-        .bind(tenant_id)
-        .bind(&body.user_ids)
-        .execute(state.db()?)
-        .await?;
-        result.rows_affected() as i64
+        .await?
+        .rows_affected()
     };
 
-    // TODO: send batch action commands to Telegram bot
-
+    let success_count = success_ids.len();
+    let failed_count = failed.len();
     Ok(Json(json!({
         "status": "ok",
+        "action": body.action,
+        "success_ids": success_ids,
+        "failed": failed,
+        "summary": {
+            "total": requested_ids.len(),
+            "success": success_count,
+            "failed": failed_count,
+        },
         "data": {
             "group_id": body.group_id,
             "action": body.action,
@@ -519,6 +507,9 @@ pub async fn admin_batch(
     if body.user_ids.is_empty() {
         return Err(ApiError::BadRequest("user_ids cannot be empty".into()));
     }
+    if body.user_ids.len() > 100 {
+        return Err(ApiError::BadRequest("batch size cannot exceed 100".into()));
+    }
 
     if !matches!(body.action.as_str(), "promote" | "demote") {
         return Err(ApiError::BadRequest(
@@ -526,47 +517,91 @@ pub async fn admin_batch(
         ));
     }
 
-    // Verify the group belongs to this tenant
-    let group_owned = sqlx::query(
-        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
-    )
-    .bind(body.group_id)
-    .bind(tenant_id)
-    .fetch_optional(state.db()?)
-    .await?;
+    ensure_group_owned(&state, tenant_id, body.group_id).await?;
 
-    if group_owned.is_none() {
-        return Err(ApiError::NotFound("group_not_found".into()));
-    }
-
-    // TODO: send promote/demote commands to Telegram bot
-    // For now, just update the status in the database
     let new_status = if body.action == "promote" {
         "admin"
     } else {
         "active"
     };
-
-    let result = sqlx::query(
-        r#"
-        UPDATE groups.group_members
-        SET status = $1, updated_at = now()
-        WHERE group_id = $2 AND tenant_id = $3 AND user_id = ANY($4)
-        "#,
+    let requested_ids: Vec<i64> = body
+        .user_ids
+        .iter()
+        .copied()
+        .filter(|user_id| *user_id > 0)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let existing_ids: HashSet<i64> = sqlx::query_scalar(
+        "SELECT user_id FROM groups.group_members WHERE group_id = $1 AND tenant_id = $2 AND user_id = ANY($3)",
     )
-    .bind(new_status)
     .bind(body.group_id)
     .bind(tenant_id)
-    .bind(&body.user_ids)
-    .execute(state.db()?)
-    .await?;
+    .bind(&requested_ids)
+    .fetch_all(state.db()?)
+    .await?
+    .into_iter()
+    .collect();
+    let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+    let mut success_ids = Vec::new();
+    let mut failed = Vec::new();
+    for user_id in &requested_ids {
+        if !existing_ids.contains(user_id) {
+            failed.push(json!({ "user_id": user_id, "reason": "member_not_found" }));
+            continue;
+        }
+        let result = async {
+            ensure_not_group_creator(&telegram, body.group_id, *user_id).await?;
+            telegram
+                .promote_chat_member(
+                    body.group_id,
+                    *user_id,
+                    admin_permissions(body.action == "promote", None),
+                )
+                .await
+                .map_err(ApiError::Anyhow)?;
+            Ok::<(), ApiError>(())
+        }
+        .await;
+        match result {
+            Ok(()) => success_ids.push(*user_id),
+            Err(error) => failed.push(json!({
+                "user_id": user_id,
+                "reason": error.to_string(),
+            })),
+        }
+    }
+    let affected = if success_ids.is_empty() {
+        0
+    } else {
+        sqlx::query(
+            "UPDATE groups.group_members SET status = $1, updated_at = now() WHERE group_id = $2 AND tenant_id = $3 AND user_id = ANY($4)",
+        )
+        .bind(new_status)
+        .bind(body.group_id)
+        .bind(tenant_id)
+        .bind(&success_ids)
+        .execute(state.db()?)
+        .await?
+        .rows_affected()
+    };
+    let success_count = success_ids.len();
+    let failed_count = failed.len();
 
     Ok(Json(json!({
         "status": "ok",
+        "action": body.action,
+        "success_ids": success_ids,
+        "failed": failed,
+        "summary": {
+            "total": requested_ids.len(),
+            "success": success_count,
+            "failed": failed_count,
+        },
         "data": {
             "group_id": body.group_id,
             "action": body.action,
-            "affected": result.rows_affected(),
+            "affected": affected,
         }
     })))
 }
@@ -585,18 +620,18 @@ pub async fn promote_admin(
 
     let tenant_id = resolve_tenant_id(&scope)?;
 
-    // Verify the group belongs to this tenant
-    let group_owned = sqlx::query(
-        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
-    )
-    .bind(body.group_id)
-    .bind(tenant_id)
-    .fetch_optional(state.db()?)
-    .await?;
-
-    if group_owned.is_none() {
-        return Err(ApiError::NotFound("group_not_found".into()));
-    }
+    ensure_group_owned(&state, tenant_id, body.group_id).await?;
+    ensure_member_exists(&state, tenant_id, body.group_id, body.user_id).await?;
+    let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+    ensure_not_group_creator(&telegram, body.group_id, body.user_id).await?;
+    telegram
+        .promote_chat_member(
+            body.group_id,
+            body.user_id,
+            admin_permissions(true, body.permissions.as_ref()),
+        )
+        .await
+        .map_err(ApiError::Anyhow)?;
 
     let row = sqlx::query(
         r#"
@@ -615,9 +650,6 @@ pub async fn promote_admin(
     if row.is_none() {
         return Err(ApiError::NotFound("member_not_found".into()));
     }
-
-    // TODO: send promote command to Telegram bot
-    tracing::info!("promote_admin: user {} in group {}", body.user_id, body.group_id);
 
     Ok(Json(json!({
         "status": "ok",
@@ -639,18 +671,14 @@ pub async fn demote_admin(
 
     let tenant_id = resolve_tenant_id(&scope)?;
 
-    // Verify the group belongs to this tenant
-    let group_owned = sqlx::query(
-        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
-    )
-    .bind(body.group_id)
-    .bind(tenant_id)
-    .fetch_optional(state.db()?)
-    .await?;
-
-    if group_owned.is_none() {
-        return Err(ApiError::NotFound("group_not_found".into()));
-    }
+    ensure_group_owned(&state, tenant_id, body.group_id).await?;
+    ensure_member_exists(&state, tenant_id, body.group_id, body.user_id).await?;
+    let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+    ensure_not_group_creator(&telegram, body.group_id, body.user_id).await?;
+    telegram
+        .promote_chat_member(body.group_id, body.user_id, admin_permissions(false, None))
+        .await
+        .map_err(ApiError::Anyhow)?;
 
     let row = sqlx::query(
         r#"
@@ -669,9 +697,6 @@ pub async fn demote_admin(
     if row.is_none() {
         return Err(ApiError::NotFound("member_not_found_or_not_admin".into()));
     }
-
-    // TODO: send demote command to Telegram bot
-    tracing::info!("demote_admin: user {} in group {}", body.user_id, body.group_id);
 
     Ok(Json(json!({
         "status": "ok",
@@ -770,13 +795,12 @@ pub async fn send_group_message(
     let tenant_id = resolve_tenant_id(&scope)?;
 
     // Verify the group belongs to this tenant
-    let group_owned = sqlx::query(
-        "SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
-    )
-    .bind(body.group_id)
-    .bind(tenant_id)
-    .fetch_optional(state.db()?)
-    .await?;
+    let group_owned =
+        sqlx::query("SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2")
+            .bind(body.group_id)
+            .bind(tenant_id)
+            .fetch_optional(state.db()?)
+            .await?;
 
     if group_owned.is_none() {
         return Err(ApiError::NotFound("group_not_found".into()));
@@ -786,46 +810,86 @@ pub async fn send_group_message(
         return Err(ApiError::BadRequest("content or file_id required".into()));
     }
 
-    let msg_type = body
-        .msg_type
+    let content = body.content.trim();
+    let file_id = body
+        .file_id
         .as_deref()
-        .unwrap_or_else(|| if body.file_id.is_some() { "photo" } else { "text" });
-
-    let admin_user_id = headers
-        .get("x-admin-user-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
-
-    // TODO: Actually send the message to Telegram group via bot engine.
-    // For now, we store it in the database with a placeholder tg_msg_id.
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let msg_type = if file_id.is_some() { "photo" } else { "text" };
+    let content_limit = if file_id.is_some() { 1024 } else { 4096 };
+    if content.chars().count() > content_limit {
+        return Err(ApiError::BadRequest(format!(
+            "content exceeds {content_limit} characters"
+        )));
+    }
+    if let Some(requested_type) = body.msg_type.as_deref() {
+        if requested_type != msg_type {
+            return Err(ApiError::BadRequest(
+                "msg_type does not match payload".into(),
+            ));
+        }
+    }
+    let (bot_id, telegram) = state.tenant_telegram(tenant_id).await?;
+    let sent = if let Some(file_id) = file_id {
+        telegram
+            .send_photo(SendPhotoParams {
+                chat_id: body.group_id,
+                photo: file_id.to_string(),
+                caption: (!content.is_empty()).then(|| content.to_string()),
+                parse_mode: Some("HTML".into()),
+                reply_to_message_id: body.reply_to_tg_msg_id,
+            })
+            .await
+            .map_err(ApiError::Anyhow)?
+    } else {
+        telegram
+            .send_message(SendMessageParams {
+                chat_id: body.group_id,
+                text: content.to_string(),
+                parse_mode: Some("HTML".into()),
+                reply_markup: None,
+                reply_to_message_id: body.reply_to_tg_msg_id,
+            })
+            .await
+            .map_err(ApiError::Anyhow)?
+    };
+    let quoted_text = body
+        .quoted_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(200).collect::<String>());
     let row = sqlx::query(
         r#"
         INSERT INTO groups.group_messages (
             group_id, user_id, username, content, msg_type, file_id,
-            sender_type, tenant_id, timestamp
-        ) VALUES ($1, $2, 'admin', $3, $4, $5, 'admin', $6, now())
+            tg_msg_id, quoted_tg_msg_id, quoted_text, sender_type,
+            tenant_id, timestamp, message_ts
+        ) VALUES ($1, $2, 'admin', $3, $4, $5, $6, $7, $8, 'admin', $9, now(), $10)
         RETURNING id
         "#,
     )
     .bind(body.group_id)
-    .bind(admin_user_id)
-    .bind(body.content.trim())
+    .bind(bot_id)
+    .bind(content)
     .bind(msg_type)
-    .bind(body.file_id.as_deref().unwrap_or("").trim())
+    .bind(file_id)
+    .bind(sent.message_id)
+    .bind(body.reply_to_tg_msg_id)
+    .bind(quoted_text)
     .bind(tenant_id)
+    .bind(sent.date)
     .fetch_one(state.db()?)
     .await?;
 
     let msg_id: i64 = row.try_get("id")?;
 
-    tracing::info!("send_group_message: saved msg_id={msg_id} to group {}", body.group_id);
-
     Ok(Json(json!({
         "status": "ok",
         "data": {
             "msg_id": msg_id,
-            "tg_msg_id": Value::Null,
+            "tg_msg_id": sent.message_id,
         }
     })))
 }
@@ -868,91 +932,47 @@ pub async fn reply_group_message(
         return Err(ApiError::BadRequest("content required".into()));
     }
 
-    let admin_user_id = headers
-        .get("x-admin-user-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
-
-    let quoted_text = orig_content.unwrap_or_default();
-    let quoted_text_ref = if quoted_text.len() > 200 {
-        &quoted_text[..200]
-    } else {
-        &quoted_text
-    };
-
-    // Step 1: Send the reply to Telegram group via Bot API
-    let tg_msg_id: Option<i64> = {
-        // Get bot token from registry
-        let bot_entry = state.bot_registry.get(body.group_id).await;
-
-        if let Some(entry) = bot_entry {
-            // Create Telegram client with this bot's token
-            let config = TelegramConfig {
-                bot_token: entry.bot_token,
-                api_base_url: "https://api.telegram.org".to_string(),
-                timeout_secs: 30,
-            };
-
-            match TelegramClient::new(config) {
-                Ok(client) => {
-                    let params = SendMessageParams {
-                        chat_id: body.group_id,
-                        text: body.content.trim().to_string(),
-                        parse_mode: Some("HTML".to_string()),
-                        reply_markup: None,
-                        // Key fix: set reply_to_message_id to make this a reply
-                        reply_to_message_id: Some(body.tg_msg_id),
-                    };
-
-                    match client.send_message(params).await {
-                        Ok(msg) => Some(msg.message_id),
-                        Err(e) => {
-                            tracing::warn!("Failed to send reply to Telegram: {}", e);
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to create Telegram client: {}", e);
-                    None
-                }
-            }
-        } else {
-            tracing::warn!("No bot registered for group_id={}", body.group_id);
-            None
-        }
-    };
-
-    // Step 2: Save the reply to database
+    ensure_group_owned(&state, tenant_id, body.group_id).await?;
+    let quoted_text: String = orig_content.unwrap_or_default().chars().take(200).collect();
+    let (bot_id, telegram) = state.tenant_telegram(tenant_id).await?;
+    let sent = telegram
+        .send_message(SendMessageParams {
+            chat_id: body.group_id,
+            text: body.content.trim().to_string(),
+            parse_mode: Some("HTML".into()),
+            reply_markup: None,
+            reply_to_message_id: Some(body.tg_msg_id),
+        })
+        .await
+        .map_err(ApiError::Anyhow)?;
     let row = sqlx::query(
         r#"
         INSERT INTO groups.group_messages (
             group_id, user_id, username, content, msg_type,
-            tg_msg_id, quoted_tg_msg_id, quoted_text, sender_type, tenant_id, timestamp
-        ) VALUES ($1, $2, 'admin', $3, 'text', $4, $5, $6, 'admin', $7, now())
+            tg_msg_id, quoted_tg_msg_id, quoted_text, sender_type,
+            tenant_id, timestamp, message_ts
+        ) VALUES ($1, $2, 'admin', $3, 'text', $4, $5, $6, 'admin', $7, now(), $8)
         RETURNING id
         "#,
     )
     .bind(body.group_id)
-    .bind(admin_user_id)
+    .bind(bot_id)
     .bind(body.content.trim())
-    .bind(tg_msg_id)  // Store the actual Telegram message ID
-    .bind(body.tg_msg_id)  // Store the message being replied to
-    .bind(quoted_text_ref)
+    .bind(sent.message_id)
+    .bind(body.tg_msg_id)
+    .bind(&quoted_text)
     .bind(tenant_id)
+    .bind(sent.date)
     .fetch_one(state.db()?)
     .await?;
 
     let msg_id: i64 = row.try_get("id")?;
 
-    tracing::info!("reply_group_message: saved msg_id={msg_id}, tg_msg_id={:?} replying to original tg_msg_id={}", tg_msg_id, body.tg_msg_id);
-
     Ok(Json(json!({
         "status": "ok",
         "data": {
             "msg_id": msg_id,
-            "tg_msg_id": tg_msg_id,
+            "tg_msg_id": sent.message_id,
         }
     })))
 }
@@ -971,28 +991,247 @@ pub async fn delete_group_message(
 
     let tenant_id = resolve_tenant_id(&scope)?;
 
-    // Verify the message belongs to this tenant and group
-    let result = sqlx::query(
+    if body.msg_id.is_none() && body.tg_msg_id.is_none() {
+        return Err(ApiError::BadRequest("msg_id or tg_msg_id required".into()));
+    }
+    ensure_group_owned(&state, tenant_id, body.group_id).await?;
+    let row = sqlx::query(
+        r#"
+        SELECT id, tg_msg_id
+        FROM groups.group_messages
+        WHERE group_id = $1 AND tenant_id = $2
+          AND (($3::bigint IS NOT NULL AND id = $3)
+            OR ($4::bigint IS NOT NULL AND tg_msg_id = $4))
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(body.group_id)
+    .bind(tenant_id)
+    .bind(body.msg_id)
+    .bind(body.tg_msg_id)
+    .fetch_optional(state.db()?)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("message_not_found".into()))?;
+    let msg_id: i64 = row.try_get("id")?;
+    let tg_msg_id: i64 = row
+        .try_get::<Option<i64>, _>("tg_msg_id")?
+        .ok_or_else(|| ApiError::BadRequest("message has no Telegram id".into()))?;
+    let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+    telegram
+        .delete_message(body.group_id, tg_msg_id)
+        .await
+        .map_err(ApiError::Anyhow)?;
+    sqlx::query(
         "DELETE FROM groups.group_messages WHERE id = $1 AND group_id = $2 AND tenant_id = $3",
     )
-    .bind(body.msg_id)
+    .bind(msg_id)
     .bind(body.group_id)
     .bind(tenant_id)
     .execute(state.db()?)
     .await?;
 
-    if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound("message_not_found".into()));
-    }
-
-    // TODO: Send delete command to Telegram bot
-
-    Ok(Json(json!({"status": "ok"})))
+    Ok(Json(json!({
+        "status": "ok",
+        "data": { "msg_id": msg_id, "tg_msg_id": tg_msg_id }
+    })))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+async fn ensure_group_owned(state: &AppState, tenant_id: &str, group_id: i64) -> ApiResult<()> {
+    let owned = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+    )
+    .bind(group_id)
+    .bind(tenant_id)
+    .fetch_optional(state.db()?)
+    .await?;
+    if owned.is_some() {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound("group_not_found".into()))
+    }
+}
+
+async fn ensure_member_exists(
+    state: &AppState,
+    tenant_id: &str,
+    group_id: i64,
+    user_id: i64,
+) -> ApiResult<()> {
+    let exists = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM groups.group_members WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .bind(tenant_id)
+    .fetch_optional(state.db()?)
+    .await?;
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound("member_not_found".into()))
+    }
+}
+
+async fn telegram_member_status(
+    telegram: &TelegramClient,
+    group_id: i64,
+    user_id: i64,
+) -> ApiResult<String> {
+    let member = telegram
+        .get_chat_member(group_id, user_id)
+        .await
+        .map_err(ApiError::Anyhow)?;
+    member
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::BadRequest("Telegram member status unavailable".into()))
+}
+
+async fn ensure_regular_telegram_member(
+    telegram: &TelegramClient,
+    group_id: i64,
+    user_id: i64,
+) -> ApiResult<()> {
+    let status = telegram_member_status(telegram, group_id, user_id).await?;
+    if matches!(status.as_str(), "administrator" | "creator") {
+        Err(ApiError::BadRequest(
+            "cannot operate on an administrator or group creator".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn ensure_not_group_creator(
+    telegram: &TelegramClient,
+    group_id: i64,
+    user_id: i64,
+) -> ApiResult<()> {
+    if telegram_member_status(telegram, group_id, user_id).await? == "creator" {
+        Err(ApiError::BadRequest(
+            "cannot change group creator permissions".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn execute_telegram_member_action(
+    telegram: &TelegramClient,
+    group_id: i64,
+    user_id: i64,
+    action: &str,
+    duration_seconds: Option<i32>,
+) -> ApiResult<()> {
+    match action {
+        "kick" => {
+            telegram
+                .ban_chat_member(group_id, user_id)
+                .await
+                .map_err(ApiError::Anyhow)?;
+            telegram
+                .unban_chat_member(group_id, user_id)
+                .await
+                .map_err(ApiError::Anyhow)?;
+        }
+        "ban" => {
+            telegram
+                .ban_chat_member(group_id, user_id)
+                .await
+                .map_err(ApiError::Anyhow)?;
+        }
+        "mute" => {
+            let duration = duration_seconds.unwrap_or(1800).clamp(60, 31_536_000);
+            let until_date = (Utc::now() + Duration::seconds(i64::from(duration))).timestamp();
+            telegram
+                .restrict_chat_member(
+                    group_id,
+                    user_id,
+                    json!({ "can_send_messages": false }),
+                    Some(until_date),
+                )
+                .await
+                .map_err(ApiError::Anyhow)?;
+        }
+        "unmute" => {
+            telegram
+                .restrict_chat_member(
+                    group_id,
+                    user_id,
+                    json!({
+                        "can_send_messages": true,
+                        "can_send_polls": true,
+                        "can_send_other_messages": true,
+                        "can_add_web_page_previews": true,
+                        "can_change_info": false,
+                        "can_invite_users": true,
+                        "can_pin_messages": false,
+                    }),
+                    None,
+                )
+                .await
+                .map_err(ApiError::Anyhow)?;
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "unsupported Telegram member action".into(),
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn admin_permissions(promote: bool, custom: Option<&Value>) -> Value {
+    const KEYS: [&str; 14] = [
+        "can_manage_chat",
+        "can_delete_messages",
+        "can_manage_video_chats",
+        "can_restrict_members",
+        "can_promote_members",
+        "can_change_info",
+        "can_invite_users",
+        "can_pin_messages",
+        "can_post_messages",
+        "can_edit_messages",
+        "can_post_stories",
+        "can_edit_stories",
+        "can_delete_stories",
+        "is_anonymous",
+    ];
+    let defaults = json!({
+        "can_manage_chat": promote,
+        "can_delete_messages": promote,
+        "can_manage_video_chats": false,
+        "can_restrict_members": promote,
+        "can_promote_members": false,
+        "can_change_info": false,
+        "can_invite_users": promote,
+        "can_pin_messages": promote,
+        "can_post_messages": false,
+        "can_edit_messages": false,
+        "can_post_stories": false,
+        "can_edit_stories": false,
+        "can_delete_stories": false,
+        "is_anonymous": false,
+    });
+    let mut permissions = defaults.as_object().cloned().unwrap_or_default();
+    if promote {
+        if let Some(custom) = custom.and_then(Value::as_object) {
+            for key in KEYS {
+                if let Some(value) = custom.get(key).and_then(Value::as_bool) {
+                    permissions.insert(key.to_string(), Value::Bool(value));
+                }
+            }
+        }
+    }
+    Value::Object(permissions)
+}
 
 /// Resolve the tenant_id from the scope. Platform admins get an empty string
 /// which means "no tenant filter" (they can see everything).
@@ -1010,7 +1249,10 @@ fn resolve_tenant_id(scope: &tgbot_domain::scope::Scope) -> Result<&str, ApiErro
 
 /// Require write access (owner or admin role). Viewers are read-only.
 fn require_write_access(scope: &tgbot_domain::scope::Scope) -> Result<(), ApiError> {
-    if matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin | Role::PlatformAdmin) {
+    if matches!(
+        scope.role,
+        Role::MerchantOwner | Role::MerchantAdmin | Role::PlatformAdmin
+    ) {
         Ok(())
     } else {
         Err(ApiError::Forbidden)

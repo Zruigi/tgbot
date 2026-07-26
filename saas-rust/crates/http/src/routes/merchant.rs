@@ -7,21 +7,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 use tgbot_domain::error::{ApiError, ApiResult};
-use tgbot_domain::models::{PlanCodeRequest, SaveSecretRefRequest, UpdateStatusRequest};
+use tgbot_domain::models::{PlanCodeRequest, Role, SaveSecretRefRequest, UpdateStatusRequest};
+use tgbot_integrations::telegram::{SetWebhookParams, TelegramClient, TelegramConfig};
 use uuid::Uuid;
 
-// AES-256-GCM encryption for bot tokens
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
+use super::telegram_webhook::{derive_webhook_secret, BotEntry};
 use crate::auth::resolve_scope;
+use crate::secret_crypto::SecretCipher;
 use crate::state::AppState;
 
 use super::platform::{row_to_json, rows_to_json};
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
@@ -38,7 +33,22 @@ pub async fn profile(State(state): State<AppState>, headers: HeaderMap) -> ApiRe
         .fetch_optional(state.db()?)
         .await?
         .ok_or_else(|| ApiError::NotFound("merchant_not_found".into()))?;
-    Ok(Json(json!({"status": "ok", "data": row_to_json(row)})))
+    let mut data = row_to_json(row);
+    if let Some(object) = data.as_object_mut() {
+        let has_bot_token = object
+            .get("has_bot_token")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        object.insert(
+            "bot_token".into(),
+            if has_bot_token {
+                Value::String("exists".into())
+            } else {
+                Value::Null
+            },
+        );
+    }
+    Ok(Json(json!({"status": "ok", "data": data})))
 }
 
 pub async fn update_status(
@@ -66,64 +76,132 @@ pub async fn save_bot_token_ref(
     Json(body): Json<SaveSecretRefRequest>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _merchant_id) = scope.require_merchant()?;
-    if body.bot_token.trim().is_empty() {
+    if !matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin) {
+        return Err(ApiError::Forbidden);
+    }
+    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let bot_token = body.bot_token.trim();
+    let (token_bot_id, token_secret) = bot_token
+        .split_once(':')
+        .ok_or_else(|| ApiError::BadRequest("invalid bot_token format".into()))?;
+    let token_bot_id = token_bot_id
+        .parse::<i64>()
+        .map_err(|_| ApiError::BadRequest("invalid bot_token format".into()))?;
+    if token_bot_id <= 0 || token_secret.len() < 10 {
         return Err(ApiError::BadRequest("bot_token required".into()));
     }
 
-    // ============== FIXED: 使用 AES-256-GCM 加密 bot_token ==============
-    let encrypted_token = encrypt_bot_token(&body.bot_token, &tenant_id)
-        .map_err(|e| ApiError::BadRequest(format!("encryption failed: {}", e)))?;
+    let telegram = TelegramClient::new(TelegramConfig {
+        bot_token: bot_token.into(),
+        api_base_url: std::env::var("TELEGRAM_API_BASE_URL")
+            .unwrap_or_else(|_| "https://api.telegram.org".into()),
+        timeout_secs: 10,
+    })
+    .map_err(|_| ApiError::BadRequest("failed to initialize Telegram client".into()))?;
+    let bot = telegram
+        .get_me()
+        .await
+        .map_err(|_| ApiError::BadRequest("Telegram rejected bot_token".into()))?;
+    if !bot.is_bot || bot.id != token_bot_id {
+        return Err(ApiError::BadRequest("bot_token identity mismatch".into()));
+    }
 
-    // 存储加密后的密文 (而非明文引用)
-    let encrypted_ref = format!("encrypted:{}", encrypted_token);
+    let webhook_base_url = std::env::var("TELEGRAM_WEBHOOK_BASE_URL")
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string();
+    let webhook_url = if webhook_base_url.is_empty() {
+        None
+    } else {
+        if !(webhook_base_url.starts_with("https://")
+            || webhook_base_url.starts_with("http://127.0.0.1"))
+        {
+            return Err(ApiError::BadRequest(
+                "TELEGRAM_WEBHOOK_BASE_URL must use HTTPS".into(),
+            ));
+        }
+        let secret = derive_webhook_secret(&state.config.secret_encryption_key, bot.id, bot_token)
+            .map_err(ApiError::BadRequest)?;
+        let url = format!("{webhook_base_url}/telegram/webhook/{}", bot.id);
+        telegram
+            .set_webhook(SetWebhookParams {
+                url: url.clone(),
+                secret_token: Some(secret),
+                max_connections: Some(40),
+                allowed_updates: None,
+            })
+            .await
+            .map_err(|_| ApiError::BadRequest("failed to configure Telegram webhook".into()))?;
+        Some(url)
+    };
 
+    let cipher = SecretCipher::from_encoded_key(&state.config.secret_encryption_key)
+        .map_err(ApiError::BadRequest)?;
+    let encrypted_ref = cipher
+        .encrypt(&tenant_id, "TELEGRAM_BOT_TOKEN", bot_token)
+        .map_err(ApiError::BadRequest)?;
+
+    let mut transaction = state.db()?.begin().await?;
     sqlx::query(
-        "INSERT INTO tenant_secret_refs (tenant_id, secret_key, secret_ref, updated_at) VALUES ($1, 'TELEGRAM_BOT_TOKEN', $2, now()) ON CONFLICT (tenant_id, secret_key) DO UPDATE SET secret_ref = EXCLUDED.secret_ref, updated_at = now()",
+        "INSERT INTO tenant_secret_refs (tenant_id, secret_key, secret_ref, updated_at) \
+         VALUES ($1, 'TELEGRAM_BOT_TOKEN', $2, now()) \
+         ON CONFLICT (tenant_id, secret_key) DO UPDATE \
+         SET secret_ref = EXCLUDED.secret_ref, updated_at = now()",
     )
     .bind(&tenant_id)
-    .bind(encrypted_ref)
-    .execute(state.db()?)
+    .bind(&encrypted_ref)
+    .execute(&mut *transaction)
     .await?;
-    Ok(Json(
-        json!({"status": "ok", "data": {"bot_token": "encrypted"}}),
-    ))
-}
+    sqlx::query(
+        "UPDATE merchants SET bot_id = $3, bot_username = $4, runtime_version = runtime_version + 1, \
+         updated_at = now() WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(&tenant_id)
+    .bind(merchant_id)
+    .bind(bot.id)
+    .bind(bot.username.as_deref())
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO tenant_audit_logs \
+         (tenant_id, merchant_id, actor_user_id, operator_role, action, resource_type, resource_id, payload) \
+         VALUES ($1, $2, $3, $4, 'bot_token_updated', 'merchant_bot', $5, $6)",
+    )
+    .bind(&tenant_id)
+    .bind(merchant_id)
+    .bind(scope.user_id)
+    .bind(match scope.role {
+        Role::MerchantOwner => "merchant_owner",
+        _ => "merchant_admin",
+    })
+    .bind(bot.id.to_string())
+    .bind(json!({"bot_username": bot.username}))
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
 
-// ============== AES-256-GCM 加密工具函数 ==============
+    state
+        .bot_registry
+        .register(BotEntry {
+            bot_id: bot.id,
+            bot_token: bot_token.into(),
+            tenant_id: tenant_id.clone(),
+            merchant_id: merchant_id.to_string(),
+            bot_username: bot.username.clone(),
+        })
+        .await;
 
-fn encrypt_bot_token(plaintext: &str, tenant_id: &str) -> Result<String, String> {
-    // 派生密钥: HMAC-SHA256(master_key, tenant_id)
-    // Note: Exactly 32 bytes required for HMAC-SHA256 key
-    const MASTER_KEY: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz012345";
-    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(MASTER_KEY).map_err(|e| e.to_string())?;
-    mac.update(tenant_id.as_bytes());
-    let derived_key: [u8; 32] = mac.finalize().into_bytes().into();
-
-    // 生成随机 nonce
-    let mut nonce_bytes = [0u8; 12];
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    nonce_bytes[..8].copy_from_slice(&now.to_le_bytes());
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    (now, plaintext).hash(&mut hasher);
-    nonce_bytes[8..].copy_from_slice(&hasher.finish().to_le_bytes()[..4]);
-
-    // 加密
-    let cipher = Aes256Gcm::new_from_slice(&derived_key).map_err(|e| e.to_string())?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())
-        .map_err(|e| e.to_string())?;
-
-    // 组合: nonce (12) + ciphertext + tag (16)
-    let mut result = nonce_bytes.to_vec();
-    result.extend(ciphertext);
-
-    Ok(BASE64.encode(&result))
+    Ok(Json(json!({
+        "status": "ok",
+        "data": {
+            "id": bot.id,
+            "username": bot.username,
+            "first_name": bot.first_name,
+            "is_bot": bot.is_bot,
+            "webhook_configured": webhook_url.is_some(),
+            "webhook_url": webhook_url,
+        }
+    })))
 }
 
 pub async fn subscription(
@@ -256,10 +334,10 @@ pub async fn ai_usage(
         r#"
         SELECT
             COUNT(*) AS total_requests,
-            COALESCE(SUM(total_tokens), 0) AS total_tokens,
+            COALESCE(SUM(total_tokens), 0)::bigint AS total_tokens,
             COALESCE(SUM(estimated_cost_usd), 0) AS total_cost,
-            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-            COALESCE(SUM(completion_tokens), 0) AS completion_tokens
+            COALESCE(SUM(prompt_tokens), 0)::bigint AS prompt_tokens,
+            COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens
         FROM ai_usage_logs
         WHERE tenant_id = $1
           AND created_at >= NOW() - INTERVAL '1 day' * $2
@@ -274,9 +352,9 @@ pub async fn ai_usage(
     let daily_rows = sqlx::query(
         r#"
         SELECT
-            DATE(created_at) AS date,
+            TO_CHAR(DATE(created_at), 'YYYY-MM-DD') AS date,
             COUNT(*) AS requests,
-            COALESCE(SUM(total_tokens), 0) AS tokens,
+            COALESCE(SUM(total_tokens), 0)::bigint AS tokens,
             COALESCE(SUM(estimated_cost_usd), 0) AS cost
         FROM ai_usage_logs
         WHERE tenant_id = $1
@@ -297,7 +375,7 @@ pub async fn ai_usage(
         SELECT
             model,
             COUNT(*) AS requests,
-            COALESCE(SUM(total_tokens), 0) AS tokens,
+            COALESCE(SUM(total_tokens), 0)::bigint AS tokens,
             COALESCE(SUM(estimated_cost_usd), 0) AS cost
         FROM ai_usage_logs
         WHERE tenant_id = $1

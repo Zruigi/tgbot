@@ -75,7 +75,9 @@ pub async fn list_merchants(
             ).bind(limit).bind(offset).fetch_all(pool).await?
         };
         let total = rows.len();
-        return Ok(Json(json!({"status": "ok", "data": rows_to_json(rows), "total": total})));
+        return Ok(Json(
+            json!({"status": "ok", "data": rows_to_json(rows), "total": total}),
+        ));
     }
 
     // REST fallback — simplified (no JOINs via REST)
@@ -186,16 +188,22 @@ pub async fn list_plans(
         .fetch_all(pool)
         .await?;
         let total = plans.len();
-        return Ok(Json(json!({"status": "ok", "data": rows_to_json(plans), "total": total})));
+        return Ok(Json(
+            json!({"status": "ok", "data": rows_to_json(plans), "total": total}),
+        ));
     }
 
     // REST fallback
-    match state.supabase.select(
-        "subscription_plans",
-        "plan_code,plan_name,price_usdt,duration_days,features_json,status",
-        &[("status", "active")],
-        Some(100),
-    ).await {
+    match state
+        .supabase
+        .select(
+            "subscription_plans",
+            "plan_code,plan_name,price_usdt,duration_days,features_json,status",
+            &[("status", "active")],
+            Some(100),
+        )
+        .await
+    {
         Ok(plans) => {
             let total = plans.len();
             Ok(Json(json!({"status": "ok", "data": plans, "total": total})))

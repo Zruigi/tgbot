@@ -6,15 +6,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::collections::HashMap;
 
 use crate::auth::resolve_scope;
 use crate::state::AppState;
 use tgbot_domain::error::{ApiError, ApiResult};
-use tgbot_domain::scope::Scope;
 use tgbot_domain::models::Role;
+use tgbot_domain::scope::Scope;
 
 /// In-memory OTP store: {otp: {token, expire_at, role, tenant_id, merchant_id, issued_for}}
 #[derive(Clone)]
@@ -95,7 +95,10 @@ impl CsrfStore {
     pub async fn get(&self, token: &str) -> bool {
         let now = chrono::Utc::now().timestamp() as f64;
         let store = self.0.read().await;
-        store.get(token).map(|&expire| expire > now).unwrap_or(false)
+        store
+            .get(token)
+            .map(|&expire| expire > now)
+            .unwrap_or(false)
     }
 }
 
@@ -151,9 +154,14 @@ type HmacSha256 = Hmac<Sha256>;
 const SESSION_SECRET_KEY: &[u8; 32] = b"01234567890123456789012345678901";
 
 // ============== FIXED: 使用真正的 HMAC-SHA256 ==============
-fn issue_session_token(role: &str, tenant_id: &str, merchant_id: Option<i64>, issued_for: Option<&str>) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use hmac::Mac;  // Add this to disambiguate
+fn issue_session_token(
+    role: &str,
+    tenant_id: &str,
+    merchant_id: Option<i64>,
+    issued_for: Option<&str>,
+) -> String {
+    use hmac::Mac;
+    use std::time::{SystemTime, UNIX_EPOCH}; // Add this to disambiguate
 
     let payload = build_session_token_payload(role, tenant_id, merchant_id, issued_for);
     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
@@ -162,7 +170,8 @@ fn issue_session_token(role: &str, tenant_id: &str, merchant_id: Option<i64>, is
     let payload_b64 = BASE64.encode(payload_json.as_bytes());
 
     // 使用真正的 HMAC-SHA256 进行签名
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(SESSION_SECRET_KEY).expect("HMAC can accept key");
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(SESSION_SECRET_KEY).expect("HMAC can accept key");
     mac.update(payload_b64.as_bytes());
     let signature = BASE64.encode(mac.finalize().into_bytes());
 
@@ -208,7 +217,8 @@ fn verify_session_token(token: &str) -> Option<Value> {
     let signature_b64 = parts[1];
 
     // 验证 HMAC-SHA256 签名
-    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(SESSION_SECRET_KEY).expect("HMAC can accept key");
+    let mut mac =
+        <HmacSha256 as hmac::Mac>::new_from_slice(SESSION_SECRET_KEY).expect("HMAC can accept key");
     mac.update(payload_b64.as_bytes());
     let expected_sig = BASE64.encode(mac.finalize().into_bytes());
 
@@ -244,12 +254,19 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
     let chars: Vec<u8> = input
         .chars()
         .filter_map(|c| {
-            if c >= 'A' && c <= 'Z' { Some(c as u8 - 65) }
-            else if c >= 'a' && c <= 'z' { Some(c as u8 - 71) }
-            else if c >= '0' && c <= '9' { Some(c as u8 + 4) }
-            else if c == '+' { Some(62) }
-            else if c == '/' { Some(63) }
-            else { None }
+            if c >= 'A' && c <= 'Z' {
+                Some(c as u8 - 65)
+            } else if c >= 'a' && c <= 'z' {
+                Some(c as u8 - 71)
+            } else if c >= '0' && c <= '9' {
+                Some(c as u8 + 4)
+            } else if c == '+' {
+                Some(62)
+            } else if c == '/' {
+                Some(63)
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -299,10 +316,8 @@ pub async fn login(
     let token = body.token.unwrap_or_default();
 
     // Check against WEB_ADMIN_TOKEN or BOT_TOKEN
-    let valid = !token.is_empty() && (
-        token == state.config.web_admin_token ||
-        token == state.config.bot_token
-    );
+    let valid = !token.is_empty()
+        && (token == state.config.web_admin_token || token == state.config.bot_token);
 
     if !valid {
         return Err(ApiError::Unauthorized);
@@ -409,9 +424,9 @@ pub async fn login_tma(
     // hash = HMAC-SHA256(data, bot_token)
     let parsed = parse_telegram_init_data(&init_data);
 
-    let hash = parsed.get("hash").ok_or_else(|| {
-        ApiError::BadRequest("init_data missing hash".to_string())
-    })?;
+    let hash = parsed
+        .get("hash")
+        .ok_or_else(|| ApiError::BadRequest("init_data missing hash".to_string()))?;
 
     // 从数据库获取 bot_token (简化版 - 实际应从商户配置获取)
     let bot_token = get_bot_token_for_tma(&state, &tenant_hint, merchant_id_hint).await?;
@@ -476,10 +491,7 @@ fn parse_telegram_init_data(init_data: &str) -> std::collections::HashMap<String
     for pair in init_data.split('&') {
         let parts: Vec<&str> = pair.splitn(2, '=').collect();
         if parts.len() == 2 {
-            map.insert(
-                urlencoding_decode(parts[0]),
-                urlencoding_decode(parts[1])
-            );
+            map.insert(urlencoding_decode(parts[0]), urlencoding_decode(parts[1]));
         }
     }
     map
@@ -506,7 +518,8 @@ fn urlencoding_decode(s: &str) -> String {
 
 // 构建 data_check_string (用于计算 hash)
 fn build_data_check_string(data: &std::collections::HashMap<String, String>) -> String {
-    let mut pairs: Vec<String> = data.iter()
+    let mut pairs: Vec<String> = data
+        .iter()
         .filter(|(k, _)| *k != "hash")
         .map(|(k, v)| format!("{}={}", k, v))
         .collect();
@@ -517,7 +530,8 @@ fn build_data_check_string(data: &std::collections::HashMap<String, String>) -> 
 // 计算 Telegram HMAC-SHA256 hash
 fn compute_telegram_hash(data_check_string: &str, bot_token: &str) -> String {
     // 第一轮: HMAC-SHA256(data_check_string, bot_token)
-    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(bot_token.as_bytes()).expect("HMAC can accept key");
+    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(bot_token.as_bytes())
+        .expect("HMAC can accept key");
     mac.update(data_check_string.as_bytes());
     let digest = mac.finalize().into_bytes();
 
@@ -529,7 +543,7 @@ fn compute_telegram_hash(data_check_string: &str, bot_token: &str) -> String {
 async fn get_bot_token_for_tma(
     state: &AppState,
     tenant_hint: &str,
-    merchant_id_hint: Option<i64>
+    merchant_id_hint: Option<i64>,
 ) -> ApiResult<String> {
     // 简化实现: 返回配置中的 bot_token
     // 生产环境应从数据库或密钥管理服务获取
@@ -547,9 +561,7 @@ async fn get_bot_token_for_tma(
 }
 
 // GET /api/csrf-token - Get CSRF token
-pub async fn csrf_token(
-    State(state): State<AppState>,
-) -> ApiResult<Json<Value>> {
+pub async fn csrf_token(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let csrf_store = state.csrf_store.clone();
     let csrf_token = csrf_store.generate().await;
 

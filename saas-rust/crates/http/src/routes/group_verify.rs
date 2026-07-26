@@ -157,10 +157,7 @@ pub async fn update_verify_config(
         return Err(ApiError::Forbidden);
     }
 
-    let tenant_id = if matches!(
-        scope.role,
-        Role::MerchantOwner | Role::MerchantAdmin
-    ) {
+    let tenant_id = if matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin) {
         scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?
     } else {
         ""

@@ -152,10 +152,7 @@ pub async fn update_group_config(
     let scope = resolve_scope(&state, &headers).await?;
 
     // Tenant isolation: merchants can only update their own groups
-    let tenant_id = if matches!(
-        scope.role,
-        Role::MerchantOwner | Role::MerchantAdmin
-    ) {
+    let tenant_id = if matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin) {
         scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?
     } else if matches!(scope.role, Role::MerchantViewer) {
         return Err(ApiError::Forbidden);

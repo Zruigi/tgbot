@@ -1,13 +1,10 @@
 // Config API - System configuration management
-use axum::{
-    extract::State,
-    http::HeaderMap,
-    Json,
-};
-use serde::{Deserialize, Serialize};
+use axum::{extract::State, http::HeaderMap, Json};
+use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::Row;
+use std::collections::HashMap;
 use tgbot_domain::error::{ApiError, ApiResult};
-use tgbot_domain::scope::Scope;
 
 use crate::auth::resolve_scope;
 use crate::state::AppState;
@@ -16,26 +13,17 @@ use crate::state::AppState;
 // Request/Response Types
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SystemConfig {
-    pub llm_base_url: String,
-    pub llm_api_key: String,
-    pub llm_model: String,
-    pub llm_model_lock_enabled: bool,
-    pub llm_model_lock_target: String,
-    pub global_auto_translate: bool,
-    pub translation_engine: String,
-    pub bot_token_masked: String,
-    pub admin_id: i64,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct SaveConfigRequest {
+    pub llm_api_mode: Option<String>,
+    pub llm_model_type: Option<String>,
     pub llm_base_url: Option<String>,
     pub llm_api_key: Option<String>,
     pub llm_model: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_boolish")]
     pub llm_model_lock_enabled: Option<bool>,
     pub llm_model_lock_target: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_boolish")]
     pub global_auto_translate: Option<bool>,
     pub translation_engine: Option<String>,
 }
@@ -53,7 +41,58 @@ pub struct VertexOneClickRequest {
 // ============================================================================
 
 fn is_truthy(value: &str) -> bool {
-    matches!(value.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        value.trim().to_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn deserialize_optional_boolish<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(value)),
+        Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(Some(true)),
+            "0" | "false" | "no" | "off" => Ok(Some(false)),
+            _ => Err(serde::de::Error::custom("expected a boolean value")),
+        },
+        _ => Err(serde::de::Error::custom("expected a boolean value")),
+    }
+}
+
+fn validate_setting<'a>(field: &str, value: &'a str, max_chars: usize) -> ApiResult<&'a str> {
+    let value = value.trim();
+    if value.chars().count() > max_chars {
+        return Err(ApiError::BadRequest(format!("{field} is too long")));
+    }
+    Ok(value)
+}
+
+fn validate_http_url(field: &str, value: &str) -> ApiResult<()> {
+    if !(value.starts_with("https://") || value.starts_with("http://")) {
+        return Err(ApiError::BadRequest(format!(
+            "{field} must use http:// or https://"
+        )));
+    }
+    Ok(())
+}
+
+fn mask_secret(value: &str, prefix: usize, suffix: usize) -> String {
+    let characters: Vec<char> = value.chars().collect();
+    if characters.len() <= prefix + suffix {
+        return value.to_string();
+    }
+    format!(
+        "{}...{}",
+        characters[..prefix].iter().collect::<String>(),
+        characters[characters.len() - suffix..]
+            .iter()
+            .collect::<String>()
+    )
 }
 
 // ============================================================================
@@ -68,69 +107,43 @@ pub async fn get_config(
     let scope = resolve_scope(&state, &headers).await?;
     scope.require_platform()?;
 
-    let _get_setting = |key: &str, default: &str| -> String {
-        // Query from admin_settings table - stub for now
-        default.to_string()
-    };
-
-    // Get settings from database
-    let llm_base_url = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT value FROM admin_settings WHERE key = 'llm_base_url'",
-    )
-    .fetch_optional(state.db()?)
-    .await?
-    .flatten()
-    .unwrap_or_else(|| std::env::var("LLM_BASE_URL").unwrap_or_default());
-
-    let llm_api_key = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT value FROM admin_settings WHERE key = 'llm_api_key'",
-    )
-    .fetch_optional(state.db()?)
-    .await?
-    .flatten()
-    .unwrap_or_else(|| std::env::var("LLM_API_KEY").unwrap_or_default());
-
-    let llm_model = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT value FROM admin_settings WHERE key = 'llm_model'",
-    )
-    .fetch_optional(state.db()?)
-    .await?
-    .flatten()
-    .unwrap_or_default();
-
-    let llm_model_lock_enabled = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT value FROM admin_settings WHERE key = 'llm_model_lock_enabled'",
-    )
-    .fetch_optional(state.db()?)
-    .await?
-    .flatten()
-    .map(|v| is_truthy(&v))
-    .unwrap_or(false);
-
-    let llm_model_lock_target = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT value FROM admin_settings WHERE key = 'llm_model_lock_target'",
-    )
-    .fetch_optional(state.db()?)
-    .await?
-    .flatten()
-    .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
-
-    let global_auto_translate = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT value FROM admin_settings WHERE key = 'global_auto_translate'",
-    )
-    .fetch_optional(state.db()?)
-    .await?
-    .flatten()
-    .map(|v| is_truthy(&v))
-    .unwrap_or(false);
-
-    let translation_engine = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT value FROM admin_settings WHERE key = 'translation_engine'",
-    )
-    .fetch_optional(state.db()?)
-    .await?
-    .flatten()
-    .unwrap_or_else(|| "llm".to_string());
+    let rows = sqlx::query("SELECT key, value FROM platform.admin_settings WHERE key = ANY($1)")
+        .bind(vec![
+            "llm_api_mode",
+            "llm_model_type",
+            "llm_base_url",
+            "llm_api_key",
+            "llm_model",
+            "llm_model_lock_enabled",
+            "llm_model_lock_target",
+            "global_auto_translate",
+            "translation_engine",
+        ])
+        .fetch_all(state.db()?)
+        .await?;
+    let settings: HashMap<String, String> = rows
+        .iter()
+        .map(|row| Ok((row.try_get("key")?, row.try_get("value")?)))
+        .collect::<Result<_, sqlx::Error>>()?;
+    let setting = |key: &str, default: String| settings.get(key).cloned().unwrap_or(default);
+    let llm_api_mode = setting("llm_api_mode", "rented".into());
+    let llm_model_type = setting("llm_model_type", "openai".into());
+    let llm_base_url = setting(
+        "llm_base_url",
+        std::env::var("LLM_BASE_URL").unwrap_or_default(),
+    );
+    let llm_api_key_configured = settings
+        .get("llm_api_key")
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || std::env::var("LLM_API_KEY")
+            .map(|value| !value.is_empty())
+            .unwrap_or(false);
+    let llm_model = setting("llm_model", String::new());
+    let llm_model_lock_enabled = is_truthy(&setting("llm_model_lock_enabled", "false".into()));
+    let llm_model_lock_target = setting("llm_model_lock_target", "gemini-3.1-pro-preview".into());
+    let global_auto_translate = is_truthy(&setting("global_auto_translate", "false".into()));
+    let translation_engine = setting("translation_engine", "llm".into());
 
     // Get bot token masked
     let bot_token = &state.config.bot_token;
@@ -149,8 +162,11 @@ pub async fn get_config(
     Ok(Json(json!({
         "status": "ok",
         "data": {
+            "llm_api_mode": llm_api_mode,
+            "llm_model_type": llm_model_type,
             "llm_base_url": llm_base_url,
-            "llm_api_key": llm_api_key,
+            "llm_api_key": "",
+            "llm_api_key_configured": llm_api_key_configured,
             "llm_model": llm_model,
             "llm_model_lock_enabled": llm_model_lock_enabled,
             "llm_model_lock_target": llm_model_lock_target,
@@ -171,95 +187,103 @@ pub async fn save_config(
     let scope = resolve_scope(&state, &headers).await?;
     scope.require_platform()?;
 
-    // Save each setting to database
-    if let Some(llm_base_url) = body.llm_base_url {
-        sqlx::query(
-            "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_base_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-        )
-        .bind(llm_base_url)
-        .execute(state.db()?)
-        .await?;
-    }
+    let SaveConfigRequest {
+        llm_api_mode,
+        llm_model_type,
+        llm_base_url,
+        llm_api_key,
+        llm_model,
+        llm_model_lock_enabled,
+        llm_model_lock_target,
+        global_auto_translate,
+        translation_engine,
+    } = body;
+    let mut settings: Vec<(&str, String)> = Vec::new();
 
-    if let Some(llm_api_key) = body.llm_api_key {
-        sqlx::query(
-            "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-        )
-        .bind(llm_api_key)
-        .execute(state.db()?)
-        .await?;
+    if let Some(value) = llm_api_mode {
+        let value = validate_setting("llm_api_mode", &value, 20)?;
+        if !matches!(value, "rented" | "own") {
+            return Err(ApiError::BadRequest("invalid llm_api_mode".into()));
+        }
+        settings.push(("llm_api_mode", value.into()));
     }
-
-    if let Some(llm_model) = body.llm_model {
-        if !llm_model.trim().is_empty() {
-            sqlx::query(
-                "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_model', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-            )
-            .bind(llm_model.trim())
-            .execute(state.db()?)
-            .await?;
+    if let Some(value) = llm_model_type {
+        let value = validate_setting("llm_model_type", &value, 30)?;
+        if !matches!(value, "openai" | "deepseek" | "gemini") {
+            return Err(ApiError::BadRequest("invalid llm_model_type".into()));
+        }
+        settings.push(("llm_model_type", value.into()));
+    }
+    if let Some(value) = llm_base_url {
+        let value = validate_setting("llm_base_url", &value, 2_048)?;
+        if !value.is_empty() {
+            validate_http_url("llm_base_url", value)?;
+        }
+        settings.push(("llm_base_url", value.into()));
+    }
+    if let Some(value) = llm_api_key {
+        let value = validate_setting("llm_api_key", &value, 8_192)?;
+        if !value.is_empty() {
+            settings.push(("llm_api_key", value.into()));
+        }
+    }
+    if let Some(value) = llm_model {
+        let value = validate_setting("llm_model", &value, 200)?;
+        if !value.is_empty() {
+            settings.push(("llm_model", value.into()));
         }
     }
 
-    if let Some(llm_model_lock_target) = body.llm_model_lock_target {
-        if !llm_model_lock_target.trim().is_empty() {
-            sqlx::query(
-                "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_model_lock_target', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-            )
-            .bind(llm_model_lock_target.trim())
-            .execute(state.db()?)
-            .await?;
+    let requested_lock_target = llm_model_lock_target
+        .as_deref()
+        .map(|value| validate_setting("llm_model_lock_target", value, 200))
+        .transpose()?
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(value) = &requested_lock_target {
+        settings.push(("llm_model_lock_target", value.clone()));
+    }
+    if let Some(enabled) = llm_model_lock_enabled {
+        settings.push(("llm_model_lock_enabled", enabled.to_string()));
+        if enabled {
+            let lock_target = match requested_lock_target {
+                Some(value) => value,
+                None => sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM platform.admin_settings WHERE key = 'llm_model_lock_target'",
+                )
+                .fetch_optional(state.db()?)
+                .await?
+                .unwrap_or_else(|| "gemini-3.1-pro-preview".into()),
+            };
+            settings.push(("llm_model", lock_target));
+        }
+    }
+    if let Some(enabled) = global_auto_translate {
+        settings.push(("global_auto_translate", enabled.to_string()));
+    }
+    if let Some(value) = translation_engine {
+        let value = validate_setting("translation_engine", &value, 50)?;
+        if !value.is_empty() {
+            settings.push(("translation_engine", value.into()));
         }
     }
 
-    if let Some(llm_model_lock_enabled) = body.llm_model_lock_enabled {
-        let lock_enabled_str = if llm_model_lock_enabled { "true" } else { "false" };
+    let mut transaction = state.db()?.begin().await?;
+    for (key, value) in &settings {
         sqlx::query(
-            "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_model_lock_enabled', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+            "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ($1, $2, now()) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
         )
-        .bind(lock_enabled_str)
-        .execute(state.db()?)
-        .await?;
-
-        // If lock is enabled, also update llm_model to the lock target
-        if llm_model_lock_enabled {
-            let lock_target = sqlx::query_scalar::<_, Option<String>>(
-                "SELECT value FROM admin_settings WHERE key = 'llm_model_lock_target'",
-            )
-            .fetch_optional(state.db()?)
-            .await?
-            .flatten()
-            .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
-
-            sqlx::query(
-                "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_model', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-            )
-            .bind(lock_target)
-            .execute(state.db()?)
-            .await?;
-        }
-    }
-
-    if let Some(global_auto_translate) = body.global_auto_translate {
-        let flag_str = if global_auto_translate { "true" } else { "false" };
-        sqlx::query(
-            "INSERT INTO admin_settings (key, value, updated_at) VALUES ('global_auto_translate', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-        )
-        .bind(flag_str)
-        .execute(state.db()?)
+        .bind(key)
+        .bind(value)
+        .execute(&mut *transaction)
         .await?;
     }
+    transaction.commit().await?;
 
-    if let Some(translation_engine) = body.translation_engine {
-        sqlx::query(
-            "INSERT INTO admin_settings (key, value, updated_at) VALUES ('translation_engine', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-        )
-        .bind(translation_engine)
-        .execute(state.db()?)
-        .await?;
-    }
-
-    Ok(Json(json!({ "status": "ok" })))
+    Ok(Json(
+        json!({ "status": "ok", "data": {"updated": settings.len()} }),
+    ))
 }
 
 // POST /api/config/vertex - Vertex AI one-click configuration
@@ -271,92 +295,110 @@ pub async fn vertex_oneclick_config(
     let scope = resolve_scope(&state, &headers).await?;
     scope.require_platform()?;
 
-    if body.vertex_api_key.trim().is_empty() {
+    let vertex_api_key = validate_setting("vertex_api_key", &body.vertex_api_key, 8_192)?;
+    if vertex_api_key.is_empty() {
         return Err(ApiError::BadRequest("vertex_api_key required".into()));
     }
-
-    let oneapi_base_url = body.oneapi_base_url.unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".to_string());
-    let model = body.model.unwrap_or_else(|| "gemini-2.5-flash-lite".to_string());
-
-    // Generate relay_api_key if not provided
-    let relay_api_key = body.relay_api_key.unwrap_or_else(|| {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("sk-{:x}{:x}", timestamp, rand_u64())
-    });
-
-    fn rand_u64() -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        use std::time::SystemTime;
-        let mut hasher = DefaultHasher::new();
-        SystemTime::now().hash(&mut hasher);
-        hasher.finish()
-    }
+    let oneapi_base_url = body
+        .oneapi_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("https://generativelanguage.googleapis.com/v1beta")
+        .trim_end_matches('/')
+        .to_string();
+    validate_http_url("oneapi_base_url", &oneapi_base_url)?;
+    let requested_model = body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("gemini-2.5-flash-lite")
+        .to_string();
+    validate_setting("model", &requested_model, 200)?;
+    let lock_enabled = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM platform.admin_settings WHERE key = 'llm_model_lock_enabled'",
+    )
+    .fetch_optional(state.db()?)
+    .await?
+    .map(|value| is_truthy(&value))
+    .unwrap_or(false);
+    let model = if lock_enabled {
+        sqlx::query_scalar::<_, String>(
+            "SELECT value FROM platform.admin_settings WHERE key = 'llm_model_lock_target'",
+        )
+        .fetch_optional(state.db()?)
+        .await?
+        .unwrap_or_else(|| "gemini-3.1-pro-preview".into())
+    } else {
+        requested_model
+    };
+    let relay_api_key = body
+        .relay_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "sk-{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            )
+        });
+    validate_setting("relay_api_key", &relay_api_key, 8_192)?;
 
     // Build URLs
-    let model_infer_url = format!("{}/models/{}:generateContent", oneapi_base_url.trim_end_matches('/'), model);
-    let model_list_url = format!("{}/models", oneapi_base_url.trim_end_matches('/'));
-    let openai_chat_url = format!("{}/chat/completions", oneapi_base_url.trim_end_matches('/'));
+    let model_infer_url = format!("{oneapi_base_url}/models/{model}:generateContent");
+    let model_list_url = format!("{oneapi_base_url}/models");
+    let openai_chat_url = format!("{oneapi_base_url}/chat/completions");
 
     // Save all configs
     sqlx::query(
-        "INSERT INTO admin_settings (key, value, updated_at) VALUES ('vertex_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('vertex_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
-    .bind(&body.vertex_api_key)
+    .bind(vertex_api_key)
     .execute(state.db()?)
     .await?;
 
     sqlx::query(
-        "INSERT INTO admin_settings (key, value, updated_at) VALUES ('oneapi_base_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('oneapi_base_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&oneapi_base_url)
     .execute(state.db()?)
     .await?;
 
     sqlx::query(
-        "INSERT INTO admin_settings (key, value, updated_at) VALUES ('relay_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('relay_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&relay_api_key)
     .execute(state.db()?)
     .await?;
 
     sqlx::query(
-        "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_model', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('llm_model', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&model)
     .execute(state.db()?)
     .await?;
 
     sqlx::query(
-        "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_base_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('llm_base_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&openai_chat_url)
     .execute(state.db()?)
     .await?;
 
     sqlx::query(
-        "INSERT INTO admin_settings (key, value, updated_at) VALUES ('llm_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('llm_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
     .bind(&relay_api_key)
     .execute(state.db()?)
     .await?;
 
     // Mask keys for response
-    let relay_masked = if relay_api_key.len() > 12 {
-        format!("{}...{}", &relay_api_key[..8], &relay_api_key[relay_api_key.len()-4..])
-    } else {
-        relay_api_key.clone()
-    };
-
-    let vertex_masked = if body.vertex_api_key.len() > 8 {
-        format!("{}...{}", &body.vertex_api_key[..4], &body.vertex_api_key[body.vertex_api_key.len()-4..])
-    } else {
-        body.vertex_api_key.clone()
-    };
+    let relay_masked = mask_secret(&relay_api_key, 8, 4);
+    let vertex_masked = mask_secret(vertex_api_key, 4, 4);
 
     Ok(Json(json!({
         "status": "ok",
@@ -376,9 +418,11 @@ pub async fn vertex_oneclick_config(
 
 // GET /api/config/gemini_models - Get available Gemini models
 pub async fn get_gemini_models(
-    State(_state): State<AppState>,
-    _headers: HeaderMap,
+    State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    scope.require_platform()?;
     let models = vec![
         // Gemini 3.1
         "gemini-3.1-pro-preview",

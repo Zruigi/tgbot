@@ -19,7 +19,9 @@ fn row_to_json(row: PgRow) -> Value {
         let name = col.name();
         let type_name = col.type_info().name();
         let value = match type_name {
-            "UUID" => row.try_get::<uuid::Uuid, _>(name).map(|v| Value::String(v.to_string())),
+            "UUID" => row
+                .try_get::<uuid::Uuid, _>(name)
+                .map(|v| Value::String(v.to_string())),
             "TEXT" | "VARCHAR" | "BPCHAR" => row.try_get::<String, _>(name).map(Value::String),
             "INT2" => row.try_get::<i16, _>(name).map(|v| json!(v)),
             "INT4" => row.try_get::<i32, _>(name).map(|v| json!(v)),
@@ -58,14 +60,19 @@ pub async fn select(
 ) -> Result<(Vec<Value>, i64), String> {
     if let Some(ref pool) = state.pool {
         let query = format!("SELECT {select_cols} FROM {table}");
-        let rows: Vec<PgRow> =
-            sqlx::query(&query).fetch_all(pool).await.map_err(|e| format!("PG: {e}"))?;
+        let rows: Vec<PgRow> = sqlx::query(&query)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("PG: {e}"))?;
         let total = rows.len() as i64;
         let data = rows_to_json(rows);
         Ok((data, total))
     } else {
         // REST fallback
-        let rows = state.supabase.select(table, select_cols, filters, limit).await?;
+        let rows = state
+            .supabase
+            .select(table, select_cols, filters, limit)
+            .await?;
         let total = rows.len() as i64;
         Ok((rows, total))
     }
@@ -81,25 +88,46 @@ pub async fn select_one(
 ) -> Result<Option<Value>, String> {
     if let Some(ref pool) = state.pool {
         let query = format!("SELECT {select_cols} FROM {table} WHERE {id_col} = $1 LIMIT 1");
-        let row: Option<PgRow> = sqlx::query(&query).bind(id_val).fetch_optional(pool).await.map_err(|e| format!("PG: {e}"))?;
+        let row: Option<PgRow> = sqlx::query(&query)
+            .bind(id_val)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("PG: {e}"))?;
         Ok(row.map(row_to_json))
     } else {
-        state.supabase.select_one(table, select_cols, id_col, id_val).await
+        state
+            .supabase
+            .select_one(table, select_cols, id_col, id_val)
+            .await
     }
 }
 
 // ---- Insert -----------------------------------------------------------------
 
-pub async fn insert(
-    state: &AppState,
-    table: &str,
-    body: &Value,
-) -> Result<Value, String> {
+pub async fn insert(state: &AppState, table: &str, body: &Value) -> Result<Value, String> {
     if let Some(ref pool) = state.pool {
-        let cols: Vec<String> = body.as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
-        let vals: Vec<String> = cols.iter().map(|c| format!("'{}'", body.get(c).map(|v| v.to_string()).unwrap_or_default())).collect();
-        let query = format!("INSERT INTO {table} ({}) VALUES ({}) RETURNING *", cols.join(","), vals.join(","));
-        let row: PgRow = sqlx::query(&query).fetch_one(pool).await.map_err(|e| format!("PG: {e}"))?;
+        let cols: Vec<String> = body
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let vals: Vec<String> = cols
+            .iter()
+            .map(|c| {
+                format!(
+                    "'{}'",
+                    body.get(c).map(|v| v.to_string()).unwrap_or_default()
+                )
+            })
+            .collect();
+        let query = format!(
+            "INSERT INTO {table} ({}) VALUES ({}) RETURNING *",
+            cols.join(","),
+            vals.join(",")
+        );
+        let row: PgRow = sqlx::query(&query)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("PG: {e}"))?;
         Ok(row_to_json(row))
     } else {
         state.supabase.insert(table, body).await
@@ -115,14 +143,26 @@ pub async fn update(
     filters: &[(&str, &str)],
 ) -> Result<Vec<Value>, String> {
     if let Some(ref pool) = state.pool {
-        let sets: Vec<String> = body.as_object().map(|m| m.iter().map(|(k,v)| format!("{k} = '{v}'")).collect()).unwrap_or_default();
+        let sets: Vec<String> = body
+            .as_object()
+            .map(|m| m.iter().map(|(k, v)| format!("{k} = '{v}'")).collect())
+            .unwrap_or_default();
         let mut where_clause = String::new();
         for (i, (col, val)) in filters.iter().enumerate() {
-            if i == 0 { where_clause.push_str(&format!("{col} = '{val}'")); }
-            else { where_clause.push_str(&format!(" AND {col} = '{val}'")); }
+            if i == 0 {
+                where_clause.push_str(&format!("{col} = '{val}'"));
+            } else {
+                where_clause.push_str(&format!(" AND {col} = '{val}'"));
+            }
         }
-        let query = format!("UPDATE {table} SET {} WHERE {where_clause} RETURNING *", sets.join(", "));
-        let rows: Vec<PgRow> = sqlx::query(&query).fetch_all(pool).await.map_err(|e| format!("PG: {e}"))?;
+        let query = format!(
+            "UPDATE {table} SET {} WHERE {where_clause} RETURNING *",
+            sets.join(", ")
+        );
+        let rows: Vec<PgRow> = sqlx::query(&query)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("PG: {e}"))?;
         Ok(rows_to_json(rows))
     } else {
         state.supabase.update(table, body, filters).await
@@ -131,19 +171,21 @@ pub async fn update(
 
 // ---- Delete -----------------------------------------------------------------
 
-pub async fn delete(
-    state: &AppState,
-    table: &str,
-    filters: &[(&str, &str)],
-) -> Result<(), String> {
+pub async fn delete(state: &AppState, table: &str, filters: &[(&str, &str)]) -> Result<(), String> {
     if let Some(ref pool) = state.pool {
         let mut where_clause = String::new();
         for (i, (col, val)) in filters.iter().enumerate() {
-            if i == 0 { where_clause.push_str(&format!("{col} = '{val}'")); }
-            else { where_clause.push_str(&format!(" AND {col} = '{val}'")); }
+            if i == 0 {
+                where_clause.push_str(&format!("{col} = '{val}'"));
+            } else {
+                where_clause.push_str(&format!(" AND {col} = '{val}'"));
+            }
         }
         let query = format!("DELETE FROM {table} WHERE {where_clause}");
-        sqlx::query(&query).execute(pool).await.map_err(|e| format!("PG: {e}"))?;
+        sqlx::query(&query)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("PG: {e}"))?;
         Ok(())
     } else {
         state.supabase.delete(table, filters).await

@@ -6,9 +6,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::collections::HashMap;
 
 use crate::auth::resolve_scope;
 use crate::state::AppState;
@@ -122,35 +122,60 @@ fn resolve_identity_scope(
 
     if normalized_intent == "merchant_console" {
         if has_merchant {
-            return ("merchant_owner".to_string(), "merchant_console_entry".to_string());
+            return (
+                "merchant_owner".to_string(),
+                "merchant_console_entry".to_string(),
+            );
         }
         if is_platform_admin {
-            return ("platform_admin".to_string(), "merchant_entry_fallback_platform".to_string());
+            return (
+                "platform_admin".to_string(),
+                "merchant_entry_fallback_platform".to_string(),
+            );
         }
     }
 
     if normalized_intent == "admin_console" {
         if is_platform_admin {
-            return ("platform_admin".to_string(), "admin_console_entry".to_string());
+            return (
+                "platform_admin".to_string(),
+                "admin_console_entry".to_string(),
+            );
         }
         if has_merchant {
-            return ("merchant_owner".to_string(), "admin_entry_fallback_merchant".to_string());
+            return (
+                "merchant_owner".to_string(),
+                "admin_entry_fallback_merchant".to_string(),
+            );
         }
     }
 
     if is_platform_admin && has_merchant {
-        return (normalized_last.clone(), "dual_identity_last_scope".to_string());
+        return (
+            normalized_last.clone(),
+            "dual_identity_last_scope".to_string(),
+        );
     }
     if is_platform_admin {
-        return ("platform_admin".to_string(), "platform_identity".to_string());
+        return (
+            "platform_admin".to_string(),
+            "platform_identity".to_string(),
+        );
     }
     if has_merchant {
-        return ("merchant_owner".to_string(), "merchant_identity".to_string());
+        return (
+            "merchant_owner".to_string(),
+            "merchant_identity".to_string(),
+        );
     }
     ("unregistered".to_string(), "unregistered".to_string())
 }
 
-fn build_landing_payload(role: &str, entry_intent: &str, business_window: &BusinessWindow) -> Value {
+fn build_landing_payload(
+    role: &str,
+    entry_intent: &str,
+    business_window: &BusinessWindow,
+) -> Value {
     let active = business_window.active;
     let mode = if active { "normal" } else { "after_hours" };
 
@@ -296,7 +321,10 @@ pub async fn bootstrap(
 
     // Build landing page
     let session_data = session.as_ref().unwrap();
-    let role = session_data.get("role").and_then(|v| v.as_str()).unwrap_or("platform_admin");
+    let role = session_data
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("platform_admin");
     let landing = build_landing_payload(role, &entry_intent, &business_window);
 
     Ok(Json(json!({
@@ -314,10 +342,7 @@ pub async fn bootstrap(
 }
 
 // GET /api/miniapp/context - Get current session context for MiniApp
-pub async fn context(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+pub async fn context(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     let business_window = get_business_window();
 
@@ -358,7 +383,12 @@ pub async fn logout_revoke(
     })))
 }
 
-fn issue_miniapp_token(role: &str, tenant_id: &str, merchant_id: Option<i64>, issued_for: Option<&str>) -> String {
+fn issue_miniapp_token(
+    role: &str,
+    tenant_id: &str,
+    merchant_id: Option<i64>,
+    issued_for: Option<&str>,
+) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let payload = json!({

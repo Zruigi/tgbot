@@ -5,16 +5,22 @@ use axum::{
     extract::{Path, State},
     Json,
 };
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::{Column, Row, TypeInfo};
+use sha2::Sha256;
+use sqlx::Row;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::collections::HashMap;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
+use crate::auth::resolve_scope;
+use crate::secret_crypto::SecretCipher;
 use crate::state::AppState;
 use tgbot_domain::error::{ApiError, ApiResult};
+use tgbot_integrations::telegram::{AnswerCallbackQueryParams, TelegramClient, TelegramConfig};
+use tgbot_repos::message_repo;
 
 // ---------------------------------------------------------------------------
 // Update model — mirrors Telegram Bot API Update object
@@ -173,7 +179,8 @@ impl BotRegistry {
 pub type UpdateHandlerFn = Arc<dyn Fn(TelegramUpdate, BotEntry) -> DispatchResult + Send + Sync>;
 
 /// Result of dispatching an update.
-pub type DispatchResult = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+pub type DispatchResult =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
 
 /// Dispatcher that maps (UpdateKind) -> handler.
 /// Handlers are async functions that receive the update + bot context.
@@ -231,10 +238,18 @@ impl UpdateDispatcher {
             drop(handlers);
             let dh = self.default_handler.read().await;
             if let Some(handler) = dh.as_ref() {
-                debug!(?kind, update_id = update.update_id, "Dispatching to default handler");
+                debug!(
+                    ?kind,
+                    update_id = update.update_id,
+                    "Dispatching to default handler"
+                );
                 handler(update, entry).await
             } else {
-                warn!(?kind, update_id = update.update_id, "No handler for update kind");
+                warn!(
+                    ?kind,
+                    update_id = update.update_id,
+                    "No handler for update kind"
+                );
                 Ok(())
             }
         }
@@ -251,17 +266,12 @@ pub fn verify_webhook_secret(
     headers: &axum::http::HeaderMap,
     expected_secret: &str,
 ) -> ApiResult<()> {
-    if expected_secret.is_empty() {
-        // No secret configured — skip verification
-        return Ok(());
-    }
-
     let provided = headers
         .get("x-telegram-bot-api-secret-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if provided == expected_secret {
+    if constant_time_equal(provided.as_bytes(), expected_secret.as_bytes()) {
         Ok(())
     } else {
         warn!("Webhook secret token mismatch");
@@ -289,18 +299,19 @@ pub async fn webhook_handler(
     info!(bot_id, "Received webhook update");
 
     // 1. Resolve bot entry from registry
-    let entry = state
-        .bot_registry
-        .get(bot_id)
-        .await
-        .ok_or_else(|| {
-            warn!(bot_id, "Webhook received for unknown bot_id");
-            ApiError::NotFound(format!("Bot {} not found in registry", bot_id))
-        })?;
+    let entry = state.bot_registry.get(bot_id).await.ok_or_else(|| {
+        warn!(bot_id, "Webhook received for unknown bot_id");
+        ApiError::NotFound(format!("Bot {} not found in registry", bot_id))
+    })?;
 
     // 2. Verify webhook secret (if configured)
     // For multi-tenant bots, the secret is derived from the bot's token hash
-    let webhook_secret = derive_webhook_secret(&entry.bot_token);
+    let webhook_secret = derive_webhook_secret(
+        &state.config.secret_encryption_key,
+        bot_id,
+        &entry.bot_token,
+    )
+    .map_err(|error| ApiError::Anyhow(anyhow::anyhow!(error)))?;
     verify_webhook_secret(&headers, &webhook_secret)?;
 
     // 3. Parse update
@@ -332,7 +343,10 @@ pub async fn webhook_handler(
             }
         }
     } else {
-        warn!(bot_id, update_id, "No update dispatcher configured, dropping update");
+        warn!(
+            bot_id,
+            update_id, "No update dispatcher configured, dropping update"
+        );
     }
 
     // Always return 200 OK to Telegram Bot API
@@ -345,8 +359,32 @@ pub async fn webhook_handler(
 pub async fn register_bot(
     State(state): State<AppState>,
     Path(bot_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<RegisterBotRequest>,
 ) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    scope.require_platform()?;
+    let token_bot_id = body
+        .bot_token
+        .split_once(':')
+        .and_then(|(value, _)| value.parse::<i64>().ok())
+        .ok_or_else(|| ApiError::BadRequest("invalid bot_token format".into()))?;
+    if token_bot_id != bot_id {
+        return Err(ApiError::BadRequest("bot_token identity mismatch".into()));
+    }
+    let merchant_id = uuid::Uuid::parse_str(&body.merchant_id)
+        .map_err(|_| ApiError::BadRequest("invalid merchant_id".into()))?;
+    let merchant_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM merchants WHERE id = $1 AND tenant_id = $2 AND bot_id = $3)",
+    )
+    .bind(merchant_id)
+    .bind(&body.tenant_id)
+    .bind(bot_id)
+    .fetch_one(state.db()?)
+    .await?;
+    if !merchant_exists {
+        return Err(ApiError::NotFound("merchant bot binding not found".into()));
+    }
     let entry = BotEntry {
         bot_id,
         bot_token: body.bot_token.clone(),
@@ -369,7 +407,10 @@ pub async fn register_bot(
 pub async fn unregister_bot(
     State(state): State<AppState>,
     Path(bot_id): Path<i64>,
+    headers: axum::http::HeaderMap,
 ) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    scope.require_platform()?;
     state.bot_registry.unregister(bot_id).await;
 
     Ok(Json(json!({
@@ -383,7 +424,10 @@ pub async fn unregister_bot(
 /// List all registered bots (for admin/monitoring).
 pub async fn list_bots(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
 ) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    scope.require_platform()?;
     let entries = state.bot_registry.list_entries().await;
     let bots: Vec<Value> = entries
         .iter()
@@ -408,17 +452,19 @@ pub async fn list_bots(
 /// Test endpoint: dispatch a raw update to a specific bot's handler (admin only).
 pub async fn dispatch_test(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<DispatchTestRequest>,
 ) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    scope.require_platform()?;
     let entry = state
         .bot_registry
         .get(body.bot_id)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("Bot {} not found", body.bot_id)))?;
 
-    let update: TelegramUpdate = serde_json::from_value(body.update).map_err(|e| {
-        ApiError::BadRequest(format!("Invalid update payload: {}", e))
-    })?;
+    let update: TelegramUpdate = serde_json::from_value(body.update)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid update payload: {}", e)))?;
 
     let kind = update.kind();
     let update_id = update.update_id;
@@ -472,25 +518,50 @@ pub struct DispatchTestRequest {
 
 /// Derive a deterministic webhook secret from the bot token.
 /// This allows us to validate incoming webhooks without storing a separate secret.
-fn derive_webhook_secret(bot_token: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+pub fn derive_webhook_secret(
+    master_key: &str,
+    bot_id: i64,
+    bot_token: &str,
+) -> Result<String, String> {
+    if master_key.trim().is_empty() {
+        return Err("TGBOT_SECRET_ENCRYPTION_KEY is required".into());
+    }
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(master_key.as_bytes())
+        .map_err(|_| "failed to initialize webhook secret".to_string())?;
+    mac.update(format!("telegram-webhook\0{bot_id}\0{bot_token}").as_bytes());
+    Ok(format!("wh_{}", hex::encode(mac.finalize().into_bytes())))
+}
 
-    let mut hasher = DefaultHasher::new();
-    bot_token.hash(&mut hasher);
-    format!("wh_{:016x}", hasher.finish())
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
 }
 
 /// Load all active merchant bots from the database into the registry.
 /// Called at startup to warm the registry.
-pub async fn load_bots_from_db(pool: &sqlx::PgPool, registry: &BotRegistry) -> anyhow::Result<()> {
+pub async fn load_bots_from_db(
+    pool: &sqlx::PgPool,
+    registry: &BotRegistry,
+    encryption_key: &str,
+) -> anyhow::Result<()> {
     let rows = sqlx::query(
-        "SELECT id, tenant_id, bot_id, bot_username, bot_token_ref \
-         FROM merchants \
-         WHERE status = 'active' AND bot_id IS NOT NULL",
+        "SELECT m.id, m.tenant_id, m.bot_id, m.bot_username, secrets.secret_ref AS bot_token_ref \
+         FROM merchants m \
+         JOIN tenant_secret_refs secrets \
+           ON secrets.tenant_id = m.tenant_id AND secrets.secret_key = 'TELEGRAM_BOT_TOKEN' \
+         WHERE m.status IN ('active', 'active_free') AND m.bot_id IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let cipher = SecretCipher::from_encoded_key(encryption_key).map_err(anyhow::Error::msg)?;
 
     let mut count = 0u32;
     for row in rows {
@@ -500,10 +571,16 @@ pub async fn load_bots_from_db(pool: &sqlx::PgPool, registry: &BotRegistry) -> a
         let bot_username: Option<String> = row.try_get("bot_username")?;
         let bot_token_ref: Option<String> = row.try_get("bot_token_ref")?;
 
-        // bot_token_ref stores a reference/pointer to the actual token;
-        // In production this would be decrypted from a secrets manager.
-        // For now, we use the ref as the token itself if available.
-        let bot_token = bot_token_ref.unwrap_or_default();
+        let Some(bot_token_ref) = bot_token_ref else {
+            continue;
+        };
+        let bot_token = match cipher.decrypt(&tenant_id, "TELEGRAM_BOT_TOKEN", &bot_token_ref) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(tenant_id, error, "Skipping bot with unreadable token");
+                continue;
+            }
+        };
 
         if let Some(bid) = bot_id {
             registry
@@ -529,73 +606,134 @@ pub async fn load_bots_from_db(pool: &sqlx::PgPool, registry: &BotRegistry) -> a
 
 /// Install the default handler set into the dispatcher.
 /// This provides basic logging and no-op for unhandled update kinds.
-pub async fn install_default_handlers(dispatcher: &UpdateDispatcher) {
-    // Message handler
+pub async fn install_default_handlers(
+    dispatcher: &UpdateDispatcher,
+    pool: Option<sqlx::PgPool>,
+    telegram_api_base_url: String,
+) {
+    let message_pool = pool.clone();
     dispatcher
-        .on(UpdateKind::Message, |update, entry| async move {
-            if let Some(msg) = &update.message {
-                let chat_id = msg.get("chat").and_then(|c| c.get("id"));
-                let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                let from = msg
-                    .get("from")
-                    .and_then(|f| f.get("username").and_then(|u| u.as_str()))
-                    .unwrap_or("unknown");
-                info!(
-                    bot_id = entry.bot_id,
-                    ?chat_id,
-                    from,
-                    text_len = text.len(),
-                    "Received message"
-                );
+        .on(UpdateKind::Message, move |update, entry| {
+            let pool = message_pool.clone();
+            async move {
+                if let (Some(message), Some(pool)) = (&update.message, pool.as_ref()) {
+                    handle_incoming_message(pool, &entry, message, false).await?;
+                }
+                if let Some(msg) = &update.message {
+                    let chat_id = msg.get("chat").and_then(|c| c.get("id"));
+                    let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    let from = msg
+                        .get("from")
+                        .and_then(|f| f.get("username").and_then(|u| u.as_str()))
+                        .unwrap_or("unknown");
+                    info!(
+                        bot_id = entry.bot_id,
+                        ?chat_id,
+                        from,
+                        text_len = text.len(),
+                        "Received message"
+                    );
+                }
+                Ok(())
             }
-            Ok(())
+        })
+        .await;
+
+    let edited_message_pool = pool.clone();
+    dispatcher
+        .on(UpdateKind::EditedMessage, move |update, entry| {
+            let pool = edited_message_pool.clone();
+            async move {
+                if let (Some(message), Some(pool)) = (&update.edited_message, pool.as_ref()) {
+                    handle_incoming_message(pool, &entry, message, true).await?;
+                }
+                Ok(())
+            }
         })
         .await;
 
     // Callback query handler
+    let callback_pool = pool.clone();
     dispatcher
-        .on(UpdateKind::CallbackQuery, |update, entry| async move {
-            if let Some(cq) = &update.callback_query {
-                let data = cq.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                info!(
-                    bot_id = entry.bot_id,
-                    data,
-                    "Received callback query"
-                );
+        .on(UpdateKind::CallbackQuery, move |update, entry| {
+            let pool = callback_pool.clone();
+            let telegram_api_base_url = telegram_api_base_url.clone();
+            async move {
+                if handle_channel_subscription_callback(
+                    &update,
+                    &entry,
+                    pool.as_ref(),
+                    &telegram_api_base_url,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                if let Some(cq) = &update.callback_query {
+                    let data = cq.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                    info!(bot_id = entry.bot_id, data, "Received callback query");
+                }
+                Ok(())
             }
-            Ok(())
         })
         .await;
 
     // Chat join request handler
+    let join_request_pool = pool.clone();
     dispatcher
-        .on(UpdateKind::ChatJoinRequest, |update, entry| async move {
-            if let Some(jr) = &update.chat_join_request {
-                let chat_id = jr.get("chat").and_then(|c| c.get("id"));
-                let from = jr.get("from").and_then(|f| f.get("id"));
-                info!(
-                    bot_id = entry.bot_id,
-                    ?chat_id,
-                    ?from,
-                    "Received chat join request"
-                );
+        .on(UpdateKind::ChatJoinRequest, move |update, entry| {
+            let pool = join_request_pool.clone();
+            async move {
+                if let Some(jr) = &update.chat_join_request {
+                    if let Some(pool) = pool.as_ref() {
+                        handle_chat_join_request(pool, &entry, jr).await?;
+                    }
+                    let chat_id = jr.get("chat").and_then(|c| c.get("id"));
+                    let from = jr.get("from").and_then(|f| f.get("id"));
+                    info!(
+                        bot_id = entry.bot_id,
+                        ?chat_id,
+                        ?from,
+                        "Received chat join request"
+                    );
+                }
+                Ok(())
             }
-            Ok(())
         })
         .await;
 
     // My chat member handler
+    let my_chat_member_pool = pool.clone();
     dispatcher
-        .on(UpdateKind::MyChatMember, |update, entry| async move {
-            if let Some(cm) = &update.my_chat_member {
-                let chat_id = cm.get("chat").and_then(|c| c.get("id"));
-                info!(
-                    bot_id = entry.bot_id,
-                    ?chat_id,
-                    "Chat member status changed"
-                );
+        .on(UpdateKind::MyChatMember, move |update, entry| {
+            let pool = my_chat_member_pool.clone();
+            async move {
+                if let Some(cm) = &update.my_chat_member {
+                    if let Some(pool) = pool.as_ref() {
+                        handle_chat_member_update(pool, &entry, cm, true).await?;
+                    }
+                    let chat_id = cm.get("chat").and_then(|c| c.get("id"));
+                    info!(
+                        bot_id = entry.bot_id,
+                        ?chat_id,
+                        "Chat member status changed"
+                    );
+                }
+                Ok(())
             }
-            Ok(())
+        })
+        .await;
+
+    let chat_member_pool = pool.clone();
+    dispatcher
+        .on(UpdateKind::ChatMember, move |update, entry| {
+            let pool = chat_member_pool.clone();
+            async move {
+                if let (Some(member), Some(pool)) = (&update.chat_member, pool.as_ref()) {
+                    handle_chat_member_update(pool, &entry, member, false).await?;
+                }
+                Ok(())
+            }
         })
         .await;
 
@@ -611,4 +749,815 @@ pub async fn install_default_handlers(dispatcher: &UpdateDispatcher) {
             Ok(())
         })
         .await;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InboundContent {
+    content: Option<String>,
+    msg_type: String,
+    file_id: Option<String>,
+}
+
+struct TrackedGroupPolicy {
+    is_monitored: bool,
+}
+
+async fn handle_incoming_message(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    message: &Value,
+    edited: bool,
+) -> Result<(), String> {
+    let Some(chat) = message.get("chat") else {
+        return Ok(());
+    };
+    let Some(chat_id) = chat.get("id").and_then(Value::as_i64) else {
+        return Ok(());
+    };
+    let chat_type = chat.get("type").and_then(Value::as_str).unwrap_or("");
+    let Some(message_id) = message
+        .get("message_id")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+    else {
+        return Ok(());
+    };
+    let Some(from) = message.get("from") else {
+        return Ok(());
+    };
+    if from.get("is_bot").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(());
+    }
+    let user_id = from
+        .get("id")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Telegram message has no sender id".to_string())?;
+    let username = optional_nonempty_string(from, "username");
+    let first_name = optional_nonempty_string(from, "first_name");
+    let last_name = optional_nonempty_string(from, "last_name");
+    let message_ts = message
+        .get("date")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let reply_to_message_id = message
+        .get("reply_to_message")
+        .and_then(|reply| reply.get("message_id"))
+        .and_then(Value::as_i64);
+    let inbound = extract_inbound_content(message);
+
+    match chat_type {
+        "private" => {
+            upsert_chat_user(
+                pool,
+                user_id,
+                username.as_deref(),
+                first_name.as_deref(),
+                last_name.as_deref(),
+            )
+            .await?;
+            let existing_id = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM chat.messages \
+                 WHERE tenant_id = $1 AND tg_msg_id = $2 \
+                   AND from_userid = $3 AND to_userid = $4 \
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(&entry.tenant_id)
+            .bind(message_id)
+            .bind(user_id)
+            .bind(entry.bot_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| "failed to check private message duplicate".to_string())?;
+            if let Some(existing_id) = existing_id {
+                if edited {
+                    sqlx::query(
+                        "UPDATE chat.messages SET content = $2, msg_type = $3, file_id = $4, \
+                         original_text = COALESCE(original_text, content), status = 'edited' \
+                         WHERE id = $1 AND tenant_id = $5",
+                    )
+                    .bind(existing_id)
+                    .bind(inbound.as_ref().and_then(|value| value.content.as_deref()))
+                    .bind(
+                        inbound
+                            .as_ref()
+                            .map(|value| value.msg_type.as_str())
+                            .unwrap_or("service"),
+                    )
+                    .bind(inbound.as_ref().and_then(|value| value.file_id.as_deref()))
+                    .bind(&entry.tenant_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|_| "failed to update private message".to_string())?;
+                }
+                return Ok(());
+            }
+            let Some(inbound) = inbound else {
+                return Ok(());
+            };
+            let stored_id = message_repo::save_message(
+                pool,
+                user_id,
+                entry.bot_id,
+                inbound.content.as_deref(),
+                &inbound.msg_type,
+                inbound.file_id.as_deref(),
+                None,
+                false,
+                Some(message_id),
+                &entry.tenant_id,
+                reply_to_message_id,
+            )
+            .await
+            .map_err(|_| "failed to persist private message".to_string())?;
+            if let Some(message_ts) = message_ts {
+                sqlx::query(
+                    "UPDATE chat.messages SET timestamp = to_timestamp($2) \
+                     WHERE id = $1 AND tenant_id = $3",
+                )
+                .bind(stored_id)
+                .bind(message_ts)
+                .bind(&entry.tenant_id)
+                .execute(pool)
+                .await
+                .map_err(|_| "failed to persist private message timestamp".to_string())?;
+            }
+            sqlx::query(
+                "UPDATE chat.admin_inbox SET username = $2, updated_at = now() \
+                 WHERE user_id = $1 AND tenant_id = $3",
+            )
+            .bind(user_id)
+            .bind(username.as_deref().unwrap_or(""))
+            .bind(&entry.tenant_id)
+            .execute(pool)
+            .await
+            .map_err(|_| "failed to update private inbox identity".to_string())?;
+            return Ok(());
+        }
+        "group" | "supergroup" => {
+            let group_title =
+                optional_nonempty_string(chat, "title").unwrap_or_else(|| "Unknown".into());
+            let group_policy = claim_or_refresh_group(pool, entry, chat_id, &group_title).await?;
+            upsert_group_member(
+                pool,
+                &entry.tenant_id,
+                chat_id,
+                &group_title,
+                user_id,
+                username.as_deref(),
+                first_name.as_deref(),
+                last_name.as_deref(),
+                "active",
+            )
+            .await?;
+            apply_message_membership_events(pool, entry, message, chat_id, &group_title).await?;
+            if !group_policy.is_monitored {
+                return Ok(());
+            }
+            let Some(inbound) = inbound else {
+                return Ok(());
+            };
+            let quoted_text = message
+                .get("reply_to_message")
+                .and_then(|reply| reply.get("text").or_else(|| reply.get("caption")))
+                .and_then(Value::as_str);
+            if edited {
+                sqlx::query(
+                    "UPDATE groups.group_messages SET content = $4, msg_type = $5, file_id = $6, \
+                     quoted_tg_msg_id = $7, quoted_text = $8, message_ts = COALESCE($9, message_ts), \
+                     timestamp = COALESCE(to_timestamp($9), timestamp) \
+                     WHERE group_id = $1 AND tg_msg_id = $2 AND tenant_id = $3",
+                )
+                .bind(chat_id)
+                .bind(message_id)
+                .bind(&entry.tenant_id)
+                .bind(inbound.content.as_deref())
+                .bind(&inbound.msg_type)
+                .bind(inbound.file_id.as_deref())
+                .bind(reply_to_message_id)
+                .bind(quoted_text)
+                .bind(message_ts)
+                .execute(pool)
+                .await
+                .map_err(|_| "failed to update group message".to_string())?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO groups.group_messages \
+                     (group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, \
+                      file_id, quoted_tg_msg_id, quoted_text, tenant_id, message_ts, timestamp) \
+                     SELECT $1, $2, $3, $4, 'user', $5, $6, $7, $8, $9, $10, $11, \
+                            COALESCE(to_timestamp($11), now()) \
+                     WHERE NOT EXISTS (SELECT 1 FROM groups.group_messages \
+                       WHERE group_id = $1 AND tg_msg_id = $4 AND tenant_id = $10)",
+                )
+                .bind(chat_id)
+                .bind(user_id)
+                .bind(username.as_deref())
+                .bind(message_id)
+                .bind(inbound.content.as_deref())
+                .bind(&inbound.msg_type)
+                .bind(inbound.file_id.as_deref())
+                .bind(reply_to_message_id)
+                .bind(quoted_text)
+                .bind(&entry.tenant_id)
+                .bind(message_ts)
+                .execute(pool)
+                .await
+                .map_err(|_| "failed to persist group message".to_string())?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn claim_or_refresh_group(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    group_id: i64,
+    group_title: &str,
+) -> Result<TrackedGroupPolicy, String> {
+    let row = sqlx::query(
+        "INSERT INTO groups.tracked_groups (group_id, group_title, tenant_id, first_seen, updated_at) \
+         VALUES ($1, $2, $3, now(), now()) \
+         ON CONFLICT (group_id) DO UPDATE SET group_title = EXCLUDED.group_title, updated_at = now() \
+         WHERE groups.tracked_groups.tenant_id = EXCLUDED.tenant_id \
+         RETURNING is_monitored",
+    )
+    .bind(group_id)
+    .bind(group_title)
+    .bind(&entry.tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| "failed to refresh tracked group".to_string())?
+    .ok_or_else(|| "group belongs to another tenant".to_string())?;
+    Ok(TrackedGroupPolicy {
+        is_monitored: row
+            .try_get("is_monitored")
+            .map_err(|_| "tracked group has invalid monitor state".to_string())?,
+    })
+}
+
+async fn upsert_chat_user(
+    pool: &sqlx::PgPool,
+    user_id: i64,
+    username: Option<&str>,
+    first_name: Option<&str>,
+    last_name: Option<&str>,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO chat.users (user_id, username, first_name, last_name) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, \
+         first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, updated_at = now()",
+    )
+    .bind(user_id)
+    .bind(username)
+    .bind(first_name)
+    .bind(last_name)
+    .execute(pool)
+    .await
+    .map_err(|_| "failed to persist Telegram user".to_string())?;
+    Ok(())
+}
+
+async fn upsert_group_member(
+    pool: &sqlx::PgPool,
+    tenant_id: &str,
+    group_id: i64,
+    group_title: &str,
+    user_id: i64,
+    username: Option<&str>,
+    first_name: Option<&str>,
+    last_name: Option<&str>,
+    status: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO groups.group_members \
+         (user_id, username, first_name, last_name, group_id, group_title, tenant_id, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (group_id, user_id) DO UPDATE SET username = EXCLUDED.username, \
+         first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, \
+         group_title = EXCLUDED.group_title, status = EXCLUDED.status, updated_at = now() \
+         WHERE groups.group_members.tenant_id = EXCLUDED.tenant_id",
+    )
+    .bind(user_id)
+    .bind(username)
+    .bind(first_name)
+    .bind(last_name)
+    .bind(group_id)
+    .bind(group_title)
+    .bind(tenant_id)
+    .bind(status)
+    .execute(pool)
+    .await
+    .map_err(|_| "failed to persist group member".to_string())?;
+    Ok(())
+}
+
+async fn apply_message_membership_events(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    message: &Value,
+    group_id: i64,
+    group_title: &str,
+) -> Result<(), String> {
+    if let Some(users) = message.get("new_chat_members").and_then(Value::as_array) {
+        for user in users {
+            let Some(user_id) = user
+                .get("id")
+                .and_then(Value::as_i64)
+                .filter(|value| *value > 0)
+            else {
+                continue;
+            };
+            if user_id == entry.bot_id {
+                continue;
+            }
+            upsert_group_member(
+                pool,
+                &entry.tenant_id,
+                group_id,
+                group_title,
+                user_id,
+                optional_nonempty_string(user, "username").as_deref(),
+                optional_nonempty_string(user, "first_name").as_deref(),
+                optional_nonempty_string(user, "last_name").as_deref(),
+                "active",
+            )
+            .await?;
+        }
+    }
+    if let Some(user) = message.get("left_chat_member") {
+        if let Some(user_id) = user
+            .get("id")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+        {
+            sqlx::query(
+                "UPDATE groups.group_members SET status = 'left', updated_at = now() \
+                 WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3",
+            )
+            .bind(group_id)
+            .bind(user_id)
+            .bind(&entry.tenant_id)
+            .execute(pool)
+            .await
+            .map_err(|_| "failed to persist departing group member".to_string())?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_chat_join_request(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    request: &Value,
+) -> Result<(), String> {
+    let chat = request
+        .get("chat")
+        .ok_or_else(|| "join request has no chat".to_string())?;
+    let group_id = chat
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "join request has no group id".to_string())?;
+    let group_title = optional_nonempty_string(chat, "title").unwrap_or_else(|| "Unknown".into());
+    claim_or_refresh_group(pool, entry, group_id, &group_title).await?;
+    let user = request
+        .get("from")
+        .ok_or_else(|| "join request has no user".to_string())?;
+    let user_id = user
+        .get("id")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "join request has invalid user".to_string())?;
+    upsert_group_member(
+        pool,
+        &entry.tenant_id,
+        group_id,
+        &group_title,
+        user_id,
+        optional_nonempty_string(user, "username").as_deref(),
+        optional_nonempty_string(user, "first_name").as_deref(),
+        optional_nonempty_string(user, "last_name").as_deref(),
+        "pending",
+    )
+    .await
+}
+
+async fn handle_chat_member_update(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    update: &Value,
+    is_bot_update: bool,
+) -> Result<(), String> {
+    let chat = update
+        .get("chat")
+        .ok_or_else(|| "member update has no chat".to_string())?;
+    let group_id = chat
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "member update has no group id".to_string())?;
+    let group_title = optional_nonempty_string(chat, "title").unwrap_or_else(|| "Unknown".into());
+    let member = update
+        .get("new_chat_member")
+        .ok_or_else(|| "member update has no new state".to_string())?;
+    let telegram_status = member
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("left");
+    if is_bot_update {
+        claim_or_refresh_group(pool, entry, group_id, &group_title).await?;
+        if matches!(telegram_status, "left" | "kicked") {
+            sqlx::query(
+                "UPDATE groups.tracked_groups SET is_monitored = false, updated_at = now() \
+                 WHERE group_id = $1 AND tenant_id = $2",
+            )
+            .bind(group_id)
+            .bind(&entry.tenant_id)
+            .execute(pool)
+            .await
+            .map_err(|_| "failed to disable departed group".to_string())?;
+        }
+        return Ok(());
+    }
+    claim_or_refresh_group(pool, entry, group_id, &group_title).await?;
+    let user = member
+        .get("user")
+        .ok_or_else(|| "member update has no user".to_string())?;
+    let user_id = user
+        .get("id")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "member update has invalid user".to_string())?;
+    let status = persisted_member_status(member);
+    upsert_group_member(
+        pool,
+        &entry.tenant_id,
+        group_id,
+        &group_title,
+        user_id,
+        optional_nonempty_string(user, "username").as_deref(),
+        optional_nonempty_string(user, "first_name").as_deref(),
+        optional_nonempty_string(user, "last_name").as_deref(),
+        status,
+    )
+    .await
+}
+
+fn extract_inbound_content(message: &Value) -> Option<InboundContent> {
+    if let Some(text) = message.get("text").and_then(Value::as_str) {
+        return Some(InboundContent {
+            content: Some(text.to_string()),
+            msg_type: "text".into(),
+            file_id: None,
+        });
+    }
+    let caption = message
+        .get("caption")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(photo) = message.get("photo").and_then(Value::as_array) {
+        return Some(InboundContent {
+            content: caption,
+            msg_type: "photo".into(),
+            file_id: photo
+                .iter()
+                .rev()
+                .find_map(|item| item.get("file_id").and_then(Value::as_str))
+                .map(str::to_string),
+        });
+    }
+    for (field, msg_type) in [
+        ("document", "document"),
+        ("video", "video"),
+        ("audio", "audio"),
+        ("voice", "voice"),
+        ("animation", "animation"),
+        ("sticker", "sticker"),
+    ] {
+        if let Some(media) = message.get(field) {
+            return Some(InboundContent {
+                content: caption.clone().or_else(|| {
+                    media
+                        .get("emoji")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }),
+                msg_type: msg_type.into(),
+                file_id: media
+                    .get("file_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+    }
+    None
+}
+
+fn persisted_member_status(member: &Value) -> &'static str {
+    match member.get("status").and_then(Value::as_str) {
+        Some("creator" | "administrator") => "admin",
+        Some("member") => "active",
+        Some("restricted")
+            if member
+                .get("is_member")
+                .and_then(Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            "active"
+        }
+        Some("kicked") => "banned",
+        _ => "left",
+    }
+}
+
+fn optional_nonempty_string(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+async fn handle_channel_subscription_callback(
+    update: &TelegramUpdate,
+    entry: &BotEntry,
+    pool: Option<&sqlx::PgPool>,
+    telegram_api_base_url: &str,
+) -> Result<bool, String> {
+    let Some(callback) = update.callback_query.as_ref() else {
+        return Ok(false);
+    };
+    let Some(data) = callback.get("data").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    if !data.starts_with("subscribe_") {
+        return Ok(false);
+    }
+
+    let callback_id = callback
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "channel subscription callback has no id".to_string())?;
+    let telegram = TelegramClient::new(TelegramConfig {
+        bot_token: entry.bot_token.clone(),
+        api_base_url: telegram_api_base_url.to_string(),
+        timeout_secs: 30,
+    })
+    .map_err(|_| "failed to initialize Telegram client".to_string())?;
+    let parsed = parse_channel_subscription_callback(data);
+    let user_id = callback
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(Value::as_i64);
+    let message = callback.get("message");
+    let callback_chat_id = message
+        .and_then(|message| message.get("chat"))
+        .and_then(|chat| chat.get("id"))
+        .and_then(Value::as_i64);
+    let message_id = message
+        .and_then(|message| message.get("message_id"))
+        .and_then(Value::as_i64);
+    let (group_id, channel_id, user_id) = match (parsed, user_id) {
+        (Some((group_id, channel_id)), Some(user_id))
+            if user_id > 0 && callback_chat_id == Some(group_id) =>
+        {
+            (group_id, channel_id, user_id)
+        }
+        _ => {
+            answer_subscription_callback(&telegram, callback_id, "验证请求无效", true).await?;
+            return Ok(true);
+        }
+    };
+    let Some(pool) = pool else {
+        answer_subscription_callback(&telegram, callback_id, "验证服务暂不可用", true).await?;
+        return Err("channel subscription callback requires PostgreSQL".into());
+    };
+
+    let config = sqlx::query(
+        "SELECT verify_enabled, verify_type, verify_channel_id \
+         FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+    )
+    .bind(group_id)
+    .bind(&entry.tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| "failed to load channel verification config".to_string())?;
+    let valid_config = config.is_some_and(|row| {
+        row.try_get::<bool, _>("verify_enabled").unwrap_or(false)
+            && row.try_get::<String, _>("verify_type").ok().as_deref() == Some("channel")
+            && row
+                .try_get::<Option<String>, _>("verify_channel_id")
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse::<i64>().ok())
+                == Some(channel_id)
+    });
+    if !valid_config {
+        answer_subscription_callback(&telegram, callback_id, "验证配置已更新，请刷新后重试", true)
+            .await?;
+        return Ok(true);
+    }
+
+    let member = match telegram.get_chat_member(channel_id, user_id).await {
+        Ok(member) => member,
+        Err(_) => {
+            answer_subscription_callback(&telegram, callback_id, "暂时无法检查关注状态", true)
+                .await?;
+            return Err("Telegram channel membership check failed".into());
+        }
+    };
+    if !telegram_member_is_subscribed(&member) {
+        answer_subscription_callback(&telegram, callback_id, "请先关注频道", false).await?;
+        return Ok(true);
+    }
+
+    telegram
+        .restrict_chat_member(
+            group_id,
+            user_id,
+            json!({
+                "can_send_messages": true,
+                "can_send_polls": true,
+                "can_send_other_messages": true,
+                "can_add_web_page_previews": true,
+                "can_change_info": false,
+                "can_invite_users": true,
+                "can_pin_messages": false,
+            }),
+            None,
+        )
+        .await
+        .map_err(|_| "Telegram member unmute failed".to_string())?;
+    sqlx::query(
+        "UPDATE groups.group_members SET status = 'active', is_verified = true, \
+         verified_at = now(), updated_at = now() \
+         WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .bind(&entry.tenant_id)
+    .execute(pool)
+    .await
+    .map_err(|_| "failed to persist channel verification".to_string())?;
+    answer_subscription_callback(&telegram, callback_id, "✅ 验证成功！您已被解禁", true).await?;
+
+    if let Some(message_id) = message_id {
+        if telegram.delete_message(group_id, message_id).await.is_ok() {
+            sqlx::query(
+                "UPDATE groups.channel_reminders SET is_deleted = true \
+                 WHERE group_id = $1 AND user_id = $2 AND message_id = $3 AND tenant_id = $4",
+            )
+            .bind(group_id)
+            .bind(user_id)
+            .bind(message_id)
+            .bind(&entry.tenant_id)
+            .execute(pool)
+            .await
+            .map_err(|_| "failed to mark channel reminder deleted".to_string())?;
+        }
+    }
+
+    Ok(true)
+}
+
+fn parse_channel_subscription_callback(data: &str) -> Option<(i64, i64)> {
+    let mut parts = data.split('_');
+    if parts.next()? != "subscribe" {
+        return None;
+    }
+    let group_id = parts.next()?.parse().ok()?;
+    let channel_id = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((group_id, channel_id))
+}
+
+fn telegram_member_is_subscribed(member: &Value) -> bool {
+    match member.get("status").and_then(Value::as_str) {
+        Some("creator" | "administrator" | "member") => true,
+        Some("restricted") => member
+            .get("is_member")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+async fn answer_subscription_callback(
+    telegram: &TelegramClient,
+    callback_id: &str,
+    text: &str,
+    show_alert: bool,
+) -> Result<(), String> {
+    telegram
+        .answer_callback_query(AnswerCallbackQueryParams {
+            callback_query_id: callback_id.to_string(),
+            text: Some(text.to_string()),
+            show_alert: Some(show_alert),
+        })
+        .await
+        .map_err(|_| "Telegram callback acknowledgement failed".to_string())
+}
+
+#[cfg(test)]
+mod channel_subscription_tests {
+    use super::*;
+
+    #[test]
+    fn parses_strict_channel_subscription_callback() {
+        assert_eq!(
+            parse_channel_subscription_callback("subscribe_-10001_-30001"),
+            Some((-10001, -30001))
+        );
+        assert_eq!(
+            parse_channel_subscription_callback("subscribe_bad_-30001"),
+            None
+        );
+        assert_eq!(
+            parse_channel_subscription_callback("subscribe_-10001_-30001_extra"),
+            None
+        );
+        assert_eq!(
+            parse_channel_subscription_callback("unrelated_-10001_-30001"),
+            None
+        );
+    }
+
+    #[test]
+    fn accepts_only_active_channel_members() {
+        assert!(telegram_member_is_subscribed(
+            &json!({ "status": "member" })
+        ));
+        assert!(telegram_member_is_subscribed(&json!({
+            "status": "restricted",
+            "is_member": true,
+        })));
+        assert!(!telegram_member_is_subscribed(&json!({
+            "status": "restricted",
+            "is_member": false,
+        })));
+        assert!(!telegram_member_is_subscribed(&json!({ "status": "left" })));
+    }
+
+    #[test]
+    fn persists_restricted_non_members_as_left() {
+        assert_eq!(
+            persisted_member_status(&json!({
+                "status": "restricted",
+                "is_member": true,
+            })),
+            "active"
+        );
+        assert_eq!(
+            persisted_member_status(&json!({
+                "status": "restricted",
+                "is_member": false,
+            })),
+            "left"
+        );
+        assert_eq!(
+            persisted_member_status(&json!({ "status": "administrator" })),
+            "admin"
+        );
+        assert_eq!(
+            persisted_member_status(&json!({ "status": "kicked" })),
+            "banned"
+        );
+    }
+
+    #[test]
+    fn extracts_text_and_largest_photo() {
+        assert_eq!(
+            extract_inbound_content(&json!({ "text": "hello" })),
+            Some(InboundContent {
+                content: Some("hello".into()),
+                msg_type: "text".into(),
+                file_id: None,
+            })
+        );
+        assert_eq!(
+            extract_inbound_content(&json!({
+                "caption": "image",
+                "photo": [{ "file_id": "small" }, { "file_id": "large" }],
+            })),
+            Some(InboundContent {
+                content: Some("image".into()),
+                msg_type: "photo".into(),
+                file_id: Some("large".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_service_only_messages() {
+        assert_eq!(
+            extract_inbound_content(&json!({ "new_chat_members": [] })),
+            None
+        );
+    }
 }

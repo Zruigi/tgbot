@@ -35,6 +35,13 @@ const SENSITIVE_HEADERS: &[&str] = &[
 /// Global rate limiter state (per-IP, default: 100 req / 60s)
 static RATE_LIMITER: LazyLock<RwLock<HashMap<String, Vec<Instant>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+static RATE_LIMIT_REQUESTS_PER_MINUTE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("HTTP_RATE_LIMIT_REQUESTS_PER_MINUTE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| (1..=100_000).contains(value))
+        .unwrap_or(100)
+});
 
 /// Periodic cleanup task for expired rate limiter entries (runs every 5 min)
 pub async fn rate_limiter_cleanup_task() {
@@ -60,17 +67,17 @@ pub fn redact_sensitive_headers(headers: &HeaderMap) -> Vec<(String, String)> {
             if SENSITIVE_HEADERS.contains(&name_lower.as_str()) {
                 (name.as_str().to_string(), "[REDACTED]".to_string())
             } else {
-                (name.as_str().to_string(), value.to_str().unwrap_or("[INVALID]").to_string())
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or("[INVALID]").to_string(),
+                )
             }
         })
         .collect()
 }
 
 /// Security headers middleware — adds hardening headers to all responses
-pub async fn security_headers_middleware(
-    request: Request<Body>,
-    next: Next,
-) -> impl IntoResponse {
+pub async fn security_headers_middleware(request: Request<Body>, next: Next) -> impl IntoResponse {
     // Log redacted headers at debug level
     let redacted = redact_sensitive_headers(request.headers());
     tracing::debug!(?redacted, "request headers (sensitive values redacted)");
@@ -81,16 +88,16 @@ pub async fn security_headers_middleware(
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
     headers.insert("X-Frame-Options", "DENY".parse().unwrap());
     headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
-    headers.insert("Referrer-Policy", "strict-origin-when-cross-origin".parse().unwrap());
+    headers.insert(
+        "Referrer-Policy",
+        "strict-origin-when-cross-origin".parse().unwrap(),
+    );
 
     response
 }
 
 /// Per-IP rate limiting middleware — returns 429 if over limit
-pub async fn rate_limit_middleware(
-    request: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn rate_limit_middleware(request: Request<Body>, next: Next) -> Response {
     // Extract IP from ConnectInfo or fallback
     let ip = request
         .extensions()
@@ -111,7 +118,7 @@ pub async fn rate_limit_middleware(
         let window = Duration::from_secs(60);
         let timestamps = buckets.entry(ip).or_default();
         timestamps.retain(|&t| now.duration_since(t) < window);
-        if timestamps.len() >= 100 {
+        if timestamps.len() >= *RATE_LIMIT_REQUESTS_PER_MINUTE {
             false
         } else {
             timestamps.push(now);

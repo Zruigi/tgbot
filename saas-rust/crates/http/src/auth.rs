@@ -49,8 +49,8 @@ async fn resolve_internal_scope(state: &AppState, headers: &HeaderMap) -> ApiRes
     // 1. x-merchant-id as UUID (e.g. "550e8400-...")
     // 2. x-merchant-id as legacy integer (e.g. "42") — Python proxy sends this
     // 3. x-legacy-merchant-id as integer (e.g. "42") — explicit fallback header
-    let merchant_id = if let Some(mid) = header_str(headers, "x-merchant-id")
-        .and_then(|v| Uuid::parse_str(&v).ok())
+    let merchant_id = if let Some(mid) =
+        header_str(headers, "x-merchant-id").and_then(|v| Uuid::parse_str(&v).ok())
     {
         // Format 1: UUID
         Some(mid)
@@ -60,7 +60,7 @@ async fn resolve_internal_scope(state: &AppState, headers: &HeaderMap) -> ApiRes
     {
         // Format 2/3: legacy integer → look up UUID via DB
         sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT id FROM merchants WHERE legacy_merchant_id = $1"
+            "SELECT id FROM merchants WHERE legacy_merchant_id = $1",
         )
         .bind(legacy_id_str)
         .fetch_optional(state.db()?)

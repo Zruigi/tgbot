@@ -9,7 +9,7 @@
 
 use axum::{extract::State, http::HeaderMap, Json};
 use serde_json::{json, Value};
-use tgbot_domain::error::{ApiResult};
+use tgbot_domain::error::ApiResult;
 
 use crate::auth::resolve_scope;
 use crate::state::AppState;
@@ -39,14 +39,16 @@ pub async fn tool_system_query(
 ) -> ApiResult<Json<Value>> {
     let _scope = resolve_scope(&state, &headers).await?;
 
+    use std::sync::Arc;
     use tgbot_agent::schema::{AgentContext, Tool};
     use tgbot_agent::tools::system_query::SystemQueryTool;
-    use std::sync::Arc;
 
     let tool = Arc::new(SystemQueryTool::new(Arc::new(state.db()?.clone())));
     let context = AgentContext::new(0);
     let result = tool.execute(&body, &context).await;
-    Ok(Json(serde_json::to_value(&result).unwrap_or(json!({"status": "error", "message": "serialization failed"}))))
+    Ok(Json(serde_json::to_value(&result).unwrap_or(
+        json!({"status": "error", "message": "serialization failed"}),
+    )))
 }
 
 pub async fn tool_telegram_sdk_query(
@@ -74,7 +76,9 @@ pub async fn tool_query_ad_clusters(
 ) -> ApiResult<Json<Value>> {
     let _scope = resolve_scope(&state, &headers).await?;
     tracing::info!("agent_tool: query_ad_clusters called");
-    Ok(Json(json!({"status": "ok", "tool": "query_ad_clusters", "data": [], "input": body})))
+    Ok(Json(
+        json!({"status": "ok", "tool": "query_ad_clusters", "data": [], "input": body}),
+    ))
 }
 
 pub async fn tool_delete_ad_cluster(
@@ -83,8 +87,14 @@ pub async fn tool_delete_ad_cluster(
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let _scope = resolve_scope(&state, &_headers).await?;
-    let cluster_id = body.get("cluster_id").and_then(|v| v.as_str()).unwrap_or("unknown");
-    tracing::warn!("agent_tool: delete_ad_cluster called for cluster_id={}", cluster_id);
+    let cluster_id = body
+        .get("cluster_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    tracing::warn!(
+        "agent_tool: delete_ad_cluster called for cluster_id={}",
+        cluster_id
+    );
     Ok(Json(json!({
         "status": "ok",
         "tool": "delete_ad_cluster",
