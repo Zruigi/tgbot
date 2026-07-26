@@ -14,6 +14,9 @@ pub struct MigrationVerificationReport {
     pub merchants: MerchantVerification,
     pub messages: MessageVerification,
     pub groups: GroupVerification,
+    pub group_messages: GroupMessageVerification,
+    pub users: UserVerification,
+    pub admin_inbox: AdminInboxVerification,
     pub overall: OverallVerification,
 }
 
@@ -47,6 +50,34 @@ pub struct GroupVerification {
     pub details: String,
 }
 
+/// Group message migration verification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMessageVerification {
+    pub source_count: i64,
+    pub target_count: i64,
+    pub is_valid: bool,
+    pub details: String,
+}
+
+/// User migration verification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserVerification {
+    pub source_count: i64,
+    pub target_count: i64,
+    pub is_valid: bool,
+    pub details: String,
+}
+
+/// Admin inbox migration verification (excluding virtual assistants)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminInboxVerification {
+    pub source_count: i64,
+    pub target_count: i64,
+    pub virtual_assistant_excluded: i64,
+    pub is_valid: bool,
+    pub details: String,
+}
+
 /// Overall verification summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverallVerification {
@@ -72,20 +103,38 @@ pub async fn verify_all_counts(
     // Verify groups
     let group_verification = verify_groups(sqlite_config, pg_pool).await?;
 
+    // Verify group messages
+    let group_message_verification = verify_group_messages(sqlite_config, pg_pool).await?;
+
+    // Verify users
+    let user_verification = verify_users(sqlite_config, pg_pool).await?;
+
+    // Verify admin inbox
+    let admin_inbox_verification = verify_admin_inbox(sqlite_config, pg_pool).await?;
+
     // Calculate overall verification
     let total_source = merchant_verification.source_count
         + message_verification.source_count
         + group_verification.source_groups
-        + group_verification.source_members;
+        + group_verification.source_members
+        + group_message_verification.source_count
+        + user_verification.source_count
+        + admin_inbox_verification.source_count;
 
     let total_target = merchant_verification.target_count
         + message_verification.target_count
         + group_verification.target_groups
-        + group_verification.target_members;
+        + group_verification.target_members
+        + group_message_verification.target_count
+        + user_verification.target_count
+        + admin_inbox_verification.target_count;
 
     let all_valid = merchant_verification.is_valid
         && message_verification.is_valid
-        && group_verification.is_valid;
+        && group_verification.is_valid
+        && group_message_verification.is_valid
+        && user_verification.is_valid
+        && admin_inbox_verification.is_valid;
 
     let summary = if all_valid {
         format!(
@@ -102,6 +151,15 @@ pub async fn verify_all_counts(
         }
         if !group_verification.is_valid {
             issues.push("groups/members mismatch");
+        }
+        if !group_message_verification.is_valid {
+            issues.push("group_messages mismatch");
+        }
+        if !user_verification.is_valid {
+            issues.push("users mismatch");
+        }
+        if !admin_inbox_verification.is_valid {
+            issues.push("admin_inbox mismatch");
         }
         format!(
             "Verification failed: {}. Source: {}, Target: {}",
@@ -122,6 +180,9 @@ pub async fn verify_all_counts(
         merchants: merchant_verification,
         messages: message_verification,
         groups: group_verification,
+        group_messages: group_message_verification,
+        users: user_verification,
+        admin_inbox: admin_inbox_verification,
         overall,
     };
 
@@ -185,7 +246,7 @@ async fn verify_messages(
     let source_count = sqlite_reader.count_messages()?;
 
     let target_count: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM chat_messages"
+        "SELECT COUNT(*)::bigint FROM chat.messages"
     )
     .fetch_one(pg_pool)
     .await?;
@@ -226,7 +287,7 @@ async fn verify_groups(
     let source_members = sqlite_reader.read_all_group_members()?.len() as i64;
 
     let target_groups: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM tracked_groups"
+        "SELECT COUNT(*)::bigint FROM groups.tracked_groups"
     )
     .fetch_one(pg_pool)
     .await?;
@@ -263,6 +324,122 @@ async fn verify_groups(
     })
 }
 
+/// Verify group message migration counts
+async fn verify_group_messages(
+    sqlite_config: &SqliteConfig,
+    pg_pool: &PgPool,
+) -> Result<GroupMessageVerification> {
+    let sqlite_reader = SqliteReader::new(sqlite_config)?;
+    let source_count = sqlite_reader.count_group_messages()?;
+
+    let target_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM groups.group_messages"
+    )
+    .fetch_one(pg_pool)
+    .await?;
+
+    let is_valid = source_count == target_count;
+
+    let details = if is_valid {
+        format!("Source: {}, Target: {}", source_count, target_count)
+    } else {
+        format!("MISMATCH - Source: {}, Target: {}", source_count, target_count)
+    };
+
+    tracing::info!("Group message verification: {}", details);
+
+    Ok(GroupMessageVerification {
+        source_count,
+        target_count,
+        is_valid,
+        details,
+    })
+}
+
+/// Verify user migration counts
+async fn verify_users(
+    sqlite_config: &SqliteConfig,
+    pg_pool: &PgPool,
+) -> Result<UserVerification> {
+    let sqlite_reader = SqliteReader::new(sqlite_config)?;
+    let source_count = sqlite_reader.count_users()?;
+
+    let target_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM chat.users"
+    )
+    .fetch_one(pg_pool)
+    .await?;
+
+    let is_valid = source_count == target_count;
+
+    let details = if is_valid {
+        format!("Source: {}, Target: {}", source_count, target_count)
+    } else {
+        format!("MISMATCH - Source: {}, Target: {}", source_count, target_count)
+    };
+
+    tracing::info!("User verification: {}", details);
+
+    Ok(UserVerification {
+        source_count,
+        target_count,
+        is_valid,
+        details,
+    })
+}
+
+/// Verify admin inbox migration counts (excluding virtual assistants)
+async fn verify_admin_inbox(
+    sqlite_config: &SqliteConfig,
+    pg_pool: &PgPool,
+) -> Result<AdminInboxVerification> {
+    let sqlite_reader = SqliteReader::new(sqlite_config)?;
+    let source_raw = sqlite_reader.read_admin_inbox()?;
+
+    // Count virtual assistant IDs to exclude
+    let virtual_assistant_ids = [0i64, -99999i64, 900000001i64];
+    let mut virtual_assistant_excluded = 0i64;
+    let mut source_count = 0i64;
+
+    for entry in &source_raw {
+        if virtual_assistant_ids.contains(&entry.from_userid) {
+            virtual_assistant_excluded += 1;
+        } else {
+            source_count += 1;
+        }
+    }
+
+    let target_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM chat.admin_inbox"
+    )
+    .fetch_one(pg_pool)
+    .await?;
+
+    let is_valid = source_count == target_count;
+
+    let details = if is_valid {
+        format!(
+            "Source: {} (excluded {} virtual assistants), Target: {}",
+            source_count, virtual_assistant_excluded, target_count
+        )
+    } else {
+        format!(
+            "MISMATCH - Source: {} (excluded {} virtual assistants), Target: {}",
+            source_count, virtual_assistant_excluded, target_count
+        )
+    };
+
+    tracing::info!("Admin inbox verification: {}", details);
+
+    Ok(AdminInboxVerification {
+        source_count,
+        target_count,
+        virtual_assistant_excluded,
+        is_valid,
+        details,
+    })
+}
+
 /// Quick count verification (without full verification report)
 pub async fn quick_verify(
     sqlite_config: &SqliteConfig,
@@ -279,13 +456,13 @@ pub async fn quick_verify(
     .await?;
 
     let messages: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM chat_messages"
+        "SELECT COUNT(*)::bigint FROM chat.messages"
     )
     .fetch_one(pg_pool)
     .await?;
 
     let groups: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM tracked_groups"
+        "SELECT COUNT(*)::bigint FROM groups.tracked_groups"
     )
     .fetch_one(pg_pool)
     .await?;

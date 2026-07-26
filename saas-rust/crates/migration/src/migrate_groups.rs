@@ -113,7 +113,7 @@ async fn migrate_single_group(
 
     sqlx::query(
         r#"
-        INSERT INTO tracked_groups (
+        INSERT INTO groups.tracked_groups (
             group_id,
             group_title,
             tenant_id,
@@ -287,7 +287,7 @@ pub async fn verify_group_migration(
     let source_members = sqlite_reader.read_all_group_members()?.len() as i64;
 
     let target_groups: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM tracked_groups"
+        "SELECT COUNT(*)::bigint FROM groups.tracked_groups"
     )
     .fetch_one(pg_pool)
     .await

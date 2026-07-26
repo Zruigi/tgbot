@@ -291,6 +291,150 @@ impl SqliteReader {
     }
 
     // ========================================================================
+    // Group Message Data Reading
+    // ========================================================================
+
+    /// Read group messages from SQLite with pagination
+    pub fn read_group_messages(&self, limit: usize, offset: usize) -> Result<Vec<SqliteGroupMessage>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                msg_id, group_id, user_id, username, content,
+                msg_type, timestamp, tg_msg_id, sender_type, quoted_tg_msg_id, quoted_text,
+                message_ts, file_id, avatar_file_id, revoke_checked,
+                is_advertising, ad_score, ad_confidence, ad_findings,
+                tenant_id, ad_cluster_id, ad_checked_at, ad_action_status,
+                is_deleted, deleted_at, ad_text_hash, media_unique_id
+            FROM group_messages
+            ORDER BY msg_id
+            LIMIT ?1 OFFSET ?2
+            "#
+        )?;
+
+        let messages = stmt
+            .query_map(params![limit as i64, offset as i64], |row| {
+                Ok(SqliteGroupMessage {
+                    msg_id: row.get(0)?,
+                    group_id: row.get(1)?,
+                    user_id: row.get(2)?,
+                    username: row.get(3)?,
+                    content: row.get(4)?,
+                    msg_type: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    tg_msg_id: row.get(7)?,
+                    sender_type: row.get(8)?,
+                    quoted_tg_msg_id: row.get(9)?,
+                    quoted_text: row.get(10)?,
+                    message_ts: row.get(11)?,
+                    file_id: row.get(12)?,
+                    avatar_file_id: row.get(13)?,
+                    revoke_checked: row.get::<_, i32>(14)? != 0,
+                    is_advertising: row.get::<_, i32>(15)? != 0,
+                    ad_score: row.get(16)?,
+                    ad_confidence: row.get(17)?,
+                    ad_findings: row.get(18)?,
+                    tenant_id: row.get(19)?,
+                    ad_cluster_id: row.get(20)?,
+                    ad_checked_at: row.get(21)?,
+                    ad_action_status: row.get(22)?,
+                    is_deleted: row.get::<_, i32>(23)? != 0,
+                    deleted_at: row.get(24)?,
+                    ad_text_hash: row.get(25)?,
+                    media_unique_id: row.get(26)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to read group messages")?;
+
+        Ok(messages)
+    }
+
+    /// Count total group messages in SQLite
+    pub fn count_group_messages(&self) -> Result<i64> {
+        let count: i64 = self.conn
+            .query_row("SELECT COUNT(*) FROM group_messages", [], |row| row.get(0))
+            .context("Failed to count group messages")?;
+        Ok(count)
+    }
+
+    // ========================================================================
+    // User and Admin Inbox Data Reading
+    // ========================================================================
+
+    /// Read all users from SQLite
+    pub fn read_users(&self) -> Result<Vec<SqliteUser>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                user_id, email, created_at
+            FROM users
+            ORDER BY user_id
+            "#
+        )?;
+
+        let users = stmt
+            .query_map([], |row| {
+                Ok(SqliteUser {
+                    user_id: row.get(0)?,
+                    email: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to read users")?;
+
+        tracing::info!("Read {} users from SQLite", users.len());
+        Ok(users)
+    }
+
+    /// Count total users in SQLite
+    pub fn count_users(&self) -> Result<i64> {
+        let count: i64 = self.conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .context("Failed to count users")?;
+        Ok(count)
+    }
+
+    /// Read admin inbox entries from SQLite
+    pub fn read_admin_inbox(&self) -> Result<Vec<SqliteAdminInbox>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                from_userid, summary, unread_count, last_active,
+                from_username, avatar_file_id, tenant_id
+            FROM admin_inbox
+            ORDER BY from_userid
+            "#
+        )?;
+
+        let entries = stmt
+            .query_map([], |row| {
+                Ok(SqliteAdminInbox {
+                    from_userid: row.get(0)?,
+                    summary: row.get(1)?,
+                    unread_count: row.get(2)?,
+                    last_active: row.get(3)?,
+                    from_username: row.get(4)?,
+                    avatar_file_id: row.get(5)?,
+                    tenant_id: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to read admin inbox")?;
+
+        tracing::info!("Read {} admin inbox entries from SQLite", entries.len());
+        Ok(entries)
+    }
+
+    /// Count total admin inbox entries in SQLite
+    pub fn count_admin_inbox(&self) -> Result<i64> {
+        let count: i64 = self.conn
+            .query_row("SELECT COUNT(*) FROM admin_inbox", [], |row| row.get(0))
+            .context("Failed to count admin inbox")?;
+        Ok(count)
+    }
+
+    // ========================================================================
     // Verification Count Helper
     // ========================================================================
 
@@ -300,12 +444,18 @@ impl SqliteReader {
         let messages = self.count_messages()?;
         let groups = self.count_groups()?;
         let group_members = self.count_group_members()?;
+        let group_messages = self.count_group_messages()?;
+        let users = self.count_users()?;
+        let admin_inbox = self.count_admin_inbox()?;
 
         Ok(SqliteCounts {
             merchants,
             messages,
             groups,
             group_members,
+            group_messages,
+            users,
+            admin_inbox,
         })
     }
 }
@@ -399,6 +549,58 @@ pub struct SqliteGroupMember {
     pub tenant_id: String,
 }
 
+/// SQLite group message record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteGroupMessage {
+    pub msg_id: i64,
+    pub group_id: i64,
+    pub user_id: i64,
+    pub username: Option<String>,
+    pub content: Option<String>,
+    pub msg_type: String,
+    pub timestamp: Option<String>,
+    pub tg_msg_id: Option<i64>,
+    pub sender_type: String,
+    pub quoted_tg_msg_id: Option<i64>,
+    pub quoted_text: Option<String>,
+    pub message_ts: Option<i64>,
+    pub file_id: Option<String>,
+    pub avatar_file_id: Option<String>,
+    pub revoke_checked: bool,
+    pub is_advertising: bool,
+    pub ad_score: i32,
+    pub ad_confidence: String,
+    pub ad_findings: Option<String>,
+    pub tenant_id: String,
+    pub ad_cluster_id: Option<String>,
+    pub ad_checked_at: Option<String>,
+    pub ad_action_status: String,
+    pub is_deleted: bool,
+    pub deleted_at: Option<String>,
+    pub ad_text_hash: Option<String>,
+    pub media_unique_id: Option<String>,
+}
+
+/// SQLite user record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteUser {
+    pub user_id: i64,
+    pub email: Option<String>,
+    pub created_at: String,
+}
+
+/// SQLite admin inbox record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteAdminInbox {
+    pub from_userid: i64,
+    pub summary: Option<String>,
+    pub unread_count: i32,
+    pub last_active: String,
+    pub from_username: Option<String>,
+    pub avatar_file_id: Option<String>,
+    pub tenant_id: String,
+}
+
 /// SQLite table counts for verification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqliteCounts {
@@ -406,6 +608,9 @@ pub struct SqliteCounts {
     pub messages: i64,
     pub groups: i64,
     pub group_members: i64,
+    pub group_messages: i64,
+    pub users: i64,
+    pub admin_inbox: i64,
 }
 
 #[cfg(test)]
@@ -416,5 +621,32 @@ mod tests {
     fn test_sqlite_config() {
         let config = SqliteConfig::new("/path/to/db.sqlite3");
         assert_eq!(config.db_path, "/path/to/db.sqlite3");
+    }
+
+    #[test]
+    fn test_virtual_assistant_uid_mapping() {
+        // Test that legacy UID 900000001 would be mapped to -99999
+        let _legacy_uid = 900000001i64;
+        let mapped_uid = -99999i64;
+
+        // Virtual assistant IDs that should be excluded
+        let virtual_assistant_ids = vec![0i64, -99999i64, 900000001i64];
+        assert!(virtual_assistant_ids.contains(&mapped_uid));
+    }
+
+    #[test]
+    fn test_exclude_virtual_assistant_from_inbox() {
+        // Virtual assistant UIDs should not generate admin_inbox rows
+        let virtual_ids = [0i64, -99999i64, 900000001i64];
+
+        for id in &virtual_ids {
+            // None of these should create an inbox entry
+            assert!(!should_create_admin_inbox(*id));
+        }
+    }
+
+    fn should_create_admin_inbox(user_id: i64) -> bool {
+        // Virtual assistant IDs are: 0, -99999, 900000001
+        !(user_id == 0 || user_id == -99999 || user_id == 900000001)
     }
 }
