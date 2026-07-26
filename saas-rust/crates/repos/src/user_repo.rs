@@ -1,6 +1,8 @@
 // User repository — inbox and chat-history queries
 // Migrated from backend/repositories/user_repo.py
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -11,6 +13,28 @@ use super::row_to_json;
 // ---------------------------------------------------------------------------
 // GET /api/users — inbox list
 // ---------------------------------------------------------------------------
+
+/// User ids that must never show up in the admin inbox:
+/// 0 (invalid), -99999 (virtual AI assistant), 900000001 (legacy AI assistant).
+const EXCLUDED_INBOX_USER_IDS: [i64; 3] = [0, -99999, 900000001];
+
+/// Drop virtual/legacy AI-assistant entries and dedupe by `user_id`.
+///
+/// The inbox queries order rows by `last_active DESC`, so keeping the first
+/// occurrence of each `user_id` keeps the most recently active entry.
+/// Entries without a numeric `user_id` are treated as invalid and dropped.
+fn sanitize_inbox_list(items: Vec<Value>) -> Vec<Value> {
+    let mut seen: HashSet<i64> = HashSet::new();
+    items
+        .into_iter()
+        .filter(|item| {
+            let Some(user_id) = item.get("user_id").and_then(Value::as_i64) else {
+                return false;
+            };
+            !EXCLUDED_INBOX_USER_IDS.contains(&user_id) && seen.insert(user_id)
+        })
+        .collect()
+}
 
 /// Fetch the admin inbox for a tenant (tenant-scoped).
 ///
@@ -35,7 +59,9 @@ pub async fn get_inbox_list_for_tenant(pool: &PgPool, tenant_id: &str) -> Result
     .bind(tenant_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(row_to_json).collect())
+    Ok(sanitize_inbox_list(
+        rows.into_iter().map(row_to_json).collect(),
+    ))
 }
 
 /// Fetch the full admin inbox (platform-admin, no tenant filter).
@@ -64,7 +90,9 @@ pub async fn get_inbox_list(pool: &PgPool) -> Result<Vec<Value>> {
         info!("Admin inbox is empty – skipping auto-rebuild (handled by pipeline)");
     }
 
-    Ok(rows.into_iter().map(row_to_json).collect())
+    Ok(sanitize_inbox_list(
+        rows.into_iter().map(row_to_json).collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -362,4 +390,68 @@ pub async fn get_bot_id_for_tenant(pool: &PgPool, tenant_id: &str) -> Result<Opt
             .fetch_optional(pool)
             .await?;
     Ok(bot_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn inbox_entry(user_id: i64, username: &str, last_active: &str) -> Value {
+        json!({
+            "user_id": user_id,
+            "from_username": username,
+            "summary": "hi",
+            "unread_count": 0,
+            "last_active": last_active,
+            "avatar_file_id": Value::Null,
+            "tenant_id": "t1",
+        })
+    }
+
+    #[test]
+    fn filters_each_excluded_user_id() {
+        for excluded in [0_i64, -99999, 900000001] {
+            let sanitized = sanitize_inbox_list(vec![
+                inbox_entry(excluded, "assistant", "2026-07-26T10:00:00+00:00"),
+                inbox_entry(1001, "alice", "2026-07-26T09:00:00+00:00"),
+            ]);
+            assert_eq!(
+                sanitized,
+                vec![inbox_entry(1001, "alice", "2026-07-26T09:00:00+00:00")],
+                "user_id {excluded} should be filtered out",
+            );
+        }
+        // Entries without a numeric user_id are invalid and dropped too.
+        assert!(sanitize_inbox_list(vec![json!({"from_username": "ghost"})]).is_empty());
+        assert!(sanitize_inbox_list(vec![json!({"user_id": Value::Null})]).is_empty());
+    }
+
+    #[test]
+    fn dedupes_by_user_id_keeping_most_recent() {
+        // The inbox queries order by last_active DESC, so the first
+        // occurrence is the most recent one and must be the survivor.
+        let sanitized = sanitize_inbox_list(vec![
+            inbox_entry(1001, "alice-new", "2026-07-26T10:00:00+00:00"),
+            inbox_entry(2002, "bob", "2026-07-26T09:30:00+00:00"),
+            inbox_entry(1001, "alice-old", "2026-07-25T08:00:00+00:00"),
+        ]);
+        assert_eq!(
+            sanitized,
+            vec![
+                inbox_entry(1001, "alice-new", "2026-07-26T10:00:00+00:00"),
+                inbox_entry(2002, "bob", "2026-07-26T09:30:00+00:00"),
+            ]
+        );
+    }
+
+    #[test]
+    fn passes_through_normal_users() {
+        let users = vec![
+            inbox_entry(1001, "alice", "2026-07-26T10:00:00+00:00"),
+            inbox_entry(2002, "bob", "2026-07-26T09:30:00+00:00"),
+            inbox_entry(3003, "carol", "2026-07-25T08:00:00+00:00"),
+        ];
+        assert_eq!(sanitize_inbox_list(users.clone()), users);
+    }
 }
