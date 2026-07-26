@@ -3307,7 +3307,6 @@ dependencies = [
  "sqlx",
  "teloxide",
  "tgbot-agent",
- "tgbot-bot",
  "tgbot-domain",
  "tgbot-http",
  "tgbot-integrations",

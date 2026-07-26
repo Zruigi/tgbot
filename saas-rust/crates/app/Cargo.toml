@@ -16,7 +16,6 @@ tgbot-http = { workspace = true }
 tgbot-domain = { workspace = true }
 tgbot-repos = { workspace = true }
 tgbot-services = { workspace = true }
-tgbot-bot = { workspace = true }
 tgbot-agent = { workspace = true }
 tgbot-integrations = { workspace = true }
 tgbot-workers = { workspace = true }
