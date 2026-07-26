@@ -14,8 +14,8 @@ CREATE INDEX IF NOT EXISTS idx_payment_orders_merchant ON payment_orders(merchan
 -- =====================================================
 -- AI 使用量索引
 -- =====================================================
-CREATE INDEX IF NOT EXISTS idx_ai_usage_tenant ON ai_usage(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_ai_usage_date ON ai_usage(tenant_id, date DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_tenant ON ai_usage_logs(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_date ON ai_usage_logs(tenant_id, created_at DESC);
 
 -- =====================================================
 -- 广播任务结果索引

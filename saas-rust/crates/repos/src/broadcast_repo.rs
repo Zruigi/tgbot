@@ -5,7 +5,7 @@ use sqlx::PgPool;
 
 use crate::row_to_json;
 
-/// Upsert a broadcast target (insert or update on conflict by chat_id).
+/// Upsert a broadcast target for one tenant.
 pub async fn upsert_broadcast_target(
     pool: &PgPool,
     chat_id: i64,
@@ -18,14 +18,13 @@ pub async fn upsert_broadcast_target(
 ) -> Result<Value> {
     let row = sqlx::query(
         r#"
-        INSERT INTO broadcast_targets (chat_id, chat_title, chat_type, chat_username, can_broadcast, tenant_id, member_count, updated_at)
+        INSERT INTO broadcast.broadcast_targets (chat_id, chat_title, chat_type, chat_username, can_broadcast, tenant_id, member_count, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-        ON CONFLICT (chat_id) DO UPDATE SET
+        ON CONFLICT (chat_id, tenant_id) DO UPDATE SET
             chat_title    = EXCLUDED.chat_title,
             chat_type     = EXCLUDED.chat_type,
             chat_username = EXCLUDED.chat_username,
             can_broadcast = EXCLUDED.can_broadcast,
-            tenant_id     = EXCLUDED.tenant_id,
             member_count  = EXCLUDED.member_count,
             updated_at    = now()
         RETURNING *
@@ -54,7 +53,7 @@ pub async fn list_broadcast_targets(
         if enabled_only {
             sqlx::query(
                 r#"
-                SELECT * FROM broadcast_targets
+                SELECT * FROM broadcast.broadcast_targets
                 WHERE tenant_id = $1 AND can_broadcast = true AND chat_type = ANY($2)
                 ORDER BY updated_at DESC
                 "#,
@@ -66,7 +65,7 @@ pub async fn list_broadcast_targets(
         } else {
             sqlx::query(
                 r#"
-                SELECT * FROM broadcast_targets
+                SELECT * FROM broadcast.broadcast_targets
                 WHERE tenant_id = $1 AND chat_type = ANY($2)
                 ORDER BY updated_at DESC
                 "#,
@@ -79,7 +78,7 @@ pub async fn list_broadcast_targets(
     } else if enabled_only {
         sqlx::query(
             r#"
-            SELECT * FROM broadcast_targets
+            SELECT * FROM broadcast.broadcast_targets
             WHERE tenant_id = $1 AND can_broadcast = true
             ORDER BY updated_at DESC
             "#,
@@ -90,7 +89,7 @@ pub async fn list_broadcast_targets(
     } else {
         sqlx::query(
             r#"
-            SELECT * FROM broadcast_targets
+            SELECT * FROM broadcast.broadcast_targets
             WHERE tenant_id = $1
             ORDER BY updated_at DESC
             "#,
@@ -105,13 +104,15 @@ pub async fn list_broadcast_targets(
 /// Update whether a target can participate in broadcasts.
 pub async fn set_broadcast_target_permission(
     pool: &PgPool,
+    tenant_id: &str,
     chat_id: i64,
     can_broadcast: bool,
 ) -> Result<bool> {
     let result = sqlx::query(
-        "UPDATE broadcast_targets SET can_broadcast = $1, updated_at = now() WHERE chat_id = $2",
+        "UPDATE broadcast.broadcast_targets SET can_broadcast = $1, updated_at = now() WHERE tenant_id = $2 AND chat_id = $3",
     )
     .bind(can_broadcast)
+    .bind(tenant_id)
     .bind(chat_id)
     .execute(pool)
     .await?;
@@ -119,10 +120,13 @@ pub async fn set_broadcast_target_permission(
 }
 
 /// Delete a broadcast target.
-pub async fn delete_broadcast_target(pool: &PgPool, chat_id: i64) -> Result<bool> {
-    let result = sqlx::query("DELETE FROM broadcast_targets WHERE chat_id = $1")
-        .bind(chat_id)
-        .execute(pool)
-        .await?;
+pub async fn delete_broadcast_target(pool: &PgPool, tenant_id: &str, chat_id: i64) -> Result<bool> {
+    let result = sqlx::query(
+        "DELETE FROM broadcast.broadcast_targets WHERE tenant_id = $1 AND chat_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(chat_id)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() > 0)
 }

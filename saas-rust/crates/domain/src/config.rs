@@ -9,8 +9,11 @@ pub struct Config {
     pub supabase_service_role_key: String,
     pub supabase_jwt_secret: String,
     pub internal_saas_secret: String,
+    pub secret_encryption_key: String,
     pub web_admin_token: String,
     pub bot_token: String,
+    pub telegram_auto_replies_enabled: bool,
+    pub telegram_commands_enabled: bool,
     pub cors_allowed_origin: String,
 }
 
@@ -41,10 +44,90 @@ impl Config {
                 .unwrap_or_default(),
             supabase_jwt_secret,
             internal_saas_secret,
+            secret_encryption_key: std::env::var("TGBOT_SECRET_ENCRYPTION_KEY").unwrap_or_default(),
             web_admin_token: std::env::var("WEB_ADMIN_TOKEN").unwrap_or_default(),
             bot_token: std::env::var("BOT_TOKEN").unwrap_or_default(),
+            telegram_auto_replies_enabled: parse_telegram_auto_replies_enabled(
+                std::env::var("TELEGRAM_AUTO_REPLIES_ENABLED")
+                    .ok()
+                    .as_deref(),
+            ),
+            telegram_commands_enabled: parse_telegram_commands_enabled(
+                std::env::var("TELEGRAM_COMMANDS_ENABLED").ok().as_deref(),
+            ),
             cors_allowed_origin: std::env::var("CORS_ALLOWED_ORIGIN")
                 .unwrap_or_else(|_| "*".to_string()),
         })
+    }
+}
+
+pub fn parse_telegram_auto_replies_enabled(value: Option<&str>) -> bool {
+    parse_telegram_commands_enabled(value)
+}
+
+pub fn parse_telegram_commands_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_enabled_not_set() {
+        assert!(!parse_telegram_commands_enabled(None));
+    }
+
+    #[test]
+    fn test_parse_enabled_empty() {
+        assert!(!parse_telegram_commands_enabled(Some("")));
+    }
+
+    #[test]
+    fn test_parse_enabled_true_variants() {
+        for value in [
+            "1", "true", "True", "TRUE", "tRuE", "yes", "Yes", "YES", "on", "On", "ON",
+        ] {
+            assert!(
+                parse_telegram_commands_enabled(Some(value)),
+                "value={value:?}"
+            );
+        }
+        // trimmed
+        assert!(parse_telegram_commands_enabled(Some("  true  ")));
+        assert!(parse_telegram_commands_enabled(Some("\t  yes  \n")));
+    }
+
+    #[test]
+    fn test_parse_enabled_false_or_invalid() {
+        for value in [
+            "false",
+            "False",
+            "FALSE",
+            "0",
+            "no",
+            "off",
+            "banana",
+            "2",
+            "ye s",
+            "truefalse",
+        ] {
+            assert!(
+                !parse_telegram_commands_enabled(Some(value)),
+                "value={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_auto_replies_default_off_and_explicit_on() {
+        assert!(!parse_telegram_auto_replies_enabled(None));
+        assert!(!parse_telegram_auto_replies_enabled(Some("false")));
+        assert!(parse_telegram_auto_replies_enabled(Some(" true ")));
     }
 }

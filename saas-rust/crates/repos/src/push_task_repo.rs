@@ -24,7 +24,7 @@ pub async fn create_push_task(
 ) -> Result<i64> {
     let row = sqlx::query(
         r#"
-        INSERT INTO push_tasks (
+        INSERT INTO broadcast.push_tasks (
             tenant_id, merchant_id, task_name, content, image_file_id, do_translate,
             target_chat_ids, start_at, interval_hours, status, next_run_at
         )
@@ -61,7 +61,7 @@ pub async fn list_push_tasks(
         (Some(tid), Some(st)) => {
             sqlx::query(
                 r#"
-                SELECT * FROM push_tasks
+                SELECT * FROM broadcast.push_tasks
                 WHERE tenant_id = $1 AND status = $2
                 ORDER BY created_at DESC
                 LIMIT $3 OFFSET $4
@@ -77,7 +77,7 @@ pub async fn list_push_tasks(
         (Some(tid), None) => {
             sqlx::query(
                 r#"
-                SELECT * FROM push_tasks
+                SELECT * FROM broadcast.push_tasks
                 WHERE tenant_id = $1
                 ORDER BY created_at DESC
                 LIMIT $2 OFFSET $3
@@ -92,7 +92,7 @@ pub async fn list_push_tasks(
         (None, Some(st)) => {
             sqlx::query(
                 r#"
-                SELECT * FROM push_tasks
+                SELECT * FROM broadcast.push_tasks
                 WHERE status = $1
                 ORDER BY created_at DESC
                 LIMIT $2 OFFSET $3
@@ -107,7 +107,7 @@ pub async fn list_push_tasks(
         (None, None) => {
             sqlx::query(
                 r#"
-                SELECT * FROM push_tasks
+                SELECT * FROM broadcast.push_tasks
                 ORDER BY created_at DESC
                 LIMIT $1 OFFSET $2
                 "#,
@@ -124,13 +124,15 @@ pub async fn list_push_tasks(
 /// Update the status of a push task (paused / running).
 pub async fn update_push_task_status(
     pool: &PgPool,
+    tenant_id: &str,
     task_id: i64,
     status: &str,
 ) -> Result<bool> {
     let result = sqlx::query(
-        "UPDATE push_tasks SET status = $1, updated_at = now() WHERE id = $2",
+        "UPDATE broadcast.push_tasks SET status = $1, updated_at = now() WHERE tenant_id = $2 AND id = $3",
     )
     .bind(status)
+    .bind(tenant_id)
     .bind(task_id)
     .execute(pool)
     .await?;
@@ -138,8 +140,9 @@ pub async fn update_push_task_status(
 }
 
 /// Get a single push task by id.
-pub async fn get_push_task(pool: &PgPool, task_id: i64) -> Result<Option<Value>> {
-    let row = sqlx::query("SELECT * FROM push_tasks WHERE id = $1")
+pub async fn get_push_task(pool: &PgPool, tenant_id: &str, task_id: i64) -> Result<Option<Value>> {
+    let row = sqlx::query("SELECT * FROM broadcast.push_tasks WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
         .bind(task_id)
         .fetch_optional(pool)
         .await?;
@@ -149,6 +152,7 @@ pub async fn get_push_task(pool: &PgPool, task_id: i64) -> Result<Option<Value>>
 /// Record the result of a push task run and update next_run_at.
 pub async fn update_push_task_run_result(
     pool: &PgPool,
+    tenant_id: &str,
     task_id: i64,
     last_run_at: &str,
     next_run_at: &str,
@@ -157,19 +161,20 @@ pub async fn update_push_task_run_result(
 ) -> Result<bool> {
     let result = sqlx::query(
         r#"
-        UPDATE push_tasks
+        UPDATE broadcast.push_tasks
         SET last_run_at     = $1::timestamptz,
             next_run_at     = $2::timestamptz,
             last_run_summary = $3,
             retry_count     = $4,
             updated_at      = now()
-        WHERE id = $5
+        WHERE tenant_id = $5 AND id = $6
         "#,
     )
     .bind(last_run_at)
     .bind(next_run_at)
     .bind(summary)
     .bind(retry_count)
+    .bind(tenant_id)
     .bind(task_id)
     .execute(pool)
     .await?;
@@ -177,8 +182,9 @@ pub async fn update_push_task_run_result(
 }
 
 /// Delete a push task.
-pub async fn delete_push_task(pool: &PgPool, task_id: i64) -> Result<bool> {
-    let result = sqlx::query("DELETE FROM push_tasks WHERE id = $1")
+pub async fn delete_push_task(pool: &PgPool, tenant_id: &str, task_id: i64) -> Result<bool> {
+    let result = sqlx::query("DELETE FROM broadcast.push_tasks WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
         .bind(task_id)
         .execute(pool)
         .await?;

@@ -31,29 +31,43 @@ pub async fn save_message(
     let trace_id = Uuid::new_v4().to_string();
 
     // Resolve quoted fields when reply_to_msg_id is provided
-    let (quoted_text, quoted_file_id, quoted_type): (Option<String>, Option<String>, Option<String>) =
-        if let Some(qid) = reply_to_msg_id {
-            let row = sqlx::query(
-                "SELECT content, file_id, msg_type FROM chat_messages WHERE id = $1",
-            )
-            .bind(qid)
-            .fetch_optional(pool)
-            .await?;
-            match row {
-                Some(r) => (
-                    r.try_get("content").ok().flatten(),
-                    r.try_get("file_id").ok().flatten(),
-                    r.try_get("msg_type").ok().flatten(),
-                ),
-                None => (None, None, None),
-            }
-        } else {
-            (None, None, None)
-        };
+    let (quoted_text, quoted_file_id, quoted_type): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = if let Some(qid) = reply_to_msg_id {
+        let row = sqlx::query(
+            r#"
+                SELECT content, file_id, msg_type
+                FROM chat.messages
+                WHERE tg_msg_id = $1
+                  AND tenant_id = $2
+                  AND (from_userid IN ($3, $4) OR to_userid IN ($3, $4))
+                ORDER BY timestamp DESC
+                LIMIT 1
+                "#,
+        )
+        .bind(qid)
+        .bind(tenant_id)
+        .bind(from_userid)
+        .bind(to_userid)
+        .fetch_optional(pool)
+        .await?;
+        match row {
+            Some(r) => (
+                r.try_get("content").ok().flatten(),
+                r.try_get("file_id").ok().flatten(),
+                r.try_get("msg_type").ok().flatten(),
+            ),
+            None => (None, None, None),
+        }
+    } else {
+        (None, None, None)
+    };
 
     let row = sqlx::query(
         r#"
-        INSERT INTO chat_messages (
+        INSERT INTO chat.messages (
             trace_id, from_userid, to_userid, content, msg_type,
             file_id, media_url, is_read, tg_msg_id,
             quoted_text, quoted_msg_id, quoted_file_id, quoted_type,
@@ -104,10 +118,12 @@ async fn update_inbox_on_new_message(
 ) -> Result<()> {
     let display = match content {
         Some(c) if !c.is_empty() => {
-            if c.len() > 20 {
-                format!("{}...", &c[..20])
+            let mut characters = c.chars();
+            let preview = characters.by_ref().take(20).collect::<String>();
+            if characters.next().is_some() {
+                format!("{preview}...")
             } else {
-                c.to_string()
+                preview
             }
         }
         _ => format!("[{msg_type}]"),
@@ -126,11 +142,13 @@ async fn update_inbox_on_new_message(
     let unread: i64 = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)::bigint
-        FROM chat_messages
-        WHERE from_userid = $1 AND is_read = false AND is_deleted = false
+        FROM chat.messages
+        WHERE from_userid = $1 AND tenant_id = $2
+          AND is_read = false AND is_deleted = false
         "#,
     )
     .bind(from_userid)
+    .bind(tenant_id)
     .fetch_one(pool)
     .await?;
 
@@ -138,7 +156,7 @@ async fn update_inbox_on_new_message(
         r#"
         INSERT INTO chat.admin_inbox (user_id, username, summary, unread_count, last_active, tenant_id)
         VALUES ($1, 'User ' || $1::text, $2, $3, now(), $4)
-        ON CONFLICT (user_id) DO UPDATE SET
+        ON CONFLICT (user_id, tenant_id) DO UPDATE SET
             summary      = EXCLUDED.summary,
             unread_count = EXCLUDED.unread_count,
             last_active  = now(),
@@ -160,16 +178,26 @@ async fn update_inbox_on_new_message(
 // ---------------------------------------------------------------------------
 
 /// Soft-delete a single message by id (must belong to the given user pair).
-pub async fn delete_single_message(pool: &PgPool, user_id: i64, msg_id: i64) -> Result<bool> {
+pub async fn delete_single_message(
+    pool: &PgPool,
+    tenant_id: &str,
+    bot_id: i64,
+    user_id: i64,
+    msg_id: i64,
+) -> Result<bool> {
     let result = sqlx::query(
         r#"
-        UPDATE chat_messages
+        UPDATE chat.messages
         SET is_deleted = true
         WHERE id = $1
-          AND (from_userid = $2 OR to_userid = $2)
+          AND tenant_id = $2
+          AND ((from_userid = $3 AND to_userid = $4)
+            OR (from_userid = $4 AND to_userid = $3))
         "#,
     )
     .bind(msg_id)
+    .bind(tenant_id)
+    .bind(bot_id)
     .bind(user_id)
     .execute(pool)
     .await?;
@@ -199,8 +227,7 @@ pub async fn search_messages(
 
     // If searching within a specific user's conversation
     if let Some(uid) = user_id {
-        return search_in_user_messages(pool, uid, &pattern, tenant_id, bot_id, limit)
-            .await;
+        return search_in_user_messages(pool, uid, &pattern, tenant_id, bot_id, limit).await;
     }
 
     // Global search: private + group
@@ -222,7 +249,7 @@ async fn search_in_group(
             LEFT JOIN groups.group_members u ON gm.user_id = u.user_id AND gm.group_id = u.group_id
             WHERE gm.group_id = $1
               AND gm.content LIKE $2
-              AND gm.group_id IN (SELECT group_id FROM tracked_groups WHERE tenant_id = $3)
+              AND gm.group_id IN (SELECT group_id FROM groups.tracked_groups WHERE tenant_id = $3)
             ORDER BY gm.timestamp DESC
             LIMIT $4
             "#,
@@ -262,22 +289,24 @@ async fn search_in_user_messages(
     bot_id: Option<i64>,
     limit: i64,
 ) -> Result<Vec<Value>> {
-    let rows = if let (Some(_tid), Some(bid)) = (tenant_id, bot_id) {
+    let rows = if let (Some(tid), Some(bid)) = (tenant_id, bot_id) {
         sqlx::query(
             r#"
             SELECT m.*, 'private' AS source_type
-            FROM chat_messages m
+            FROM chat.messages m
             WHERE (m.from_userid = $1 OR m.to_userid = $1)
               AND m.content LIKE $2
               AND m.is_deleted = false
               AND ((m.from_userid = $3 OR m.to_userid = $3))
+              AND m.tenant_id = $4
             ORDER BY m.timestamp DESC
-            LIMIT $4
+            LIMIT $5
             "#,
         )
         .bind(user_id)
         .bind(pattern)
         .bind(bid)
+        .bind(tid)
         .bind(limit)
         .fetch_all(pool)
         .await?
@@ -285,7 +314,7 @@ async fn search_in_user_messages(
         sqlx::query(
             r#"
             SELECT m.*, 'private' AS source_type
-            FROM chat_messages m
+            FROM chat.messages m
             WHERE (m.from_userid = $1 OR m.to_userid = $1)
               AND m.content LIKE $2
               AND m.is_deleted = false
@@ -312,20 +341,22 @@ async fn search_all(
     let mut results = Vec::new();
 
     // Private messages
-    let private_rows = if let (Some(_tid), Some(bid)) = (tenant_id, bot_id) {
+    let private_rows = if let (Some(tid), Some(bid)) = (tenant_id, bot_id) {
         sqlx::query(
             r#"
             SELECT m.*, 'private' AS source_type
-            FROM chat_messages m
+            FROM chat.messages m
             WHERE m.content LIKE $1
               AND m.is_deleted = false
               AND (m.from_userid = $2 OR m.to_userid = $2)
+              AND m.tenant_id = $3
             ORDER BY m.timestamp DESC
-            LIMIT $3
+            LIMIT $4
             "#,
         )
         .bind(pattern)
         .bind(bid)
+        .bind(tid)
         .bind(limit)
         .fetch_all(pool)
         .await?
@@ -333,7 +364,7 @@ async fn search_all(
         sqlx::query(
             r#"
             SELECT m.*, 'private' AS source_type
-            FROM chat_messages m
+            FROM chat.messages m
             WHERE m.content LIKE $1
               AND m.is_deleted = false
             ORDER BY m.timestamp DESC
@@ -349,7 +380,10 @@ async fn search_all(
     for row in private_rows {
         let mut v = row_to_json(row);
         if let Some(obj) = v.as_object_mut() {
-            obj.insert("user_id".into(), obj.get("from_userid").cloned().unwrap_or(Value::Null));
+            obj.insert(
+                "user_id".into(),
+                obj.get("from_userid").cloned().unwrap_or(Value::Null),
+            );
         }
         results.push(v);
     }
@@ -362,7 +396,7 @@ async fn search_all(
             FROM groups.group_messages gm
             LEFT JOIN groups.group_members u ON gm.user_id = u.user_id AND gm.group_id = u.group_id
             WHERE gm.content LIKE $1
-              AND gm.group_id IN (SELECT group_id FROM tracked_groups WHERE tenant_id = $2)
+              AND gm.group_id IN (SELECT group_id FROM groups.tracked_groups WHERE tenant_id = $2)
             ORDER BY gm.timestamp DESC
             LIMIT $3
             "#,

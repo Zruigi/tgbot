@@ -196,6 +196,22 @@ INSERT INTO chart_of_accounts (code, name, type, parent_id, description) VALUES
 ('3000', '所有者权益', 'equity', NULL, '所有者权益')
 ON CONFLICT (code) DO NOTHING;
 
+UPDATE chart_of_accounts
+SET parent_id = (SELECT account_id FROM chart_of_accounts WHERE code = '1000')
+WHERE code IN ('1100', '1200', '1300');
+UPDATE chart_of_accounts
+SET parent_id = (SELECT account_id FROM chart_of_accounts WHERE code = '1100')
+WHERE code IN ('1110', '1120');
+UPDATE chart_of_accounts
+SET parent_id = (SELECT account_id FROM chart_of_accounts WHERE code = '2000')
+WHERE code IN ('2100', '2200');
+UPDATE chart_of_accounts
+SET parent_id = (SELECT account_id FROM chart_of_accounts WHERE code = '4000')
+WHERE code IN ('4100', '4200', '4300');
+UPDATE chart_of_accounts
+SET parent_id = (SELECT account_id FROM chart_of_accounts WHERE code = '5000')
+WHERE code IN ('5100', '5200', '5300', '5400');
+
 -- =====================================================
 -- ROW LEVEL SECURITY (RLS)
 -- =====================================================

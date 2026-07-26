@@ -5,7 +5,7 @@
 -- Broadcast targets: chats/groups/channels the bot can operate on
 -- =====================================================
 CREATE TABLE IF NOT EXISTS broadcast.broadcast_targets (
-    chat_id bigint PRIMARY KEY,
+    chat_id bigint NOT NULL,
     chat_title text NOT NULL DEFAULT '',
     chat_type text NOT NULL DEFAULT 'group',  -- group | supergroup | channel | private
     chat_username text,
@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS broadcast.broadcast_targets (
     tenant_id text NOT NULL DEFAULT 'default',
     member_count integer NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now()
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (chat_id, tenant_id)
 );
 
 -- =====================================================
@@ -43,13 +44,13 @@ CREATE TABLE IF NOT EXISTS broadcast.push_tasks (
 -- =====================================================
 -- Indexes
 -- =====================================================
-CREATE INDEX IF NOT EXISTS idx_bc_targets_tenant ON broadcast_targets(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_bc_targets_type ON broadcast_targets(chat_type);
-CREATE INDEX IF NOT EXISTS idx_bc_targets_can_broadcast ON broadcast_targets(can_broadcast);
-CREATE INDEX IF NOT EXISTS idx_bc_push_tasks_tenant ON push_tasks(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_bc_push_tasks_status ON push_tasks(status);
-CREATE INDEX IF NOT EXISTS idx_bc_push_tasks_next_run ON push_tasks(status, next_run_at) WHERE status = 'running';
-CREATE INDEX IF NOT EXISTS idx_bc_push_tasks_merchant ON push_tasks(merchant_id);
+CREATE INDEX IF NOT EXISTS idx_bc_targets_tenant ON broadcast.broadcast_targets(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_bc_targets_type ON broadcast.broadcast_targets(chat_type);
+CREATE INDEX IF NOT EXISTS idx_bc_targets_can_broadcast ON broadcast.broadcast_targets(can_broadcast);
+CREATE INDEX IF NOT EXISTS idx_bc_push_tasks_tenant ON broadcast.push_tasks(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_bc_push_tasks_status ON broadcast.push_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_bc_push_tasks_next_run ON broadcast.push_tasks(status, next_run_at) WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS idx_bc_push_tasks_merchant ON broadcast.push_tasks(merchant_id);
 
 -- =====================================================
 -- Row Level Security
@@ -60,13 +61,13 @@ ALTER TABLE broadcast.push_tasks ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS broadcast_targets_tenant ON broadcast.broadcast_targets;
 CREATE POLICY broadcast_targets_tenant ON broadcast.broadcast_targets
     FOR ALL USING (
-        EXISTS (SELECT 1 FROM saas_user_roles r WHERE r.user_id = auth.uid() AND r.role = 'platform_admin')
+        EXISTS (SELECT 1 FROM auth.saas_user_roles r WHERE r.user_id = auth.uid() AND r.role = 'platform_admin')
         OR tenant_id = current_setting('app.tenant_id', true)
     );
 
 DROP POLICY IF EXISTS push_tasks_tenant ON broadcast.push_tasks;
 CREATE POLICY push_tasks_tenant ON broadcast.push_tasks
     FOR ALL USING (
-        EXISTS (SELECT 1 FROM saas_user_roles r WHERE r.user_id = auth.uid() AND r.role = 'platform_admin')
+        EXISTS (SELECT 1 FROM auth.saas_user_roles r WHERE r.user_id = auth.uid() AND r.role = 'platform_admin')
         OR tenant_id = current_setting('app.tenant_id', true)
     );
