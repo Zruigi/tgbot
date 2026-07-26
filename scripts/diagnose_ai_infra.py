@@ -4,6 +4,7 @@ AI 基础设施诊断工具
 自动检查 LiteLLM、凭证、配置和网络连通性
 """
 import asyncio
+import os
 import subprocess
 import sys
 import json
@@ -119,7 +120,7 @@ class AIDiagnoser:
                 # 测试模型列表
                 async with session.get(
                     "http://localhost:4000/v1/models",
-                    headers={"Authorization": "Bearer sk-vertex-1300"}
+                    headers={"Authorization": f"Bearer {os.environ.get('LITELLM_MASTER_KEY', '')}"}
                 ) as resp:
                     if resp.status != 200:
                         return f"模型列表失败: {resp.status}"

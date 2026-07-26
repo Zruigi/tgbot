@@ -18,11 +18,14 @@ if [ "$RESPONSE" != "200" ]; then
     exit 1
 fi
 
+# LiteLLM 网关 key：从环境变量读取，不再硬编码
+LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:?请设置 LITELLM_MASTER_KEY 环境变量（LiteLLM 网关 key）}"
+
 # 检查关键模型
 MODELS=("gpt-3.5-turbo" "gpt-4" "gemini-3.1-pro-preview")
 for model in "${MODELS[@]}"; do
     RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
-      -H "Authorization: Bearer sk-vertex-1300" \
+      -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
       -H "Content-Type: application/json" \
       -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"test\"}]}" \
       http://localhost:4000/v1/chat/completions)

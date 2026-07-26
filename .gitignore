@@ -95,3 +95,6 @@ node_modules/
 google-key.json
 *.pem
 *.key
+
+# 本地清理隔离目录（含敏感备份，永不入库）
+.trash-*/

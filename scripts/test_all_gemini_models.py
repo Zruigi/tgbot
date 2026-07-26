@@ -6,12 +6,13 @@ Gemini 模型完整测试脚本
 
 import urllib.request
 import json
+import os
 import time
 import sys
 
 # 配置
 LITELLM_URL = "http://localhost:4000/v1/chat/completions"
-API_KEY = "sk-vertex-1300"
+API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 
 # 要测试的模型列表
 MODELS_TO_TEST = [
