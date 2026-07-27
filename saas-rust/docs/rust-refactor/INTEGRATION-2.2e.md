@@ -17,6 +17,14 @@ Task 2.2e ports the ad-governance subsystem (Python commit 332ba4c) to Rust. Thi
 > or warning actions still require the explicit environment gates and a real Bot
 > acceptance run. The local gate is not production or MiniApp acceptance.
 
+> **Status override for the historical deferred checklist.** Tenant-scoped
+> clustering, action idempotency, deletion/warning execution gates, and the
+> realtime trigger are implemented in this Beta candidate. The old unchecked
+> items below are retained as design notes; they are not current evidence that
+> the code path is still a placeholder. Remaining open items are unknown-LLM
+> decisions, real Telegram side-effect acceptance, and the intentionally
+> deferred Agent UI extension.
+
 ## 1. Telegram Webhook Integration Hook
 **Location**: `crates/http/src/routes/telegram_webhook.rs` line ~945 (group_messages INSERT)
 
