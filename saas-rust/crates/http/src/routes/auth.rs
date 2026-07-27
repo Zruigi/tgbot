@@ -505,14 +505,18 @@ fn build_data_check_string(data: &std::collections::HashMap<String, String>) -> 
 
 // 计算 Telegram HMAC-SHA256 hash
 fn compute_telegram_hash(data_check_string: &str, bot_token: &str) -> String {
-    // 第一轮: HMAC-SHA256(data_check_string, bot_token)
-    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(bot_token.as_bytes())
-        .expect("HMAC can accept key");
-    mac.update(data_check_string.as_bytes());
-    let digest = mac.finalize().into_bytes();
+    // Telegram Web Apps derive a per-bot secret first, then sign the sorted
+    // data-check string with that secret. Using the raw bot token here would
+    // reject valid Mini App payloads and is not the Telegram protocol.
+    let mut secret_mac =
+        <HmacSha256 as hmac::Mac>::new_from_slice(b"WebAppData").expect("HMAC can accept key");
+    secret_mac.update(bot_token.as_bytes());
+    let secret = secret_mac.finalize().into_bytes();
 
-    // 第二轮: hex(digest)
-    hex::encode(digest)
+    let mut mac =
+        <HmacSha256 as hmac::Mac>::new_from_slice(&secret).expect("HMAC can accept derived key");
+    mac.update(data_check_string.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 // 从数据库获取 TMA 登录用的 bot_token
@@ -605,4 +609,18 @@ pub async fn generate_otp_internal(
     otp_store.insert(otp.clone(), otp_data).await;
 
     otp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telegram_web_app_hash_uses_web_app_data_derived_secret() {
+        let data = "auth_date=1700000000\nquery_id=AAH\nuser={\"id\":42}";
+        assert_eq!(
+            compute_telegram_hash(data, "123456:ABCdef"),
+            "183ee3a9badd18521e50eba6626fc62a3323833eb552589b9d6817a9068dfbc2"
+        );
+    }
 }
