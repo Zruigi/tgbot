@@ -37,6 +37,9 @@ The monitor cron helper, when explicitly enabled for a legacy audit, queries
 real rows and enqueues `monitor_check` jobs; database or enqueue errors now
 propagate instead of becoming `Ok(0)`.
 
+The Supabase REST count helper likewise fails closed when PostgREST omits or
+malforms `Content-Range`; missing count metadata is not reported as zero.
+
 ## Remaining non-release evidence
 
 The following are still outside the release claim and require separate work or

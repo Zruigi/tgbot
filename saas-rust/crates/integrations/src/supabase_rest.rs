@@ -230,17 +230,32 @@ impl SupabaseRestClient {
                 .send()
                 .await
                 .map_err(|e| format!("count failed: {e}"))?;
-            // Content-Range header has the count
-            if let Some(range) = resp.headers().get("content-range") {
-                if let Ok(s) = range.to_str() {
-                    if let Some(count_str) = s.split('/').last() {
-                        return count_str
-                            .parse::<i64>()
-                            .map_err(|e| format!("parse count: {e}"));
-                    }
-                }
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp
+                    .text()
+                    .await
+                    .map_err(|e| format!("read count error body: {e}"))?;
+                return Err(format!("REST {status}: {body}"));
             }
-            return Ok(0);
+            // PostgREST only exposes an exact total through Content-Range. Do
+            // not turn a missing/malformed header into a successful zero: that
+            // would make unavailable metadata look like a real count.
+            let range = resp
+                .headers()
+                .get("content-range")
+                .ok_or_else(|| "REST count response missing Content-Range".to_string())?;
+            let range = range
+                .to_str()
+                .map_err(|e| format!("invalid Content-Range: {e}"))?;
+            let count_str = range
+                .rsplit('/')
+                .next()
+                .filter(|value| !value.is_empty() && *value != "*")
+                .ok_or_else(|| format!("invalid Content-Range value: {range}"))?;
+            return count_str
+                .parse::<i64>()
+                .map_err(|e| format!("parse count: {e}"));
         }
 
         let rows = self.select(table, "count", filters, Some(1)).await?;
@@ -331,5 +346,16 @@ mod tests {
         assert!(request.starts_with(
             "GET /rest/v1/merchants?select=id,tenant_id,status&tenant_id=eq.tenant-beta&limit=1 HTTP/1.1"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_count_fails_closed_without_content_range() {
+        let (base_url, request_handle) = mock_server("[]");
+        let client = SupabaseRestClient::new(&base_url, "test-service-key");
+
+        let error = client.count("*", &[]).await.unwrap_err();
+        assert!(error.contains("missing Content-Range"));
+        let request = request_handle.join().unwrap();
+        assert!(request.starts_with("GET /rest/v1/merchants?select=count HTTP/1.1"));
     }
 }
