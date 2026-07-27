@@ -250,7 +250,41 @@ Every query in `ad_governance.rs` and `ad_governance_worker.rs` must include `te
 
 ---
 
-## 9. Known Gaps and Deferred Items
+## 9. Current Beta Evidence and Deferred Items
+
+The following matrix is the current release-candidate status. A local runtime
+check uses disposable PostgreSQL and a mock Telegram API; it is evidence for
+code-path behavior only, not real Bot acceptance.
+
+### Verified by the local Beta gate
+
+- [x] Schema, tenant columns, indexes, RLS policies, helper grants, and the
+      `realtime_ad_scan_outbox` trigger (`0020`–`0026`), applied twice from an
+      empty database.
+- [x] Webhook message evidence writes and realtime `ad_scan_job` enqueue.
+- [x] Worker claim/completion, tenant re-checks, row locking, and action
+      idempotency with the disposable database.
+- [x] Unknown ad-scan IDs and missing capability/LLM evidence fail closed.
+- [x] Legacy advertisement compatibility event persistence, backfill, listing,
+      and tenant-scoped lookup.
+- [x] The full local runtime request matrix and method/path trace (102/102;
+      see `target/beta-reports/runtime-gate-report.json`).
+
+### Still required before gray release
+
+- [ ] Real test Bot webhook delivery, group permissions, warning/deletion
+      side-effects, Telegram retries, and rollback of a failed action.
+- [ ] Production-approved LLM catalog/classifier behavior and an explicit
+      acceptance record for unknown/low-confidence decisions.
+- [ ] Real tenant acceptance of the MiniApp/Agent workflow; the UI extension
+      remains intentionally deferred.
+- [ ] Deployment, small-tenant gray rollout, at least three days of telemetry,
+      and a rehearsed rollback.
+
+The older checklist below is retained as porting/design history and should not
+be used as the current release status.
+
+## 10. Historical Known Gaps and Deferred Items
 
 ### Implemented (MVP scope):
 - [x] Schema (6 tables, indexes, tenant_id columns)
@@ -279,7 +313,7 @@ Every query in `ad_governance.rs` and `ad_governance_worker.rs` must include `te
 
 ---
 
-## Testing Checklist
+## Historical Testing Checklist
 
 ### Unit Tests:
 - [ ] State machine: first scan forced dry_run=true
@@ -315,6 +349,14 @@ Every query in `ad_governance.rs` and `ad_governance_worker.rs` must include `te
 - `crates/services/src/lib.rs` — pub mod ad_governance
 - `crates/http/src/routes/mod.rs` — pub mod ad_scan + route registrations
 - `crates/workers/src/lib.rs` — pub mod ad_governance_worker
+
+**Current evidence**:
+- `scripts/beta-runtime-check.sh` runs migrations through `0026` twice and
+  records the local matrix in
+  `target/beta-reports/runtime-gate-report.json`.
+- `target/beta-reports/frontend-runtime-contract-report.json` records 102/102
+  method/path requests; its limitation is that request tracing does not itself
+  prove response schemas or real Telegram behavior.
 
 **Next phase** should implement:
 1. Full clustering algorithm (exact + template similarity + families)
