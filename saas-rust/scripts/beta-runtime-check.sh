@@ -24,17 +24,21 @@ bind_address=127.0.0.1:18090
 base_url="http://$bind_address"
 runtime_report_dir=${BETA_REPORT_DIR:-"$rust_root/target/beta-reports"}
 runtime_report_path="$runtime_report_dir/runtime-gate-report.json"
+runtime_contract_report_path="$runtime_report_dir/frontend-runtime-contract-report.json"
+runtime_request_trace_path="$runtime_report_dir/frontend-runtime-request-trace.tsv"
 server_log=$(mktemp)
 report_pdf=$(mktemp)
 report_xlsx=$(mktemp)
 image_fixture=$(mktemp --suffix=.png)
 contract_response=$(mktemp)
+runtime_request_log=$(mktemp)
 server_pid=
 llm_pid=
 telegram_pid=
 pg_started=
 runtime_contract_matrix_status=not_run
 runtime_contract_static_only_cases=0
+runtime_contract_runtime_seen=0
 
 cleanup() {
   if [[ -n "$server_pid" ]]; then
@@ -52,7 +56,7 @@ cleanup() {
   if [[ -n "$pg_started" ]]; then
     "$pg_ctl_bin" -D "$pg_data_dir" -m fast -w stop >/dev/null 2>&1 || true
   fi
-  rm -f "$server_log" "$report_pdf" "$report_xlsx" "$image_fixture" "$contract_response" "$pg_log"
+  rm -f "$server_log" "$report_pdf" "$report_xlsx" "$image_fixture" "$contract_response" "$pg_log" "$runtime_request_log"
   rm -rf "$pg_data_dir" "$pg_socket_dir"
 }
 trap cleanup EXIT
@@ -87,6 +91,9 @@ write_runtime_report() {
   "frontend_contracts": {
     "method_path_contracts": 102,
     "static_registration_report": "target/beta-reports/api-static-registration.json",
+    "runtime_contract_report": "target/beta-reports/frontend-runtime-contract-report.json",
+    "runtime_request_trace": "target/beta-reports/frontend-runtime-request-trace.tsv",
+    "runtime_request_seen": $runtime_contract_runtime_seen,
     "static_only_cases": $runtime_contract_static_only_cases,
     "runtime_matrix_status": "$runtime_contract_matrix_status",
     "runtime_matrix_assertions": ["success and expected error status codes", "response status/data shape", "owner/viewer/platform authorization", "cross-tenant isolation", "ephemeral payment, monitor, and merchant lifecycle"],
@@ -119,6 +126,49 @@ for command in "$initdb_bin" "$pg_ctl_bin"; do
     exit 1
   }
 done
+
+# Record every local HTTP method/path exercised by this gate without recording
+# request bodies, headers, tokens, or response data. The persistent contract
+# report is derived from this trace and the static frontend registration report.
+curl_binary=$(command -v curl)
+curl() {
+  local method=GET
+  local explicit_method=false
+  local request_body=false
+  local next_method=false
+  local next_url=false
+  local url=
+  local arg
+  for arg in "$@"; do
+    if [[ "$next_method" == true ]]; then
+      method=${arg^^}
+      explicit_method=true
+      next_method=false
+      continue
+    fi
+    if [[ "$next_url" == true ]]; then
+      url=$arg
+      next_url=false
+      continue
+    fi
+    case "$arg" in
+      -X|--request) next_method=true ;;
+      --request=*) method=${arg#*=}; explicit_method=true ;;
+      -d|--data|--data-raw|--data-binary|--data-urlencode|-F|--form|--form-string) request_body=true ;;
+      --data=*|--data-raw=*|--data-binary=*|--data-urlencode=*|--form=*|--form-string=*) request_body=true ;;
+      --url) next_url=true ;;
+      http://*|https://*) url=$arg ;;
+    esac
+  done
+  if [[ "$explicit_method" == false && "$request_body" == true ]]; then
+    method=POST
+  fi
+  method=${method^^}
+  if [[ -n "$url" ]]; then
+    printf '%s\t%s\n' "$method" "$url" >>"$runtime_request_log"
+  fi
+  "$curl_binary" "$@"
+}
 
 if ss -H -ltn "sport = :18090" | grep -q .; then
   echo "Beta runtime gate requires unused port $bind_address." >&2
@@ -583,7 +633,6 @@ curl -fsS "${platform_headers[@]}" -H 'content-type: application/json' \
 # Frontend method/path contract matrix.  These calls cover the contracts that
 # static registration alone cannot prove, using only the disposable database
 # and the local mock Telegram/LLM services started by this gate.
-runtime_contract_static_only_cases=47
 runtime_contract_matrix_status=running
 psql "$database_url" -v ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO subscription_plans
@@ -786,8 +835,6 @@ curl -fsS "${headers[@]}" -X POST -H 'content-type: application/json' \
 curl -fsS "${headers[@]}" "$base_url/api/advertisements?group_id=-10001&limit=20" \
   | jq -e '.status == "ok" and .success == true and (.data.clusters | type == "array") and .data_complete == true' >/dev/null
 assert_http_status 404 "${headers[@]}" "$base_url/api/advertisements/beta-contract-missing"
-runtime_contract_static_only_cases=47
-
 runtime_contract_matrix_status=passed
 
 curl -fsS "${headers[@]}" "$base_url/api/users" \
@@ -854,6 +901,8 @@ curl -fsS "${headers[@]}" -H 'content-type: application/json' \
 curl -fsS "${headers[@]}" -H 'content-type: application/json' \
   -d '{"model":"beta-mock","input":"exec beta"}' "$base_url/api/openai/exec" \
   | jq -e '.output == "mock:exec beta" and .output_text == "mock:exec beta" and .model == "beta-mock" and .sandbox_id == "default" and .usage.total_tokens == 7' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/openai/models" \
+  | jq -e '.status == "ok" and any(.data[]; .id == "gpt-4o-mini" and .object == "model")' >/dev/null
 curl -fsS "${headers[@]}" -H 'content-type: application/json' \
   -d '{"text":"加我微信免费领取红包返利佣金","context_type":"group_message"}' \
   "$base_url/api/ai/detect_ad" \
@@ -1507,6 +1556,15 @@ done
 [[ $(psql "$database_url" -Atc "SELECT is_deleted = false AND delete_attempts = 1 AND delete_retry_at > now() FROM groups.channel_reminders WHERE tenant_id = 'other-tenant' AND message_id = 881") == t ]]
 curl -fsS http://127.0.0.1:18092/calls \
   | jq -e 'any(.[]; .bot_id == 777000 and .method == "deleteMessage" and .chat_id == -10001 and .message_id == 880) and ([.[] | select(.method == "deleteMessage" and .chat_id == -20001)] | length == 0)' >/dev/null
+
+mkdir -p "$runtime_report_dir"
+cp "$runtime_request_log" "$runtime_request_trace_path"
+node "$script_directory/contract-runtime-report.mjs" \
+  --static "$runtime_report_dir/api-static-registration.json" \
+  --requests "$runtime_request_trace_path" \
+  --output "$runtime_contract_report_path"
+runtime_contract_static_only_cases=$(jq -er '.static_only_count' "$runtime_contract_report_path")
+runtime_contract_runtime_seen=$(jq -er '.runtime_request_seen_count' "$runtime_contract_report_path")
 
 write_runtime_report passed
 echo "Beta runtime gates passed: migrations, tenant-isolated webhook ingestion and chat, private commands and tenant auto-replies, group management and broadcast delivery, reminder cleanup, scheduled push tasks, finance, AI, config, Telegram secrets/webhooks, and group assignment APIs."
