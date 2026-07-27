@@ -4,16 +4,37 @@ set -euo pipefail
 script_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 rust_root=$(cd "$script_directory/.." && pwd)
 database_name=tgbot_rust_beta
-database_url="postgresql:///$database_name"
+# Keep the runtime gate independent of a host PostgreSQL service and sudo.  The
+# CI/container profile runs without a setuid sudo helper, so each invocation
+# owns a disposable, trust-authenticated cluster under /tmp.  The application
+# still connects as the non-superuser database owner (ubuntu), while a separate
+# bootstrap role is used only for database/role setup and RLS assertions.
+pg_bin_dir=${PG_BIN_DIR:-/usr/lib/postgresql/16/bin}
+pg_port=${BETA_RUNTIME_PG_PORT:-15432}
+pg_admin_user=beta_pg_admin
+pg_data_dir=$(mktemp -d)
+pg_socket_dir=$(mktemp -d)
+pg_log=$(mktemp)
+pg_ctl_bin="$pg_bin_dir/pg_ctl"
+initdb_bin="$pg_bin_dir/initdb"
+database_url="postgresql://ubuntu@127.0.0.1:${pg_port}/${database_name}"
+pg_admin_url="postgresql://${pg_admin_user}@127.0.0.1:${pg_port}/postgres"
+pg_admin_database_url="postgresql://${pg_admin_user}@127.0.0.1:${pg_port}/${database_name}"
 bind_address=127.0.0.1:18090
 base_url="http://$bind_address"
+runtime_report_dir=${BETA_REPORT_DIR:-"$rust_root/target/beta-reports"}
+runtime_report_path="$runtime_report_dir/runtime-gate-report.json"
 server_log=$(mktemp)
 report_pdf=$(mktemp)
 report_xlsx=$(mktemp)
 image_fixture=$(mktemp --suffix=.png)
+contract_response=$(mktemp)
 server_pid=
 llm_pid=
 telegram_pid=
+pg_started=
+runtime_contract_matrix_status=not_run
+runtime_contract_static_only_cases=0
 
 cleanup() {
   if [[ -n "$server_pid" ]]; then
@@ -28,20 +49,73 @@ cleanup() {
     kill "$telegram_pid" 2>/dev/null || true
     wait "$telegram_pid" 2>/dev/null || true
   fi
-  rm -f "$server_log" "$report_pdf" "$report_xlsx" "$image_fixture"
+  if [[ -n "$pg_started" ]]; then
+    "$pg_ctl_bin" -D "$pg_data_dir" -m fast -w stop >/dev/null 2>&1 || true
+  fi
+  rm -f "$server_log" "$report_pdf" "$report_xlsx" "$image_fixture" "$contract_response" "$pg_log"
+  rm -rf "$pg_data_dir" "$pg_socket_dir"
 }
 trap cleanup EXIT
 
+write_runtime_report() {
+  local status="$1"
+  local failure_line="${2:-}"
+  local head_commit
+  head_commit=$(git -C "$rust_root" rev-parse HEAD 2>/dev/null || printf '%s' unknown)
+  mkdir -p "$runtime_report_dir" 2>/dev/null || return 0
+  cat >"$runtime_report_path" <<EOF
+{
+  "report_type": "beta_runtime_gate",
+  "status": "$status",
+  "generated_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "head_commit": "$head_commit",
+  "database": {
+    "mode": "disposable_local_postgresql",
+    "host": "127.0.0.1",
+    "port": $pg_port,
+    "database": "$database_name",
+    "application_role": "ubuntu",
+    "bootstrap_role": "$pg_admin_user",
+    "production_credentials_used": false
+  },
+  "migrations": {
+    "passes": 2,
+    "files": ["0020_group_messages_ad_columns.sql", "0021_ad_fingerprints.sql", "0022_ad_governance.sql", "0023_ad_delete_snapshots.sql", "0024_fix_rls_recursion.sql", "0025_realtime_ad_scan_outbox.sql", "0026_ad_governance_rls.sql"],
+    "assertions": ["governance tables and nine tenant RLS policies", "least-privilege helper function grants", "realtime_ad_scan_outbox trigger", "non-owner cross-tenant read/write denial"]
+  },
+  "runtime_e2e": ["health and worker startup", "tenant-isolated webhook ingestion", "private commands and auto-replies", "chat and file delivery", "group management and reminders", "broadcast delivery", "scheduled push", "finance", "AI and skills", "platform configuration", "Telegram secrets and webhook dispatch", "realtime ad scan enqueue and worker completion", "legacy advertisement event persistence and backfill", "legacy advertisement listing and fail-closed lookup", "potential-user isolation"],
+  "frontend_contracts": {
+    "method_path_contracts": 102,
+    "static_registration_report": "target/beta-reports/api-static-registration.json",
+    "static_only_cases": $runtime_contract_static_only_cases,
+    "runtime_matrix_status": "$runtime_contract_matrix_status",
+    "runtime_matrix_assertions": ["success and expected error status codes", "response status/data shape", "owner/viewer/platform authorization", "cross-tenant isolation", "ephemeral payment, monitor, and merchant lifecycle"],
+    "production_credentials_used": false
+  },
+  "failure_line": "$failure_line"
+}
+EOF
+}
+
 report_failure() {
   local exit_status=$?
-  echo "Beta runtime gate failed at line ${BASH_LINENO[0]} (exit $exit_status)." >&2
+  local failure_line="${BASH_LINENO[0]}"
+  local failure_command="${BASH_COMMAND:-unknown}"
+  echo "Beta runtime gate failed at line ${failure_line} (exit $exit_status): ${failure_command}" >&2
+  write_runtime_report failed "${failure_line}: ${failure_command}"
   exit "$exit_status"
 }
 trap report_failure ERR
 
-for command in base64 cargo curl jq node openssl psql sudo unzip xxd; do
+for command in base64 cargo curl date jq node openssl psql dropdb createdb unzip xxd; do
   command -v "$command" >/dev/null || {
     echo "Missing required command: $command" >&2
+    exit 1
+  }
+done
+for command in "$initdb_bin" "$pg_ctl_bin"; do
+  [[ -x "$command" ]] || {
+    echo "Missing executable PostgreSQL helper: $command" >&2
     exit 1
   }
 done
@@ -58,16 +132,40 @@ if ss -H -ltn "sport = :18092" | grep -q .; then
   echo "Beta runtime gate requires unused mock Telegram port 127.0.0.1:18092." >&2
   exit 1
 fi
+if ss -H -ltn "sport = :$pg_port" | grep -q .; then
+  echo "Beta runtime gate requires unused PostgreSQL port 127.0.0.1:$pg_port." >&2
+  exit 1
+fi
 
-sudo -u postgres psql -v ON_ERROR_STOP=1 <<'SQL'
+"$initdb_bin" -D "$pg_data_dir" -U "$pg_admin_user" \
+  --auth-local=trust --auth-host=trust --no-locale >/dev/null
+"$pg_ctl_bin" -D "$pg_data_dir" \
+  -o "-p $pg_port -k $pg_socket_dir -h 127.0.0.1" \
+  -l "$pg_log" -w start >/dev/null
+pg_started=1
+
+psql "$pg_admin_url" -v ON_ERROR_STOP=1 <<'SQL'
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ubuntu') THEN
     CREATE ROLE ubuntu LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    CREATE ROLE authenticated NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    CREATE ROLE anon NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+  END IF;
+END $$;
+DO $$ BEGIN
+  ASSERT NOT EXISTS (
+    SELECT FROM pg_roles
+    WHERE rolname IN ('ubuntu', 'authenticated', 'anon')
+      AND (rolsuper OR rolcreaterole OR rolbypassrls)
+  ), 'beta migration/runtime roles must not bypass RLS or manage roles';
 END $$;
 SQL
-sudo -u postgres dropdb --if-exists "$database_name"
-sudo -u postgres createdb --owner=ubuntu "$database_name"
+dropdb --if-exists --host=127.0.0.1 --port="$pg_port" --username="$pg_admin_user" "$database_name"
+createdb --host=127.0.0.1 --port="$pg_port" --username="$pg_admin_user" --owner=ubuntu "$database_name"
 
 migrations=(
   0001_saas_core.sql
@@ -86,6 +184,13 @@ migrations=(
   0011_group_message_policy_outbox.sql
   0012_telegram_command_reply_outbox.sql
   0013_telegram_auto_reply_outbox.sql
+  0020_group_messages_ad_columns.sql
+  0021_ad_fingerprints.sql
+  0022_ad_governance.sql
+  0023_ad_delete_snapshots.sql
+  0024_fix_rls_recursion.sql
+  0025_realtime_ad_scan_outbox.sql
+  0026_ad_governance_rls.sql
 )
 
 for pass in 1 2; do
@@ -94,6 +199,68 @@ for pass in 1 2; do
       -f "$rust_root/migrations/$migration" >/dev/null
   done
 done
+
+# Readonly schema assertions — verify governance tables, least-privilege helpers,
+# realtime trigger, and tenant RLS all survived two full migration passes.
+psql "$database_url" -v ON_ERROR_STOP=1 <<'SQL'
+DO $$ BEGIN
+  -- 0022 governance core tables
+  ASSERT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'groups' AND tablename = 'ad_group_policies');
+  ASSERT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'groups' AND tablename = 'ad_scan_jobs');
+  ASSERT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'groups' AND tablename = 'ad_governance_clusters');
+  ASSERT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'groups' AND tablename = 'ad_governance_cluster_messages');
+  ASSERT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'groups' AND tablename = 'ad_governance_actions');
+  ASSERT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'groups' AND tablename = 'ad_warning_dedup');
+  -- 0021 fingerprint tables
+  ASSERT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'groups' AND tablename = 'ad_text_fingerprints');
+  ASSERT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'groups' AND tablename = 'ad_sender_profiles');
+  -- 0023 delete snapshots
+  ASSERT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'groups' AND tablename = 'ad_delete_snapshots');
+  -- 0024 fix: SECURITY DEFINER helper functions
+  ASSERT EXISTS (SELECT FROM pg_proc WHERE proname = 'is_platform_admin' AND pronamespace = 'auth'::regnamespace);
+  ASSERT EXISTS (SELECT FROM pg_proc WHERE proname = 'current_user_is_platform_admin' AND pronamespace = 'auth'::regnamespace);
+  ASSERT NOT has_function_privilege('anon', 'auth.is_platform_admin(uuid)', 'EXECUTE');
+  ASSERT NOT has_function_privilege('anon', 'auth.current_user_is_platform_admin()', 'EXECUTE');
+  ASSERT NOT has_function_privilege('authenticated', 'auth.is_platform_admin(uuid)', 'EXECUTE');
+  ASSERT has_function_privilege('authenticated', 'auth.current_user_is_platform_admin()', 'EXECUTE');
+  ASSERT (SELECT prosecdef FROM pg_proc WHERE oid = 'auth.is_platform_admin(uuid)'::regprocedure);
+  ASSERT (SELECT prosecdef FROM pg_proc WHERE oid = 'auth.current_user_is_platform_admin()'::regprocedure);
+  ASSERT EXISTS (SELECT FROM pg_trigger WHERE tgname = 'realtime_ad_scan_outbox' AND NOT tgisinternal);
+  -- 0020 ad columns on group_messages
+  ASSERT EXISTS (SELECT FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname = 'group_messages' AND c.relnamespace = 'groups'::regnamespace AND a.attname = 'ad_text_hash');
+  ASSERT EXISTS (SELECT FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname = 'group_messages' AND c.relnamespace = 'groups'::regnamespace AND a.attname = 'ad_action_status');
+  ASSERT 9 = (
+    SELECT count(*)
+    FROM pg_class table_class
+    JOIN pg_namespace schema_namespace ON schema_namespace.oid = table_class.relnamespace
+    WHERE schema_namespace.nspname = 'groups'
+      AND table_class.relname IN (
+        'ad_text_fingerprints', 'ad_sender_profiles', 'ad_group_policies',
+        'ad_scan_jobs', 'ad_governance_clusters',
+        'ad_governance_cluster_messages', 'ad_governance_actions',
+        'ad_warning_dedup', 'ad_delete_snapshots'
+      )
+      AND table_class.relrowsecurity
+      AND NOT table_class.relforcerowsecurity
+  ), 'all governance tables must have non-FORCE tenant RLS';
+  ASSERT 9 = (
+    SELECT count(*)
+    FROM pg_policies
+    WHERE schemaname = 'groups'
+      AND policyname IN (
+        'ad_text_fingerprints_tenant', 'ad_sender_profiles_tenant',
+        'ad_group_policies_tenant', 'ad_scan_jobs_tenant',
+        'ad_governance_clusters_tenant',
+        'ad_governance_cluster_messages_tenant',
+        'ad_governance_actions_tenant', 'ad_warning_dedup_tenant',
+        'ad_delete_snapshots_tenant'
+      )
+      AND cmd = 'ALL'
+      AND qual LIKE '%app.tenant_id%'
+      AND with_check LIKE '%app.tenant_id%'
+  ), 'all governance tenant policies must scope reads and writes';
+END $$;
+SQL
 
 psql "$database_url" -v ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO auth.users (id, tg_user_id, username)
@@ -140,6 +307,42 @@ VALUES
   (30001, 'shared_beta_user', 'beta inbound', 1, 'beta-local'),
   (30001, 'shared_beta_user', 'other shared inbound', 1, 'other-tenant'),
   (40001, 'other_user', 'other inbound', 1, 'other-tenant');
+INSERT INTO groups.ad_text_fingerprints
+  (tenant_id, text_hash, normalized_text, representative_text)
+VALUES
+  ('beta-local', 'beta-rls-probe', 'beta', 'beta'),
+  ('other-tenant', 'other-rls-probe', 'other', 'other');
+SQL
+
+# Exercise the policy as a non-owner role. The application owner remains able to
+# run background jobs because 0026 deliberately does not FORCE RLS.
+psql "$database_url" -v ON_ERROR_STOP=1 <<'SQL'
+GRANT USAGE ON SCHEMA auth, groups TO authenticated;
+GRANT SELECT, INSERT ON groups.ad_text_fingerprints TO authenticated;
+SQL
+psql "$pg_admin_database_url" -v ON_ERROR_STOP=1 <<'SQL'
+SET ROLE authenticated;
+SELECT set_config('app.tenant_id', 'beta-local', false);
+DO $$ BEGIN
+  ASSERT 1 = (SELECT count(*) FROM groups.ad_text_fingerprints);
+  ASSERT EXISTS (
+    SELECT FROM groups.ad_text_fingerprints
+    WHERE tenant_id = 'beta-local' AND text_hash = 'beta-rls-probe'
+  );
+  ASSERT NOT EXISTS (
+    SELECT FROM groups.ad_text_fingerprints
+    WHERE tenant_id = 'other-tenant'
+  );
+  BEGIN
+    INSERT INTO groups.ad_text_fingerprints
+      (tenant_id, text_hash, normalized_text)
+    VALUES ('other-tenant', 'cross-tenant-write', 'blocked');
+    RAISE EXCEPTION 'cross-tenant governance write was not blocked by RLS';
+  EXCEPTION
+    WHEN insufficient_privilege THEN NULL;
+  END;
+END $$;
+RESET ROLE;
 SQL
 
 psql "$database_url" -v ON_ERROR_STOP=1 <<'SQL'
@@ -201,7 +404,7 @@ for _ in $(seq 1 50); do
 done
 curl -fsS http://127.0.0.1:18092/health | jq -e '.status == "ok"' >/dev/null
 secret_encryption_key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-env \
+env -u AD_AUTO_ENFORCE_ENABLED -u AD_DELETE_ENABLED \
   DATABASE_URL="$database_url" \
   INTERNAL_SAAS_SECRET=beta-local-secret \
   LITELLM_BASE_URL=http://127.0.0.1:18091 \
@@ -269,6 +472,14 @@ platform_headers=(
   -H 'x-user-id: 11111111-1111-4111-8111-111111111111'
 )
 finance_url="$base_url/api/v1/monitors/finance"
+
+assert_http_status() {
+  local expected="$1"
+  shift
+  local actual
+  actual=$(curl -sS -o "$contract_response" -w '%{http_code}' "$@")
+  [[ "$actual" == "$expected" ]]
+}
 
 auto_reply_url="$base_url/api/merchant/telegram/auto-reply"
 curl -fsS "${headers[@]}" "$auto_reply_url" \
@@ -368,6 +579,216 @@ curl -fsS "${platform_headers[@]}" -H 'content-type: application/json' \
   -d '{"bot_id":777000,"update":{"update_id":3,"message":{"chat":{"id":123},"text":"dispatch beta"}}}' \
   "$base_url/telegram/webhook/dispatch-test" \
   | jq -e '.status == "ok" and .dispatched == true and .kind == "message"' >/dev/null
+
+# Frontend method/path contract matrix.  These calls cover the contracts that
+# static registration alone cannot prove, using only the disposable database
+# and the local mock Telegram/LLM services started by this gate.
+runtime_contract_static_only_cases=47
+runtime_contract_matrix_status=running
+psql "$database_url" -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO subscription_plans
+  (plan_code, plan_name, price_usdt, duration_days, features_json, status)
+VALUES
+  ('beta-runtime-contract-plan', 'Beta Runtime Contract', 9.99, 30, '{"tier":"beta"}'::jsonb, 'active')
+ON CONFLICT (plan_code) DO UPDATE
+SET plan_name = EXCLUDED.plan_name,
+    price_usdt = EXCLUDED.price_usdt,
+    duration_days = EXCLUDED.duration_days,
+    features_json = EXCLUDED.features_json,
+    status = EXCLUDED.status,
+    updated_at = now();
+SQL
+
+# Authentication and MiniApp lifecycle contracts.
+curl -fsS "$base_url/api/csrf-token" \
+  | jq -e '.status == "ok" and (.data.csrf_token | type == "string") and (.data.csrf_token | length) >= 32' >/dev/null
+assert_http_status 401 -X POST -H 'content-type: application/json' \
+  -d '{"token":"invalid-beta-token"}' "$base_url/api/login"
+assert_http_status 400 -X POST -H 'content-type: application/json' \
+  -d '{}' "$base_url/api/login/otp"
+assert_http_status 400 -X POST -H 'content-type: application/json' \
+  -d '{}' "$base_url/api/login/tma"
+curl -fsS -X POST -H 'content-type: application/json' -d '{}' \
+  "$base_url/api/miniapp/bootstrap" \
+  | jq -e '.status == "reopen_in_telegram_required" and .reason == "bootstrap_auth_failed" and .renewal.rotated == false' >/dev/null
+curl -fsS "$base_url/api/session/context" \
+  | jq -e '.status == "ok" and .data.authenticated == false and .data.tenant_id == ""' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/session/context" \
+  | jq -e '.status == "ok" and .data.authenticated == true and .data.role == "merchant_owner" and .data.tenant_id == "beta-local"' >/dev/null
+assert_http_status 403 "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{}' "$base_url/api/session/context"
+
+# Group listing, verification, membership, messages, and tenant isolation.
+curl -fsS "${headers[@]}" "$base_url/api/group_listen/list?page=1&size=20" \
+  | jq -e '.status == "ok" and .total == 2 and (.data | length) == 2 and all(.data[]; .tenant_id == "beta-local")' >/dev/null
+curl -fsS "${headers[@]}" -H 'content-type: application/json' \
+  -d '{"group_id":-10001,"enabled":false}' "$base_url/api/group_listen/revoke_sync" \
+  | jq -e '.status == "ok" and .delete_on_revoke == false' >/dev/null
+assert_http_status 403 "${viewer_headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"group_id":-10001,"enabled":true}' "$base_url/api/group_listen/revoke_sync"
+curl -fsS "${headers[@]}" -H 'content-type: application/json' \
+  -d '{"group_id":-10001,"enabled":true}' "$base_url/api/group_listen/revoke_sync" \
+  | jq -e '.status == "ok" and .delete_on_revoke == true' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/group_listen/unverified_users?period=week" \
+  | jq -e '.status == "ok" and .total == 4 and (.data | all(.[]; .group_id == -10001 or .group_id == -10002))' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/group_listen/verified_users?period=week" \
+  | jq -e '.status == "ok" and .total == 0 and (.data | type == "array")' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/group_members?group_id=-10001" \
+  | jq -e '.status == "ok" and .total == 4 and (.data | all(.[]; .tenant_id == "beta-local" and .group_id == -10001))' >/dev/null
+curl -fsS "${other_headers[@]}" "$base_url/api/group_members?group_id=-20001" \
+  | jq -e '.status == "ok" and .total == 1 and .data[0].tenant_id == "other-tenant"' >/dev/null
+curl -fsS "${headers[@]}" -H 'content-type: application/json' \
+  -d '{"group_id":-10001,"user_ids":[99999],"action":"promote"}' \
+  "$base_url/api/group_members/admin_batch" \
+  | jq -e '.status == "ok" and .summary.total == 1 and .summary.success == 0 and .summary.failed == 1 and .failed[0].reason == "member_not_found"' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/group_messages?group_id=-10001&limit=50&offset=0" \
+  | jq -e '.status == "ok" and .total == 1 and .data[0].tenant_id == "beta-local" and .data[0].content == "original beta group message"' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/group_messages?group_id=-20001&limit=50&offset=0" \
+  | jq -e '.status == "ok" and .total == 0 and (.data | length) == 0' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/group_verify_config?group_id=-10001" \
+  | jq -e '.status == "ok" and .total == 1 and .data[0].tenant_id == "beta-local" and .data[0].verify_enabled == true' >/dev/null
+assert_http_status 400 "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"group_id":-10001,"verify_type":"invalid"}' "$base_url/api/group_verify_config"
+curl -fsS "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"group_id":-10001,"verify_enabled":true}' "$base_url/api/group_verify_config" \
+  | jq -e '.status == "ok" and .data.group_id == -10001 and .data.tenant_id == "beta-local"' >/dev/null
+verify_stats_contract_response=$(curl -fsS "${headers[@]}" "$base_url/api/group_stats/verify_stats?group_id=-10001")
+jq -e '.status == "ok" and (.data.total_verified | type == "number") and (.data.total_unverified | type == "number") and .data.total_unverified <= 4' \
+  <<<"$verify_stats_contract_response" >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/group_stats/verify_growth?group_id=-10001&days=7" \
+  | jq -e '.status == "ok" and .data.days == 7 and (.data.items | type == "array")' >/dev/null
+
+# Merchant contracts, including a real disposable payment order lifecycle.
+curl -fsS "${headers[@]}" "$base_url/api/merchant/ai/quota" \
+  | jq -e '.status == "ok" and (.data == null or (.data | type == "object"))' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/merchant/audit_logs" \
+  | jq -e '.status == "ok" and (.data | type == "array") and (.total | type == "number")' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/merchant/features" \
+  | jq -e '.status == "ok" and (.data | type == "array") and (.total | type == "number")' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/merchant/plans" \
+  | jq -e '.status == "ok" and any(.data[]; .plan_code == "beta-runtime-contract-plan")' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/merchant/subscription" \
+  | jq -e '.status == "ok" and (.data == null or (.data | type == "object"))' >/dev/null
+assert_http_status 403 "${viewer_headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"status":"active","onboarding_completed":true}' "$base_url/api/merchant/status"
+curl -fsS "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"status":"active","onboarding_completed":true}' "$base_url/api/merchant/status" \
+  | jq -e '.status == "ok" and .data.tenant_id == "beta-local" and .data.status == "active"' >/dev/null
+merchant_order_response=$(curl -fsS "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"plan_code":"beta-runtime-contract-plan"}' "$base_url/api/merchant/payment_orders")
+merchant_order_id=$(jq -er '.data.id' <<<"$merchant_order_response")
+jq -e '.status == "ok" and .data.plan_code == "beta-runtime-contract-plan" and .data.status == "pending"' <<<"$merchant_order_response" >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/merchant/payment_orders/latest" \
+  | jq -e --arg id "$merchant_order_id" '.status == "ok" and .data.id == $id' >/dev/null
+curl -fsS "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d "{\"order_id\":\"$merchant_order_id\"}" "$base_url/api/merchant/payment_orders/mark_paid" \
+  | jq -e '.status == "ok" and .data.status == "paid"' >/dev/null
+curl -fsS "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d "{\"order_id\":\"$merchant_order_id\",\"tx_hash\":\"beta-contract-tx\"}" \
+  "$base_url/api/merchant/payment_orders/submit_tx" \
+  | jq -e '.status == "ok" and .data.tx_hash == "beta-contract-tx" and .data.status == "paid"' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/merchant/payment_config" \
+  | jq -e '.status == "ok" and (.data == null or (.data | type == "object"))' >/dev/null
+
+# Monitor contracts use one real monitor and two tenant-scoped transactions.
+contract_monitor=$(curl -fsS "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"address":"TBetaContractMonitor","network":"TRC20","remark":"contract-before"}' \
+  "$base_url/api/monitors")
+contract_monitor_id=$(jq -er '.data.monitor_id' <<<"$contract_monitor")
+jq -e '.status == "ok" and .data.address == "TBetaContractMonitor" and .data.is_active == true' <<<"$contract_monitor" >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/monitors" \
+  | jq -e --argjson id "$contract_monitor_id" '.status == "ok" and any(.data[]; .monitor_id == $id and .address == "TBetaContractMonitor")' >/dev/null
+curl -fsS "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"remark":"contract-after"}' "$base_url/api/monitors/$contract_monitor_id/remark" \
+  | jq -e '.status == "ok" and .data.remark == "contract-after"' >/dev/null
+contract_now_ms=$(date +%s%3N)
+psql "$database_url" -v ON_ERROR_STOP=1 -v monitor_id="$contract_monitor_id" -v now_ms="$contract_now_ms" <<'SQL'
+INSERT INTO monitor_transactions
+  (tx_id, monitor_id, user_id, tenant_id, address, network, direction, amount, token_symbol, tx_timestamp, counterparty)
+VALUES
+  ('beta-contract-in', :monitor_id, 10001, 'beta-local', 'TBetaContractMonitor', 'TRC20', 'in', 12.50, 'USDT', :now_ms, 'TContractIn'),
+  ('beta-contract-out', :monitor_id, 10001, 'beta-local', 'TBetaContractMonitor', 'TRC20', 'out', 2.50, 'USDT', :now_ms - 1000, 'TContractOut');
+SQL
+curl -fsS "${headers[@]}" "$base_url/api/monitors/pnl_summary?period=month" \
+  | jq -e '.status == "ok" and .data.inflow == 12.5 and .data.outflow == 2.5 and .data.tx_count == 2' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/monitors/transactions?period=month&monitor_id=$contract_monitor_id" \
+  | jq -e '.status == "ok" and .count == 2 and ([.data[].tx_id] | sort) == ["beta-contract-in","beta-contract-out"]' >/dev/null
+curl -fsS "${other_headers[@]}" "$base_url/api/monitors" \
+  | jq -e '.status == "ok" and .total == 0 and (.data | length) == 0' >/dev/null
+curl -fsS "${headers[@]}" -X DELETE "$base_url/api/monitors/$contract_monitor_id" \
+  | jq -e '.status == "ok"' >/dev/null
+psql "$database_url" -v ON_ERROR_STOP=1 <<'SQL'
+DELETE FROM monitor_transactions
+WHERE tx_id IN ('beta-contract-in', 'beta-contract-out');
+SQL
+
+# Platform contracts, including merchant, plan, payment-config, and order APIs.
+platform_merchants_response=$(curl -sS "${platform_headers[@]}" "$base_url/api/platform/merchants")
+jq -e '.status == "ok" and (.data | type == "array") and (.total | type == "number") and .total >= 2' \
+  <<<"$platform_merchants_response" >/dev/null
+platform_owner_merchants_status=$(curl -sS -o "$contract_response" -w '%{http_code}' "${headers[@]}" "$base_url/api/platform/merchants")
+[[ "$platform_owner_merchants_status" == 403 ]]
+platform_merchant_response=$(curl -fsS "${platform_headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"merchant_name":"Beta Contract Merchant","tenant_id":"beta-contract-merchant"}' \
+  "$base_url/api/platform/merchants")
+platform_merchant_id=$(jq -er '.data.id' <<<"$platform_merchant_response")
+jq -e '.status == "ok" and .data.tenant_id == "beta-contract-merchant" and .data.status == "pending"' <<<"$platform_merchant_response" >/dev/null
+curl -fsS "${platform_headers[@]}" -X POST -H 'content-type: application/json' \
+  -d "{\"merchant_id\":\"$platform_merchant_id\",\"note\":\"runtime contract\"}" \
+  "$base_url/api/platform/merchants/confirm_onboarding" \
+  | jq -e '.status == "ok" and .data.onboarding_completed == true and .data.status == "active_free"' >/dev/null
+curl -fsS "${platform_headers[@]}" -X DELETE "$base_url/api/platform/merchants/$platform_merchant_id" \
+  | jq -e '.status == "ok"' >/dev/null
+curl -fsS "${platform_headers[@]}" "$base_url/api/platform/subscriptions" \
+  | jq -e '.status == "ok" and (.data | type == "array") and (.total | type == "number")' >/dev/null
+curl -fsS "${platform_headers[@]}" "$base_url/api/platform/payment_orders" \
+  | jq -e --arg id "$merchant_order_id" '.status == "ok" and any(.data[]; .id == $id)' >/dev/null
+curl -fsS "${platform_headers[@]}" -X POST -H 'content-type: application/json' \
+  -d "{\"order_id\":\"$merchant_order_id\"}" "$base_url/api/platform/payment_orders/confirm" \
+  | jq -e '.status == "ok" and .data.status == "confirmed"' >/dev/null
+curl -fsS "${platform_headers[@]}" -X POST -H 'content-type: application/json' \
+  -d "{\"order_id\":\"$merchant_order_id\"}" "$base_url/api/platform/payment_orders/reject" \
+  | jq -e '.status == "ok"' >/dev/null
+assert_http_status 404 "${platform_headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"order_id":"00000000-0000-4000-8000-000000000000"}' "$base_url/api/platform/payment_orders/reject"
+curl -fsS "${platform_headers[@]}" "$base_url/api/platform/plans" \
+  | jq -e '.status == "ok" and any(.data[]; .plan_code == "beta-runtime-contract-plan")' >/dev/null
+curl -fsS "${platform_headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"plan_code":"beta-runtime-contract-upsert","plan_name":"Beta Upsert","price_usdt":1.5,"duration_days":7,"features_json":{"beta":true},"status":"active"}' \
+  "$base_url/api/platform/plans" \
+  | jq -e '.status == "ok" and .data.plan_code == "beta-runtime-contract-upsert" and .data.features_json.beta == true' >/dev/null
+assert_http_status 403 "${headers[@]}" "$base_url/api/platform/payment_config"
+curl -fsS "${platform_headers[@]}" "$base_url/api/platform/payment_config" \
+  | jq -e '.status == "ok" and (.data == null or (.data | type == "object"))' >/dev/null
+curl -fsS "${platform_headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"chain_type":"TRC20","payment_address":"TbetaRuntimePaymentAddress","enabled":true}' \
+  "$base_url/api/platform/payment_config" \
+  | jq -e '.status == "ok" and .data.payment_address == "TbetaRuntimePaymentAddress" and .data.enabled == true' >/dev/null
+curl -fsS "${platform_headers[@]}" "$base_url/api/platform/payment_config" \
+  | jq -e '.status == "ok" and .data.payment_address == "TbetaRuntimePaymentAddress"' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/merchant/payment_config" \
+  | jq -e '.status == "ok" and .data.payment_address == "TbetaRuntimePaymentAddress"' >/dev/null
+
+# Unknown ad scan IDs must be tenant-scoped and fail closed.
+assert_http_status 404 "${headers[@]}" "$base_url/api/agent/ad-scans/beta-contract-missing"
+assert_http_status 403 "${platform_headers[@]}" "$base_url/api/agent/ad-scans/beta-contract-missing"
+
+# Legacy n8n advertisement compatibility routes must persist/query real
+# tenant-scoped group messages; they must not return fixed empty success data.
+curl -fsS "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"group_id":-10001,"tg_msg_id":92001,"sender_user_id":30001,"content":"beta ad contact @runtime_sales"}' \
+  "$base_url/api/ad-pipeline/events/group-message" \
+  | jq -e '.status == "ok" and .data.created == true and .data.tenant_id == "beta-local" and .data.mode == "postgres.group_messages"' >/dev/null
+[[ $(psql "$database_url" -Atc "SELECT count(*) FROM groups.group_messages WHERE tenant_id = 'beta-local' AND group_id = -10001 AND tg_msg_id = 92001 AND content = 'beta ad contact @runtime_sales'") == 1 ]]
+curl -fsS "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"days":2,"limit":20}' "$base_url/api/ad-pipeline/backfill" \
+  | jq -e '.status == "ok" and .data.scanned >= 1 and (.data.clusters | type == "array")' >/dev/null
+curl -fsS "${headers[@]}" "$base_url/api/advertisements?group_id=-10001&limit=20" \
+  | jq -e '.status == "ok" and .success == true and (.data.clusters | type == "array") and .data_complete == true' >/dev/null
+assert_http_status 404 "${headers[@]}" "$base_url/api/advertisements/beta-contract-missing"
+runtime_contract_static_only_cases=47
+
+runtime_contract_matrix_status=passed
 
 curl -fsS "${headers[@]}" "$base_url/api/users" \
   | jq -e '.total == 1 and .data[0].user_id == 30001 and .data[0].tenant_id == "beta-local"' >/dev/null
@@ -820,11 +1241,11 @@ curl -fsS http://127.0.0.1:18092/calls | jq -e '
   .[0].method == "sendMessage" and
   .[0].chat_id == 30005 and
   .[0].reply_to_message_id == 805 and
-  (.[0].text | contains("新用户") and contains("/help")) and
+  (.[0].text | contains("ref_xyz") and contains("未执行任何操作")) and
   .[0].reply_markup == null
 ' >/dev/null
 [[ $(psql "$database_url" -Atc "SELECT count(*) FROM chat.messages WHERE tenant_id = 'beta-local' AND from_userid = 30005 AND to_userid = 777000 AND tg_msg_id = 805") == 1 ]]
-[[ $(psql "$database_url" -Atc "SELECT count(*) FROM chat.messages WHERE tenant_id = 'beta-local' AND from_userid = 777000 AND to_userid = 30005 AND quoted_msg_id = 805 AND is_read = true AND content LIKE '%/help%'") == 1 ]]
+[[ $(psql "$database_url" -Atc "SELECT count(*) FROM chat.messages WHERE tenant_id = 'beta-local' AND from_userid = 777000 AND to_userid = 30005 AND quoted_msg_id = 805 AND is_read = true AND content LIKE '%ref_xyz%' AND content LIKE '%未执行任何操作%'") == 1 ]]
 send_beta_webhook '{"update_id":114,"message":{"message_id":806,"from":{"id":30005,"is_bot":false,"first_name":"新用户","username":"beta_inbound"},"chat":{"id":30005,"type":"private"},"date":1700000190,"text":"/help@beta_bot_777000"}}' \
   | jq -e '. == {}' >/dev/null
 send_beta_webhook '{"update_id":115,"message":{"message_id":807,"from":{"id":30005,"is_bot":false,"first_name":"新用户","username":"beta_inbound"},"chat":{"id":30005,"type":"private"},"date":1700000200,"text":"/start@another_bot"}}' \
@@ -1011,6 +1432,37 @@ for _ in $(seq 1 50); do
 done
 [[ "$policy_job_status" == completed ]]
 [[ $(psql "$database_url" -Atc "SELECT count(*) FROM groups.group_messages WHERE tenant_id = 'beta-local' AND group_id = -10001 AND tg_msg_id = 804 AND is_advertising = true AND ad_score >= 40 AND jsonb_array_length(ad_findings::jsonb) > 0") == 1 ]]
+[[ $(psql "$database_url" -Atc "SELECT count(*) FROM groups.ad_scan_jobs WHERE tenant_id = 'beta-local' AND source = 'realtime'") == 0 ]]
+
+psql "$database_url" -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO groups.ad_group_policies (tenant_id, group_id, is_enabled, activated_by, activated_at)
+VALUES ('beta-local', -10001, true, 'beta-runtime-check', now())
+ON CONFLICT (tenant_id, group_id) DO UPDATE
+SET is_enabled = true, activated_by = EXCLUDED.activated_by, activated_at = EXCLUDED.activated_at;
+SQL
+runtime_message_ts=$(date +%s)
+send_beta_webhook "{\"update_id\":130,\"message\":{\"message_id\":810,\"from\":{\"id\":30005,\"is_bot\":false,\"first_name\":\"新用户\",\"username\":\"beta_inbound\"},\"chat\":{\"id\":-10001,\"type\":\"supergroup\",\"title\":\"Beta Group One\"},\"date\":$runtime_message_ts,\"caption\":\"实时广告治理图片消息\",\"photo\":[{\"file_id\":\"rt-small-1\",\"file_unique_id\":\"rt-photo-unique\",\"width\":10,\"height\":10},{\"file_id\":\"rt-large-1\",\"file_unique_id\":\"rt-photo-unique\",\"width\":100,\"height\":100}]}}" \
+  | jq -e '. == {}' >/dev/null
+send_beta_webhook "{\"update_id\":131,\"message\":{\"message_id\":811,\"from\":{\"id\":30006,\"is_bot\":false,\"first_name\":\"新用户二\",\"username\":\"beta_inbound_two\"},\"chat\":{\"id\":-10001,\"type\":\"supergroup\",\"title\":\"Beta Group One\"},\"date\":$runtime_message_ts,\"caption\":\"实时广告治理图片消息\",\"photo\":[{\"file_id\":\"rt-large-2\",\"file_unique_id\":\"rt-photo-unique\",\"width\":100,\"height\":100}]}}" \
+  | jq -e '. == {}' >/dev/null
+send_beta_webhook "{\"update_id\":132,\"message\":{\"message_id\":812,\"from\":{\"id\":30007,\"is_bot\":false,\"first_name\":\"新用户三\",\"username\":\"beta_inbound_three\"},\"chat\":{\"id\":-10001,\"type\":\"supergroup\",\"title\":\"Beta Group One\"},\"date\":$runtime_message_ts,\"caption\":\"实时广告治理图片消息\",\"photo\":[{\"file_id\":\"rt-large-3\",\"file_unique_id\":\"rt-photo-unique\",\"width\":100,\"height\":100}]}}" \
+  | jq -e '. == {}' >/dev/null
+realtime_scan_status=
+for _ in $(seq 1 150); do
+  realtime_scan_status=$(psql "$database_url" -Atc "SELECT status FROM groups.ad_scan_jobs WHERE tenant_id = 'beta-local' AND group_id = -10001 AND source = 'realtime' AND job_id LIKE '%_-10001_812_%' ORDER BY created_at DESC LIMIT 1")
+  [[ "$realtime_scan_status" == completed ]] && break
+  sleep 0.1
+done
+[[ "$realtime_scan_status" == completed ]]
+[[ $(psql "$database_url" -Atc "SELECT count(*) FROM groups.group_messages WHERE tenant_id = 'beta-local' AND group_id = -10001 AND tg_msg_id BETWEEN 810 AND 812 AND media_unique_id = 'rt-photo-unique' AND message_ts = $runtime_message_ts AND length(ad_text_hash) = 32") == 3 ]]
+[[ $(psql "$database_url" -Atc "SELECT count(*) FROM groups.ad_scan_jobs WHERE tenant_id = 'beta-local' AND group_id = -10001 AND source = 'realtime'") == 3 ]]
+[[ $(psql "$database_url" -Atc "SELECT count(*) FROM job_queue WHERE tenant_id = 'beta-local' AND job_type = 'ad_scan_job' AND payload ->> 'source' = 'realtime' AND payload ->> 'group_id' = '-10001' AND payload ->> 'recent_only' = 'true'") == 3 ]]
+[[ $(psql "$database_url" -Atc "SELECT count(*) FROM groups.ad_scan_jobs WHERE tenant_id = 'beta-local' AND job_id LIKE '%_-10001_812_%' AND status = 'completed' AND total_messages = 3 AND candidate_clusters = 1 AND confirmed_clusters = 1 AND summary_json::jsonb ->> 'pending_clusters' = '0' AND summary_json::jsonb ->> 'recent_only' = 'true'") == 1 ]]
+[[ $(psql "$database_url" -Atc "SELECT count(*) FROM groups.ad_governance_clusters WHERE tenant_id = 'beta-local' AND job_id LIKE '%_-10001_812_%' AND classification = 'ad' AND classification_source = 'llm' AND confidence >= 0.95 AND occurrence_count = 3 AND recent_count = 3 AND sender_count = 3 AND action_tier = 'warn'") == 1 ]]
+[[ $(psql "$database_url" -Atc "SELECT count(*) FROM groups.ad_governance_cluster_messages cluster_message JOIN groups.ad_governance_clusters cluster USING (cluster_id) WHERE cluster.tenant_id = 'beta-local' AND cluster.job_id LIKE '%_-10001_812_%' AND cluster_message.tg_msg_id BETWEEN 810 AND 812 AND cluster_message.is_actionable = true") == 3 ]]
+# Jobs are non-dry-run, but the process explicitly unsets AD_AUTO_ENFORCE_ENABLED
+# and AD_DELETE_ENABLED. Classification must persist without any Telegram action.
+[[ $(psql "$database_url" -Atc "SELECT count(*) FROM groups.ad_governance_actions WHERE tenant_id = 'beta-local' AND job_id IN (SELECT job_id FROM groups.ad_scan_jobs WHERE tenant_id = 'beta-local' AND source = 'realtime')") == 0 ]]
 [[ $(psql "$database_url" -Atc "SELECT count(*) = 1 AND bool_and(keywords LIKE '%合作%' AND keywords LIKE '%定制需求%' AND profile_tags LIKE '%合作意向%') FROM tenant_saas.potential_users WHERE tenant_id = 'beta-local' AND user_id = 30005") == t ]]
 curl -fsS "${headers[@]}" "$base_url/api/potential_users?tag=%E5%90%88%E4%BD%9C%E6%84%8F%E5%90%91&keyword=beta_inbound" \
   | jq -e '.total == 1 and (.data | length) == 1 and .data[0].group_title == "Beta Group One" and .data[0].last_name == "测试"' >/dev/null
@@ -1056,4 +1508,5 @@ done
 curl -fsS http://127.0.0.1:18092/calls \
   | jq -e 'any(.[]; .bot_id == 777000 and .method == "deleteMessage" and .chat_id == -10001 and .message_id == 880) and ([.[] | select(.method == "deleteMessage" and .chat_id == -20001)] | length == 0)' >/dev/null
 
+write_runtime_report passed
 echo "Beta runtime gates passed: migrations, tenant-isolated webhook ingestion and chat, private commands and tenant auto-replies, group management and broadcast delivery, reminder cleanup, scheduled push tasks, finance, AI, config, Telegram secrets/webhooks, and group assignment APIs."

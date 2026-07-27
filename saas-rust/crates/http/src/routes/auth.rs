@@ -1,20 +1,15 @@
 // Auth routes - Login, OTP, CSRF Token, TMA login
-use axum::{
-    extract::{Query, State},
-    http::HeaderMap,
-    Json,
-};
+use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::Row;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::auth::resolve_scope;
+use crate::secret_crypto::SecretCipher;
 use crate::state::AppState;
 use tgbot_domain::error::{ApiError, ApiResult};
-use tgbot_domain::models::Role;
-use tgbot_domain::scope::Scope;
 
 /// In-memory OTP store: {otp: {token, expire_at, role, tenant_id, merchant_id, issued_for}}
 #[derive(Clone)]
@@ -131,20 +126,18 @@ fn build_session_token_payload(
     merchant_id: Option<i64>,
     issued_for: Option<&str>,
 ) -> Value {
+    let issued_at = chrono::Utc::now().timestamp();
     json!({
         "role": role,
         "actor_role": role,
         "tenant_id": tenant_id,
         "merchant_id": merchant_id,
         "issued_for": issued_for.unwrap_or(""),
-        "iat": chrono::Utc::now().timestamp()
+        "iat": issued_at,
+        "exp": issued_at + 24 * 60 * 60
     })
 }
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -154,15 +147,12 @@ type HmacSha256 = Hmac<Sha256>;
 const SESSION_SECRET_KEY: &[u8; 32] = b"01234567890123456789012345678901";
 
 // ============== FIXED: 使用真正的 HMAC-SHA256 ==============
-fn issue_session_token(
+pub(crate) fn issue_session_token(
     role: &str,
     tenant_id: &str,
     merchant_id: Option<i64>,
     issued_for: Option<&str>,
 ) -> String {
-    use hmac::Mac;
-    use std::time::{SystemTime, UNIX_EPOCH}; // Add this to disambiguate
-
     let payload = build_session_token_payload(role, tenant_id, merchant_id, issued_for);
     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
 
@@ -178,36 +168,8 @@ fn issue_session_token(
     format!("{}.{}", payload_b64, signature)
 }
 
-fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
-
-        result.push(ALPHABET[b0 >> 2] as char);
-        result.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-
-        if chunk.len() > 1 {
-            result.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
-        } else {
-            result.push('=');
-        }
-
-        if chunk.len() > 2 {
-            result.push(ALPHABET[b2 & 0x3f] as char);
-        } else {
-            result.push('=');
-        }
-    }
-
-    result
-}
-
 // ============== FIXED: 使用真正的 HMAC-SHA256 验证 ==============
-fn verify_session_token(token: &str) -> Option<Value> {
+pub(crate) fn verify_session_token(token: &str) -> Option<Value> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 2 {
         return None;
@@ -230,7 +192,12 @@ fn verify_session_token(token: &str) -> Option<Value> {
     // Decode payload
     let decoded = BASE64.decode(payload_b64).ok()?;
     let json_str = String::from_utf8(decoded).ok()?;
-    serde_json::from_str(&json_str).ok()
+    let payload: Value = serde_json::from_str(&json_str).ok()?;
+    let exp = payload.get("exp").and_then(Value::as_i64)?;
+    if exp <= chrono::Utc::now().timestamp() {
+        return None;
+    }
+    Some(payload)
 }
 
 // 恒定时间比较 - 防止时序攻击
@@ -245,44 +212,6 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
         result |= a_bytes[i] ^ b_bytes[i];
     }
     result == 0
-}
-
-fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
-    let input = input.trim_end_matches('=');
-    let mut output = Vec::new();
-
-    let chars: Vec<u8> = input
-        .chars()
-        .filter_map(|c| {
-            if c >= 'A' && c <= 'Z' {
-                Some(c as u8 - 65)
-            } else if c >= 'a' && c <= 'z' {
-                Some(c as u8 - 71)
-            } else if c >= '0' && c <= '9' {
-                Some(c as u8 + 4)
-            } else if c == '+' {
-                Some(62)
-            } else if c == '/' {
-                Some(63)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for chunk in chars.chunks(4) {
-        if chunk.len() >= 2 {
-            output.push((chunk[0] << 2) | (chunk[1] >> 4));
-        }
-        if chunk.len() >= 3 {
-            output.push((chunk[1] << 4) | (chunk[2] >> 2));
-        }
-        if chunk.len() >= 4 {
-            output.push((chunk[2] << 6) | chunk[3]);
-        }
-    }
-
-    Ok(output)
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,13 +369,19 @@ pub async fn login_tma(
         return Err(ApiError::Unauthorized);
     }
 
-    // 从 init_data 提取用户信息
+    // 从 init_data 提取用户信息。Telegram 的 user.id 是后续租户归属
+    // 校验的唯一可信用户标识；没有它不能把一个已签名的 payload 映射成
+    // merchant_owner 或 platform_admin。
     let auth_date = parsed.get("auth_date").and_then(|v| v.parse::<i64>().ok());
     let user_json: Option<String> = match parsed.get("user") {
         Some(v) => Some(v.to_string()),
         None => None,
     };
     let user_json_ref: Option<&str> = user_json.as_deref();
+    let telegram_user_id = user_json_ref
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|user| user.get("id").and_then(Value::as_i64))
+        .ok_or(ApiError::Unauthorized)?;
 
     // 检查 auth_date 是否在合理范围内 (24小时内)
     if let Some(ts) = auth_date {
@@ -454,16 +389,57 @@ pub async fn login_tma(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        if (now - ts) > 86400 {
+        if now.saturating_sub(ts) > 86400 || ts > now.saturating_add(300) {
             return Err(ApiError::BadRequest("init_data expired".to_string()));
         }
     }
 
-    // 解析用户信息
-    let (role, tenant_id) = if tenant_hint.is_empty() {
-        ("platform_admin".to_string(), "".to_string())
+    // tenant_hint 是客户端输入，不能单独决定会话角色。平台会话必须对应
+    // 已登记的 platform_admin；商户会话必须对应该租户的 owner/member。
+    let (role, tenant_id) = if tenant_hint.trim().is_empty() {
+        let is_platform_admin: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM auth.users u
+                 JOIN auth.saas_user_roles r ON r.user_id = u.id
+                 WHERE u.tg_user_id = $1 AND r.role = 'platform_admin'
+             )",
+        )
+        .bind(telegram_user_id)
+        .fetch_one(state.db()?)
+        .await?;
+        if !is_platform_admin {
+            return Err(ApiError::Unauthorized);
+        }
+        ("platform_admin".to_string(), String::new())
     } else {
-        ("merchant_owner".to_string(), tenant_hint)
+        let member_role: Option<String> = sqlx::query_scalar(
+            "SELECT CASE
+                 WHEN m.owner_tg_user_id = $1 THEN 'merchant_owner'
+                 ELSE tm.role
+             END
+             FROM merchants m
+             LEFT JOIN auth.users u ON u.tg_user_id = $1
+             LEFT JOIN tenant_memberships tm
+               ON tm.user_id = u.id AND tm.tenant_id = m.tenant_id
+             WHERE m.tenant_id = $2
+               AND m.status IN ('active', 'active_free')
+               AND (m.owner_tg_user_id = $1 OR tm.user_id IS NOT NULL)
+             ORDER BY CASE WHEN m.owner_tg_user_id = $1 THEN 0 ELSE 1 END
+             LIMIT 1",
+        )
+        .bind(telegram_user_id)
+        .bind(tenant_hint.trim())
+        .fetch_optional(state.db()?)
+        .await?;
+
+        let role = match member_role.as_deref() {
+            Some("merchant_owner") | Some("merchant_admin") | Some("merchant_viewer") => {
+                member_role.unwrap()
+            }
+            _ => return Err(ApiError::Unauthorized),
+        };
+        (role, tenant_hint.trim().to_string())
     };
 
     let session_token = issue_session_token(&role, &tenant_id, merchant_id_hint, user_json_ref);
@@ -545,18 +521,46 @@ async fn get_bot_token_for_tma(
     tenant_hint: &str,
     merchant_id_hint: Option<i64>,
 ) -> ApiResult<String> {
-    // 简化实现: 返回配置中的 bot_token
-    // 生产环境应从数据库或密钥管理服务获取
-    let token = std::env::var("TMA_BOT_TOKEN")
-        .or_else(|_| std::env::var("BOT_TOKEN"))
-        .unwrap_or_default();
-
-    if token.is_empty() {
-        // 如果没有配置，返回测试用 token (仅用于开发)
-        tracing::warn!("No bot_token configured for TMA login");
-        return Ok("test_bot_token_for_development".to_string());
+    let tenant_id = tenant_hint.trim();
+    if tenant_id.is_empty() {
+        // 平台登录可以使用专门的 TMA token；缺失时必须拒绝，不能回退到
+        // 可预测的开发 token。
+        let token = std::env::var("TMA_BOT_TOKEN")
+            .or_else(|_| std::env::var("BOT_TOKEN"))
+            .unwrap_or_else(|_| state.config.bot_token.clone());
+        if token.trim().is_empty() {
+            tracing::warn!("No bot_token configured for TMA login");
+            return Err(ApiError::Unauthorized);
+        }
+        return Ok(token);
     }
 
+    // 商户 token 必须从该 tenant 的加密 secret ref 解密；禁止使用全局
+    // BOT_TOKEN，否则任意 tenant_hint 都可能借用另一租户的签名密钥。
+    let row = sqlx::query(
+        "SELECT secrets.secret_ref
+         FROM merchants m
+         JOIN tenant_secret_refs secrets
+           ON secrets.tenant_id = m.tenant_id
+          AND secrets.secret_key = 'TELEGRAM_BOT_TOKEN'
+         WHERE m.tenant_id = $1
+           AND ($2::bigint IS NULL OR m.legacy_merchant_id = $2)
+           AND m.status IN ('active', 'active_free')",
+    )
+    .bind(tenant_id)
+    .bind(merchant_id_hint)
+    .fetch_optional(state.db()?)
+    .await?
+    .ok_or(ApiError::Unauthorized)?;
+    let secret_ref: String = row.try_get("secret_ref")?;
+    let cipher = SecretCipher::from_encoded_key(&state.config.secret_encryption_key)
+        .map_err(ApiError::BadRequest)?;
+    let token = cipher
+        .decrypt(tenant_id, "TELEGRAM_BOT_TOKEN", &secret_ref)
+        .map_err(ApiError::BadRequest)?;
+    if token.trim().is_empty() {
+        return Err(ApiError::Unauthorized);
+    }
     Ok(token)
 }
 

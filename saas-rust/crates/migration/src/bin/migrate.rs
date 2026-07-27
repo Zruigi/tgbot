@@ -1,18 +1,58 @@
 //! SQLite to PostgreSQL migration tool for tgbot
 
 use anyhow::{anyhow, Context, Result};
-use std::env;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::Row;
+use std::env;
 use tgbot_migration::{
-    sqlite_reader::SqliteConfig,
-    migrate_merchants::migrate_merchants,
-    migrate_messages::migrate_messages,
-    migrate_groups::migrate_groups,
-    migrate_group_messages::migrate_group_messages,
-    migrate_users::migrate_users,
-    migrate_small_tables::migrate_small_tables,
-    verify_counts::verify_all_counts,
+    migrate_group_messages::migrate_group_messages, migrate_groups::migrate_groups,
+    migrate_merchants::migrate_merchants, migrate_messages::migrate_messages,
+    migrate_small_tables::migrate_small_tables, migrate_users::migrate_users,
+    sqlite_reader::SqliteConfig, verify_counts::verify_all_counts,
 };
+
+async fn audit_migrator_role(pool: &sqlx::PgPool, dedicated_role: bool) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT current_user AS role_name, rolsuper, rolcreaterole, rolcreatedb, rolbypassrls
+         FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to inspect PostgreSQL migration role")?;
+    let role_name: String = row.try_get("role_name")?;
+    let is_super: bool = row.try_get("rolsuper")?;
+    let can_create_role: bool = row.try_get("rolcreaterole")?;
+    let can_create_db: bool = row.try_get("rolcreatedb")?;
+    let bypass_rls: bool = row.try_get("rolbypassrls")?;
+
+    if dedicated_role {
+        if !bypass_rls {
+            return Err(anyhow!(
+                "MIGRATOR_DATABASE_URL role {role_name} must have BYPASSRLS"
+            ));
+        }
+        if is_super || can_create_role || can_create_db {
+            return Err(anyhow!(
+                "migration role {role_name} is over-privileged (superuser/create-role/create-db)"
+            ));
+        }
+        tracing::info!(
+            role = %role_name,
+            bypass_rls,
+            "migration role preflight passed; dedicated role is not superuser"
+        );
+    } else {
+        tracing::warn!(
+            role = %role_name,
+            bypass_rls,
+            is_super,
+            can_create_role,
+            can_create_db,
+            "using DATABASE_URL for migration; dedicated BYPASSRLS role was not supplied"
+        );
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,6 +90,7 @@ async fn main() -> Result<()> {
         .context("Failed to connect to PostgreSQL")?;
 
     tracing::info!("Connected to PostgreSQL database");
+    audit_migrator_role(&pg_pool, is_migrator_role).await?;
 
     // Run migrations
     tracing::info!("Starting data migration...");
@@ -59,57 +100,97 @@ async fn main() -> Result<()> {
     let merchant_stats = migrate_merchants(&sqlite_config, &pg_pool)
         .await
         .context("Failed to migrate merchants")?;
-    tracing::info!("Merchants: {} migrated, {} skipped, {} errors",
-        merchant_stats.migrated, merchant_stats.skipped, merchant_stats.errors);
+    tracing::info!(
+        "Merchants: {} migrated, {} skipped, {} errors",
+        merchant_stats.migrated,
+        merchant_stats.skipped,
+        merchant_stats.errors
+    );
 
     // 2. Migrate messages (private chat messages)
     tracing::info!("\n=== Phase 2: Private Chat Messages ===");
     let message_stats = migrate_messages(&sqlite_config, &pg_pool, 100)
         .await
         .context("Failed to migrate messages")?;
-    tracing::info!("Messages: {} migrated, {} skipped, {} errors",
-        message_stats.migrated, message_stats.skipped, message_stats.errors);
+    tracing::info!(
+        "Messages: {} migrated, {} skipped, {} errors",
+        message_stats.migrated,
+        message_stats.skipped,
+        message_stats.errors
+    );
 
     // 3. Migrate groups and members
     tracing::info!("\n=== Phase 3: Groups and Members ===");
     let group_stats = migrate_groups(&sqlite_config, &pg_pool)
         .await
         .context("Failed to migrate groups")?;
-    tracing::info!("Groups: {} migrated, {} skipped, {} errors",
-        group_stats.groups.migrated, group_stats.groups.skipped, group_stats.groups.errors);
-    tracing::info!("Members: {} migrated, {} skipped, {} errors",
-        group_stats.members.migrated, group_stats.members.skipped, group_stats.members.errors);
+    tracing::info!(
+        "Groups: {} migrated, {} skipped, {} errors",
+        group_stats.groups.migrated,
+        group_stats.groups.skipped,
+        group_stats.groups.errors
+    );
+    tracing::info!(
+        "Members: {} migrated, {} skipped, {} errors",
+        group_stats.members.migrated,
+        group_stats.members.skipped,
+        group_stats.members.errors
+    );
 
     // 4. Migrate group messages
     tracing::info!("\n=== Phase 4: Group Messages ===");
     let group_msg_stats = migrate_group_messages(&sqlite_config, &pg_pool, 500)
         .await
         .context("Failed to migrate group messages")?;
-    tracing::info!("Group Messages: {} migrated, {} skipped, {} errors",
-        group_msg_stats.migrated, group_msg_stats.skipped, group_msg_stats.errors);
+    tracing::info!(
+        "Group Messages: {} migrated, {} skipped, {} errors",
+        group_msg_stats.migrated,
+        group_msg_stats.skipped,
+        group_msg_stats.errors
+    );
 
     // 5. Migrate users and admin inbox
     tracing::info!("\n=== Phase 5: Users and Admin Inbox ===");
     let user_stats = migrate_users(&sqlite_config, &pg_pool)
         .await
         .context("Failed to migrate users")?;
-    tracing::info!("Users: {} migrated, {} skipped, {} errors",
-        user_stats.users.migrated, user_stats.users.skipped, user_stats.users.errors);
-    tracing::info!("Admin Inbox: {} migrated, {} skipped, {} errors, {} virtual_assistant_excluded",
-        user_stats.admin_inbox.migrated, user_stats.admin_inbox.skipped,
-        user_stats.admin_inbox.errors, user_stats.admin_inbox.virtual_assistant_excluded);
+    tracing::info!(
+        "Users: {} migrated, {} skipped, {} errors",
+        user_stats.users.migrated,
+        user_stats.users.skipped,
+        user_stats.users.errors
+    );
+    tracing::info!(
+        "Admin Inbox: {} migrated, {} skipped, {} errors, {} virtual_assistant_excluded",
+        user_stats.admin_inbox.migrated,
+        user_stats.admin_inbox.skipped,
+        user_stats.admin_inbox.errors,
+        user_stats.admin_inbox.virtual_assistant_excluded
+    );
 
     // 6. Migrate small tables (plans, address_monitors, monitor_transactions)
     tracing::info!("\n=== Phase 6: Small Tables ===");
     let small_stats = migrate_small_tables(&sqlite_config, &pg_pool)
         .await
         .context("Failed to migrate small tables")?;
-    tracing::info!("Plans: {} migrated, {} skipped, {} errors",
-        small_stats.plans.migrated, small_stats.plans.skipped, small_stats.plans.errors);
-    tracing::info!("Address Monitors: {} migrated, {} skipped, {} errors",
-        small_stats.address_monitors.migrated, small_stats.address_monitors.skipped, small_stats.address_monitors.errors);
-    tracing::info!("Monitor Transactions: {} migrated, {} skipped, {} errors",
-        small_stats.monitor_transactions.migrated, small_stats.monitor_transactions.skipped, small_stats.monitor_transactions.errors);
+    tracing::info!(
+        "Plans: {} migrated, {} skipped, {} errors",
+        small_stats.plans.migrated,
+        small_stats.plans.skipped,
+        small_stats.plans.errors
+    );
+    tracing::info!(
+        "Address Monitors: {} migrated, {} skipped, {} errors",
+        small_stats.address_monitors.migrated,
+        small_stats.address_monitors.skipped,
+        small_stats.address_monitors.errors
+    );
+    tracing::info!(
+        "Monitor Transactions: {} migrated, {} skipped, {} errors",
+        small_stats.monitor_transactions.migrated,
+        small_stats.monitor_transactions.skipped,
+        small_stats.monitor_transactions.errors
+    );
 
     // Verify data integrity
     tracing::info!("\n=== Verification Phase ===");

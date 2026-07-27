@@ -98,7 +98,7 @@ pub struct TransactionInfo {
     pub to_address: Option<String>,
     #[serde(rename = "contract_type")]
     pub contract_type: Option<String>,
-    #[serde(rename = "contract_type")]
+    #[serde(rename = "amount", default)]
     pub amount: Option<i64>,
     #[serde(rename = "contract")]
     pub contract: Option<Value>,
@@ -185,11 +185,7 @@ impl TronGridClient {
 
     /// Get TRC20 token balance for an address and token contract.
     #[instrument(skip(self))]
-    pub async fn get_trc20_balance(
-        &self,
-        address: &str,
-        token_contract: &str,
-    ) -> Result<String> {
+    pub async fn get_trc20_balance(&self, address: &str, token_contract: &str) -> Result<String> {
         let url = format!(
             "{}/v1/accounts/{}/trc20/{}",
             self.config.base_url, address, token_contract
@@ -236,11 +232,7 @@ impl TronGridClient {
 
     /// Get transaction history for an address.
     #[instrument(skip(self), fields(address = %address))]
-    pub async fn get_account_transactions(
-        &self,
-        address: &str,
-        limit: usize,
-    ) -> Result<Value> {
+    pub async fn get_account_transactions(&self, address: &str, limit: usize) -> Result<Value> {
         let url = format!(
             "{}/v1/accounts/{}/transactions?limit={}",
             self.config.base_url, address, limit
@@ -331,5 +323,53 @@ mod tests {
         std::env::remove_var("TRONGRID_API_KEY");
         let cfg = TronGridConfig::from_env();
         assert!(cfg.is_err());
+    }
+
+    #[test]
+    fn test_transaction_info_contract_type_and_amount() {
+        // TronGrid transaction info with both contract_type and amount at top level
+        let json = r#"{
+            "txID": "abc123",
+            "block_timestamp": 1700000000,
+            "owner_address": "TWallet1",
+            "to_address": "TWallet2",
+            "contract_type": "Transfer",
+            "amount": 1000000,
+            "contract": {"type_url": "TransferContract", "value": {"amount": 1000000}}
+        }"#;
+        let tx: TransactionInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(tx.tx_id.as_deref(), Some("abc123"));
+        assert_eq!(tx.contract_type.as_deref(), Some("Transfer"));
+        assert_eq!(tx.amount, Some(1_000_000));
+    }
+
+    #[test]
+    fn test_transaction_info_amount_absent() {
+        // TronGrid transaction info without top-level amount (e.g., non-transfer contracts)
+        let json = r#"{
+            "txID": "def456",
+            "block_timestamp": 1700000001,
+            "owner_address": "TWallet1",
+            "to_address": "TWallet2",
+            "contract_type": "TriggerSmartContract",
+            "contract": {"type_url": "TriggerSmartContract", "value": {}}
+        }"#;
+        let tx: TransactionInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(tx.contract_type.as_deref(), Some("TriggerSmartContract"));
+        // amount is absent → default to None
+        assert_eq!(tx.amount, None);
+    }
+
+    #[test]
+    fn test_transaction_info_amount_zero() {
+        // Transaction with amount = 0
+        let json = r#"{
+            "txID": "ghi789",
+            "contract_type": "Transfer",
+            "amount": 0
+        }"#;
+        let tx: TransactionInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(tx.contract_type.as_deref(), Some("Transfer"));
+        assert_eq!(tx.amount, Some(0));
     }
 }

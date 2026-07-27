@@ -160,7 +160,11 @@ fn test_real_group_id_override_injection_defense() {
     let llm_group_id = "999";
     let real_group_id = Some("123");
     let effective = override_group_id(llm_group_id, real_group_id);
-    assert_eq!(effective, Some("123".to_string()), "Real group_id should override LLM value");
+    assert_eq!(
+        effective,
+        Some("123".to_string()),
+        "Real group_id should override LLM value"
+    );
 }
 
 #[test]
@@ -169,7 +173,11 @@ fn test_real_group_id_none_fallback() {
     let llm_group_id = "456";
     let real_group_id = None;
     let effective = override_group_id(llm_group_id, real_group_id);
-    assert_eq!(effective, Some("456".to_string()), "LLM group_id should be used when real is None");
+    assert_eq!(
+        effective,
+        Some("456".to_string()),
+        "LLM group_id should be used when real is None"
+    );
 }
 
 // ============================================================================
@@ -251,7 +259,9 @@ fn parse_intent_analysis(json_text: &str) -> Result<serde_json::Value, serde_jso
 
 /// Override LLM-extracted group_id with system real value (injection defense)
 fn override_group_id(llm_value: &str, real_value: Option<&str>) -> Option<String> {
-    real_value.map(|v| v.to_string()).or_else(|| Some(llm_value.to_string()))
+    real_value
+        .map(|v| v.to_string())
+        .or_else(|| Some(llm_value.to_string()))
 }
 
 /// Simple regex capture helper (for testing without regex crate)
@@ -274,7 +284,8 @@ fn extract_regex_capture(pattern: &str, text: &str) -> Option<String> {
                 return Some(current_num);
             }
         }
-    } else if pattern.contains(r"(\d{1,3})") && (pattern.contains("小时") || pattern.contains("h")) {
+    } else if pattern.contains(r"(\d{1,3})") && (pattern.contains("小时") || pattern.contains("h"))
+    {
         // Extract hour count
         if let Some(idx) = text.find("小时").or_else(|| text.find("h")) {
             let before = &text[..idx];
@@ -310,21 +321,30 @@ fn test_gate_off_confirm_false_dry_run() {
 fn test_gate_off_confirm_true_dry_run() {
     // Gate OFF, confirm=true → STILL dry_run=true (gate supremacy), no mutations
     let dry_run = compute_dry_run(true, false);
-    assert!(dry_run, "Gate OFF should force dry_run regardless of confirm");
+    assert!(
+        dry_run,
+        "Gate OFF should force dry_run regardless of confirm"
+    );
 }
 
 #[test]
 fn test_gate_on_confirm_false_dry_run() {
     // Gate ON, confirm=false → dry_run=true, no mutations
     let dry_run = compute_dry_run(false, true);
-    assert!(dry_run, "confirm=false should force dry_run even when gate ON");
+    assert!(
+        dry_run,
+        "confirm=false should force dry_run even when gate ON"
+    );
 }
 
 #[test]
 fn test_gate_on_confirm_true_real_execution() {
     // Gate ON, confirm=true → dry_run=false, real mutations allowed
     let dry_run = compute_dry_run(true, true);
-    assert!(!dry_run, "Gate ON + confirm=true should allow real execution");
+    assert!(
+        !dry_run,
+        "Gate ON + confirm=true should allow real execution"
+    );
 }
 
 // ============================================================================
@@ -345,7 +365,10 @@ fn test_telegram_unavailable_fail_closed() {
     let dry_run = false;
 
     let should_refuse = telegram_client.is_none() && !dry_run;
-    assert!(should_refuse, "Missing Telegram client in real-execution mode must refuse deletion");
+    assert!(
+        should_refuse,
+        "Missing Telegram client in real-execution mode must refuse deletion"
+    );
 }
 
 // ============================================================================

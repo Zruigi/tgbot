@@ -41,8 +41,7 @@ impl PaddleOCRConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
-            default_lang: std::env::var("PADDLEOCR_DEFAULT_LANG")
-                .unwrap_or_else(|_| "ch".into()),
+            default_lang: std::env::var("PADDLEOCR_DEFAULT_LANG").unwrap_or_else(|_| "ch".into()),
         })
     }
 }
@@ -192,7 +191,9 @@ impl PaddleOCRClient {
         let encoded = base64::engine::general_purpose::STANDARD.encode(image_bytes);
         self.ocr(&OcrRequest {
             image: encoded,
-            lang: lang.map(|l| l.to_string()).or(Some(self.config.default_lang.clone())),
+            lang: lang
+                .map(|l| l.to_string())
+                .or(Some(self.config.default_lang.clone())),
             use_angle_cls: Some(true),
             use_gpu: None,
         })
@@ -200,11 +201,7 @@ impl PaddleOCRClient {
     }
 
     /// Convenience: extract plain text from an image.
-    pub async fn extract_text(
-        &self,
-        image_bytes: &[u8],
-        lang: Option<&str>,
-    ) -> Result<String> {
+    pub async fn extract_text(&self, image_bytes: &[u8], lang: Option<&str>) -> Result<String> {
         let resp = self.ocr_image_bytes(image_bytes, lang).await?;
         // Prefer the joined `text` field if present
         if let Some(text) = &resp.text {

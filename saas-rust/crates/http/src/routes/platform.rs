@@ -326,10 +326,15 @@ pub async fn reject_payment_order(
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     scope.require_platform()?;
-    sqlx::query("UPDATE payment_orders SET status = 'rejected', updated_at = now() WHERE id = $1")
-        .bind(body.order_id)
-        .execute(state.db()?)
-        .await?;
+    let result = sqlx::query(
+        "UPDATE payment_orders SET status = 'rejected', updated_at = now() WHERE id = $1",
+    )
+    .bind(body.order_id)
+    .execute(state.db()?)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("payment_order_not_found".into()));
+    }
     Ok(Json(json!({"status": "ok"})))
 }
 
@@ -337,7 +342,24 @@ pub async fn get_payment_config(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let _scope = resolve_scope(&state, &headers).await?;
+    let scope = resolve_scope(&state, &headers).await?;
+    scope.require_platform()?;
+    payment_config_response(state).await
+}
+
+/// Merchant-scoped compatibility alias. The platform endpoint above remains
+/// platform-admin-only; keeping a separate handler prevents the alias from
+/// accidentally widening the platform route's authorization.
+pub async fn get_merchant_payment_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    scope.require_merchant()?;
+    payment_config_response(state).await
+}
+
+async fn payment_config_response(state: AppState) -> ApiResult<Json<Value>> {
     let row = sqlx::query("SELECT * FROM platform_payment_configs WHERE id = 1")
         .fetch_optional(state.db()?)
         .await?;
@@ -385,7 +407,9 @@ pub async fn runtime_statuses(
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     scope.require_platform()?;
-    Ok(Json(json!({"status": "ok", "data": [], "total": 0})))
+    Err(ApiError::NotImplemented(
+        "runtime_statuses_not_available_use_worker_telemetry".into(),
+    ))
 }
 
 // POST /api/platform/subscriptions/downgrade - Run subscription downgrade for expired subscriptions

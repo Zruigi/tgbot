@@ -78,8 +78,14 @@ impl ToolDefinition {
     /// 转换为 LLM 可用的 function calling schema
     pub fn schema_for_llm(&self) -> serde_json::Value {
         let params = &self.parameters;
-        let properties = params.get("properties").cloned().unwrap_or(serde_json::json!({}));
-        let required = params.get("required").cloned().unwrap_or(serde_json::json!([]));
+        let properties = params
+            .get("properties")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let required = params
+            .get("required")
+            .cloned()
+            .unwrap_or(serde_json::json!([]));
 
         serde_json::json!({
             "type": "function",
@@ -389,7 +395,11 @@ pub trait Tool: Send + Sync {
     }
 
     /// 执行工具逻辑
-    async fn execute(&self, params: &serde_json::Value, context: &AgentContext) -> ToolExecuteResult;
+    async fn execute(
+        &self,
+        params: &serde_json::Value,
+        context: &AgentContext,
+    ) -> ToolExecuteResult;
 
     /// 转换为 ToolDefinition
     fn definition(&self) -> ToolDefinition {

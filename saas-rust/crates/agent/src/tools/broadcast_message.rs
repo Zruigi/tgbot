@@ -4,9 +4,13 @@
 use crate::schema::{AgentContext, Tool, ToolExecuteResult};
 use async_trait::async_trait;
 use serde_json::Value;
+use sqlx::PgPool;
 use std::sync::Arc;
 use tgbot_integrations::telegram::{SendMessageParams, TelegramClient};
 use tracing::{error, info, warn};
+
+const MAX_BROADCAST_TARGETS: usize = 500;
+const MAX_BROADCAST_TEXT_CHARS: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // BroadcastMessageTool
@@ -19,6 +23,7 @@ use tracing::{error, info, warn};
 /// - 纯文本、带图片、自定义按钮
 /// - 目标类型：users / groups / all
 pub struct BroadcastMessageTool {
+    pool: Option<Arc<PgPool>>,
     telegram_client: Option<Arc<TelegramClient>>,
 }
 
@@ -26,6 +31,7 @@ impl BroadcastMessageTool {
     /// Create a new tool without Telegram client (for testing)
     pub fn new() -> Self {
         Self {
+            pool: None,
             telegram_client: None,
         }
     }
@@ -33,6 +39,14 @@ impl BroadcastMessageTool {
     /// Create a tool with Telegram client for real message sending
     pub fn with_telegram(client: Arc<TelegramClient>) -> Self {
         Self {
+            pool: None,
+            telegram_client: Some(client),
+        }
+    }
+
+    pub fn with_pool_and_telegram(pool: Arc<PgPool>, client: Arc<TelegramClient>) -> Self {
+        Self {
+            pool: Some(pool),
             telegram_client: Some(client),
         }
     }
@@ -101,7 +115,7 @@ impl Tool for BroadcastMessageTool {
         })
     }
 
-    async fn execute(&self, params: &Value, _context: &AgentContext) -> ToolExecuteResult {
+    async fn execute(&self, params: &Value, context: &AgentContext) -> ToolExecuteResult {
         let content = params
             .get("content")
             .and_then(|v| v.as_str())
@@ -110,6 +124,29 @@ impl Tool for BroadcastMessageTool {
 
         if content.is_empty() {
             return ToolExecuteResult::fail("消息内容不能为空");
+        }
+        if content.chars().count() > MAX_BROADCAST_TEXT_CHARS {
+            return ToolExecuteResult::fail("消息内容不能超过 4096 个字符");
+        }
+
+        if self.telegram_client.is_none() {
+            return ToolExecuteResult::fail("Telegram 客户端未配置，广播未执行");
+        }
+
+        if params
+            .get("include_image")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return ToolExecuteResult::fail("广播图片发送尚未接通，广播未执行");
+        }
+
+        if params
+            .get("do_translate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return ToolExecuteResult::fail("广播自动翻译尚未接通，广播未执行");
         }
 
         info!(
@@ -125,12 +162,14 @@ impl Tool for BroadcastMessageTool {
             .get("target_type")
             .and_then(|v| v.as_str())
             .unwrap_or("users");
+        if !matches!(target_type, "users" | "groups" | "all") {
+            return ToolExecuteResult::fail("target_type 必须是 users、groups 或 all");
+        }
 
-        let target_ids = params
-            .get("target_ids")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>())
-            .unwrap_or_default();
+        let target_ids = match parse_target_ids(params.get("target_ids")) {
+            Ok(ids) => ids,
+            Err(error) => return ToolExecuteResult::fail(&error),
+        };
 
         let buttons = params
             .get("buttons")
@@ -138,28 +177,27 @@ impl Tool for BroadcastMessageTool {
             .cloned()
             .unwrap_or_default();
 
-        let _do_translate = params
-            .get("do_translate")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
         // 执行广播
         match self
-            .execute_broadcast(target_type, &target_ids, content, &buttons)
+            .execute_broadcast(target_type, &target_ids, content, &buttons, context)
             .await
         {
             Ok(result) => {
                 let total = result.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                 let success = result.get("success").and_then(|v| v.as_u64()).unwrap_or(0);
                 let failed = result.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
-
-                ToolExecuteResult::ok_with_data(
-                    result,
-                    &format!(
+                ToolExecuteResult {
+                    success: success > 0,
+                    data: Some(result),
+                    message: Some(format!(
                         "广播完成: 总计{}个目标, 成功{}个, 失败{}个",
                         total, success, failed
-                    ),
-                )
+                    )),
+                    action_taken: success > 0,
+                    needs_confirmation: false,
+                    requires_llm_generation: false,
+                    generated_content: None,
+                }
             }
             Err(e) => {
                 error!("BroadcastTool 执行失败: {}", e);
@@ -177,31 +215,22 @@ impl BroadcastMessageTool {
         target_ids: &[i64],
         content: &str,
         buttons: &[Value],
+        context: &AgentContext,
     ) -> Result<serde_json::Value, String> {
-        // 模拟广播结果（实际需接入 tgbot-services / tgbot-bot）
-        // TODO: 接入真实 Bot 实例进行消息发送
+        let (user_ids, chat_ids) = self
+            .get_target_lists(target_type, target_ids, context)
+            .await?;
 
-        // 模拟获取目标列表
-        let (user_ids, chat_ids) = if target_ids.is_empty() {
-            self.get_target_lists(target_type).await
-        } else {
-            (
-                if target_type == "users" || target_type == "all" {
-                    target_ids.to_vec()
-                } else {
-                    vec![]
-                },
-                if target_type == "groups" || target_type == "all" {
-                    target_ids.to_vec()
-                } else {
-                    vec![]
-                },
-            )
-        };
+        if user_ids.len() + chat_ids.len() > MAX_BROADCAST_TARGETS {
+            return Err(format!(
+                "广播目标超过单次上限 {MAX_BROADCAST_TARGETS}，广播未执行"
+            ));
+        }
 
         let mut total = 0;
         let mut success = 0;
         let mut failed_items: Vec<serde_json::Value> = vec![];
+        let reply_markup = build_reply_markup(buttons)?;
 
         // 群发到用户
         if !user_ids.is_empty() {
@@ -212,7 +241,7 @@ impl BroadcastMessageTool {
                         chat_id: *uid,
                         text: content.to_string(),
                         parse_mode: Some("HTML".to_string()),
-                        reply_markup: None,
+                        reply_markup: reply_markup.clone(),
                         reply_to_message_id: None,
                     };
                     match client.send_message(params).await {
@@ -226,14 +255,8 @@ impl BroadcastMessageTool {
                         }
                     }
                 }
-            } else {
-                warn!("BroadcastMessageTool: Telegram client 未配置，跳过实际发送");
             }
             total += user_ids.len();
-            // If no client, count as success (mock mode)
-            if self.telegram_client.is_none() {
-                success += user_ids.len();
-            }
         }
 
         // 群发到群组
@@ -245,7 +268,7 @@ impl BroadcastMessageTool {
                         chat_id: *gid,
                         text: content.to_string(),
                         parse_mode: Some("HTML".to_string()),
-                        reply_markup: None,
+                        reply_markup: reply_markup.clone(),
                         reply_to_message_id: None,
                     };
                     match client.send_message(params).await {
@@ -259,14 +282,8 @@ impl BroadcastMessageTool {
                         }
                     }
                 }
-            } else {
-                warn!("BroadcastMessageTool: Telegram client 未配置，跳过实际发送");
             }
             total += chat_ids.len();
-            // If no client, count as success (mock mode)
-            if self.telegram_client.is_none() {
-                success += chat_ids.len();
-            }
         }
 
         if total == 0 {
@@ -282,19 +299,158 @@ impl BroadcastMessageTool {
         }))
     }
 
-    /// 获取目标列表
-    async fn get_target_lists(&self, target_type: &str) -> (Vec<i64>, Vec<i64>) {
-        // TODO: 接入 database 模块获取真实目标列表
-        // 参考 Python: database.get_inbox_list() / database.get_broadcast_targets()
+    async fn get_target_lists(
+        &self,
+        target_type: &str,
+        requested_ids: &[i64],
+        context: &AgentContext,
+    ) -> Result<(Vec<i64>, Vec<i64>), String> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| "未配置广播目标数据源，广播未执行".to_string())?;
+        let tenant_id = context
+            .metadata
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "缺少 tenant_id，广播未执行".to_string())?;
 
-        info!(
-            "BroadcastMessageTool::get_target_lists — 占位实现, target_type={}",
-            target_type
-        );
+        if target_type == "all" && !requested_ids.is_empty() {
+            return Err("target_type=all 时不能使用未分类的 target_ids".into());
+        }
 
-        // 返回空列表（实际需从数据库查询）
-        (vec![], vec![])
+        let user_ids = if matches!(target_type, "users" | "all") {
+            let bot_id = sqlx::query_scalar::<_, i64>(
+                "SELECT bot_id FROM merchants WHERE tenant_id = $1 AND bot_id IS NOT NULL",
+            )
+            .bind(tenant_id)
+            .fetch_optional(pool.as_ref())
+            .await
+            .map_err(|error| format!("读取租户 Bot 失败: {error}"))?
+            .ok_or_else(|| "当前租户未绑定 Bot，广播未执行".to_string())?;
+            if requested_ids.is_empty() {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT DISTINCT CASE WHEN from_userid = $2 THEN to_userid ELSE from_userid END \
+                     FROM chat.messages \
+                     WHERE tenant_id = $1 AND (from_userid = $2 OR to_userid = $2) \
+                       AND is_deleted = false \
+                     ORDER BY 1",
+                )
+                .bind(tenant_id)
+                .bind(bot_id)
+                .fetch_all(pool.as_ref())
+                .await
+            } else {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT DISTINCT CASE WHEN from_userid = $2 THEN to_userid ELSE from_userid END \
+                     FROM chat.messages \
+                     WHERE tenant_id = $1 AND (from_userid = $2 OR to_userid = $2) \
+                       AND is_deleted = false \
+                       AND (CASE WHEN from_userid = $2 THEN to_userid ELSE from_userid END) = ANY($3) \
+                     ORDER BY 1",
+                )
+                .bind(tenant_id)
+                .bind(bot_id)
+                .bind(requested_ids)
+                .fetch_all(pool.as_ref())
+                .await
+            }
+            .map_err(|error| format!("读取租户广播用户失败: {error}"))?
+        } else {
+            Vec::new()
+        };
+        let chat_ids = if matches!(target_type, "groups" | "all") {
+            if requested_ids.is_empty() {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT chat_id FROM broadcast.broadcast_targets \
+                     WHERE tenant_id = $1 AND can_broadcast = true ORDER BY chat_id",
+                )
+                .bind(tenant_id)
+                .fetch_all(pool.as_ref())
+                .await
+            } else {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT chat_id FROM broadcast.broadcast_targets \
+                     WHERE tenant_id = $1 AND chat_id = ANY($2) AND can_broadcast = true \
+                     ORDER BY chat_id",
+                )
+                .bind(tenant_id)
+                .bind(requested_ids)
+                .fetch_all(pool.as_ref())
+                .await
+            }
+            .map_err(|error| format!("读取租户广播群组失败: {error}"))?
+        } else {
+            Vec::new()
+        };
+
+        if !requested_ids.is_empty() {
+            let requested = requested_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            let allowed = user_ids
+                .iter()
+                .chain(chat_ids.iter())
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            if requested != allowed {
+                return Err("广播目标包含未绑定到当前租户的 ID，广播未执行".into());
+            }
+        }
+
+        Ok((user_ids, chat_ids))
     }
+}
+
+fn build_reply_markup(buttons: &[Value]) -> Result<Option<Value>, String> {
+    if buttons.is_empty() {
+        return Ok(None);
+    }
+    let mut row = Vec::with_capacity(buttons.len());
+    for button in buttons {
+        let text = button
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "广播按钮缺少 text".to_string())?;
+        let url = button
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+            .ok_or_else(|| "广播按钮 url 必须是 http(s) 地址".to_string())?;
+        row.push(serde_json::json!({"text": text, "url": url}));
+    }
+    Ok(Some(serde_json::json!({"inline_keyboard": [row]})))
+}
+
+fn parse_target_ids(value: Option<&Value>) -> Result<Vec<i64>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| "target_ids 必须是整数数组".to_string())?;
+    if values.len() > MAX_BROADCAST_TARGETS {
+        return Err(format!("target_ids 不能超过 {MAX_BROADCAST_TARGETS} 个"));
+    }
+    let mut ids = std::collections::HashSet::with_capacity(values.len());
+    for value in values {
+        let id = value
+            .as_i64()
+            .filter(|id| *id != 0)
+            .ok_or_else(|| "target_ids 只能包含非零整数".to_string())?;
+        if !ids.insert(id) {
+            return Err("target_ids 不能包含重复 ID".to_string());
+        }
+    }
+    let mut ids = ids.into_iter().collect::<Vec<_>>();
+    ids.sort_unstable();
+    Ok(ids)
 }
 
 // ---------------------------------------------------------------------------
@@ -356,5 +512,35 @@ mod tests {
         });
         let result = tool.execute(&params, &ctx).await;
         assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn invalid_target_ids_fail_before_any_send() {
+        let tool = BroadcastMessageTool::new();
+        let ctx = AgentContext::new(1);
+        for target_ids in [
+            serde_json::json!("1"),
+            serde_json::json!([1, "2"]),
+            serde_json::json!([1, 1]),
+            serde_json::json!([0]),
+        ] {
+            let result = tool
+                .execute(
+                    &serde_json::json!({"content": "测试广播", "target_ids": target_ids}),
+                    &ctx,
+                )
+                .await;
+            assert!(!result.success);
+            assert!(!result.action_taken);
+        }
+    }
+
+    #[test]
+    fn valid_target_ids_are_deduplicated_only_by_rejection() {
+        assert_eq!(
+            parse_target_ids(Some(&serde_json::json!([42, -100]))).unwrap(),
+            vec![-100, 42]
+        );
+        assert!(parse_target_ids(Some(&serde_json::json!([42, 42]))).is_err());
     }
 }

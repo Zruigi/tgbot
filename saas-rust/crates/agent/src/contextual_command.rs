@@ -60,7 +60,9 @@ pub fn resolve_contextual_command(
     }
 
     // 情况 B: 群序号跟进指令
-    if let Some(expanded) = expand_ordinal_group_selection(user_text, metadata, previous_assistant_text) {
+    if let Some(expanded) =
+        expand_ordinal_group_selection(user_text, metadata, previous_assistant_text)
+    {
         return expanded;
     }
 
@@ -85,7 +87,10 @@ fn expand_terse_delete(
 
     // 检查上一轮回复中是否包含广告标志
     let ad_markers = ["条合格广告", "具备删除权限", "广告记录"];
-    if !ad_markers.iter().any(|marker| previous_assistant_text.contains(marker)) {
+    if !ad_markers
+        .iter()
+        .any(|marker| previous_assistant_text.contains(marker))
+    {
         return None;
     }
 
@@ -116,9 +121,7 @@ fn expand_ordinal_group_selection(
     let normalized = normalize(user_text);
 
     // 编译正则表达式以匹配群序号模式
-    let ordinal_pattern = Regex::new(
-        r"第\s*(\d{1,2}|一|二|三|四|五|六|七|八|九|十)\s*个"
-    ).ok()?;
+    let ordinal_pattern = Regex::new(r"第\s*(\d{1,2}|一|二|三|四|五|六|七|八|九|十)\s*个").ok()?;
 
     // 检查是否包含"第N个"模式
     let ordinal_match = ordinal_pattern.captures(&normalized)?;
@@ -160,10 +163,7 @@ fn expand_ordinal_group_selection(
     let group_id_pattern = Regex::new(r"\((-?\d{5,})\)").ok()?;
     let group_ids: Vec<i64> = group_id_pattern
         .captures_iter(group_section)
-        .filter_map(|cap| {
-            cap.get(1)
-                .and_then(|m| m.as_str().parse::<i64>().ok())
-        })
+        .filter_map(|cap| cap.get(1).and_then(|m| m.as_str().parse::<i64>().ok()))
         .collect();
 
     if group_ids.is_empty() {
@@ -233,7 +233,8 @@ mod tests {
     #[test]
     fn test_ordinal_chinese_numbers() {
         let mut metadata = HashMap::new();
-        let previous = "群组：\n1. A (-1002222222221)\n2. B (-1002222222222)\n3. C (-1002222222223)\n频道：";
+        let previous =
+            "群组：\n1. A (-1002222222221)\n2. B (-1002222222222)\n3. C (-1002222222223)\n频道：";
 
         let result = resolve_contextual_command("第二个", &mut metadata, previous);
         assert_eq!(result, "查看群 -1002222222222 最近群消息");

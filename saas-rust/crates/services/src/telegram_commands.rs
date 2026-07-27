@@ -94,9 +94,15 @@ pub fn parse_telegram_command(text: &str, bot_username: &str) -> Option<Telegram
 /// 根据命令和用户名字构建回复文本。
 ///
 /// 回复使用简洁中文，仅列出已实现的 `/start` 和 `/help`，不添加按钮，不声称其他功能可用。
+/// 尚未接通的深链参数会显式 fail-closed，不能退化成普通 `/start` 假成功。
 pub fn build_command_reply(command: &TelegramCommand, first_name: &str) -> CommandReply {
     let text = match command {
-        TelegramCommand::Start(_payload) => {
+        TelegramCommand::Start(Some(payload)) => {
+            format!(
+                "已识别 /start 深链参数 `{payload}`，但当前 Rust 命令 Worker 尚未接通对应业务流程，因此未执行任何操作。请使用正式 Webhook/MiniApp 入口。"
+            )
+        }
+        TelegramCommand::Start(None) => {
             format!(
                 "你好，{first_name}！欢迎使用本机器人。\n\n已实现的命令：\n/start - 开始使用机器人\n/help - 显示帮助信息"
             )
@@ -233,6 +239,17 @@ mod tests {
         assert!(reply.text.contains("Alice"));
         assert!(reply.text.contains("/start"));
         assert!(reply.text.contains("/help"));
+    }
+
+    #[test]
+    fn test_start_payload_fails_closed_instead_of_being_dropped() {
+        let reply = build_command_reply(
+            &TelegramCommand::Start(Some("unmute_-100123".into())),
+            "Alice",
+        );
+        assert!(reply.text.contains("unmute_-100123"));
+        assert!(reply.text.contains("未执行任何操作"));
+        assert!(!reply.text.contains("欢迎使用"));
     }
 
     #[test]

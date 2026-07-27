@@ -104,11 +104,7 @@ pub async fn expire_sessions(pool: &PgPool) -> Result<u64> {
 // ---------------------------------------------------------------------------
 
 /// Get verification statistics for a group or tenant.
-pub async fn get_stats(
-    pool: &PgPool,
-    tenant_id: &str,
-    group_id: Option<i64>,
-) -> Result<Value> {
+pub async fn get_stats(pool: &PgPool, tenant_id: &str, group_id: Option<i64>) -> Result<Value> {
     let total_verified: i64;
     let total_unverified: i64;
     let pending_sessions: i64;

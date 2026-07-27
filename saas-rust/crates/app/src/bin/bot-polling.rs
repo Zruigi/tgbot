@@ -8,31 +8,53 @@
 //!
 //! # Gate
 //!
-//! This binary refuses to start unless TELEGRAM_COMMANDS_ENABLED=true is set
+//! This binary refuses to start unless TELEGRAM_POLLING_ENABLED=true is set
 //! explicitly. This prevents accidental use with a production bot token.
 
 use teloxide::prelude::*;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use tgbot_services::telegram_commands::{build_command_reply, parse_telegram_command};
+use tgbot_services::telegram_commands::{
+    build_command_reply, parse_telegram_command, TelegramCommand,
+};
 
-/// Commands recognised by the polling binary.
-///
-/// Only `/start` and `/help` are supported — matching the shared
-/// `tgbot_services::telegram_commands::parse_telegram_command` parser.
 #[derive(Debug, Clone, PartialEq)]
-enum Command {
-    Start,
-    Help,
+enum MessageAction {
+    Command(TelegramCommand),
+    UnknownCommand,
+    Ignore,
 }
 
-fn parse_commands(text: &str) -> Option<Command> {
-    let bot_username = std::env::var("BOT_USERNAME").unwrap_or_default();
-    match parse_telegram_command(text, &bot_username) {
-        Some(tgbot_services::telegram_commands::TelegramCommand::Start(_)) => Some(Command::Start),
-        Some(tgbot_services::telegram_commands::TelegramCommand::Help) => Some(Command::Help),
-        None => None,
+#[derive(Clone)]
+struct BotUsername(String);
+
+fn is_polling_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn classify_message(text: &str, bot_username: &str) -> MessageAction {
+    if let Some(command) = parse_telegram_command(text, bot_username) {
+        return MessageAction::Command(command);
     }
+
+    let token = text.trim().split_whitespace().next().unwrap_or_default();
+    if !token.starts_with('/') {
+        return MessageAction::Ignore;
+    }
+
+    if let Some((_, suffix)) = token.split_once('@') {
+        let expected = bot_username.trim_start_matches('@');
+        if suffix.is_empty() || !suffix.eq_ignore_ascii_case(expected) {
+            return MessageAction::Ignore;
+        }
+    }
+
+    MessageAction::UnknownCommand
 }
 
 #[tokio::main]
@@ -49,19 +71,13 @@ async fn main() -> anyhow::Result<()> {
     // === Fail-closed gate ===
     // This polling binary has no tenant isolation.  It MUST NOT be run against
     // a production bot token unless the operator explicitly opts in.
-    let enabled = std::env::var("TELEGRAM_COMMANDS_ENABLED")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        });
+    let polling_setting = std::env::var("TELEGRAM_POLLING_ENABLED").ok();
+    let enabled = is_polling_enabled(polling_setting.as_deref());
     if !enabled {
         tracing::error!(
-            "TELEGRAM_COMMANDS_ENABLED is not set to true. \
+            "TELEGRAM_POLLING_ENABLED is not set to true. \
              The polling binary has no tenant isolation and must be explicitly enabled. \
-             Set TELEGRAM_COMMANDS_ENABLED=true to proceed."
+             Set TELEGRAM_POLLING_ENABLED=true to proceed."
         );
         std::process::exit(1);
     }
@@ -72,28 +88,17 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting polling bot...");
     let bot = Bot::new(&token);
-
     let me = bot.get_me().send().await?;
-    let username = me.username.as_deref().unwrap_or("unknown");
-    tracing::info!("Bot @{} is online!", username);
+    let bot_username = me
+        .username
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Telegram bot account has no username"))?;
+    tracing::info!(bot_username = %bot_username, "Polling bot identity resolved");
 
-    let handler = dptree::entry()
-        .branch(
-            Update::filter_message()
-                .filter(|msg: Message| {
-                    msg.text()
-                        .and_then(|text| parse_commands(text))
-                        .is_some()
-                })
-                .endpoint(command_handler),
-        )
-        .branch(
-            Update::filter_message()
-                .filter(|msg: Message| msg.text().is_some())
-                .endpoint(fallback_message),
-        );
+    let handler = Update::filter_message().endpoint(message_handler);
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![BotUsername(bot_username)])
         .default_handler(|_upd| async move {})
         .error_handler(LoggingErrorHandler::with_custom_text("Bot error"))
         .build();
@@ -103,36 +108,150 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn command_handler(bot: Bot, msg: Message) -> Result<(), teloxide::RequestError> {
+async fn message_handler(
+    bot: Bot,
+    msg: Message,
+    bot_username: BotUsername,
+) -> Result<(), teloxide::RequestError> {
     let Some(text) = msg.text() else {
         return Ok(());
     };
-    let Some(command) = parse_commands(text) else {
-        return Ok(());
-    };
-    let first_name = msg
-        .from()
-        .map(|u| u.first_name.clone())
-        .unwrap_or_else(|| "朋友".into());
-
-    let shared_cmd = match command {
-        Command::Start => tgbot_services::telegram_commands::TelegramCommand::Start(None),
-        Command::Help => tgbot_services::telegram_commands::TelegramCommand::Help,
-    };
-    let reply = build_command_reply(&shared_cmd, &first_name);
-
-    bot.send_message(msg.chat.id, reply.text).send().await?;
-    Ok(())
-}
-
-async fn fallback_message(bot: Bot, msg: Message) -> Result<(), teloxide::RequestError> {
-    if let Some(text) = msg.text() {
-        if text.starts_with('/') {
+    match classify_message(text, &bot_username.0) {
+        MessageAction::Command(command) => {
+            let first_name = msg
+                .from
+                .as_ref()
+                .map(|user| user.first_name.clone())
+                .unwrap_or_else(|| "朋友".into());
+            let reply = build_command_reply(&command, &first_name);
+            bot.send_message(msg.chat.id, reply.text).send().await?;
+        }
+        MessageAction::UnknownCommand => {
             bot.send_message(msg.chat.id, "未知命令。请输入 /help 查看可用命令。")
                 .send()
                 .await?;
         }
-        // Non-command text is silently ignored in polling mode.
+        MessageAction::Ignore => {}
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gate_disabled_by_default() {
+        assert!(!is_polling_enabled(None));
+    }
+
+    #[test]
+    fn test_gate_true_enables() {
+        for v in &["1", "true", "TRUE", "yes", "on", "  true  "] {
+            assert!(
+                is_polling_enabled(Some(v)),
+                "value {v:?} should enable the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gate_false_disables() {
+        for v in &["0", "false", "no", "off", "random", ""] {
+            assert!(
+                !is_polling_enabled(Some(v)),
+                "value {v:?} should not enable the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_commands_start_without_payload() {
+        assert_eq!(
+            classify_message("/start", "MyTestBot"),
+            MessageAction::Command(TelegramCommand::Start(None))
+        );
+    }
+
+    #[test]
+    fn test_parse_commands_start_with_payload() {
+        assert_eq!(
+            classify_message("/start ref_abc", "MyTestBot"),
+            MessageAction::Command(TelegramCommand::Start(Some("ref_abc".into())))
+        );
+    }
+
+    #[test]
+    fn test_parse_commands_start_with_bot_suffix_and_payload() {
+        assert_eq!(
+            classify_message("/start@MyTestBot ref_xyz", "MyTestBot"),
+            MessageAction::Command(TelegramCommand::Start(Some("ref_xyz".into())))
+        );
+    }
+
+    #[test]
+    fn test_parse_commands_help() {
+        assert_eq!(
+            classify_message("/help", "MyTestBot"),
+            MessageAction::Command(TelegramCommand::Help)
+        );
+    }
+
+    #[test]
+    fn test_parse_commands_help_with_bot_suffix() {
+        assert_eq!(
+            classify_message("/help@MyTestBot", "MyTestBot"),
+            MessageAction::Command(TelegramCommand::Help)
+        );
+    }
+
+    #[test]
+    fn test_parse_commands_wrong_bot_suffix() {
+        assert_eq!(
+            classify_message("/start@WrongBot", "MyTestBot"),
+            MessageAction::Ignore
+        );
+    }
+
+    #[test]
+    fn test_parse_commands_help_wrong_bot_suffix() {
+        assert_eq!(
+            classify_message("/help@WrongBot", "MyTestBot"),
+            MessageAction::Ignore
+        );
+    }
+
+    #[test]
+    fn test_parse_commands_plain_text() {
+        assert_eq!(
+            classify_message("hello world", "MyTestBot"),
+            MessageAction::Ignore
+        );
+    }
+
+    #[test]
+    fn test_parse_commands_unknown_command() {
+        assert_eq!(
+            classify_message("/unknown", "MyTestBot"),
+            MessageAction::UnknownCommand
+        );
+
+        assert_eq!(
+            classify_message("/unknown@MyTestBot", "MyTestBot"),
+            MessageAction::UnknownCommand
+        );
+
+        assert_eq!(
+            classify_message("/unknown@OtherBot", "MyTestBot"),
+            MessageAction::Ignore
+        );
+    }
+
+    #[test]
+    fn test_parse_commands_empty() {
+        assert_eq!(classify_message("", "MyTestBot"), MessageAction::Ignore);
+    }
 }

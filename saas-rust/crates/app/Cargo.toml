@@ -3,6 +3,10 @@ name = "tgbot-app"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+dev-polling = ["dep:teloxide"]
+
 [[bin]]
 name = "tgbot-app"
 path = "src/main.rs"
@@ -10,6 +14,7 @@ path = "src/main.rs"
 [[bin]]
 name = "bot-polling"
 path = "src/bin/bot-polling.rs"
+required-features = ["dev-polling"]
 
 [dependencies]
 tgbot-http = { workspace = true }
@@ -31,4 +36,4 @@ sqlx = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-teloxide = { workspace = true }
+teloxide = { workspace = true, optional = true }

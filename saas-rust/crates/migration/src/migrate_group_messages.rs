@@ -75,12 +75,11 @@ pub async fn migrate_group_messages(
     }
 
     // Get skipped count (already migrated)
-    let target_count: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM groups.group_messages"
-    )
-    .fetch_one(pg_pool)
-    .await
-    .context("Failed to count group messages in PostgreSQL")?;
+    let target_count: i64 =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM groups.group_messages")
+            .fetch_one(pg_pool)
+            .await
+            .context("Failed to count group messages in PostgreSQL")?;
 
     // If target count is close to source, consider the rest as skipped (already migrated)
     if target_count < stats.total_source {
@@ -261,12 +260,11 @@ pub async fn verify_group_message_migration(
     let sqlite_reader = SqliteReader::new(sqlite_config)?;
     let source_count = sqlite_reader.count_group_messages()?;
 
-    let target_count: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM groups.group_messages"
-    )
-    .fetch_one(pg_pool)
-    .await
-    .context("Failed to count group messages in PostgreSQL")?;
+    let target_count: i64 =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM groups.group_messages")
+            .fetch_one(pg_pool)
+            .await
+            .context("Failed to count group messages in PostgreSQL")?;
 
     let result = GroupMessageVerificationResult {
         source_count,
@@ -316,6 +314,9 @@ mod tests {
         };
 
         assert_eq!(stats.total_source, 1000);
-        assert_eq!(stats.migrated + stats.skipped + stats.errors, stats.total_source);
+        assert_eq!(
+            stats.migrated + stats.skipped + stats.errors,
+            stats.total_source
+        );
     }
 }

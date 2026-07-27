@@ -3,6 +3,20 @@
 ## Overview
 Task 2.2e ports the ad-governance subsystem (Python commit 332ba4c) to Rust. This document describes integration points where Rust code must hook into existing systems.
 
+> **Current Beta evidence (2026-07-27).** The hook described below is now
+> implemented by the `groups.group_messages` insert/update path and migration
+> `0025_realtime_ad_scan_outbox.sql`: the trigger creates a tenant-scoped
+> `groups.ad_scan_jobs` row and `job_queue` payload when an enabled policy and
+> message evidence are present. `AdGovernanceWorker` consumes that payload with
+> tenant/group rechecks. Migrations `0020`–`0026` and the realtime path pass the
+> disposable-database runtime gate; see
+> `target/beta-reports/runtime-gate-report.json`.
+>
+> This file retains the original porting notes below as historical context.
+> Unknown LLM decisions remain pending and fail closed, and Telegram deletion
+> or warning actions still require the explicit environment gates and a real Bot
+> acceptance run. The local gate is not production or MiniApp acceptance.
+
 ## 1. Telegram Webhook Integration Hook
 **Location**: `crates/http/src/routes/telegram_webhook.rs` line ~945 (group_messages INSERT)
 

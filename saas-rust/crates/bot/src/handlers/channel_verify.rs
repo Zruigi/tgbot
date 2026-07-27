@@ -3,10 +3,12 @@
 //! Verifies whether a user has subscribed to a required channel.
 //! Used for "join to unban" flows in group chats.
 
-use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId, UserId, ChatMemberKind};
-use teloxide::payloads::SendMessageSetters;
 use crate::handlers::HandlerResult;
+use teloxide::payloads::SendMessageSetters;
+use teloxide::prelude::*;
+use teloxide::types::{
+    ChatMemberKind, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, UserId,
+};
 
 // ---------------------------------------------------------------------------
 // Check channel subscription
@@ -14,17 +16,19 @@ use crate::handlers::HandlerResult;
 
 /// Check if a user is a member of a given channel.
 /// Returns true if the user is a member, administrator, or creator.
-pub async fn check_channel_subscription(
-    bot: &Bot,
-    user_id: i64,
-    channel_id: i64,
-) -> bool {
+pub async fn check_channel_subscription(bot: &Bot, user_id: i64, channel_id: i64) -> bool {
     // Skip checks for non-positive user IDs (channels/anonymous)
     if user_id <= 0 {
         return true;
     }
 
-    match bot.get_chat_member(teloxide::types::Recipient::Id(teloxide::types::ChatId(channel_id)), teloxide::types::UserId(user_id.try_into().unwrap())).await {
+    match bot
+        .get_chat_member(
+            teloxide::types::Recipient::Id(teloxide::types::ChatId(channel_id)),
+            teloxide::types::UserId(user_id.try_into().unwrap()),
+        )
+        .await
+    {
         Ok(member) => {
             matches!(
                 member.kind,
@@ -46,10 +50,7 @@ pub async fn check_channel_subscription(
 
 /// Process the "subscribe button" callback to verify and lift restrictions.
 /// Callback data format: `subscribe_{group_id}_{channel_id}`
-pub async fn handle_subscribe_button(
-    bot: &Bot,
-    query: CallbackQuery,
-) -> HandlerResult<()> {
+pub async fn handle_subscribe_button(bot: &Bot, query: CallbackQuery) -> HandlerResult<()> {
     let chat_id = match &query.message {
         Some(m) => m.chat().id.0,
         None => return Ok(()),
@@ -113,7 +114,9 @@ pub async fn handle_subscribe_button(
 
         // Optionally delete the reminder message
         if let Some(mid) = message_id {
-            let _ = bot.delete_message(teloxide::types::ChatId(group_id), MessageId(mid)).await;
+            let _ = bot
+                .delete_message(teloxide::types::ChatId(group_id), MessageId(mid))
+                .await;
         }
 
         tracing::info!(
@@ -161,7 +164,10 @@ pub async fn handle_subscribe_button(
 fn build_channel_link(channel_id: i64) -> String {
     // -100xxx... format for private channels
     if channel_id < 0 {
-        format!("https://t.me/c/{}", channel_id.to_string().trim_start_matches("-100"))
+        format!(
+            "https://t.me/c/{}",
+            channel_id.to_string().trim_start_matches("-100")
+        )
     } else {
         format!("https://t.me/{}", channel_id)
     }
@@ -184,7 +190,9 @@ pub async fn send_channel_reminder_message(
     let keyboard = InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::url(
             "📢 直接关注",
-            channel_link.parse().unwrap_or_else(|_| "https://t.me".parse().unwrap()),
+            channel_link
+                .parse()
+                .unwrap_or_else(|_| "https://t.me".parse().unwrap()),
         )],
         vec![InlineKeyboardButton::callback(
             "✅ 回补订阅解开禁言",
@@ -295,7 +303,9 @@ pub async fn handle_start_with_channel_check(
                 let keyboard = InlineKeyboardMarkup::new(vec![
                     vec![InlineKeyboardButton::url(
                         "📢 关注频道",
-                        channel_link.parse().unwrap_or_else(|_| "https://t.me".parse().unwrap()),
+                        channel_link
+                            .parse()
+                            .unwrap_or_else(|_| "https://t.me".parse().unwrap()),
                     )],
                     vec![InlineKeyboardButton::callback(
                         "✅ 已关注，重新验证",

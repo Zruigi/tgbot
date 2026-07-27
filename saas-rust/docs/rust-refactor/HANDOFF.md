@@ -1,6 +1,6 @@
 # TGBot Rust 重构 — HANDOFF 笔记
 
-> 最后更新: 2026-06-26
+> 最后更新: 2026-07-27
 
 ## 当前状态
 
@@ -14,7 +14,7 @@
 | Phase 3 | ✅ | 身份认证与租户隔离已实现 |
 | Phase 4 | ✅ | 数据库迁移脚本（0001-0005）|
 | Phase 5 | ✅ | SaaS 核心路由完整 |
-| Phase 6 | ✅ | 聊天 API 完整（含 stub）|
+| Phase 6 | ✅ | 聊天 API 已接入真实 Postgres/Telegram 路径；不可用能力 fail-closed |
 | Phase 7 | ✅ | 群组与验证 API 完整 |
 | Phase 8 | ✅ | 广播与推送 API 完整 |
 | Phase 9 | ✅ | 监控与财务 API 完整 |
@@ -42,16 +42,15 @@ cargo check
 ## 已知问题
 
 1. **编译警告** ~30 个 - 除无用的 import 外无风险
-2. **chat/ai_reply** 是 stub → 返回 "[AI回复功能尚未集成]"
-3. **chat/get_file** 是 stub → 返回 null url
-4. **advertisements** 是 stub → 返回空 data
-5. **ai/skills** 是 stub → 返回空 data
+2. 真实测试 Bot 尚未完成 Webhook、群管理、文件、AI、支付和失败重试验收。
+3. `advertisements`/`ad-pipeline` 兼容路由现在查询 `groups.group_messages` 并按租户聚合；缺少真实数据时返回证据字段，不返回伪造空成功。
+4. 运行时状态快照目前明确返回 501（使用 worker telemetry），不再伪造空列表。
 
 ## 下一步任务
 
-1. 将 stub 改为真正实现
-2. 更新根目录 `CLAUDE.md`
-3. 补充新增路由的测试
+1. 完成真实 Bot 契约与 MiniApp 验收，再决定灰度。
+2. 更新根目录 `CLAUDE.md`（如需要）。
+3. 持续补充新增路由的测试和迁移跳过审计。
 
 ## 兼容性别名清单
 

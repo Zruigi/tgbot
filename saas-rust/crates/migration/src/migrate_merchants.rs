@@ -58,7 +58,11 @@ pub async fn migrate_merchants(
                     status: "migrated".to_string(),
                     error: None,
                 });
-                tracing::debug!("Migrated merchant: {} ({})", merchant.merchant_name, merchant.tenant_id);
+                tracing::debug!(
+                    "Migrated merchant: {} ({})",
+                    merchant.merchant_name,
+                    merchant.tenant_id
+                );
             }
             Err(e) => {
                 // Check if it's a duplicate key error (already migrated)
@@ -96,14 +100,12 @@ pub async fn migrate_merchants(
 }
 
 /// Migrate a single merchant from SQLite to PostgreSQL
-async fn migrate_single_merchant(
-    sqlite_merchant: &SqliteMerchant,
-    pg_pool: &PgPool,
-) -> Result<()> {
+async fn migrate_single_merchant(sqlite_merchant: &SqliteMerchant, pg_pool: &PgPool) -> Result<()> {
     // Parse timestamps
     let created_at = parse_timestamp(&sqlite_merchant.created_at)?;
     let updated_at = parse_timestamp(&sqlite_merchant.updated_at)?;
-    let subscription_expires_at = sqlite_merchant.subscription_expires_at
+    let subscription_expires_at = sqlite_merchant
+        .subscription_expires_at
         .as_ref()
         .and_then(|s| parse_timestamp(s).ok());
 
@@ -145,7 +147,7 @@ async fn migrate_single_merchant(
             config_version = EXCLUDED.config_version,
             feature_version = EXCLUDED.feature_version,
             updated_at = EXCLUDED.updated_at
-        "#
+        "#,
     )
     .bind(sqlite_merchant.id)
     .bind(&sqlite_merchant.tenant_id)
@@ -209,16 +211,14 @@ pub async fn verify_merchant_migration(
     let source_count = source_merchants.len() as i64;
 
     // Get target count from PostgreSQL
-    let target_count: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM merchants"
-    )
-    .fetch_one(pg_pool)
-    .await
-    .context("Failed to count merchants in PostgreSQL")?;
+    let target_count: i64 = sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM merchants")
+        .fetch_one(pg_pool)
+        .await
+        .context("Failed to count merchants in PostgreSQL")?;
 
     // Get count of merchants with legacy_id (successfully migrated)
     let migrated_count: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM merchants WHERE legacy_merchant_id IS NOT NULL"
+        "SELECT COUNT(*)::bigint FROM merchants WHERE legacy_merchant_id IS NOT NULL",
     )
     .fetch_one(pg_pool)
     .await

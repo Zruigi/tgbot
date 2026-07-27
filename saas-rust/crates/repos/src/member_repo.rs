@@ -269,11 +269,7 @@ pub async fn count_verified_members(pool: &PgPool, group_id: i64, tenant_id: &st
 // ---------------------------------------------------------------------------
 
 /// Fetch all member records for a given user_id (across groups).
-pub async fn get_user_members(
-    pool: &PgPool,
-    user_id: i64,
-    tenant_id: &str,
-) -> Result<Vec<Value>> {
+pub async fn get_user_members(pool: &PgPool, user_id: i64, tenant_id: &str) -> Result<Vec<Value>> {
     let rows = sqlx::query(
         "SELECT * FROM groups.group_members WHERE user_id = $1 AND tenant_id = $2 ORDER BY joined_at DESC",
     )

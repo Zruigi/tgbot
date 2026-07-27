@@ -1,9 +1,9 @@
-pub mod schema;
-pub mod core;
-pub mod safety;
-pub mod prompts;
 pub mod ad_detection;
-pub mod tools;
-pub mod session;
 pub mod contextual_command;
+pub mod core;
 pub mod deletion_guard;
+pub mod prompts;
+pub mod safety;
+pub mod schema;
+pub mod session;
+pub mod tools;

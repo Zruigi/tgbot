@@ -70,10 +70,7 @@ impl Tool for DeleteRecentAdMessagesTool {
     }
 
     async fn execute(&self, params: &Value, context: &AgentContext) -> ToolExecuteResult {
-        let snapshot_id = match params
-            .get("snapshot_id")
-            .and_then(|v| v.as_str())
-        {
+        let snapshot_id = match params.get("snapshot_id").and_then(|v| v.as_str()) {
             Some(id) => id,
             None => {
                 return ToolExecuteResult {
@@ -98,7 +95,13 @@ impl Tool for DeleteRecentAdMessagesTool {
             .metadata
             .get("tenant_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("default");
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(tenant_id) = tenant_id else {
+            return ToolExecuteResult::fail(
+                "delete_recent_ad_messages requires an explicit tenant scope",
+            );
+        };
 
         // Load snapshot with TENANT SCOPING (fix #3)
         let snapshot_row = match sqlx::query(
@@ -231,7 +234,10 @@ impl Tool for DeleteRecentAdMessagesTool {
                     continue;
                 }
             };
-            let user_id = ref_item.get("user_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let user_id = ref_item
+                .get("user_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
 
             // Re-verify row exists and matches criteria
             let row_exists = match sqlx::query(
@@ -383,7 +389,12 @@ impl Tool for DeleteRecentAdMessagesTool {
             .bind("delete_recent_ad_messages")
             .bind("group_messages")
             .bind(snapshot_id)
-            .bind(format!(r#"{{"deleted":{}, "skipped":{}, "errors":{}}}"#, deleted, skipped, error_details.len()))
+            .bind(format!(
+                r#"{{"deleted":{}, "skipped":{}, "errors":{}}}"#,
+                deleted,
+                skipped,
+                error_details.len()
+            ))
             .execute(self.pool.as_ref())
             .await
             .ok();
@@ -391,10 +402,12 @@ impl Tool for DeleteRecentAdMessagesTool {
 
         // Mark snapshot consumed only on real execution
         if !dry_run {
-            let _ = sqlx::query("UPDATE groups.ad_delete_snapshots SET consumed_at = now() WHERE snapshot_id = $1")
-                .bind(snapshot_id)
-                .execute(self.pool.as_ref())
-                .await;
+            let _ = sqlx::query(
+                "UPDATE groups.ad_delete_snapshots SET consumed_at = now() WHERE snapshot_id = $1",
+            )
+            .bind(snapshot_id)
+            .execute(self.pool.as_ref())
+            .await;
         }
 
         ToolExecuteResult {

@@ -84,7 +84,9 @@ impl Tool for SkillManageTool {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let tenant_id = context.metadata.get("tenant_id")
+        let tenant_id = context
+            .metadata
+            .get("tenant_id")
             .and_then(|v| v.as_str())
             .unwrap_or("default");
 
@@ -96,13 +98,29 @@ impl Tool for SkillManageTool {
                 if name.is_empty() {
                     return ToolExecuteResult::fail("新增技能需要提供 name 参数");
                 }
-                self.add_or_update_skill(&name, &description, prompt_template, "custom", true, tenant_id).await
+                self.add_or_update_skill(
+                    &name,
+                    &description,
+                    prompt_template,
+                    "custom",
+                    true,
+                    tenant_id,
+                )
+                .await
             }
             "update" => {
                 if name.is_empty() {
                     return ToolExecuteResult::fail("更新技能需要提供 name 参数");
                 }
-                self.add_or_update_skill(&name, &description, prompt_template, "custom", true, tenant_id).await
+                self.add_or_update_skill(
+                    &name,
+                    &description,
+                    prompt_template,
+                    "custom",
+                    true,
+                    tenant_id,
+                )
+                .await
             }
             "enable" => {
                 if name.is_empty() {
@@ -160,7 +178,10 @@ impl SkillManageTool {
             })
             .collect();
 
-        Ok((serde_json::json!(skills), format!("共 {} 个技能", skills.len())))
+        Ok((
+            serde_json::json!(skills),
+            format!("共 {} 个技能", skills.len()),
+        ))
     }
 
     /// 新增或更新技能
@@ -199,7 +220,15 @@ impl SkillManageTool {
 
         Ok((
             serde_json::json!({ "name": name }),
-            format!("技能已{}: {}", if source == "custom" { "新增" } else { "更新" }, name),
+            format!(
+                "技能已{}: {}",
+                if source == "custom" {
+                    "新增"
+                } else {
+                    "更新"
+                },
+                name
+            ),
         ))
     }
 
@@ -229,12 +258,19 @@ impl SkillManageTool {
 
         Ok((
             serde_json::json!({ "name": name, "is_enabled": is_enabled }),
-            format!("技能已{}: {}", if is_enabled { "启用" } else { "停用" }, name),
+            format!(
+                "技能已{}: {}",
+                if is_enabled { "启用" } else { "停用" },
+                name
+            ),
         ))
     }
 
     /// 扫描并导入本地技能模板
-    async fn import_builtin_skills(&self, tenant_id: &str) -> Result<(Value, String), anyhow::Error> {
+    async fn import_builtin_skills(
+        &self,
+        tenant_id: &str,
+    ) -> Result<(Value, String), anyhow::Error> {
         // 获取技能目录
         let skill_dirs = self.get_skill_dirs();
 

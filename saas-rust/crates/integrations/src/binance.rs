@@ -148,7 +148,10 @@ impl BinanceClient {
     /// Get current price for a symbol.
     #[instrument(skip(self), fields(symbol = %symbol))]
     pub async fn get_price(&self, symbol: &str) -> Result<f64> {
-        let url = format!("{}/api/v3/ticker/price?symbol={}", self.config.base_url, symbol);
+        let url = format!(
+            "{}/api/v3/ticker/price?symbol={}",
+            self.config.base_url, symbol
+        );
         debug!(url, "querying Binance price");
 
         let resp = self
@@ -183,7 +186,10 @@ impl BinanceClient {
     /// Get 24hr ticker statistics for a symbol.
     #[instrument(skip(self))]
     pub async fn get_24hr_ticker(&self, symbol: &str) -> Result<Ticker24hr> {
-        let url = format!("{}/api/v3/ticker/24hr?symbol={}", self.config.base_url, symbol);
+        let url = format!(
+            "{}/api/v3/ticker/24hr?symbol={}",
+            self.config.base_url, symbol
+        );
         debug!(url, "querying Binance 24hr ticker");
 
         let resp = self
@@ -214,7 +220,9 @@ impl BinanceClient {
     pub async fn get_recent_trades(&self, symbol: &str, limit: usize) -> Result<Vec<Trade>> {
         let url = format!(
             "{}/api/v3/trades?symbol={}&limit={}",
-            self.config.base_url, symbol, limit.min(1000)
+            self.config.base_url,
+            symbol,
+            limit.min(1000)
         );
         debug!(url, "querying Binance recent trades");
 
@@ -250,7 +258,10 @@ impl BinanceClient {
     ) -> Result<Vec<KLine>> {
         let url = format!(
             "{}/api/v3/klines?symbol={}&interval={}&limit={}",
-            self.config.base_url, symbol, interval, limit.min(1000)
+            self.config.base_url,
+            symbol,
+            interval,
+            limit.min(1000)
         );
         debug!(url, "querying Binance klines");
 

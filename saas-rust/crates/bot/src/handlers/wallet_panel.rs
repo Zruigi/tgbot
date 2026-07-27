@@ -4,10 +4,10 @@
 //! for adding new addresses or cancelling existing monitors.
 //! Admin users can view all monitors system-wide.
 
-use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
-use teloxide::payloads::SendMessageSetters;
 use sqlx::Row;
+use teloxide::payloads::SendMessageSetters;
+use teloxide::prelude::*;
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode};
 
 use crate::handlers::HandlerResult;
 
@@ -79,7 +79,10 @@ pub async fn build_wallet_keyboard(
         if admin_view_all {
             let text = "🛠 <b>全部活跃监听</b>\n\n📭 当前系统中没有活跃监听。";
             let kb = vec![
-                vec![InlineKeyboardButton::callback("🔄 刷新", "wallet_admin_all")],
+                vec![InlineKeyboardButton::callback(
+                    "🔄 刷新",
+                    "wallet_admin_all",
+                )],
                 vec![InlineKeyboardButton::callback(
                     "🔙 返回主菜单",
                     "back_to_start",
@@ -114,7 +117,10 @@ pub async fn build_wallet_keyboard(
                 html_escape(&m.address),
             ));
         } else {
-            lines.push(format!("• <code>{net}</code>\n  <code>{}</code>", html_escape(&m.address)));
+            lines.push(format!(
+                "• <code>{net}</code>\n  <code>{}</code>",
+                html_escape(&m.address)
+            ));
         }
 
         let short = format_short_addr(&m.address);
@@ -132,7 +138,10 @@ pub async fn build_wallet_keyboard(
     }
 
     if monitors.len() > MAX_ROWS {
-        lines.push(format!("\n… 共 {} 条，仅显示前 {MAX_ROWS} 条。", monitors.len()));
+        lines.push(format!(
+            "\n… 共 {} 条，仅显示前 {MAX_ROWS} 条。",
+            monitors.len()
+        ));
     }
 
     if admin_view_all {
@@ -308,20 +317,14 @@ async fn get_monitors_by_user(
 }
 
 /// Get all active monitors (admin view).
-async fn get_all_monitors_for_admin(
-    pool: &sqlx::PgPool,
-    active_only: bool,
-) -> Vec<MonitorRecord> {
+async fn get_all_monitors_for_admin(pool: &sqlx::PgPool, active_only: bool) -> Vec<MonitorRecord> {
     let query = if active_only {
         "SELECT monitor_id, address, network, user_id FROM wallet_monitors WHERE active = true ORDER BY created_at DESC LIMIT 100"
     } else {
         "SELECT monitor_id, address, network, user_id FROM wallet_monitors ORDER BY created_at DESC LIMIT 100"
     };
 
-    let rows = sqlx::query(query)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+    let rows = sqlx::query(query).fetch_all(pool).await.unwrap_or_default();
 
     rows.iter()
         .map(|row| MonitorRecord {
@@ -334,11 +337,7 @@ async fn get_all_monitors_for_admin(
 }
 
 /// Deactivate a wallet monitor. Returns true if the operation succeeded.
-pub async fn deactivate_wallet_monitor(
-    pool: &sqlx::PgPool,
-    monitor_id: i64,
-    user_id: i64,
-) -> bool {
+pub async fn deactivate_wallet_monitor(pool: &sqlx::PgPool, monitor_id: i64, user_id: i64) -> bool {
     let result = sqlx::query(
         "UPDATE wallet_monitors SET active = false, updated_at = now() WHERE monitor_id = $1 AND user_id = $2 AND active = true",
     )

@@ -2,12 +2,12 @@
 
 #[cfg(test)]
 mod tests {
-    use tgbot_agent::schema::{AgentContext, AgentResponse};
-    use tgbot_agent::deletion_guard::{is_agent_cancellation_text, is_agent_confirmation_text};
-    use tgbot_agent::contextual_command::resolve_contextual_command;
-    use tgbot_agent::session::{AgentSession, AgentSessionStore};
     use serde_json::json;
     use std::collections::HashMap;
+    use tgbot_agent::contextual_command::resolve_contextual_command;
+    use tgbot_agent::deletion_guard::{is_agent_cancellation_text, is_agent_confirmation_text};
+    use tgbot_agent::schema::{AgentContext, AgentResponse};
+    use tgbot_agent::session::{AgentSession, AgentSessionStore};
 
     // =====================================================================
     // BEHAVIOR 2: CANCELLATION WORDS — 5 tests
@@ -87,7 +87,8 @@ mod tests {
     #[test]
     fn test_ordinal_group_selection() {
         let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
-        let previous = "群组：\n1. A (-1002222222221)\n2. B (-1002222222222)\n3. C (-1002222222223)\n频道：";
+        let previous =
+            "群组：\n1. A (-1002222222221)\n2. B (-1002222222222)\n3. C (-1002222222223)\n频道：";
 
         let result = resolve_contextual_command("第二个", &mut metadata, previous);
         assert_eq!(result, "查看群 -1002222222222 最近群消息");
@@ -109,7 +110,8 @@ mod tests {
     #[test]
     fn test_ordinal_chinese_numbers() {
         let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
-        let previous = "群组：\n1. A (-1002222222221)\n2. B (-1002222222222)\n3. C (-1002222222223)\n频道：";
+        let previous =
+            "群组：\n1. A (-1002222222221)\n2. B (-1002222222222)\n3. C (-1002222222223)\n频道：";
 
         let result = resolve_contextual_command("第三个", &mut metadata, previous);
         assert_eq!(result, "查看群 -1002222222223 最近群消息");
@@ -134,14 +136,19 @@ mod tests {
         let key = AgentSessionStore::session_key("tenant1", 123, Some("merchant1"));
 
         let mut ctx = AgentContext::new(123);
-        ctx.metadata.insert("last_ad_query_group_id".into(), json!(-1002222222221i64));
+        ctx.metadata
+            .insert("last_ad_query_group_id".into(), json!(-1002222222221i64));
 
         let session1 = AgentSession::new(ctx);
         store.update(&key, session1.clone());
 
         let session2 = store.get(&key).unwrap();
         assert_eq!(
-            session2.ctx.metadata.get("last_ad_query_group_id").and_then(|v| v.as_i64()),
+            session2
+                .ctx
+                .metadata
+                .get("last_ad_query_group_id")
+                .and_then(|v| v.as_i64()),
             Some(-1002222222221)
         );
     }
@@ -153,10 +160,12 @@ mod tests {
         let key2 = AgentSessionStore::session_key("tenant1", 456, None);
 
         let mut ctx1 = AgentContext::new(123);
-        ctx1.metadata.insert("last_ad_query_group_id".into(), json!(-1002222222221i64));
+        ctx1.metadata
+            .insert("last_ad_query_group_id".into(), json!(-1002222222221i64));
 
         let mut ctx2 = AgentContext::new(456);
-        ctx2.metadata.insert("last_ad_query_group_id".into(), json!(-1002222222222i64));
+        ctx2.metadata
+            .insert("last_ad_query_group_id".into(), json!(-1002222222222i64));
 
         store.update(&key1, AgentSession::new(ctx1));
         store.update(&key2, AgentSession::new(ctx2));
@@ -165,11 +174,19 @@ mod tests {
         let session2 = store.get(&key2).unwrap();
 
         assert_eq!(
-            session1.ctx.metadata.get("last_ad_query_group_id").and_then(|v| v.as_i64()),
+            session1
+                .ctx
+                .metadata
+                .get("last_ad_query_group_id")
+                .and_then(|v| v.as_i64()),
             Some(-1002222222221)
         );
         assert_eq!(
-            session2.ctx.metadata.get("last_ad_query_group_id").and_then(|v| v.as_i64()),
+            session2
+                .ctx
+                .metadata
+                .get("last_ad_query_group_id")
+                .and_then(|v| v.as_i64()),
             Some(-1002222222222)
         );
     }
@@ -179,7 +196,7 @@ mod tests {
         let session = AgentSession {
             ctx: AgentContext::new(123),
             pending: None,
-            updated_at: 0,  // Very old timestamp
+            updated_at: 0, // Very old timestamp
         };
         assert!(session.is_expired());
     }
@@ -205,7 +222,9 @@ mod tests {
         metadata.insert("last_ad_query_group_id".into(), json!(-1002222222222i64));
 
         assert_eq!(
-            metadata.get("last_ad_query_group_id").and_then(|v| v.as_i64()),
+            metadata
+                .get("last_ad_query_group_id")
+                .and_then(|v| v.as_i64()),
             Some(-1002222222222)
         );
     }
@@ -216,8 +235,14 @@ mod tests {
         ctx.metadata.insert("chat_id".into(), json!(456i64));
         ctx.metadata.insert("group_id".into(), json!(456i64));
 
-        assert_eq!(ctx.metadata.get("chat_id").and_then(|v| v.as_i64()), Some(456));
-        assert_eq!(ctx.metadata.get("group_id").and_then(|v| v.as_i64()), Some(456));
+        assert_eq!(
+            ctx.metadata.get("chat_id").and_then(|v| v.as_i64()),
+            Some(456)
+        );
+        assert_eq!(
+            ctx.metadata.get("group_id").and_then(|v| v.as_i64()),
+            Some(456)
+        );
     }
 
     // =====================================================================
@@ -233,14 +258,14 @@ mod tests {
     }
 
     #[test]
-    fn test_negation_guard_2() {
-    }
+    fn test_negation_guard_2() {}
 
     #[test]
     fn test_question_guard_structure() {
         // Verify that questions can be distinguished from commands
         // This is tested in contextual_command module
-        let normalized_question = "为什么要删除广告".to_lowercase()
+        let normalized_question = "为什么要删除广告"
+            .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>();
@@ -251,7 +276,8 @@ mod tests {
     fn test_single_item_guard() {
         // The single-item guard checks for "一条" without time keywords
         let text_with_single_no_time = "删除一条广告";
-        let normalized = text_with_single_no_time.to_lowercase()
+        let normalized = text_with_single_no_time
+            .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>();
@@ -267,7 +293,8 @@ mod tests {
     #[test]
     fn test_single_item_with_time_allowed() {
         let text_with_single_and_time = "删除最近一条广告";
-        let normalized = text_with_single_and_time.to_lowercase()
+        let normalized = text_with_single_and_time
+            .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>();
@@ -284,7 +311,8 @@ mod tests {
     fn test_basic_allowed_pattern() {
         // Pattern: has delete keyword AND has ad keyword AND no negation/question/single
         let text = "删除最近24小时广告";
-        let normalized = text.to_lowercase()
+        let normalized = text
+            .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>();
@@ -301,7 +329,8 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_commands() {
-        let normalized = "删 除".to_lowercase()
+        let normalized = "删 除"
+            .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>();
@@ -311,7 +340,8 @@ mod tests {
     #[test]
     fn test_no_ad_keyword_rejected() {
         let text = "删除消息";
-        let normalized = text.to_lowercase()
+        let normalized = text
+            .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>();
@@ -326,7 +356,8 @@ mod tests {
     #[test]
     fn test_no_delete_keyword_rejected() {
         let text = "这些广告糟糕";
-        let normalized = text.to_lowercase()
+        let normalized = text
+            .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>();

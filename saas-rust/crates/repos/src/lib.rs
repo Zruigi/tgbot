@@ -1,20 +1,31 @@
-pub mod admin_repo;
-pub mod ai_usage_repo;
 pub mod audit_repo;
 pub mod broadcast_repo;
-pub mod feature_repo;
-pub mod finance_repo;
 pub mod group_repo;
-pub mod member_repo;
-pub mod merchant_repo;
 pub mod message_repo;
-pub mod monitor_repo;
-pub mod payment_repo;
 pub mod push_task_repo;
-pub mod quota_repo;
-pub mod subscription_repo;
 pub mod user_repo;
 pub mod verify_repo;
+
+// These source-compatibility modules are intentionally not compiled into the
+// formal release target. Enable `legacy-stubs` only for an explicit audit.
+#[cfg(feature = "legacy-stubs")]
+pub mod admin_repo;
+#[cfg(feature = "legacy-stubs")]
+pub mod ai_usage_repo;
+#[cfg(feature = "legacy-stubs")]
+pub mod feature_repo;
+#[cfg(feature = "legacy-stubs")]
+pub mod finance_repo;
+#[cfg(feature = "legacy-stubs")]
+pub mod merchant_repo;
+#[cfg(feature = "legacy-stubs")]
+pub mod monitor_repo;
+#[cfg(feature = "legacy-stubs")]
+pub mod payment_repo;
+#[cfg(feature = "legacy-stubs")]
+pub mod quota_repo;
+#[cfg(feature = "legacy-stubs")]
+pub mod subscription_repo;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};

@@ -3,7 +3,7 @@
 
 use crate::schema::{AgentContext, AgentResponse};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, Duration};
 
@@ -33,12 +33,7 @@ impl AgentSession {
 
     /// 生成会话 key
     pub fn session_key(tenant_id: &str, user_id: i64, merchant_id: Option<&str>) -> String {
-        format!(
-            "{}:{}:{}",
-            tenant_id,
-            user_id,
-            merchant_id.unwrap_or("")
-        )
+        format!("{}:{}:{}", tenant_id, user_id, merchant_id.unwrap_or(""))
     }
 
     /// 更新会话时间戳
@@ -87,9 +82,7 @@ impl AgentSessionStore {
                 let now = current_timestamp();
 
                 // 清理过期会话
-                sessions.retain(|_, session| {
-                    now - session.updated_at <= SESSION_TTL_SECS
-                });
+                sessions.retain(|_, session| now - session.updated_at <= SESSION_TTL_SECS);
             }
         });
 
@@ -98,12 +91,7 @@ impl AgentSessionStore {
 
     /// 生成会话 key
     pub fn session_key(tenant_id: &str, user_id: i64, merchant_id: Option<&str>) -> String {
-        format!(
-            "{}:{}:{}",
-            tenant_id,
-            user_id,
-            merchant_id.unwrap_or("")
-        )
+        format!("{}:{}:{}", tenant_id, user_id, merchant_id.unwrap_or(""))
     }
 
     /// 获取或创建会话
@@ -171,9 +159,7 @@ static GLOBAL_SESSION_STORE: OnceLock<Arc<AgentSessionStore>> = OnceLock::new();
 
 /// Get the global agent session store (lazy initialized)
 pub fn get_session_store() -> Arc<AgentSessionStore> {
-    Arc::clone(
-        GLOBAL_SESSION_STORE.get_or_init(|| Arc::new(AgentSessionStore::new()))
-    )
+    Arc::clone(GLOBAL_SESSION_STORE.get_or_init(|| Arc::new(AgentSessionStore::new())))
 }
 
 #[cfg(test)]

@@ -155,24 +155,20 @@ impl N8NClient {
         &self,
         req: &WebhookTriggerRequest,
     ) -> Result<WebhookTriggerResponse> {
-        let segment = if req.test {
-            "webhook-test"
-        } else {
-            "webhook"
-        };
+        let segment = if req.test { "webhook-test" } else { "webhook" };
         let url = format!("{}/{}/{}", self.config.base_url, segment, req.path);
         debug!(url, "triggering n8n webhook");
 
         let http_req = self
             .http
             .post(&url)
-            .header(
-                "X-N8N-API-KEY",
-                &self.config.api_key,
-            )
+            .header("X-N8N-API-KEY", &self.config.api_key)
             .json(&req.body);
 
-        let resp = http_req.send().await.context("n8n webhook request failed")?;
+        let resp = http_req
+            .send()
+            .await
+            .context("n8n webhook request failed")?;
         let status = resp.status();
 
         if !status.is_success() {
@@ -204,11 +200,7 @@ impl N8NClient {
     }
 
     /// Convenience: trigger a production webhook with a JSON body.
-    pub async fn trigger(
-        &self,
-        path: &str,
-        body: Value,
-    ) -> Result<WebhookTriggerResponse> {
+    pub async fn trigger(&self, path: &str, body: Value) -> Result<WebhookTriggerResponse> {
         self.trigger_webhook(&WebhookTriggerRequest {
             path: path.to_string(),
             test: false,
@@ -218,11 +210,7 @@ impl N8NClient {
     }
 
     /// Convenience: trigger a test webhook with a JSON body.
-    pub async fn trigger_test(
-        &self,
-        path: &str,
-        body: Value,
-    ) -> Result<WebhookTriggerResponse> {
+    pub async fn trigger_test(&self, path: &str, body: Value) -> Result<WebhookTriggerResponse> {
         self.trigger_webhook(&WebhookTriggerRequest {
             path: path.to_string(),
             test: true,
@@ -265,10 +253,7 @@ impl N8NClient {
 
     /// Get a single workflow by ID.
     pub async fn get_workflow(&self, workflow_id: &str) -> Result<Workflow> {
-        let url = format!(
-            "{}/api/v1/workflows/{}",
-            self.config.base_url, workflow_id
-        );
+        let url = format!("{}/api/v1/workflows/{}", self.config.base_url, workflow_id);
         debug!(url, "getting n8n workflow");
 
         let resp = self

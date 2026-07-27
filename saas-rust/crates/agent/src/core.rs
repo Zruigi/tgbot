@@ -11,10 +11,10 @@ use crate::schema::{
 use crate::tools::broadcast_message::BroadcastMessageTool;
 use crate::tools::delete_recent_ad_messages::DeleteRecentAdMessagesTool;
 use crate::tools::detect_advertising::DetectAdvertisingTool;
-use crate::tools::query_recent_ad_messages::QueryRecentAdMessagesTool;
 use crate::tools::finance_query::FinanceQueryTool;
 use crate::tools::n8n_workflow::N8NWorkflowTool;
 use crate::tools::ocr::OcrTool;
+use crate::tools::query_recent_ad_messages::QueryRecentAdMessagesTool;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -146,11 +146,14 @@ impl AIAgent {
     ) -> AgentResponse {
         // Deterministic pre-route: check for ad deletion request (no LLM)
         if let Some(deletion_response) = self.prepare_recent_ad_deletion(user_message, ctx).await {
-            ctx.conversation_history.push(ChatMessage::user(user_message));
-            ctx.conversation_history.push(ChatMessage::assistant(&deletion_response.text));
+            ctx.conversation_history
+                .push(ChatMessage::user(user_message));
+            ctx.conversation_history
+                .push(ChatMessage::assistant(&deletion_response.text));
             if ctx.conversation_history.len() > MAX_HISTORY {
-                ctx.conversation_history =
-                    ctx.conversation_history[ctx.conversation_history.len() - MAX_HISTORY..].to_vec();
+                ctx.conversation_history = ctx.conversation_history
+                    [ctx.conversation_history.len() - MAX_HISTORY..]
+                    .to_vec();
             }
             return deletion_response;
         }
@@ -319,37 +322,66 @@ impl AIAgent {
 
                 // 如果是内容生成工具的特殊请求
                 let mut result_value = exec_result.to_json_value();
+                let mut generation_error: Option<String> = None;
                 if exec_result.requires_llm_generation {
-                    if let Some(data) = exec_result.data.as_ref() {
-                        if let Some(gen_prompt) =
-                            data.get("generate_prompt").and_then(|v| v.as_str())
-                        {
-                            if !gen_prompt.is_empty() {
-                                match self
-                                    .call_llm(
-                                        &[ChatMessage::user(gen_prompt)],
-                                        model,
-                                        &[],
-                                        round_num,
-                                    )
-                                    .await
-                                {
-                                    Ok(gen_result) => {
-                                        result_value.as_object_mut().map(|obj| {
-                                            obj.insert(
-                                                "generated_content".into(),
-                                                Value::String(gen_result.text),
-                                            );
-                                            obj.remove("requires_llm_generation");
-                                        });
-                                    }
-                                    Err(e) => {
-                                        warn!("LLM generation for tool failed: {}", e);
-                                    }
-                                }
+                    let gen_prompt = exec_result
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("generate_prompt"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|prompt| !prompt.is_empty());
+                    let Some(gen_prompt) = gen_prompt else {
+                        let error = "工具请求内容生成但未提供有效提示词".to_string();
+                        // Keep the error visible to callers instead of returning
+                        // the tool's optimistic success flag.
+                        if let Some(object) = result_value.as_object_mut() {
+                            object.insert("success".into(), Value::Bool(false));
+                        }
+                        all_results.push(SingleToolResult {
+                            tool_name: tool_name.clone(),
+                            result: Some(result_value),
+                            success: false,
+                            error: Some(error),
+                            blocked: false,
+                            needs_confirmation: false,
+                        });
+                        continue;
+                    };
+                    match self
+                        .call_llm(&[ChatMessage::user(gen_prompt)], model, &[], round_num)
+                        .await
+                    {
+                        Ok(gen_result) => {
+                            result_value.as_object_mut().map(|obj| {
+                                obj.insert(
+                                    "generated_content".into(),
+                                    Value::String(gen_result.text),
+                                );
+                                obj.remove("requires_llm_generation");
+                            });
+                        }
+                        Err(e) => {
+                            let message = format!("LLM generation for tool failed: {e}");
+                            warn!("{}", message);
+                            generation_error = Some(message);
+                            if let Some(object) = result_value.as_object_mut() {
+                                object.insert("success".into(), Value::Bool(false));
                             }
                         }
                     }
+                }
+
+                if let Some(error) = generation_error {
+                    all_results.push(SingleToolResult {
+                        tool_name: tool_name.clone(),
+                        result: Some(result_value),
+                        success: false,
+                        error: Some(error),
+                        blocked: false,
+                        needs_confirmation: false,
+                    });
+                    continue;
                 }
 
                 // 只有执行成功且需要确认时才走确认流程
@@ -448,6 +480,7 @@ impl AIAgent {
         let mut action_taken = false;
         let mut has_failure = false;
         let mut failure_messages: Vec<String> = Vec::new();
+        let mut confirmation_items = 0usize;
 
         for (tool_name, prev_result) in &pending_response.tool_results {
             let needs_confirm = prev_result
@@ -459,9 +492,24 @@ impl AIAgent {
                 continue;
             }
 
+            confirmation_items += 1;
+
             let tool_instance = match self.tools.get(tool_name) {
                 Some(t) => t,
-                None => continue,
+                None => {
+                    has_failure = true;
+                    let message = format!("{}: 待确认工具未注册，本次未执行", tool_name);
+                    failure_messages.push(message.clone());
+                    executed_results.insert(
+                        tool_name.clone(),
+                        serde_json::json!({
+                            "success": false,
+                            "action_taken": false,
+                            "message": message,
+                        }),
+                    );
+                    continue;
+                }
             };
 
             let params = prev_result
@@ -471,8 +519,11 @@ impl AIAgent {
 
             match tool_instance.execute(&params, ctx).await {
                 result => {
-                    let result_value = result.to_json_value();
-                    executed_results.insert(tool_name.clone(), result_value.clone());
+                    let mut result_value = result.to_json_value();
+
+                    if result.action_taken {
+                        action_taken = true;
+                    }
 
                     if !result.success {
                         has_failure = true;
@@ -481,11 +532,28 @@ impl AIAgent {
                             tool_name,
                             result.message.unwrap_or_else(|| "执行失败".into())
                         ));
-                    } else if result.action_taken {
-                        action_taken = true;
+                    } else if !result.action_taken {
+                        // A dangerous confirmation is only successful when the tool reports
+                        // an actual side effect. A successful no-op must never be presented as
+                        // "操作已执行完毕".
+                        has_failure = true;
+                        failure_messages.push(format!(
+                            "{}: 工具未报告实际动作，本次按未执行处理",
+                            tool_name
+                        ));
+                        if let Some(result_object) = result_value.as_object_mut() {
+                            result_object.insert("success".into(), Value::Bool(false));
+                            result_object.insert("fail_closed".into(), Value::Bool(true));
+                        }
                     }
+                    executed_results.insert(tool_name.clone(), result_value);
                 }
             }
+        }
+
+        if confirmation_items == 0 {
+            has_failure = true;
+            failure_messages.push("没有找到可执行的待确认工具，本次未执行任何操作".into());
         }
 
         // Build result text based on execution status
@@ -540,7 +608,7 @@ impl AIAgent {
         let confidence = if has_failure { 0.7 } else { 1.0 };
 
         AgentResponse {
-            text: result_text,  // ← 关键：仅返回执行结果，不拼接 pending_response.text
+            text: result_text, // ← 关键：仅返回执行结果，不拼接 pending_response.text
             tool_calls_made: pending_response.tool_calls_made.clone(),
             tool_results: executed_results,
             is_action_taken: action_taken,
@@ -848,11 +916,6 @@ impl AIAgent {
                     serde_json::json!({"action": "unreconciled"})
                 } else if text.contains("科目") || text.contains("分类") {
                     serde_json::json!({"action": "categories"})
-                } else if (text.to_lowercase().contains("trc20")
-                    || text.to_lowercase().contains("bsc"))
-                    && text.contains("测试")
-                {
-                    serde_json::json!({"action": "onchain_api_test"})
                 } else {
                     serde_json::json!({"action": "analysis"})
                 }
@@ -862,7 +925,9 @@ impl AIAgent {
             }
             "telegram_sdk_query" => {
                 // 4c3f1dc: 数字 group_id 优先于群名解析
-                if let Ok(re) = regex::Regex::new(r"(?i)(?:group_id|chat_id|群|群组)\s*[:：=]?\s*(-?\d{5,})") {
+                if let Ok(re) =
+                    regex::Regex::new(r"(?i)(?:group_id|chat_id|群|群组)\s*[:：=]?\s*(-?\d{5,})")
+                {
                     if let Some(caps) = re.captures(text) {
                         if let Some(id_str) = caps.get(1) {
                             if let Ok(chat_id) = id_str.as_str().parse::<i64>() {
@@ -1001,7 +1066,7 @@ impl AIAgent {
     async fn prepare_recent_ad_deletion(
         &self,
         user_text: &str,
-        _ctx: &mut AgentContext,
+        ctx: &mut AgentContext,
     ) -> Option<AgentResponse> {
         if !self.is_recent_ad_delete_request(user_text) {
             return None;
@@ -1036,60 +1101,63 @@ impl AIAgent {
         };
 
         // Parse group ID if present
-        let group_match = if let Some(caps) = regex::Regex::new(r"(?:group_id|群|群组)\s*[:：=]?\s*(-?\d{5,})")
-            .ok()
-            .and_then(|re| re.captures_iter(user_text).next())
+        let group_match = if let Some(caps) =
+            regex::Regex::new(r"(?:group_id|群|群组)\s*[:：=]?\s*(-?\d{5,})")
+                .ok()
+                .and_then(|re| re.captures_iter(user_text).next())
         {
             caps.get(1).and_then(|m| m.as_str().parse::<i64>().ok())
         } else {
             None
         };
 
-        // Check if should include sender's messages
-        let _include_sender_messages = [
-            "发布者的所有消息",
-            "发布者所有消息",
-            "发送者的所有消息",
-            "发送者所有消息",
-            "该用户所有消息",
-            "他们的所有消息",
-        ]
-        .iter()
-        .any(|phrase| {
-            user_text
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect::<String>()
-                .contains(phrase)
+        let params = serde_json::json!({
+            "hours": hours,
+            "limit": requested_limit,
+            "group_id": group_match,
         });
-
-        // TODO: Call query_recent_ad_messages tool to generate snapshot
-        // For now, return a placeholder response that requires confirmation
-
+        let Some(tool) = self.tools.get("query_recent_ad_messages") else {
+            return Some(AgentResponse {
+                text: "广告查询工具未注册，本次没有执行任何查询。".into(),
+                tool_calls_made: vec![],
+                tool_results: HashMap::new(),
+                is_action_taken: false,
+                action_summary: "query_recent_ad_messages unavailable".into(),
+                requires_confirmation: false,
+                confidence: 1.0,
+                raw_response: None,
+            });
+        };
+        let exec_result = tool.execute(&params, ctx).await;
+        let result_value = exec_result.to_json_value();
+        let message = exec_result
+            .message
+            .clone()
+            .unwrap_or_else(|| "广告查询未完成".into());
+        let text = if exec_result.success && exec_result.needs_confirmation {
+            format!("{}，请确认后再执行删除。", message)
+        } else if exec_result.success {
+            message.clone()
+        } else {
+            format!("广告查询失败：{}", message)
+        };
+        let mut tool_results = HashMap::new();
+        tool_results.insert("query_recent_ad_messages".into(), result_value);
         Some(AgentResponse {
-            text: "已准备查询广告消息，生成快照待删除确认...".into(),
+            text,
             tool_calls_made: vec!["query_recent_ad_messages".into()],
-            tool_results: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "query_recent_ad_messages".into(),
-                    serde_json::json!({
-                        "needs_confirmation": true,
-                        "message": "Snapshot prepared, awaiting confirmation"
-                    }),
-                );
-                m
-            },
+            tool_results,
             is_action_taken: false,
             action_summary: format!(
-                "Query {} hours of ads (limit {}), {}group_id {}",
+                "查询 {} 小时广告（limit {}，{}group_id {}）: {}",
                 hours,
                 requested_limit,
                 if group_match.is_some() { "" } else { "no " },
-                group_match.unwrap_or(0)
+                group_match.unwrap_or(0),
+                message
             ),
-            requires_confirmation: true,
-            confidence: 0.95,
+            requires_confirmation: exec_result.success && exec_result.needs_confirmation,
+            confidence: if exec_result.success { 1.0 } else { 0.0 },
             raw_response: None,
         })
     }
@@ -1411,9 +1479,18 @@ pub fn default_tool_registry_with_pool_and_telegram(
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     // 从独立模块加载的工具
-    registry.register(Arc::new(FinanceQueryTool));
+    if let Some(ref pool) = pool {
+        registry.register(Arc::new(FinanceQueryTool::with_pool(pool.clone())));
+    } else {
+        registry.register(Arc::new(FinanceQueryTool::new()));
+    }
     // 注册 BroadcastMessageTool，传入可选的 Telegram 客户端
-    if let Some(client) = telegram_client.clone() {
+    if let (Some(pool), Some(client)) = (pool.as_ref(), telegram_client.clone()) {
+        registry.register(Arc::new(BroadcastMessageTool::with_pool_and_telegram(
+            pool.clone(),
+            client,
+        )));
+    } else if let Some(client) = telegram_client.clone() {
         registry.register(Arc::new(BroadcastMessageTool::with_telegram(client)));
     } else {
         registry.register(Arc::new(BroadcastMessageTool::new()));
@@ -1441,7 +1518,9 @@ pub fn default_tool_registry_with_pool_and_telegram(
     if let Some(pool) = pool {
         if let Some(client) = telegram_client {
             registry.register(Arc::new(QueryRecentAdMessagesTool::new(pool.clone())));
-            registry.register(Arc::new(DeleteRecentAdMessagesTool::with_telegram(pool, client)));
+            registry.register(Arc::new(DeleteRecentAdMessagesTool::with_telegram(
+                pool, client,
+            )));
         } else {
             registry.register(Arc::new(QueryRecentAdMessagesTool::new(pool.clone())));
             registry.register(Arc::new(DeleteRecentAdMessagesTool::new(pool)));
@@ -1473,6 +1552,99 @@ mod tests {
                 text: "这是一个模拟回复".into(),
                 tool_calls: vec![],
             })
+        }
+    }
+
+    struct ConfirmNoActionTool;
+
+    #[async_trait]
+    impl Tool for ConfirmNoActionTool {
+        fn name(&self) -> &str {
+            "confirm_no_action"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that completes without a side effect"
+        }
+
+        async fn execute(&self, _params: &Value, _context: &AgentContext) -> ToolExecuteResult {
+            ToolExecuteResult::ok("没有执行实际动作")
+        }
+    }
+
+    struct ConfirmActionTool;
+
+    #[async_trait]
+    impl Tool for ConfirmActionTool {
+        fn name(&self) -> &str {
+            "confirm_action"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that reports a real side effect"
+        }
+
+        async fn execute(&self, _params: &Value, _context: &AgentContext) -> ToolExecuteResult {
+            ToolExecuteResult {
+                success: true,
+                data: None,
+                message: Some("实际动作已执行".into()),
+                action_taken: true,
+                needs_confirmation: false,
+                requires_llm_generation: false,
+                generated_content: None,
+            }
+        }
+    }
+
+    struct ConfirmPartialTool;
+
+    #[async_trait]
+    impl Tool for ConfirmPartialTool {
+        fn name(&self) -> &str {
+            "confirm_partial"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that reports a partial side effect"
+        }
+
+        async fn execute(&self, _params: &Value, _context: &AgentContext) -> ToolExecuteResult {
+            ToolExecuteResult {
+                success: false,
+                data: None,
+                message: Some("部分目标失败".into()),
+                action_taken: true,
+                needs_confirmation: false,
+                requires_llm_generation: false,
+                generated_content: None,
+            }
+        }
+    }
+
+    fn pending_confirmation(tool_name: Option<&str>) -> AgentResponse {
+        let mut tool_results = HashMap::new();
+        if let Some(tool_name) = tool_name {
+            tool_results.insert(
+                tool_name.to_string(),
+                serde_json::json!({
+                    "needs_confirmation": true,
+                    "_params": {"confirm": true},
+                }),
+            );
+        }
+
+        AgentResponse {
+            text: "请确认操作".into(),
+            tool_calls_made: tool_name
+                .map(|name| vec![name.to_string()])
+                .unwrap_or_default(),
+            tool_results,
+            is_action_taken: false,
+            action_summary: "待确认".into(),
+            requires_confirmation: true,
+            confidence: 0.6,
+            raw_response: None,
         }
     }
 
@@ -1558,6 +1730,91 @@ mod tests {
         let result = agent.confirm_and_execute(&response, &ctx).await;
         assert!(!result.requires_confirmation);
         assert_eq!(result.text, "回复内容");
+    }
+
+    #[tokio::test]
+    async fn test_confirm_and_execute_fails_closed_without_pending_tool() {
+        let agent = AIAgent::new(Arc::new(MockLlmCaller), Arc::new(ToolRegistry::new()));
+        let result = agent
+            .confirm_and_execute(&pending_confirmation(None), &AgentContext::new(1))
+            .await;
+
+        assert!(result.text.contains("未执行"));
+        assert!(!result.text.contains("操作已执行完毕"));
+        assert!(!result.is_action_taken);
+        assert!(result.tool_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_confirm_and_execute_fails_closed_when_tool_is_missing() {
+        let agent = AIAgent::new(Arc::new(MockLlmCaller), Arc::new(ToolRegistry::new()));
+        let result = agent
+            .confirm_and_execute(
+                &pending_confirmation(Some("missing_tool")),
+                &AgentContext::new(1),
+            )
+            .await;
+
+        assert!(result.text.contains("未执行"));
+        assert!(!result.text.contains("操作已执行完毕"));
+        assert!(!result.is_action_taken);
+        assert_eq!(result.tool_results["missing_tool"]["success"], false);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_and_execute_fails_closed_on_successful_noop() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ConfirmNoActionTool));
+        let agent = AIAgent::new(Arc::new(MockLlmCaller), Arc::new(tools));
+        let result = agent
+            .confirm_and_execute(
+                &pending_confirmation(Some("confirm_no_action")),
+                &AgentContext::new(1),
+            )
+            .await;
+
+        assert!(result.text.contains("未执行"));
+        assert!(!result.text.contains("操作已执行完毕"));
+        assert!(!result.is_action_taken);
+        assert_eq!(result.tool_results["confirm_no_action"]["success"], false);
+        assert_eq!(
+            result.tool_results["confirm_no_action"]["fail_closed"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn test_confirm_and_execute_reports_success_only_after_action() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ConfirmActionTool));
+        let agent = AIAgent::new(Arc::new(MockLlmCaller), Arc::new(tools));
+        let result = agent
+            .confirm_and_execute(
+                &pending_confirmation(Some("confirm_action")),
+                &AgentContext::new(1),
+            )
+            .await;
+
+        assert!(result.text.starts_with("操作已执行完毕"));
+        assert!(result.is_action_taken);
+        assert_eq!(result.tool_results["confirm_action"]["success"], true);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_and_execute_reports_partial_side_effects() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ConfirmPartialTool));
+        let agent = AIAgent::new(Arc::new(MockLlmCaller), Arc::new(tools));
+        let result = agent
+            .confirm_and_execute(
+                &pending_confirmation(Some("confirm_partial")),
+                &AgentContext::new(1),
+            )
+            .await;
+
+        assert!(result.text.contains("部分执行"));
+        assert!(result.is_action_taken);
+        assert_eq!(result.tool_results["confirm_partial"]["success"], false);
     }
 
     #[test]

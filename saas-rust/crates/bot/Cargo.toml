@@ -3,6 +3,11 @@ name = "tgbot-bot"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Historical standalone bot package; the formal release is tgbot-app.
+legacy-bot = []
+
 [dependencies]
 tgbot-domain = { workspace = true }
 tgbot-services = { workspace = true }

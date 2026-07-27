@@ -14,12 +14,21 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_services::ad_governance::AdGovernanceService;
-use std::sync::Arc;
 
 use crate::auth::resolve_scope;
 use crate::state::AppState;
+
+fn map_ad_scan_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.contains("not found") || message.contains("access denied") {
+        ApiError::NotFound("ad_scan_not_found".into())
+    } else {
+        ApiError::Anyhow(error)
+    }
+}
 
 // ============================================================================
 // Request/Response Models
@@ -103,7 +112,8 @@ pub async fn create_ad_scan(
             activate_policy,
             &source,
         )
-        .await?;
+        .await
+        .map_err(map_ad_scan_error)?;
 
     Ok(Json(json!({
         "status": "ok",
@@ -122,7 +132,10 @@ pub async fn get_ad_scan(
     let (tenant_id, _) = scope.require_merchant()?;
 
     let service = AdGovernanceService::new(Arc::new(state.db()?.clone()));
-    let job = service.get_job(&tenant_id, &job_id).await?;
+    let job = service
+        .get_job(&tenant_id, &job_id)
+        .await
+        .map_err(map_ad_scan_error)?;
 
     Ok(Json(json!({
         "status": "ok",
@@ -147,7 +160,8 @@ pub async fn get_ad_scan_clusters(
     let service = AdGovernanceService::new(Arc::new(state.db()?.clone()));
     let clusters = service
         .get_clusters(&tenant_id, &job_id, tier, limit)
-        .await?;
+        .await
+        .map_err(map_ad_scan_error)?;
 
     Ok(Json(json!({
         "status": "ok",
@@ -176,14 +190,17 @@ pub async fn confirm_ad_scan(
     // Configure job with confirmed settings
     let _configured = service
         .configure_job(&tenant_id, &job_id, dry_run, activate_policy)
-        .await?;
+        .await
+        .map_err(map_ad_scan_error)?;
 
     // Start the job (transitions to queued → worker picks it up)
-    let job = service.start_job(&tenant_id, &job_id).await?;
+    let job = service
+        .start_job(&tenant_id, &job_id)
+        .await
+        .map_err(map_ad_scan_error)?;
 
     Ok(Json(json!({
         "status": "ok",
         "job": job,
     })))
 }
-

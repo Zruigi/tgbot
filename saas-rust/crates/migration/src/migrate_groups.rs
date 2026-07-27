@@ -69,10 +69,7 @@ pub async fn migrate_groups(
 }
 
 /// Migrate a list of groups
-async fn migrate_group_list(
-    groups: &[SqliteGroup],
-    pg_pool: &PgPool,
-) -> Result<GroupStats> {
+async fn migrate_group_list(groups: &[SqliteGroup], pg_pool: &PgPool) -> Result<GroupStats> {
     let mut stats = GroupStats {
         total_source: groups.len() as i64,
         migrated: 0,
@@ -102,10 +99,7 @@ async fn migrate_group_list(
 }
 
 /// Migrate a single group
-async fn migrate_single_group(
-    sqlite_group: &SqliteGroup,
-    pg_pool: &PgPool,
-) -> Result<()> {
+async fn migrate_single_group(sqlite_group: &SqliteGroup, pg_pool: &PgPool) -> Result<()> {
     let first_seen = parse_timestamp(&sqlite_group.first_seen)?;
     let updated_at = parse_timestamp(&sqlite_group.updated_at)?;
     let verify_type = sqlite_group.verify_type.clone();
@@ -198,12 +192,11 @@ async fn migrate_member_list(
 }
 
 /// Migrate a single group member
-async fn migrate_single_member(
-    sqlite_member: &SqliteGroupMember,
-    pg_pool: &PgPool,
-) -> Result<()> {
+async fn migrate_single_member(sqlite_member: &SqliteGroupMember, pg_pool: &PgPool) -> Result<()> {
     let joined_at = parse_timestamp(&sqlite_member.joined_at)?;
-    let verified_at = sqlite_member.verified_at.as_ref()
+    let verified_at = sqlite_member
+        .verified_at
+        .as_ref()
         .and_then(|s| parse_timestamp(s).ok());
 
     sqlx::query(
@@ -231,7 +224,7 @@ async fn migrate_single_member(
             is_verified = COALESCE(EXCLUDED.is_verified, groups.group_members.is_verified),
             verified_at = COALESCE(EXCLUDED.verified_at, groups.group_members.verified_at),
             avatar_file_id = COALESCE(EXCLUDED.avatar_file_id, groups.group_members.avatar_file_id)
-        "#
+        "#,
     )
     .bind(sqlite_member.user_id)
     .bind(&sqlite_member.username)
@@ -286,19 +279,17 @@ pub async fn verify_group_migration(
     let source_groups = sqlite_reader.read_groups()?.len() as i64;
     let source_members = sqlite_reader.read_all_group_members()?.len() as i64;
 
-    let target_groups: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM groups.tracked_groups"
-    )
-    .fetch_one(pg_pool)
-    .await
-    .context("Failed to count groups in PostgreSQL")?;
+    let target_groups: i64 =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM groups.tracked_groups")
+            .fetch_one(pg_pool)
+            .await
+            .context("Failed to count groups in PostgreSQL")?;
 
-    let target_members: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM groups.group_members"
-    )
-    .fetch_one(pg_pool)
-    .await
-    .context("Failed to count group members in PostgreSQL")?;
+    let target_members: i64 =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM groups.group_members")
+            .fetch_one(pg_pool)
+            .await
+            .context("Failed to count group members in PostgreSQL")?;
 
     let result = GroupVerificationResult {
         source_groups,

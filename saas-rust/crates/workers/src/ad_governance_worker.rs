@@ -15,11 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 use tracing::{error, info, instrument, warn};
-use uuid::Uuid;
 
 use crate::job_queue::ClaimedJob;
-use crate::scheduler::Worker;
 use crate::push_task_worker::TelegramClientResolver;
+use crate::scheduler::Worker;
 
 use tgbot_integrations::litellm::LiteLLMClient;
 use tgbot_integrations::telegram::SendMessageParams;
@@ -35,7 +34,10 @@ pub struct AdGovernanceWorker {
 }
 
 impl AdGovernanceWorker {
-    pub fn new(telegram_resolver: Arc<dyn TelegramClientResolver>, litellm: Arc<LiteLLMClient>) -> Self {
+    pub fn new(
+        telegram_resolver: Arc<dyn TelegramClientResolver>,
+        litellm: Arc<LiteLLMClient>,
+    ) -> Self {
         Self {
             telegram_resolver,
             litellm,
@@ -58,37 +60,63 @@ impl Worker for AdGovernanceWorker {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("missing job_id"))?
             .to_string();
-        let tenant_id: String = payload
+        let tenant_id = payload
             .get("tenant_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("default")
-            .to_string();
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("missing tenant_id"))?;
+        if tenant_id != claimed.job.tenant_id {
+            return Err(anyhow!("tenant mismatch between queue row and payload"));
+        }
+        let payload_group_id = payload.get("group_id").and_then(Value::as_i64);
+        let recent_only = payload
+            .get("recent_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         info!(job_id, tenant_id, "processing ad scan job");
 
-        match self.run_scan_job(pool, &tenant_id, &job_id).await {
+        match self
+            .run_scan_job(pool, tenant_id, &job_id, payload_group_id, recent_only)
+            .await
+        {
             Ok(_) => {
                 info!(job_id, "ad scan job completed successfully");
                 Ok(())
             }
             Err(e) => {
                 error!(job_id, error = %e, "ad scan job failed");
-                let _ = sqlx::query(
+                let status_result = sqlx::query(
                     "UPDATE groups.ad_scan_jobs SET status = 'failed', error = $1, finished_at = now() WHERE job_id = $2 AND tenant_id = $3",
                 )
                 .bind(e.to_string())
                 .bind(&job_id)
-                .bind(&tenant_id)
+                .bind(tenant_id)
                 .execute(pool)
                 .await;
-                Err(e)
+                match status_result {
+                    Ok(_) => Err(e),
+                    Err(status_error) => Err(anyhow!(
+                        "{}; additionally failed to persist failed job status: {}",
+                        e,
+                        status_error
+                    )),
+                }
             }
         }
     }
 }
 
 impl AdGovernanceWorker {
-    async fn run_scan_job(&self, pool: &PgPool, tenant_id: &str, job_id: &str) -> Result<()> {
+    async fn run_scan_job(
+        &self,
+        pool: &PgPool,
+        tenant_id: &str,
+        job_id: &str,
+        payload_group_id: Option<i64>,
+        recent_only: bool,
+    ) -> Result<()> {
         let service = AdGovernanceService::new(Arc::new(pool.clone()));
 
         // Get job with tenant scope
@@ -111,17 +139,24 @@ impl AdGovernanceWorker {
 
         let group_id: i64 = job_row.get("group_id");
         let dry_run: bool = job_row.get("dry_run");
+        let activate_policy: bool = job_row.get("activate_policy");
+        let requested_by: Option<String> = job_row.get("requested_by");
+        if payload_group_id.is_some_and(|value| value != group_id) {
+            return Err(anyhow!("group mismatch between scan job and payload"));
+        }
 
         // Transition to scanning
         sqlx::query(
-            "UPDATE groups.ad_scan_jobs SET status = 'scanning', progress = 10, started_at = now() WHERE job_id = $1",
+            "UPDATE groups.ad_scan_jobs SET status = 'scanning', progress = 10, started_at = now() \
+             WHERE job_id = $1 AND tenant_id = $2",
         )
         .bind(job_id)
+        .bind(tenant_id)
         .execute(pool)
         .await?;
 
         // Load messages from groups.group_messages with all required columns
-        let messages = load_group_messages(pool, tenant_id, group_id).await?;
+        let messages = load_group_messages(pool, tenant_id, group_id, recent_only).await?;
         let total_messages = messages.len() as i32;
 
         // Clustering pipeline using service functions
@@ -132,24 +167,33 @@ impl AdGovernanceWorker {
         let candidates: Vec<_> = exact_clusters
             .into_iter()
             .filter(|cluster| {
-                let row_count = cluster.get("rows").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let row_count = cluster
+                    .get("rows")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
                 row_count >= 3
                     || cluster
                         .get("fingerprint_hash")
                         .and_then(|v| v.as_str())
                         .map(|h| known_hashes.contains(h))
                         .unwrap_or(false)
-                    || cluster.get("stored_ad").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || cluster
+                        .get("stored_ad")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
             })
             .collect();
 
         // Update progress
         sqlx::query(
-            "UPDATE groups.ad_scan_jobs SET progress = 35, total_messages = $1, candidate_clusters = $2 WHERE job_id = $3",
+            "UPDATE groups.ad_scan_jobs SET progress = 35, total_messages = $1, candidate_clusters = $2 \
+             WHERE job_id = $3 AND tenant_id = $4",
         )
         .bind(total_messages)
         .bind(candidates.len() as i32)
         .bind(job_id)
+        .bind(tenant_id)
         .execute(pool)
         .await?;
 
@@ -188,10 +232,14 @@ impl AdGovernanceWorker {
         }
 
         // Transition to classifying
-        sqlx::query("UPDATE groups.ad_scan_jobs SET status = 'classifying', progress = 60 WHERE job_id = $1")
-            .bind(job_id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE groups.ad_scan_jobs SET status = 'classifying', progress = 60 \
+             WHERE job_id = $1 AND tenant_id = $2",
+        )
+        .bind(job_id)
+        .bind(tenant_id)
+        .execute(pool)
+        .await?;
 
         // Persist clusters and execute actions
         let now_ts = Utc::now().timestamp();
@@ -204,49 +252,63 @@ impl AdGovernanceWorker {
             let classification = decisions
                 .get(template_hash)
                 .cloned()
-                .unwrap_or_else(|| json!({"is_ad": false, "source": "unknown", "confidence": 0.0}));
+                .unwrap_or_else(|| json!({"source": "pending", "confidence": 0.0}));
 
             // Persist cluster and cluster_messages
-            let _ = persist_cluster(pool, tenant_id, group_id, job_id, cluster, &classification, now_ts).await;
+            persist_cluster(
+                pool,
+                tenant_id,
+                group_id,
+                job_id,
+                cluster,
+                &classification,
+                now_ts,
+            )
+            .await?;
 
             // Execute actions based on enforcement gates
-            if !dry_run {
-                let auto_enforce = std::env::var("AD_AUTO_ENFORCE_ENABLED")
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    == "true";
-                if auto_enforce {
-                    let _ = self
-                        .execute_actions(pool, tenant_id, group_id, cluster, &classification)
-                        .await
-                        .map_err(|e| {
-                            warn!("action execution error: {}", e);
-                        });
-                }
+            if enforcement_allowed(dry_run, env_gate_enabled("AD_AUTO_ENFORCE_ENABLED")) {
+                self.execute_actions(pool, tenant_id, group_id, job_id, cluster, &classification)
+                    .await?;
             }
         }
 
         // Update with summary
+        let confirmed_clusters = decisions
+            .values()
+            .filter(|decision| decision.get("is_ad").and_then(Value::as_bool) == Some(true))
+            .count();
+        let pending_clusters = candidates.len().saturating_sub(decisions.len());
         let summary = json!({
             "total_messages": total_messages,
             "candidate_clusters": candidates.len(),
-            "confirmed_clusters": decisions.len(),
+            "confirmed_clusters": confirmed_clusters,
+            "pending_clusters": pending_clusters,
+            "recent_only": recent_only,
         });
 
-        sqlx::query(
-            "UPDATE groups.ad_scan_jobs SET status = 'completed', progress = 100, summary_json = $1, finished_at = now() WHERE job_id = $2",
-        )
-        .bind(summary.to_string())
-        .bind(job_id)
-        .execute(pool)
-        .await?;
+        validate_policy_activation(dry_run, activate_policy, pending_clusters)?;
+        service
+            .finalize_successful_scan(
+                tenant_id,
+                job_id,
+                group_id,
+                &summary,
+                confirmed_clusters as i32,
+                activate_policy,
+                requested_by.as_deref(),
+            )
+            .await?;
 
         info!(job_id, "scan job pipeline completed");
         Ok(())
     }
 
     /// LLM classification: 15s timeout, returns empty on failure
-    async fn classify_with_llm(&self, candidates: &[HashMap<String, Value>]) -> Result<HashMap<String, Value>> {
+    async fn classify_with_llm(
+        &self,
+        candidates: &[HashMap<String, Value>],
+    ) -> Result<HashMap<String, Value>> {
         let items: Vec<Value> = candidates
             .iter()
             .take(20)
@@ -318,10 +380,14 @@ impl AdGovernanceWorker {
         pool: &PgPool,
         tenant_id: &str,
         group_id: i64,
+        job_id: &str,
         cluster: &HashMap<String, Value>,
         classification: &Value,
     ) -> Result<()> {
-        let is_ad = classification.get("is_ad").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_ad = classification
+            .get("is_ad")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if !is_ad {
             return Ok(());
         }
@@ -331,10 +397,14 @@ impl AdGovernanceWorker {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        let cluster_id = format!("gov:unknown:{}", template_hash);
+        let cluster_id = format!("gov:{}:{}", job_id, template_hash);
 
         // Get cluster's messages to determine action tier and refs
-        let rows_arr = cluster.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let rows_arr = cluster
+            .get("rows")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         if rows_arr.is_empty() {
             return Ok(());
         }
@@ -360,198 +430,307 @@ impl AdGovernanceWorker {
             .collect();
 
         // Determine action tier
-        let action_tier = if rows_arr.len() >= 6 && sender_ids.len() >= 3 {
-            "exact_delete_mute"
-        } else if rows_arr.len() >= 6 {
-            "exact_delete"
-        } else if rows_arr.len() > 1 && recent_messages.len() >= 5 {
-            "similar_delete"
-        } else if recent_messages.len() >= 3 {
-            "warn"
-        } else {
-            "none"
-        };
+        let action_tier = cluster_action_tier(cluster);
 
         if action_tier == "none" {
             return Ok(());
         }
 
         let service = AdGovernanceService::new(Arc::new(pool.clone()));
-        let telegram = self.telegram_resolver.resolve(pool, tenant_id).await?;
-
-        // PERMISSION PRECHECK: check bot can delete before attempting
-        if matches!(action_tier, "exact_delete" | "similar_delete" | "exact_delete_mute") {
-            if std::env::var("AD_DELETE_ENABLED").unwrap_or_default().to_lowercase() == "true" {
-                match check_bot_delete_permission(&telegram, group_id).await {
-                    Ok(true) => {} // OK to proceed
-                    Ok(false) | Err(_) => {
-                        // Fail-closed: record action as failed and skip execution
-                        let _ = service.record_action(
-                            tenant_id,
-                            group_id,
-                            &cluster_id,
-                            action_tier,
-                            "batch",
-                            &json!({"tier": action_tier, "message_count": recent_messages.len()}),
-                            Some("bot_missing_delete_permission"),
-                            false,
-                        ).await;
-                        return Ok(());
-                    }
-                }
-            }
-        }
 
         match action_tier {
             "exact_delete" | "similar_delete" | "exact_delete_mute" => {
-                if std::env::var("AD_DELETE_ENABLED").unwrap_or_default().to_lowercase() == "true" {
-                    // Record planned action first (idempotent via action_key)
-                    let action_recorded = service.record_action(
+                // Delete/mute is protected by an independent default-off gate.
+                if !env_gate_enabled("AD_DELETE_ENABLED") {
+                    return Ok(());
+                }
+
+                let telegram = self.telegram_resolver.resolve(pool, tenant_id).await?;
+                let permission_error = match check_bot_delete_permission(&telegram, group_id).await
+                {
+                    Ok(true) => None,
+                    Ok(false) => Some("bot_missing_delete_permission".to_string()),
+                    Err(error) => Some(format!("bot_delete_permission_check_failed: {error}")),
+                };
+                if let Some(permission_error) = permission_error {
+                    service
+                        .record_action(
+                            tenant_id,
+                            job_id,
+                            group_id,
+                            &cluster_id,
+                            "delete",
+                            "batch",
+                            &json!({"tier": action_tier, "message_count": recent_messages.len()}),
+                            Some(&permission_error),
+                            false,
+                        )
+                        .await?;
+                    return Err(anyhow!(permission_error));
+                }
+
+                let telegram_message_ids = recent_messages
+                    .iter()
+                    .filter_map(|message| message.get("tg_msg_id").and_then(Value::as_i64))
+                    .collect::<Vec<_>>();
+                if telegram_message_ids.is_empty() {
+                    return Ok(());
+                }
+
+                let Some(delete_action_key) = service
+                    .record_action(
                         tenant_id,
+                        job_id,
                         group_id,
                         &cluster_id,
                         "delete",
                         "batch",
-                        &json!({"tier": action_tier, "message_count": recent_messages.len()}),
+                        &json!({"tier": action_tier, "message_ids": telegram_message_ids}),
                         None,
                         false,
-                    ).await.unwrap_or(false);
+                    )
+                    .await?
+                else {
+                    return Ok(());
+                };
 
-                    // Skip if action already executed (idempotent gate)
-                    if !action_recorded {
-                        return Ok(());
+                for tg_msg_id in telegram_message_ids {
+                    if let Err(error) = telegram.delete_message(group_id, tg_msg_id).await {
+                        let message =
+                            format!("failed to delete Telegram message {tg_msg_id}: {error}");
+                        mark_action_failed_preserving_error(
+                            &service,
+                            tenant_id,
+                            job_id,
+                            group_id,
+                            &delete_action_key,
+                            &message,
+                        )
+                        .await?;
+                        return Err(anyhow!(message));
                     }
 
-                    // Execute delete on each message
-                    for msg in &recent_messages {
-                        if let Some(tg_msg_id) = msg.get("tg_msg_id").and_then(|v| v.as_i64()) {
-                            match telegram.delete_message(group_id, tg_msg_id).await {
-                                Ok(_) => {
-                                    // Soft-delete in DB
-                                    let _ = sqlx::query(
-                                        "UPDATE groups.group_messages SET is_deleted = true, deleted_at = now(), ad_action_status = 'deleted' WHERE group_id = $1 AND tg_msg_id = $2",
-                                    )
-                                    .bind(group_id)
-                                    .bind(tg_msg_id)
-                                    .execute(pool)
-                                    .await;
-                                }
-                                Err(e) => {
-                                    warn!("failed to delete message {}: {}", tg_msg_id, e);
-                                    // Update action row with error
-                                    let _ = sqlx::query(
-                                        "UPDATE groups.ad_governance_actions SET status = 'failed', error = $1 WHERE action_key LIKE $2"
-                                    )
-                                    .bind(e.to_string())
-                                    .bind(format!("{}:{}:{}:delete:%", tenant_id, group_id, cluster_id))
-                                    .execute(pool)
-                                    .await;
-                                }
+                    let result = sqlx::query(
+                        "UPDATE groups.group_messages \
+                         SET is_deleted = true, deleted_at = now(), ad_action_status = 'deleted' \
+                         WHERE tenant_id = $1 AND group_id = $2 AND tg_msg_id = $3",
+                    )
+                    .bind(tenant_id)
+                    .bind(group_id)
+                    .bind(tg_msg_id)
+                    .execute(pool)
+                    .await;
+                    match result {
+                        Ok(result) if result.rows_affected() > 0 => {}
+                        Ok(_) => {
+                            let message = format!(
+                                "Telegram message {tg_msg_id} deleted but scoped database row was not found"
+                            );
+                            mark_action_failed_preserving_error(
+                                &service,
+                                tenant_id,
+                                job_id,
+                                group_id,
+                                &delete_action_key,
+                                &message,
+                            )
+                            .await?;
+                            return Err(anyhow!(message));
+                        }
+                        Err(error) => {
+                            let message = format!(
+                                "Telegram message {tg_msg_id} deleted but database update failed: {error}"
+                            );
+                            mark_action_failed_preserving_error(
+                                &service,
+                                tenant_id,
+                                job_id,
+                                group_id,
+                                &delete_action_key,
+                                &message,
+                            )
+                            .await?;
+                            return Err(anyhow!(message));
+                        }
+                    }
+                }
+                service
+                    .mark_action_executed(tenant_id, job_id, group_id, &delete_action_key)
+                    .await?;
+
+                // MUTE ARM (for exact_delete_mute tier)
+                if action_tier == "exact_delete_mute" && sender_ids.len() >= 3 {
+                    let mute_seconds = get_mute_duration(pool, tenant_id, group_id).await?;
+
+                    let mut safe_senders = Vec::new();
+                    for sender_id in &sender_ids {
+                        let member = telegram
+                            .get_chat_member(group_id, *sender_id)
+                            .await
+                            .map_err(|error| {
+                                anyhow!(
+                                    "cannot verify sender {} admin status: {}",
+                                    sender_id,
+                                    error
+                                )
+                            })?;
+                        match member.get("status").and_then(Value::as_str) {
+                            Some("administrator" | "creator" | "left" | "kicked") => {}
+                            Some("member" | "restricted") => safe_senders.push(*sender_id),
+                            Some(status) => {
+                                return Err(anyhow!(
+                                    "unsupported Telegram member status for sender {}: {}",
+                                    sender_id,
+                                    status
+                                ));
+                            }
+                            None => {
+                                return Err(anyhow!(
+                                    "missing Telegram member status for sender {}",
+                                    sender_id
+                                ));
                             }
                         }
                     }
 
-                    // MUTE ARM (for exact_delete_mute tier)
-                    if action_tier == "exact_delete_mute" && sender_ids.len() >= 3 {
-                        let mute_seconds = get_mute_duration(pool, tenant_id, group_id).await.unwrap_or(2592000);
+                    for sender_id in safe_senders {
+                        let Some(mute_action_key) = service
+                            .record_action(
+                                tenant_id,
+                                job_id,
+                                group_id,
+                                &cluster_id,
+                                "mute",
+                                &sender_id.to_string(),
+                                &json!({"sender_id": sender_id, "seconds": mute_seconds}),
+                                None,
+                                false,
+                            )
+                            .await?
+                        else {
+                            continue;
+                        };
 
-                        // Collect non-admin senders
-                        let mut safe_senders = Vec::new();
-                        for sender_id in &sender_ids {
-                            match telegram.get_chat_member(group_id, *sender_id).await {
-                                Ok(member_obj) => {
-                                    let status = member_obj.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                                    if !matches!(status, "administrator" | "creator") {
-                                        safe_senders.push(*sender_id);
-                                    }
-                                }
-                                Err(_) => {
-                                    // Assume not admin on error, include in safe senders
-                                    safe_senders.push(*sender_id);
-                                }
-                            }
+                        let permissions = json!({"can_send_messages": false});
+                        let until_date = Utc::now().timestamp() + i64::from(mute_seconds);
+                        if let Err(error) = telegram
+                            .restrict_chat_member(
+                                group_id,
+                                sender_id,
+                                permissions,
+                                Some(until_date),
+                            )
+                            .await
+                        {
+                            let message = format!("failed to mute sender {sender_id}: {error}");
+                            mark_action_failed_preserving_error(
+                                &service,
+                                tenant_id,
+                                job_id,
+                                group_id,
+                                &mute_action_key,
+                                &message,
+                            )
+                            .await?;
+                            return Err(anyhow!(message));
                         }
-
-                        // Mute each safe sender
-                        for sender_id in safe_senders {
-                            let permissions = json!({"can_send_messages": false});
-                            let until_date = (Utc::now().timestamp() + mute_seconds as i64) as i64;
-                            match telegram.restrict_chat_member(group_id, sender_id, permissions, Some(until_date)).await {
-                                Ok(_) => {
-                                    // Record mute action
-                                    let _ = service.record_action(
-                                        tenant_id,
-                                        group_id,
-                                        &cluster_id,
-                                        "mute",
-                                        &sender_id.to_string(),
-                                        &json!({"sender_id": sender_id, "seconds": mute_seconds}),
-                                        None,
-                                        false,
-                                    ).await;
-                                }
-                                Err(e) => {
-                                    warn!("failed to mute sender {}: {}", sender_id, e);
-                                }
-                            }
-                        }
+                        service
+                            .mark_action_executed(tenant_id, job_id, group_id, &mute_action_key)
+                            .await?;
                     }
                 }
             }
             "warn" => {
-                // Record planned warning action
-                let _ = service.record_action(
-                    tenant_id,
-                    group_id,
-                    &cluster_id,
-                    "warning",
-                    "batch",
-                    &json!({"sender_ids": sender_ids.iter().copied().collect::<Vec<_>>()}),
-                    None,
-                    false,
-                ).await;
+                if sender_ids.is_empty() {
+                    return Ok(());
+                }
+                let telegram = self.telegram_resolver.resolve(pool, tenant_id).await?;
+                let Some(warning_action_key) = service
+                    .record_action(
+                        tenant_id,
+                        job_id,
+                        group_id,
+                        &cluster_id,
+                        "warning",
+                        "batch",
+                        &json!({"sender_ids": sender_ids.iter().copied().collect::<Vec<_>>()}),
+                        None,
+                        false,
+                    )
+                    .await?
+                else {
+                    return Ok(());
+                };
 
                 // Claim warning senders and send message
-                if !sender_ids.is_empty() {
-                    let claimed = service.claim_warning_senders(tenant_id, group_id, template_hash, sender_ids.iter().copied().collect()).await.unwrap_or_default();
-                    if !claimed.is_empty() {
-                        let mentions = claimed
-                            .iter()
-                            .map(|id| format!("<a href=\"tg://user?id={}\">{}</a>", id, id))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let msg_text = format!("{}\n请勿重复发布高度相似的推广信息；继续刷屏将触发自动清理。", mentions);
-                        let params = SendMessageParams {
-                            chat_id: group_id,
-                            text: msg_text,
-                            parse_mode: Some("HTML".to_string()),
-                            reply_markup: None,
-                            reply_to_message_id: None,
-                        };
-                        match telegram.send_message(params).await {
-                            Ok(_) => {
-                                // Update action status to executed
-                                let _ = sqlx::query(
-                                    "UPDATE groups.ad_governance_actions SET status = 'executed' WHERE action_key LIKE $1"
-                                )
-                                .bind(format!("{}:{}:{}:warning:%", tenant_id, group_id, cluster_id))
-                                .execute(pool)
-                                .await;
-                            }
-                            Err(e) => {
-                                warn!("failed to send warning message: {}", e);
-                                // Update action status to failed
-                                let _ = sqlx::query(
-                                    "UPDATE groups.ad_governance_actions SET status = 'failed', error = $1 WHERE action_key LIKE $2"
-                                )
-                                .bind(e.to_string())
-                                .bind(format!("{}:{}:{}:warning:%", tenant_id, group_id, cluster_id))
-                                .execute(pool)
-                                .await;
-                            }
-                        }
+                let claimed = match service
+                    .claim_warning_senders(
+                        tenant_id,
+                        group_id,
+                        template_hash,
+                        sender_ids.iter().copied().collect(),
+                    )
+                    .await
+                {
+                    Ok(claimed) => claimed,
+                    Err(error) => {
+                        let message = format!("failed to claim warning senders: {error}");
+                        mark_action_failed_preserving_error(
+                            &service,
+                            tenant_id,
+                            job_id,
+                            group_id,
+                            &warning_action_key,
+                            &message,
+                        )
+                        .await?;
+                        return Err(anyhow!(message));
                     }
+                };
+                if claimed.is_empty() {
+                    service
+                        .mark_action_skipped(
+                            tenant_id,
+                            job_id,
+                            group_id,
+                            &warning_action_key,
+                            "all warning senders were deduplicated",
+                        )
+                        .await?;
+                    return Ok(());
                 }
+
+                let mentions = claimed
+                    .iter()
+                    .map(|id| format!("<a href=\"tg://user?id={}\">{}</a>", id, id))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let params = SendMessageParams {
+                    chat_id: group_id,
+                    text: format!(
+                        "{}\n请勿重复发布高度相似的推广信息；继续刷屏将触发自动清理。",
+                        mentions
+                    ),
+                    parse_mode: Some("HTML".to_string()),
+                    reply_markup: None,
+                    reply_to_message_id: None,
+                };
+                if let Err(error) = telegram.send_message(params).await {
+                    let message = format!("failed to send warning message: {error}");
+                    mark_action_failed_preserving_error(
+                        &service,
+                        tenant_id,
+                        job_id,
+                        group_id,
+                        &warning_action_key,
+                        &message,
+                    )
+                    .await?;
+                    return Err(anyhow!(message));
+                }
+                service
+                    .mark_action_executed(tenant_id, job_id, group_id, &warning_action_key)
+                    .await?;
             }
             _ => {}
         }
@@ -564,22 +743,119 @@ impl AdGovernanceWorker {
 // Helper Functions
 // ============================================================================
 
+fn flag_value_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+fn env_gate_enabled(name: &str) -> bool {
+    let value = std::env::var(name).ok();
+    flag_value_enabled(value.as_deref())
+}
+
+fn enforcement_allowed(dry_run: bool, auto_enforce_enabled: bool) -> bool {
+    !dry_run && auto_enforce_enabled
+}
+
+fn validate_policy_activation(
+    dry_run: bool,
+    activate_policy: bool,
+    pending_clusters: usize,
+) -> Result<()> {
+    if !activate_policy {
+        return Ok(());
+    }
+    if dry_run {
+        return Err(anyhow!(
+            "activate_policy cannot be applied by a dry-run scan"
+        ));
+    }
+    if pending_clusters > 0 {
+        return Err(anyhow!(
+            "activate_policy cannot be applied with pending classifications"
+        ));
+    }
+    Ok(())
+}
+
+async fn mark_action_failed_preserving_error(
+    service: &AdGovernanceService,
+    tenant_id: &str,
+    job_id: &str,
+    group_id: i64,
+    action_key: &str,
+    original_error: &str,
+) -> Result<()> {
+    service
+        .mark_action_failed(tenant_id, job_id, group_id, action_key, original_error)
+        .await
+        .map_err(|status_error| {
+            anyhow!(
+                "{}; additionally failed to persist action failure: {}",
+                original_error,
+                status_error
+            )
+        })
+}
+
+fn cluster_action_tier(cluster: &HashMap<String, Value>) -> &'static str {
+    let rows = cluster
+        .get("rows")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let recent_cutoff = Utc::now().timestamp() - 86400;
+    let recent_rows = rows
+        .iter()
+        .filter(|row| {
+            row.get("message_ts")
+                .and_then(Value::as_i64)
+                .is_some_and(|timestamp| timestamp >= recent_cutoff)
+        })
+        .collect::<Vec<_>>();
+    let sender_count = recent_rows
+        .iter()
+        .filter_map(|row| row.get("user_id").and_then(Value::as_i64))
+        .collect::<HashSet<_>>()
+        .len();
+
+    if rows.len() >= 6 && sender_count >= 3 {
+        "exact_delete_mute"
+    } else if rows.len() >= 6 {
+        "exact_delete"
+    } else if rows.len() > 1 && recent_rows.len() >= 5 {
+        "similar_delete"
+    } else if recent_rows.len() >= 3 {
+        "warn"
+    } else {
+        "none"
+    }
+}
+
 /// Load messages from groups.group_messages with all required columns
-async fn load_group_messages(pool: &PgPool, tenant_id: &str, group_id: i64) -> Result<Vec<Value>> {
+async fn load_group_messages(
+    pool: &PgPool,
+    tenant_id: &str,
+    group_id: i64,
+    recent_only: bool,
+) -> Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"
         SELECT id, user_id, username, tg_msg_id, content, message_ts,
                is_advertising, ad_score, media_unique_id, sender_type, is_deleted
         FROM groups.group_messages
         WHERE tenant_id = $1 AND group_id = $2
-          AND sender_type = 'user' AND COALESCE(content, '') != ''
+          AND sender_type = 'user'
+          AND (NULLIF(btrim(COALESCE(content, '')), '') IS NOT NULL
+               OR NULLIF(btrim(COALESCE(media_unique_id, '')), '') IS NOT NULL)
           AND NOT is_deleted
+          AND (NOT $3 OR message_ts >= EXTRACT(EPOCH FROM now() - interval '24 hours')::bigint)
         ORDER BY message_ts ASC, id ASC
         LIMIT 10000
         "#,
     )
     .bind(tenant_id)
     .bind(group_id)
+    .bind(recent_only)
     .fetch_all(pool)
     .await?;
 
@@ -620,21 +896,24 @@ async fn check_bot_delete_permission(
     telegram: &tgbot_integrations::telegram::TelegramClient,
     group_id: i64,
 ) -> Result<bool> {
-    // Get bot info
-    let bot_me = telegram.get_chat(group_id).await?;
-    let bot_id = bot_me.get("id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("bot id not found"))?;
+    let bot_id = telegram.get_me().await?.id;
 
     // Check bot's member status in group
     let member = telegram.get_chat_member(group_id, bot_id).await?;
     let status = member.get("status").and_then(|v| v.as_str()).unwrap_or("");
 
-    Ok(status == "creator" || (status == "administrator" && member.get("can_delete_messages").and_then(|v| v.as_bool()).unwrap_or(false)))
+    Ok(status == "creator"
+        || (status == "administrator"
+            && member
+                .get("can_delete_messages")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)))
 }
 
 /// Get mute duration for tenant+group, default 30 days
 async fn get_mute_duration(pool: &PgPool, tenant_id: &str, group_id: i64) -> Result<i32> {
     let mute_seconds: Option<i32> = sqlx::query_scalar(
-        "SELECT mute_seconds FROM groups.ad_group_policies WHERE tenant_id = $1 AND group_id = $2"
+        "SELECT mute_seconds FROM groups.ad_group_policies WHERE tenant_id = $1 AND group_id = $2",
     )
     .bind(tenant_id)
     .bind(group_id)
@@ -655,13 +934,42 @@ async fn persist_cluster(
     classification: &Value,
     now_ts: i64,
 ) -> Result<()> {
-    let cluster_id = format!("gov:{}:{}", job_id, cluster.get("template_hash").and_then(|v| v.as_str()).unwrap_or("unknown"));
-    let exact_hash = cluster.get("exact_hash").and_then(|v| v.as_str()).unwrap_or("");
-    let template_hash = cluster.get("template_hash").and_then(|v| v.as_str()).unwrap_or("");
-    let representative_text = cluster.get("representative_text").and_then(|v| v.as_str()).unwrap_or("");
+    let cluster_id = format!(
+        "gov:{}:{}",
+        job_id,
+        cluster
+            .get("template_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+    );
+    let exact_hash = cluster
+        .get("exact_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let template_hash = cluster
+        .get("template_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let representative_text = cluster
+        .get("representative_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
-    let rows_arr = cluster.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let confirmed = classification.get("is_ad").and_then(|v| v.as_bool()).unwrap_or(false);
+    let rows_arr = cluster
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let classification_label = match classification.get("is_ad").and_then(Value::as_bool) {
+        Some(true) => "ad",
+        Some(false) => "not_ad",
+        None => "pending",
+    };
+    let action_tier = if classification_label == "ad" {
+        cluster_action_tier(cluster)
+    } else {
+        "none"
+    };
 
     // Insert cluster
     sqlx::query(
@@ -671,7 +979,12 @@ async fn persist_cluster(
              exact_hash, template_hash, similarity, occurrence_count, recent_count,
              sender_count, classification, classification_source, confidence, reason, action_tier)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-        ON CONFLICT (cluster_id) DO NOTHING
+        ON CONFLICT (cluster_id) DO UPDATE SET
+            classification = EXCLUDED.classification,
+            classification_source = EXCLUDED.classification_source,
+            confidence = EXCLUDED.confidence,
+            reason = EXCLUDED.reason,
+            action_tier = EXCLUDED.action_tier
         "#,
     )
     .bind(&cluster_id)
@@ -683,16 +996,32 @@ async fn persist_cluster(
     .bind(template_hash)
     .bind(1.0) // similarity
     .bind(rows_arr.len() as i32)
-    .bind(rows_arr.iter().filter(|r| {
-        let ts = r.get("message_ts").and_then(|v| v.as_i64()).unwrap_or(0);
-        ts as i64 >= now_ts - 86400
-    }).count() as i32)
-    .bind(rows_arr.iter().filter_map(|r| r.get("user_id").and_then(|v| v.as_i64())).collect::<HashSet<_>>().len() as i32)
-    .bind(if confirmed { "ad" } else { "not_ad" })
+    .bind(
+        rows_arr
+            .iter()
+            .filter(|r| {
+                let ts = r.get("message_ts").and_then(|v| v.as_i64()).unwrap_or(0);
+                ts as i64 >= now_ts - 86400
+            })
+            .count() as i32,
+    )
+    .bind(
+        rows_arr
+            .iter()
+            .filter_map(|r| r.get("user_id").and_then(|v| v.as_i64()))
+            .collect::<HashSet<_>>()
+            .len() as i32,
+    )
+    .bind(classification_label)
     .bind(classification.get("source").and_then(|v| v.as_str()))
-    .bind(classification.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0))
+    .bind(
+        classification
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+    )
     .bind(classification.get("reason").and_then(|v| v.as_str()))
-    .bind("none") // action_tier computed during execution
+    .bind(action_tier)
     .execute(pool)
     .await?;
 
@@ -702,8 +1031,12 @@ async fn persist_cluster(
             let msg_id: i64 = msg_obj.get("msg_id").and_then(|v| v.as_i64()).unwrap_or(0);
             let tg_msg_id: Option<i64> = msg_obj.get("tg_msg_id").and_then(|v| v.as_i64());
             let sender_id: Option<i64> = msg_obj.get("user_id").and_then(|v| v.as_i64());
-            let message_ts: Option<i32> = msg_obj.get("message_ts").and_then(|v| v.as_i64().map(|v| v as i32));
-            let is_actionable = message_ts.map(|ts| ts as i64 >= now_ts - 86400).unwrap_or(false);
+            let message_ts: Option<i32> = msg_obj
+                .get("message_ts")
+                .and_then(|v| v.as_i64().map(|v| v as i32));
+            let is_actionable = message_ts
+                .map(|ts| ts as i64 >= now_ts - 86400)
+                .unwrap_or(false);
 
             sqlx::query(
                 r#"
@@ -742,29 +1075,38 @@ mod tests {
 
     #[test]
     fn test_gate_matrix_dry_run_skips_execution() {
-        // dry_run=true -> no delete/warn/mute regardless of env gates
-        let dry_run = true;
-        assert!(dry_run, "dry_run gate should block execution");
+        assert!(!enforcement_allowed(true, true));
+        assert!(!enforcement_allowed(true, false));
+        assert!(enforcement_allowed(false, true));
     }
 
     #[test]
     fn test_gate_matrix_auto_enforce_disabled_by_default() {
-        // AD_AUTO_ENFORCE_ENABLED defaults to false
-        let enforce = std::env::var("AD_AUTO_ENFORCE_ENABLED")
-            .unwrap_or_default()
-            .to_lowercase()
-            == "true";
-        assert!(!enforce, "AD_AUTO_ENFORCE_ENABLED should default to false");
+        assert!(!flag_value_enabled(None));
+        assert!(!flag_value_enabled(Some("")));
+        assert!(!flag_value_enabled(Some("1")));
+        assert!(!flag_value_enabled(Some(" true ")));
+        assert!(flag_value_enabled(Some("true")));
+        assert!(flag_value_enabled(Some("TRUE")));
     }
 
     #[test]
     fn test_gate_matrix_delete_enabled_disabled_by_default() {
-        // AD_DELETE_ENABLED defaults to false
-        let delete_enabled = std::env::var("AD_DELETE_ENABLED")
-            .unwrap_or_default()
-            .to_lowercase()
-            == "true";
-        assert!(!delete_enabled, "AD_DELETE_ENABLED should default to false");
+        assert!(!flag_value_enabled(None));
+        assert!(!flag_value_enabled(Some("false")));
+    }
+
+    #[test]
+    fn test_policy_activation_rejects_dry_run() {
+        assert!(validate_policy_activation(true, true, 0).is_err());
+        assert!(validate_policy_activation(true, false, 1).is_ok());
+        assert!(validate_policy_activation(false, true, 0).is_ok());
+    }
+
+    #[test]
+    fn test_policy_activation_rejects_pending_classifications() {
+        assert!(validate_policy_activation(false, true, 1).is_err());
+        assert!(validate_policy_activation(false, true, 0).is_ok());
     }
 
     #[test]
@@ -817,10 +1159,19 @@ mod tests {
     fn test_template_hash_is_key_for_decisions() {
         // Decisions map uses template_hash as key, not exact_hash or family_hash
         let mut cluster: HashMap<String, Value> = HashMap::new();
-        cluster.insert("template_hash".to_string(), Value::String("t_hash_1".to_string()));
-        cluster.insert("exact_hash".to_string(), Value::String("e_hash_1".to_string()));
+        cluster.insert(
+            "template_hash".to_string(),
+            Value::String("t_hash_1".to_string()),
+        );
+        cluster.insert(
+            "exact_hash".to_string(),
+            Value::String("e_hash_1".to_string()),
+        );
 
-        let template_hash = cluster.get("template_hash").and_then(|v| v.as_str()).unwrap_or("");
+        let template_hash = cluster
+            .get("template_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         assert_eq!(template_hash, "t_hash_1");
     }
 
@@ -828,7 +1179,10 @@ mod tests {
     fn test_warn_message_text() {
         // Verbatim Python warn text (L797-798)
         let mentions = "<a href=\"tg://user?id=123\">123</a>";
-        let msg_text = format!("{}\n请勿重复发布高度相似的推广信息；继续刷屏将触发自动清理。", mentions);
+        let msg_text = format!(
+            "{}\n请勿重复发布高度相似的推广信息；继续刷屏将触发自动清理。",
+            mentions
+        );
         assert!(msg_text.contains("请勿重复发布高度相似的推广信息"));
         assert!(msg_text.contains("继续刷屏将触发自动清理"));
     }
@@ -855,8 +1209,14 @@ mod tests {
         let target_id = "batch";
         let timestamp = 1000i64;
 
-        let key1 = format!("{}:{}:{}:{}:{}:{}", tenant_id, group_id, cluster_id, action_type, target_id, timestamp);
-        let key2 = format!("{}:{}:{}:{}:{}:{}", tenant_id, group_id, cluster_id, action_type, target_id, timestamp);
+        let key1 = format!(
+            "{}:{}:{}:{}:{}:{}",
+            tenant_id, group_id, cluster_id, action_type, target_id, timestamp
+        );
+        let key2 = format!(
+            "{}:{}:{}:{}:{}:{}",
+            tenant_id, group_id, cluster_id, action_type, target_id, timestamp
+        );
 
         // Same action_key = idempotent, second insert conflicts
         assert_eq!(key1, key2);
@@ -866,6 +1226,9 @@ mod tests {
     fn test_permission_precheck_fail_closed() {
         // If bot missing delete permission, action recorded as failed and execution skipped
         let has_permission = false;
-        assert!(!has_permission, "When permission check fails, execution should not proceed");
+        assert!(
+            !has_permission,
+            "When permission check fails, execution should not proceed"
+        );
     }
 }

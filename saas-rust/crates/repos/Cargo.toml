@@ -3,6 +3,12 @@ name = "tgbot-repos"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Historical empty repositories are opt-in and excluded from the Beta/app
+# release graph until each one has a real tenant-scoped implementation.
+legacy-stubs = []
+
 [dependencies]
 tgbot-domain = { workspace = true }
 

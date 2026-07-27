@@ -57,8 +57,12 @@ mod tests {
     #[test]
     fn test_parse_telegram_commands_enabled() {
         // Re-export the config-level parser used by the HTTP layer.
-        assert!(tgbot_domain::config::parse_telegram_commands_enabled(Some("true")));
+        assert!(tgbot_domain::config::parse_telegram_commands_enabled(Some(
+            "true"
+        )));
         assert!(!tgbot_domain::config::parse_telegram_commands_enabled(None));
-        assert!(!tgbot_domain::config::parse_telegram_commands_enabled(Some("false")));
+        assert!(!tgbot_domain::config::parse_telegram_commands_enabled(
+            Some("false")
+        ));
     }
 }

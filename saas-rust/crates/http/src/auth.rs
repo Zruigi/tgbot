@@ -1,6 +1,7 @@
 use axum::http::HeaderMap;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
+use serde_json::Value;
 use sqlx::Row;
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_domain::models::Role;
@@ -20,7 +21,95 @@ pub async fn resolve_scope(state: &AppState, headers: &HeaderMap) -> ApiResult<S
     if let Some(scope) = resolve_internal_scope(state, headers).await? {
         return Ok(scope);
     }
+    if let Some(scope) = resolve_session_token_scope(state, headers).await? {
+        return Ok(scope);
+    }
     resolve_supabase_scope(state, headers).await
+}
+
+async fn resolve_session_token_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<Option<Scope>> {
+    let Some(token) = bearer_token(headers) else {
+        return Ok(None);
+    };
+    let Some(payload) = crate::routes::auth::verify_session_token(&token) else {
+        return Ok(None);
+    };
+    let role = match payload.get("role").and_then(|value| value.as_str()) {
+        Some("platform_admin") => Role::PlatformAdmin,
+        Some("merchant_owner") => Role::MerchantOwner,
+        Some("merchant_admin") => Role::MerchantAdmin,
+        Some("merchant_viewer") => Role::MerchantViewer,
+        _ => return Err(ApiError::Unauthorized),
+    };
+    let tenant_id = payload
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+
+    if role == Role::PlatformAdmin {
+        if tenant_id.is_some() {
+            return Err(ApiError::Unauthorized);
+        }
+        return Ok(Some(Scope {
+            authenticated: true,
+            user_id: None,
+            role: Role::PlatformAdmin,
+            actor_role: Role::PlatformAdmin,
+            tenant_id: None,
+            merchant_id: None,
+        }));
+    }
+
+    let Some(tenant_id) = tenant_id else {
+        return Err(ApiError::Unauthorized);
+    };
+    let merchant_hint = payload.get("merchant_id").and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|raw| raw.parse::<i64>().ok()))
+    });
+    let merchant_id = if let Some(legacy_id) = merchant_hint {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM merchants WHERE tenant_id = $1 AND legacy_merchant_id = $2",
+        )
+        .bind(&tenant_id)
+        .bind(legacy_id)
+        .fetch_optional(state.db()?)
+        .await?
+    } else if let Some(uuid) = payload
+        .get("merchant_id")
+        .and_then(Value::as_str)
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+    {
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM merchants WHERE tenant_id = $1 AND id = $2")
+            .bind(&tenant_id)
+            .bind(uuid)
+            .fetch_optional(state.db()?)
+            .await?
+    } else {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM merchants WHERE tenant_id = $1 ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(&tenant_id)
+        .fetch_optional(state.db()?)
+        .await?
+    };
+    let Some(merchant_id) = merchant_id else {
+        return Err(ApiError::Forbidden);
+    };
+    Ok(Some(Scope {
+        authenticated: true,
+        user_id: None,
+        role: role.clone(),
+        actor_role: role,
+        tenant_id: Some(tenant_id),
+        merchant_id: Some(merchant_id),
+    }))
 }
 
 async fn resolve_internal_scope(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<Scope>> {

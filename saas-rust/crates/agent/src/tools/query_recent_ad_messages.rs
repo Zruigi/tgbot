@@ -71,7 +71,7 @@ impl Tool for QueryRecentAdMessagesTool {
         })
     }
 
-    async fn execute(&self, params: &Value, _context: &AgentContext) -> ToolExecuteResult {
+    async fn execute(&self, params: &Value, context: &AgentContext) -> ToolExecuteResult {
         let hours = params
             .get("hours")
             .and_then(|v| v.as_i64())
@@ -85,6 +85,18 @@ impl Tool for QueryRecentAdMessagesTool {
             .max(1)
             .min(50);
         let group_id = params.get("group_id").and_then(|v| v.as_i64());
+
+        let tenant_id = context
+            .metadata
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(tenant_id) = tenant_id else {
+            return ToolExecuteResult::fail(
+                "query_recent_ad_messages requires an explicit tenant scope",
+            );
+        };
 
         // Query recent ad messages using ad_pipeline logic
         let cutoff_ts = chrono::Utc::now().timestamp() - (hours * 3600);
@@ -104,6 +116,7 @@ impl Tool for QueryRecentAdMessagesTool {
               AND NOT COALESCE(is_deleted, false)
               AND (is_advertising = true OR ad_score >= 40)
               AND ($2::bigint IS NULL OR group_id = $2)
+              AND tenant_id = $4
             ORDER BY COALESCE(message_ts::bigint, EXTRACT(EPOCH FROM timestamp)::bigint) DESC, id DESC
             LIMIT $3
             "#,
@@ -111,6 +124,7 @@ impl Tool for QueryRecentAdMessagesTool {
         .bind(cutoff_ts)
         .bind(group_id)
         .bind(limit)
+        .bind(tenant_id)
         .fetch_all(self.pool.as_ref())
         .await
         {
@@ -152,14 +166,17 @@ impl Tool for QueryRecentAdMessagesTool {
                 "msg_id": row.get::<i64, _>("id"),
                 "group_id": row.get::<i64, _>("group_id"),
                 "chat_id": row.get::<i64, _>("group_id"),
-                "tg_msg_id": row.get::<i64, _>("tg_msg_id"),
+                "tg_msg_id": row.get::<Option<i64>, _>("tg_msg_id"),
                 "user_id": row.get::<i64, _>("user_id"),
                 "message_ts": row.get::<Option<i64>, _>("msg_ts"),
             }));
         }
 
         // Generate deterministic snapshot ID (uuid-like but deterministic based on content)
-        let snapshot_id = format!("snap-{}", uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string());
+        let snapshot_id = format!(
+            "snap-{}",
+            uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string()
+        );
 
         // Persist snapshot
         if let Err(e) = sqlx::query(
@@ -171,7 +188,7 @@ impl Tool for QueryRecentAdMessagesTool {
             "#,
         )
         .bind(&snapshot_id)
-        .bind("default")
+        .bind(tenant_id)
         .bind(group_id)
         .bind(serde_json::to_value(&refs).unwrap_or(Value::Null))
         .bind(0i32)

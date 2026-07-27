@@ -6,9 +6,9 @@
 
 use std::fmt::Write;
 
-use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
 use teloxide::payloads::SendMessageSetters;
+use teloxide::prelude::*;
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode};
 
 use crate::handlers::HandlerResult;
 
@@ -183,7 +183,9 @@ pub async fn handle_address_input(
             let keyboard = InlineKeyboardMarkup::new(vec![
                 vec![InlineKeyboardButton::url(
                     format!("🔗 前往 {scan_label} 查看完整账单"),
-                    scan_url.parse().unwrap_or_else(|_| "https://example.com".parse().unwrap()),
+                    scan_url
+                        .parse()
+                        .unwrap_or_else(|_| "https://example.com".parse().unwrap()),
                 )],
                 vec![InlineKeyboardButton::callback(
                     "🔙 返回主菜单",
@@ -235,10 +237,7 @@ async fn query_chain_data(
     }
 }
 
-async fn query_trc20(
-    address: &str,
-    api_key: &str,
-) -> anyhow::Result<(Vec<TxRecord>, Option<i64>)> {
+async fn query_trc20(address: &str, api_key: &str) -> anyhow::Result<(Vec<TxRecord>, Option<i64>)> {
     let url = format!(
         "https://api.trongrid.io/v1/accounts/{address}/transactions/trc20?limit=20&order_by=block_timestamp,desc"
     );
@@ -255,7 +254,11 @@ async fn query_trc20(
     let mut txs = Vec::new();
     let mut latest_ts: Option<i64> = None;
 
-    if resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if resp
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         if let Some(data) = resp.get("data").and_then(|v| v.as_array()) {
             // Filter for USDT (TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t)
             let usdt_txs: Vec<&serde_json::Value> = data
@@ -270,9 +273,7 @@ async fn query_trc20(
                 .collect();
 
             if let Some(first) = usdt_txs.first() {
-                latest_ts = first
-                    .get("block_timestamp")
-                    .and_then(|v| v.as_i64());
+                latest_ts = first.get("block_timestamp").and_then(|v| v.as_i64());
             }
 
             for tx in usdt_txs.iter().take(10) {
@@ -283,10 +284,7 @@ async fn query_trc20(
                     .unwrap_or(0.0)
                     / 1_000_000.0;
 
-                let to_addr = tx
-                    .get("to")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let to_addr = tx.get("to").and_then(|v| v.as_str()).unwrap_or("");
                 let direction = if to_addr == address {
                     TxDirection::Incoming
                 } else {
@@ -314,10 +312,7 @@ async fn query_trc20(
     Ok((txs, latest_ts))
 }
 
-async fn query_bsc(
-    address: &str,
-    api_key: &str,
-) -> anyhow::Result<(Vec<TxRecord>, Option<i64>)> {
+async fn query_bsc(address: &str, api_key: &str) -> anyhow::Result<(Vec<TxRecord>, Option<i64>)> {
     let url = format!(
         "https://api.bscscan.com/api?module=account&action=tokentx\
          &contractaddress=0x55d398326f99059fF775485246999027B3197955\

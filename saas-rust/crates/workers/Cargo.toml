@@ -3,6 +3,13 @@ name = "tgbot-workers"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# ai_worker and monitor_worker are historical, unregistered workers. They are
+# excluded from the formal scheduler/app graph until their data paths are
+# implemented and tenant-audited.
+legacy-workers = ["tgbot-repos/legacy-stubs"]
+
 [dependencies]
 tgbot-domain = { workspace = true }
 tgbot-repos = { workspace = true }

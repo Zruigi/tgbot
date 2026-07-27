@@ -3,9 +3,9 @@
 //! Provides the admin configuration panel for managing translation engines,
 //! LLM model selection, API key verification, and system settings.
 
-use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
 use teloxide::payloads::SendMessageSetters;
+use teloxide::prelude::*;
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode};
 
 use crate::handlers::HandlerResult;
 
@@ -106,11 +106,18 @@ pub async fn admin_panel(
          🔸 <b>当前模型</b>: <code>{model}</code>\n\
          🔸 <b>安全核验</b>: <code>{}</code>\n\n\
          请选择操作：",
-        if ocr_enabled { "开启 ✅" } else { "关闭 ❌" }
+        if ocr_enabled {
+            "开启 ✅"
+        } else {
+            "关闭 ❌"
+        }
     );
 
     let keyboard = InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::callback(toggle_text, "adm:toggle_eng")],
+        vec![InlineKeyboardButton::callback(
+            toggle_text,
+            "adm:toggle_eng",
+        )],
         vec![InlineKeyboardButton::callback(
             "🧠 2026 模型矩阵",
             "adm:providers",
@@ -222,9 +229,7 @@ pub async fn handle_admin_callback(
             let provider = d.strip_prefix("adm:pv:").unwrap_or("");
             user_data.pending_provider = Some(provider.to_string());
 
-            let models = find_provider(provider)
-                .map(|p| p.models)
-                .unwrap_or(&[]);
+            let models = find_provider(provider).map(|p| p.models).unwrap_or(&[]);
 
             let mut btns: Vec<Vec<InlineKeyboardButton>> = models
                 .iter()
@@ -252,10 +257,7 @@ pub async fn handle_admin_callback(
         }
         d if d.starts_with("adm:set_mod:") => {
             let model_code = d.strip_prefix("adm:set_mod:").unwrap_or("");
-            let provider = user_data
-                .pending_provider
-                .as_deref()
-                .unwrap_or("OpenAI");
+            let provider = user_data.pending_provider.as_deref().unwrap_or("OpenAI");
             let base_url = find_provider(provider)
                 .map(|p| p.base_url)
                 .unwrap_or("https://api.openai.com/v1");
@@ -367,9 +369,7 @@ pub async fn save_custom_model(
 
     bot.send_message(
         chat_id,
-        format!(
-            "✅ 模型名称已更新为: <code>{model}</code>\n请输入 API Key 或发送 /skip："
-        ),
+        format!("✅ 模型名称已更新为: <code>{model}</code>\n请输入 API Key 或发送 /skip："),
     )
     .parse_mode(ParseMode::Html)
     .await?;
@@ -386,10 +386,7 @@ pub async fn save_token(
     user_data: &mut AdminUserData,
 ) -> HandlerResult<Option<AdminState>> {
     let token = text.trim();
-    let model = user_data
-        .pending_model
-        .as_deref()
-        .unwrap_or("Unknown");
+    let model = user_data.pending_model.as_deref().unwrap_or("Unknown");
 
     if token == "/skip" {
         bot.send_message(chat_id, "✅ 配置已保持。").await?;
@@ -481,15 +478,14 @@ impl AdminUserData {
 
 /// Get an admin setting from the database, with a default value.
 pub async fn get_admin_setting(pool: &sqlx::PgPool, key: &str, default: &str) -> String {
-    let result: Option<String> = sqlx::query_scalar(
-        "SELECT value FROM admin_settings WHERE key = $1",
-    )
-    .bind(key)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten();
+    let result: Option<String> =
+        sqlx::query_scalar("SELECT value FROM admin_settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
 
     result.unwrap_or_else(|| default.to_string())
 }

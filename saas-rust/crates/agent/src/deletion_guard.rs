@@ -12,14 +12,7 @@ pub fn is_agent_cancellation_text(text: &str) -> bool {
 
     matches!(
         normalized.as_str(),
-        "取消"
-            | "取消操作"
-            | "不要了"
-            | "停止"
-            | "别执行"
-            | "不删除"
-            | "cancel"
-            | "no"
+        "取消" | "取消操作" | "不要了" | "停止" | "别执行" | "不删除" | "cancel" | "no"
     )
 }
 
@@ -34,14 +27,7 @@ pub fn is_agent_confirmation_text(text: &str) -> bool {
 
     matches!(
         normalized.as_str(),
-        "确认"
-            | "确定"
-            | "同意"
-            | "yes"
-            | "ok"
-            | "可以"
-            | "go"
-            | "yes."
+        "确认" | "确定" | "同意" | "yes" | "ok" | "可以" | "go" | "yes."
     )
 }
 

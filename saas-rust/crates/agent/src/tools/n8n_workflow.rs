@@ -66,7 +66,10 @@ impl Tool for N8NWorkflowTool {
             .get("workflow_path")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let payload = params.get("payload").cloned().unwrap_or(serde_json::json!({}));
+        let payload = params
+            .get("payload")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
         let test_mode = params
             .get("test_mode")
             .and_then(|v| v.as_bool())

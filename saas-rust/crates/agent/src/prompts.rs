@@ -93,11 +93,7 @@ pub fn build_system_prompt(ctx: Option<&AgentContext>) -> String {
             if let Some(skills) = custom_skills.as_array() {
                 let mut lines = Vec::new();
                 for s in skills.iter().take(20) {
-                    let name = s
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim();
+                    let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
                     let desc = s
                         .get("description")
                         .and_then(|v| v.as_str())
@@ -148,10 +144,7 @@ pub fn build_tool_use_prompt(user_msg: &str, available_tools: &[serde_json::Valu
             (name, desc, param_str)
         } else {
             let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let desc = t
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
+            let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("?");
             (name, desc, String::new())
         };
         tools_desc.push(if params.is_empty() {

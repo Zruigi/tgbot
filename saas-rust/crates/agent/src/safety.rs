@@ -116,7 +116,11 @@ fn default_risk_level() -> String {
 }
 
 impl SafetyCheckResult {
-    pub fn passed(sanitized: serde_json::Value, needs_confirmation: bool, risk_level: &str) -> Self {
+    pub fn passed(
+        sanitized: serde_json::Value,
+        needs_confirmation: bool,
+        risk_level: &str,
+    ) -> Self {
         Self {
             passed: true,
             reason: String::new(),
@@ -248,10 +252,7 @@ impl SafetyGuardrail {
         user_id: i64,
     ) {
         let params_preview = format!("{:.100}", params.to_string());
-        let status = result
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
+        let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("?");
         info!(
             "Audit | user={} | tool={} | status={} | summary={}",
             user_id, tool_name, status, params_preview
@@ -315,8 +316,7 @@ impl SafetyGuardrail {
 
         if recent_1min.len() >= limits.calls_per_minute as usize {
             if let Some((earliest, _)) = recent_1min.first() {
-                let wait = earliest.duration_since(Instant::now()).as_secs_f64()
-                    + 60.0
+                let wait = earliest.duration_since(Instant::now()).as_secs_f64() + 60.0
                     - earliest.elapsed().as_secs_f64();
                 return Some(wait.max(0.0));
             }

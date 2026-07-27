@@ -287,7 +287,9 @@ pub async fn track_group_message(
 
     info!(
         "[GroupMonitor] Message from {} in {} ({})",
-        user.id, chat.title().as_deref().unwrap_or("Unknown"), chat.id
+        user.id,
+        chat.title().as_deref().unwrap_or("Unknown"),
+        chat.id
     );
 
     // Track group seen (update group info in database)
@@ -319,7 +321,10 @@ async fn track_group_seen(bot: &Bot, state: &GroupMonitorState, message: &Messag
         if config.is_monitored {
             // Record message to group_messages table
             // In production, this would call member_repo::save_group_message
-            debug!("[GroupMonitor] Group {} is monitored, recording message", chat.id);
+            debug!(
+                "[GroupMonitor] Group {} is monitored, recording message",
+                chat.id
+            );
         }
     }
 }
@@ -385,7 +390,10 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
     // Update cooldown
     {
         let mut cooldown = state.verify_cooldown.write().await;
-        cooldown.insert((chat.id.0, user_id.0 as i64), chrono::Utc::now().timestamp() as f64);
+        cooldown.insert(
+            (chat.id.0, user_id.0 as i64),
+            chrono::Utc::now().timestamp() as f64,
+        );
     }
 
     // Check if user is member of the channel
@@ -413,10 +421,17 @@ async fn check_channel_verify(bot: &Bot, state: &GroupMonitorState, message: &Me
             .unwrap_or(&default_template);
 
         let text = template
-            .replace("{user}", &format!(r#"<a href="tg://user?id={}">{}</a>"#, user_id.0, user_name))
+            .replace(
+                "{user}",
+                &format!(r#"<a href="tg://user?id={}">{}</a>"#, user_id.0, user_name),
+            )
             .replace("{channel}", &channel_id.to_string());
 
-        if let Ok(msg) = bot.send_message(chat.id, text).parse_mode(teloxide::types::ParseMode::Html).await {
+        if let Ok(msg) = bot
+            .send_message(chat.id, text)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await
+        {
             // Auto-delete after 5 seconds
             let bot_clone = bot.clone();
             let chat_id = chat.id;
@@ -446,11 +461,7 @@ async fn check_channel_membership(bot: &Bot, user_id: UserId, channel_id: i64) -
 }
 
 /// Handle address auto-detection and query
-async fn handle_group_address_auto_query(
-    bot: &Bot,
-    state: &GroupMonitorState,
-    message: &Message,
-) {
+async fn handle_group_address_auto_query(bot: &Bot, state: &GroupMonitorState, message: &Message) {
     let text = message.text().or(message.caption()).unwrap_or("");
 
     let addresses = detect_addresses(text);
@@ -483,7 +494,10 @@ async fn handle_group_address_auto_query(
         // Update cooldown
         {
             let mut cooldown = state.address_query_cooldown.write().await;
-            cooldown.insert((group_id, addr.clone()), chrono::Utc::now().timestamp() as f64);
+            cooldown.insert(
+                (group_id, addr.clone()),
+                chrono::Utc::now().timestamp() as f64,
+            );
         }
 
         // Query address snapshot
@@ -493,7 +507,11 @@ async fn handle_group_address_auto_query(
                 let tip_lines = build_address_tip_lines(addr, &snapshot);
                 let tip = tip_lines.join("\n");
 
-                if let Err(e) = bot.send_message(message.chat.id, tip).parse_mode(teloxide::types::ParseMode::Html).await {
+                if let Err(e) = bot
+                    .send_message(message.chat.id, tip)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await
+                {
                     warn!("[GroupMonitor] Failed to send address tip: {}", e);
                 }
             }
@@ -528,7 +546,10 @@ fn build_address_tip_lines(address: &str, snapshot: &AddressSnapshot) -> Vec<Str
     }
     lines.push(format!(
         "💰USDT余额： {} USDT",
-        snapshot.usdt_balance.map(|v| v.to_string()).unwrap_or_else(|| "0.00".to_string())
+        snapshot
+            .usdt_balance
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "0.00".to_string())
     ));
 
     if let (Some(eu), Some(el)) = (snapshot.energy_used, snapshot.energy_limit) {
@@ -574,25 +595,25 @@ fn build_address_tip_lines(address: &str, snapshot: &AddressSnapshot) -> Vec<Str
         lines.push(format!("⤴️USDT支出笔数：{}    ⤵️USDT收入笔数：{}", to, ti));
     } else {
         lines.push(format!("24h 笔数: <b>{}</b>", snapshot.tx_count_24h));
-        lines.push(format!(
-            "24h 转入: <b>{:.2} USDT</b>",
-            snapshot.inflow_24h
-        ));
-        lines.push(format!(
-            "24h 转出: <b>{:.2} USDT</b>",
-            snapshot.outflow_24h
-        ));
+        lines.push(format!("24h 转入: <b>{:.2} USDT</b>", snapshot.inflow_24h));
+        lines.push(format!("24h 转出: <b>{:.2} USDT</b>", snapshot.outflow_24h));
     }
 
     for tx in snapshot.recent_txs.iter().take(5) {
-        lines.push(format!("{} {} {:.2} USDT", tx.time, tx.direction, tx.amount));
+        lines.push(format!(
+            "{} {} {:.2} USDT",
+            tx.time, tx.direction, tx.amount
+        ));
     }
 
     lines
 }
 
 /// Query address snapshot from blockchain APIs
-pub async fn query_address_snapshot(address: &str, network: &str) -> Result<AddressSnapshot, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn query_address_snapshot(
+    address: &str,
+    network: &str,
+) -> Result<AddressSnapshot, Box<dyn std::error::Error + Send + Sync>> {
     let mut result = AddressSnapshot {
         address: address.to_string(),
         network: network.to_uppercase(),
@@ -681,7 +702,8 @@ pub async fn monitor_group_keywords(
     );
 
     // Try to send invite (may fail if user hasn't started the bot)
-    let _ = bot.send_message(user.id, &invite_text)
+    let _ = bot
+        .send_message(user.id, &invite_text)
         .parse_mode(teloxide::types::ParseMode::Html)
         .await;
 
@@ -771,8 +793,15 @@ pub async fn track_channel_seen(
 // ---------------------------------------------------------------------------
 
 /// Mute a user in a group
-pub async fn mute_user(bot: &Bot, chat_id: i64, user_id: i64) -> Result<(), teloxide::RequestError> {
-    info!("[Verify] Attempting to mute user {} in chat {}", user_id, chat_id);
+pub async fn mute_user(
+    bot: &Bot,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<(), teloxide::RequestError> {
+    info!(
+        "[Verify] Attempting to mute user {} in chat {}",
+        user_id, chat_id
+    );
     bot.restrict_chat_member(
         teloxide::types::ChatId(chat_id),
         teloxide::types::UserId(user_id.try_into().unwrap()),
@@ -784,7 +813,11 @@ pub async fn mute_user(bot: &Bot, chat_id: i64, user_id: i64) -> Result<(), telo
 }
 
 /// Unmute a user in a group
-pub async fn unmute_user(bot: &Bot, chat_id: i64, user_id: i64) -> Result<(), teloxide::RequestError> {
+pub async fn unmute_user(
+    bot: &Bot,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<(), teloxide::RequestError> {
     bot.restrict_chat_member(
         teloxide::types::ChatId(chat_id),
         teloxide::types::UserId(user_id.try_into().unwrap()),
@@ -795,11 +828,23 @@ pub async fn unmute_user(bot: &Bot, chat_id: i64, user_id: i64) -> Result<(), te
 }
 
 /// Kick a user from a group (ban + unban to allow rejoin)
-pub async fn kick_user(bot: &Bot, chat_id: i64, user_id: i64) -> Result<(), teloxide::RequestError> {
+pub async fn kick_user(
+    bot: &Bot,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<(), teloxide::RequestError> {
     info!("[Verify] Kicking user {} from chat {}", user_id, chat_id);
-    bot.ban_chat_member(teloxide::types::ChatId(chat_id), teloxide::types::UserId(user_id.try_into().unwrap())).await?;
+    bot.ban_chat_member(
+        teloxide::types::ChatId(chat_id),
+        teloxide::types::UserId(user_id.try_into().unwrap()),
+    )
+    .await?;
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    bot.unban_chat_member(teloxide::types::ChatId(chat_id), teloxide::types::UserId(user_id.try_into().unwrap())).await?;
+    bot.unban_chat_member(
+        teloxide::types::ChatId(chat_id),
+        teloxide::types::UserId(user_id.try_into().unwrap()),
+    )
+    .await?;
     info!("[Verify] Kicked user {} from chat {}", user_id, chat_id);
     Ok(())
 }

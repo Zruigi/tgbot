@@ -59,13 +59,11 @@ pub async fn list_groups(
 
 /// Fetch a single tracked group by group_id.
 pub async fn get_group(pool: &PgPool, group_id: i64, tenant_id: &str) -> Result<Option<Value>> {
-    let row = sqlx::query(
-        "SELECT * FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
-    )
-    .bind(group_id)
-    .bind(tenant_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query("SELECT * FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2")
+        .bind(group_id)
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(row_to_json))
 }
 
@@ -149,13 +147,11 @@ pub async fn set_monitored(
 
 /// Remove a group from tracking.
 pub async fn delete_group(pool: &PgPool, group_id: i64, tenant_id: &str) -> Result<bool> {
-    let result = sqlx::query(
-        "DELETE FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2",
-    )
-    .bind(group_id)
-    .bind(tenant_id)
-    .execute(pool)
-    .await?;
+    let result = sqlx::query("DELETE FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2")
+        .bind(group_id)
+        .bind(tenant_id)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 

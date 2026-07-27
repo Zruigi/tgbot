@@ -1,14 +1,14 @@
-pub mod start;
-pub mod customer_service;
-pub mod merchant_onboarding;
-pub mod merchant_runtime;
-pub mod group_monitor;
-pub mod join_verify;
-pub mod channel_verify;
-pub mod wallet_monitor;
-pub mod crypto_price;
 pub mod admin_panel;
 pub mod alert_setting;
+pub mod channel_verify;
+pub mod crypto_price;
+pub mod customer_service;
+pub mod group_monitor;
+pub mod join_verify;
+pub mod merchant_onboarding;
+pub mod merchant_runtime;
+pub mod start;
+pub mod wallet_monitor;
 pub mod wallet_panel;
 
 // ---------------------------------------------------------------------------

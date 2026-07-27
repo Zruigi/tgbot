@@ -4,19 +4,19 @@
 //! - OTP 动态链接（不暴露明文 Token）
 //! - Deep Linking 自助解禁：unmute_{group_id} 参数处理
 
+use anyhow::Result;
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use teloxide::payloads::{AnswerCallbackQuerySetters, EditMessageTextSetters, SendMessageSetters};
 use teloxide::{
     prelude::*,
-    types::{ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery},
+    types::{CallbackQuery, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Message},
     Bot,
 };
-use anyhow::Result;
-use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
 use tracing::info;
-use std::num::NonZeroUsize;
-use teloxide::payloads::{SendMessageSetters, EditMessageTextSetters, AnswerCallbackQuerySetters};
 
 // ---------------------------------------------------------------------------
 // 频率限制缓存：{user_id: last_verify_time}，TTL 60秒，上限 1000 条
@@ -55,7 +55,11 @@ fn is_admin(user_id: i64) -> bool {
 // ---------------------------------------------------------------------------
 // 菜单构建
 // ---------------------------------------------------------------------------
-fn main_menu_action_map(_locale: &str, has_merchant_console: bool, is_admin: bool) -> HashMap<String, String> {
+fn main_menu_action_map(
+    _locale: &str,
+    has_merchant_console: bool,
+    is_admin: bool,
+) -> HashMap<String, String> {
     let mut mapping = HashMap::new();
     mapping.insert("语言设置".to_string(), "lang_menu".to_string());
     mapping.insert("联系客服".to_string(), "contact_admin".to_string());
@@ -82,7 +86,10 @@ fn main_menu_action_map(_locale: &str, has_merchant_console: bool, is_admin: boo
 fn admin_keyboard(_locale: &str) -> InlineKeyboardMarkup {
     let rows = vec![
         vec![InlineKeyboardButton::callback("管理后台", "admin_web_otp")],
-        vec![InlineKeyboardButton::callback("商户后台", "merchant_web_otp")],
+        vec![InlineKeyboardButton::callback(
+            "商户后台",
+            "merchant_web_otp",
+        )],
         vec![
             InlineKeyboardButton::callback("系统设置", "admin_settings"),
             InlineKeyboardButton::callback("现货价格", "spot_price"),
@@ -101,14 +108,21 @@ fn admin_keyboard(_locale: &str) -> InlineKeyboardMarkup {
 }
 
 fn user_keyboard(_locale: &str, has_merchant_console: bool) -> InlineKeyboardMarkup {
-    let mut rows = vec![
-        vec![InlineKeyboardButton::callback("联系客服", "contact_admin")],
-    ];
+    let mut rows = vec![vec![InlineKeyboardButton::callback(
+        "联系客服",
+        "contact_admin",
+    )]];
 
     if has_merchant_console {
-        rows.push(vec![InlineKeyboardButton::callback("商户后台", "merchant_web_otp")]);
+        rows.push(vec![InlineKeyboardButton::callback(
+            "商户后台",
+            "merchant_web_otp",
+        )]);
     } else {
-        rows.push(vec![InlineKeyboardButton::callback("注册商户", "register_merchant")]);
+        rows.push(vec![InlineKeyboardButton::callback(
+            "注册商户",
+            "register_merchant",
+        )]);
     }
 
     rows.extend(vec![
@@ -137,7 +151,10 @@ fn language_keyboard(current_locale: &str) -> InlineKeyboardMarkup {
             &format!("lang_set:{}", code),
         )]);
     }
-    rows.push(vec![InlineKeyboardButton::callback("返回主菜单", "back_to_start")]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "返回主菜单",
+        "back_to_start",
+    )]);
     InlineKeyboardMarkup::new(rows)
 }
 
@@ -199,11 +216,7 @@ pub async fn start_command(
 // ---------------------------------------------------------------------------
 // 处理 unmute_{group_id} Deep Linking 参数
 // ---------------------------------------------------------------------------
-async fn handle_unmute_deeplink(
-    bot: &Bot,
-    user_id: i64,
-    param: &str,
-) -> Result<()> {
+async fn handle_unmute_deeplink(bot: &Bot, user_id: i64, param: &str) -> Result<()> {
     // 1. 解析 group_id
     let group_id = param
         .trim_start_matches("unmute_")
@@ -232,12 +245,18 @@ async fn handle_unmute_deeplink(
 
     if let Some(channel_id) = verify_channel_id {
         // 4. 检查用户是否已关注频道
-        if let Ok(member) = bot.get_chat_member(teloxide::types::ChatId(channel_id), teloxide::types::UserId(user_id.try_into().unwrap())).await {
+        if let Ok(member) = bot
+            .get_chat_member(
+                teloxide::types::ChatId(channel_id),
+                teloxide::types::UserId(user_id.try_into().unwrap()),
+            )
+            .await
+        {
             let is_member = matches!(
                 member.kind,
                 teloxide::types::ChatMemberKind::Owner(_)
-                | teloxide::types::ChatMemberKind::Administrator(_)
-                | teloxide::types::ChatMemberKind::Member
+                    | teloxide::types::ChatMemberKind::Administrator(_)
+                    | teloxide::types::ChatMemberKind::Member
             );
 
             if is_member {
@@ -247,7 +266,10 @@ async fn handle_unmute_deeplink(
                 // 未关注：发送频道链接 + 验证按钮
                 let channel_link = format!("https://t.me/{}", channel_id);
                 let keyboard = InlineKeyboardMarkup::new(vec![
-                    vec![InlineKeyboardButton::url("📢 前往关注频道", channel_link.parse().unwrap())],
+                    vec![InlineKeyboardButton::url(
+                        "📢 前往关注频道",
+                        channel_link.parse().unwrap(),
+                    )],
                     vec![InlineKeyboardButton::callback(
                         "✅ 我已关注，点击验证",
                         &format!("unmute_verify:{}:{}", group_id, channel_id),
@@ -266,7 +288,7 @@ async fn handle_unmute_deeplink(
     } else {
         bot.send_message(
             teloxide::types::ChatId(user_id),
-            "❌ 该群组未配置验证频道，无法解禁。"
+            "❌ 该群组未配置验证频道，无法解禁。",
         )
         .await?;
     }
@@ -290,7 +312,10 @@ async fn execute_unmute(bot: &Bot, user_id: i64, group_id: i64) -> Result<()> {
     )
     .await?;
 
-    info!("[解禁] 已恢复用户发言权限 user={} group={}", user_id, group_id);
+    info!(
+        "[解禁] 已恢复用户发言权限 user={} group={}",
+        user_id, group_id
+    );
 
     // 2. 更新数据库（后续实现）
     // await database.set_member_verified(group_id, user_id);
@@ -309,10 +334,7 @@ async fn execute_unmute(bot: &Bot, user_id: i64, group_id: i64) -> Result<()> {
 // ---------------------------------------------------------------------------
 // 按钮回调处理
 // ---------------------------------------------------------------------------
-pub async fn button_callback(
-    bot: Bot,
-    callback: CallbackQuery,
-) -> Result<()> {
+pub async fn button_callback(bot: Bot, callback: CallbackQuery) -> Result<()> {
     let data = match &callback.data {
         Some(d) => d,
         None => return Ok(()),
@@ -329,25 +351,32 @@ pub async fn button_callback(
             let group_id: i64 = parts[1].parse().unwrap_or(0);
             let verify_channel_id: i64 = parts[2].parse().unwrap_or(0);
 
-            if let Ok(member) = bot.get_chat_member(
-                teloxide::types::ChatId(verify_channel_id),
-                teloxide::types::UserId(user_id.try_into().unwrap())
-            ).await {
+            if let Ok(member) = bot
+                .get_chat_member(
+                    teloxide::types::ChatId(verify_channel_id),
+                    teloxide::types::UserId(user_id.try_into().unwrap()),
+                )
+                .await
+            {
                 let is_member = matches!(
                     member.kind,
                     teloxide::types::ChatMemberKind::Owner(_)
-                    | teloxide::types::ChatMemberKind::Administrator(_)
-                    | teloxide::types::ChatMemberKind::Member
+                        | teloxide::types::ChatMemberKind::Administrator(_)
+                        | teloxide::types::ChatMemberKind::Member
                 );
 
                 if is_member {
-                    bot.answer_callback_query(&callback.id).text("⏳ 正在处理解禁请求，请稍候...").await?;
+                    bot.answer_callback_query(&callback.id)
+                        .text("⏳ 正在处理解禁请求，请稍候...")
+                        .await?;
                     execute_unmute(&bot, user_id, group_id).await?;
                     return Ok(());
                 }
             }
 
-            bot.answer_callback_query(&callback.id).text("❌ 未检测到你的关注，请先关注频道后再试").await?;
+            bot.answer_callback_query(&callback.id)
+                .text("❌ 未检测到你的关注，请先关注频道后再试")
+                .await?;
         }
         return Ok(());
     }
@@ -389,7 +418,9 @@ pub async fn button_callback(
     // 管理后台 OTP
     if data == "admin_web_otp" {
         if !is_admin_user {
-            bot.answer_callback_query(&callback.id).text("权限不足").await?;
+            bot.answer_callback_query(&callback.id)
+                .text("权限不足")
+                .await?;
             return Ok(());
         }
 
@@ -418,9 +449,9 @@ pub async fn button_callback(
         let text = "联系客服\n\n请直接发送消息，客服会尽快回复您。";
         if let Some(msg) = &callback.message {
             bot.edit_message_text(msg.chat().id, msg.id(), text)
-                .reply_markup(InlineKeyboardMarkup::new(vec![
-                    vec![InlineKeyboardButton::callback("返回主菜单", "back_to_start")],
-                ]))
+                .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                    InlineKeyboardButton::callback("返回主菜单", "back_to_start"),
+                ]]))
                 .await?;
         }
         bot.answer_callback_query(&callback.id).await?;
@@ -447,7 +478,9 @@ pub async fn button_callback(
 
     // 系统设置（仅提示）
     if data == "admin_settings" {
-        bot.answer_callback_query(&callback.id).text("系统设置请在 Web 后台操作").await?;
+        bot.answer_callback_query(&callback.id)
+            .text("系统设置请在 Web 后台操作")
+            .await?;
         return Ok(());
     }
 
@@ -462,7 +495,9 @@ pub async fn button_callback(
         return Ok(());
     }
 
-    bot.answer_callback_query(&callback.id).text("功能开发中").await?;
+    bot.answer_callback_query(&callback.id)
+        .text("功能开发中")
+        .await?;
     Ok(())
 }
 
@@ -516,18 +551,22 @@ pub async fn main_menu_message_handler(
         }
         Some("admin_web_otp") => {
             if !is_admin_user {
-                bot.send_message(msg.chat.id, "❌ 仅管理员可使用此功能").await?;
+                bot.send_message(msg.chat.id, "❌ 仅管理员可使用此功能")
+                    .await?;
                 return Ok(());
             }
             // TODO: 生成 OTP 链接
-            bot.send_message(msg.chat.id, "管理后台\n\n(OTP 链接生成功能开发中)").await?;
+            bot.send_message(msg.chat.id, "管理后台\n\n(OTP 链接生成功能开发中)")
+                .await?;
         }
         Some("merchant_web_otp") => {
             // TODO: 检查商户绑定并生成 OTP
-            bot.send_message(msg.chat.id, "商户后台\n\n(OTP 链接生成功能开发中)").await?;
+            bot.send_message(msg.chat.id, "商户后台\n\n(OTP 链接生成功能开发中)")
+                .await?;
         }
         Some("admin_settings") => {
-            bot.send_message(msg.chat.id, "系统设置请在 Web 后台操作").await?;
+            bot.send_message(msg.chat.id, "系统设置请在 Web 后台操作")
+                .await?;
         }
         _ => {
             // 未匹配到菜单动作，静默忽略

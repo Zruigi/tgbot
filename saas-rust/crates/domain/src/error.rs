@@ -17,6 +17,8 @@ pub enum ApiError {
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    NotImplemented(String),
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
@@ -31,6 +33,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             ApiError::Sqlx(_) | ApiError::Anyhow(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = self.to_string();

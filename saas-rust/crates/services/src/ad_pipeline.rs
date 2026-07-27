@@ -140,7 +140,10 @@ pub fn cluster_messages(rows: &[AdMessageRow], limit: i64, min_duplicate_count: 
     let mut clusters: Vec<Value> = Vec::new();
     for hash in order {
         let mut cluster = by_hash.remove(&hash).expect("cluster present");
-        let representative = cluster["representative_text"].as_str().unwrap_or("").to_string();
+        let representative = cluster["representative_text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         let flags = detect_advertising_signals(&representative, "group_message");
         let score = flags.ad_score as i64;
         let is_live_ad = flags.is_advertising;
@@ -469,7 +472,10 @@ mod tests {
         assert_eq!(cluster["occurrences"], 2);
         assert_eq!(cluster["message_refs"].as_array().unwrap().len(), 2);
         assert_eq!(cluster["sender_ids"].as_array().unwrap().len(), 2);
-        assert!(cluster["cluster_id"].as_str().unwrap().starts_with("pg-md5:"));
+        assert!(cluster["cluster_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("pg-md5:"));
         assert_eq!(cluster["llm_status"], "pending");
         assert_eq!(cluster["confirmed_for_deletion"], false);
     }

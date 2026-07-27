@@ -5,7 +5,7 @@ use crate::schema::{AgentContext, Tool, ToolExecuteResult};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
-use tgbot_integrations::paddleocr::{PaddleOCRClient, PaddleOCRConfig, OcrRequest};
+use tgbot_integrations::paddleocr::{OcrRequest, PaddleOCRClient, PaddleOCRConfig};
 use tracing::{error, info};
 
 /// OCR 工具 - 图像文字识别
@@ -67,14 +67,8 @@ impl Tool for OcrTool {
             .get("source_type")
             .and_then(|v| v.as_str())
             .unwrap_or("url");
-        let source = params
-            .get("source")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let lang = params
-            .get("lang")
-            .and_then(|v| v.as_str())
-            .unwrap_or("ch");
+        let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let lang = params.get("lang").and_then(|v| v.as_str()).unwrap_or("ch");
 
         if source.is_empty() {
             return ToolExecuteResult::fail("图片 source 不能为空");
@@ -105,7 +99,9 @@ impl Tool for OcrTool {
             }
             "file_id" => {
                 // 文件ID需要先下载，这里先返回提示
-                return ToolExecuteResult::fail("file_id 类型的 OCR 暂不支持，请使用 URL 或 Base64 方式");
+                return ToolExecuteResult::fail(
+                    "file_id 类型的 OCR 暂不支持，请使用 URL 或 Base64 方式",
+                );
             }
             _ => {
                 return ToolExecuteResult::fail(&format!("未知的 source_type: {}", source_type));

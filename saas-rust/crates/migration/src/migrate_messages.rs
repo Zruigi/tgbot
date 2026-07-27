@@ -76,12 +76,11 @@ pub async fn migrate_messages(
     }
 
     // Get skipped count (already migrated)
-    let target_count: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM chat.messages"
-    )
-    .fetch_one(pg_pool)
-    .await
-    .context("Failed to count messages in PostgreSQL")?;
+    let target_count: i64 =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM chat.messages")
+            .fetch_one(pg_pool)
+            .await
+            .context("Failed to count messages in PostgreSQL")?;
 
     // If target count is close to source, consider the rest as skipped (already migrated)
     if target_count < stats.total_source {
@@ -99,10 +98,7 @@ pub async fn migrate_messages(
 }
 
 /// Migrate a batch of messages
-async fn migrate_message_batch(
-    messages: &[SqliteMessage],
-    pg_pool: &PgPool,
-) -> Result<i64> {
+async fn migrate_message_batch(messages: &[SqliteMessage], pg_pool: &PgPool) -> Result<i64> {
     let mut migrated = 0;
 
     for msg in messages {
@@ -119,18 +115,23 @@ async fn migrate_message_batch(
 }
 
 /// Migrate a single message from SQLite to PostgreSQL
-async fn migrate_single_message(
-    sqlite_msg: &SqliteMessage,
-    pg_pool: &PgPool,
-) -> Result<()> {
+async fn migrate_single_message(sqlite_msg: &SqliteMessage, pg_pool: &PgPool) -> Result<()> {
     // Generate trace_id if not present
-    let trace_id = sqlite_msg.trace_id.clone()
+    let trace_id = sqlite_msg
+        .trace_id
+        .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Parse timestamp
     let timestamp = parse_timestamp(&sqlite_msg.timestamp)?;
-    let quoted_type = sqlite_msg.quoted_type.clone().unwrap_or_else(|| "text".to_string());
-    let status = sqlite_msg.status.clone().unwrap_or_else(|| "sent".to_string());
+    let quoted_type = sqlite_msg
+        .quoted_type
+        .clone()
+        .unwrap_or_else(|| "text".to_string());
+    let status = sqlite_msg
+        .status
+        .clone()
+        .unwrap_or_else(|| "sent".to_string());
     let msg_type = sqlite_msg.msg_type.clone();
 
     // Insert message into PostgreSQL
@@ -233,12 +234,11 @@ pub async fn verify_message_migration(
     let sqlite_reader = SqliteReader::new(sqlite_config)?;
     let source_count = sqlite_reader.count_messages()?;
 
-    let target_count: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM chat.messages"
-    )
-    .fetch_one(pg_pool)
-    .await
-    .context("Failed to count messages in PostgreSQL")?;
+    let target_count: i64 =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM chat.messages")
+            .fetch_one(pg_pool)
+            .await
+            .context("Failed to count messages in PostgreSQL")?;
 
     let result = MessageVerificationResult {
         source_count,

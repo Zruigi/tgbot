@@ -16,9 +16,9 @@ use tgbot_integrations::supabase_rest::SupabaseRestClient;
 use tgbot_integrations::telegram::{TelegramClient, TelegramConfig};
 use tgbot_repos::user_repo;
 use tgbot_workers::{
-    AdGovernanceWorker, Dispatcher as WorkerDispatcher, GroupMessagePolicyWorker, PushTaskWorker, Scheduler,
-    SchedulerConfig, TelegramAutoReplyWorker, TelegramClientResolver, TelegramCommandWorker,
-    Worker, WorkerHandle,
+    AdGovernanceWorker, Dispatcher as WorkerDispatcher, GroupMessagePolicyWorker, PushTaskWorker,
+    Scheduler, SchedulerConfig, TelegramAutoReplyWorker, TelegramClientResolver,
+    TelegramCommandWorker, Worker, WorkerHandle,
 };
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -120,8 +120,10 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(PushTaskWorker::new(resolver.clone(), Arc::new(llm.clone())))
                 as Arc<dyn Worker>,
             Arc::new(GroupMessagePolicyWorker::new()) as Arc<dyn Worker>,
-            Arc::new(AdGovernanceWorker::new(resolver.clone(), Arc::new(llm.clone())))
-                as Arc<dyn Worker>,
+            Arc::new(AdGovernanceWorker::new(
+                resolver.clone(),
+                Arc::new(llm.clone()),
+            )) as Arc<dyn Worker>,
         ];
         if config.telegram_commands_enabled {
             workers.push(Arc::new(TelegramCommandWorker::new(resolver.clone())) as Arc<dyn Worker>);

@@ -3,9 +3,9 @@
 //! Provides email binding/unbinding for price alerts.
 //! Users can bind an email address to receive notifications.
 
-use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
 use teloxide::payloads::SendMessageSetters;
+use teloxide::prelude::*;
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode};
 
 use crate::handlers::HandlerResult;
 
@@ -22,8 +22,9 @@ pub enum AlertSettingState {
 // Email validation (RFC 5322 simplified)
 // ---------------------------------------------------------------------------
 
-static EMAIL_REGEX: once_cell::sync::Lazy<regex::Regex> =
-    once_cell::sync::Lazy::new(|| regex::Regex::new(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$").unwrap());
+static EMAIL_REGEX: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    regex::Regex::new(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$").unwrap()
+});
 
 fn is_valid_email(email: &str) -> bool {
     EMAIL_REGEX.is_match(email)
@@ -162,12 +163,9 @@ pub async fn receive_email(
             "🔙 取消",
             "cancel_email_setting",
         )]]);
-        bot.send_message(
-            chat_id,
-            "❌ 邮箱格式不正确，请重新输入：",
-        )
-        .reply_markup(keyboard)
-        .await?;
+        bot.send_message(chat_id, "❌ 邮箱格式不正确，请重新输入：")
+            .reply_markup(keyboard)
+            .await?;
         return Ok(Some(AlertSettingState::WaitingEmail));
     }
 
@@ -186,26 +184,23 @@ pub async fn receive_email(
 
 /// Get user's email from the database.
 async fn get_user_email(pool: &sqlx::PgPool, user_id: i64) -> String {
-    let result: Option<String> = sqlx::query_scalar(
-        "SELECT email FROM users WHERE tg_user_id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten();
+    let result: Option<String> =
+        sqlx::query_scalar("SELECT email FROM users WHERE tg_user_id = $1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
 
     result.unwrap_or_default()
 }
 
 /// Set user's email. Pass `None` to clear the email.
 pub async fn set_user_email(pool: &sqlx::PgPool, user_id: i64, email: Option<&str>) {
-    let _ = sqlx::query(
-        "UPDATE users SET email = $1, updated_at = now() WHERE tg_user_id = $2",
-    )
-    .bind(email)
-    .bind(user_id)
-    .execute(pool)
-    .await;
+    let _ = sqlx::query("UPDATE users SET email = $1, updated_at = now() WHERE tg_user_id = $2")
+        .bind(email)
+        .bind(user_id)
+        .execute(pool)
+        .await;
 }

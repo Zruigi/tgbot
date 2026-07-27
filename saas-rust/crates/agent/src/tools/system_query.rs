@@ -72,37 +72,36 @@ impl Tool for SystemQueryTool {
         let limit = params
             .get("limit")
             .and_then(|v| v.as_i64())
-            .unwrap_or(10) as i32;
+            .unwrap_or(10)
+            .clamp(1, 100) as i32;
         let group_id = params.get("group_id").and_then(|v| v.as_i64());
 
-        let tenant_id = context.metadata.get("tenant_id")
+        let tenant_id = context
+            .metadata
+            .get("tenant_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("default");
+            .map(str::trim)
+            .filter(|tenant| !tenant.is_empty());
+
+        let Some(tenant_id) = tenant_id else {
+            return ToolExecuteResult::fail(
+                "system_query requires an explicit tenant scope; refusing an unscoped query",
+            );
+        };
 
         info!("系统查询: query_type={}, limit={}", query_type, limit);
 
-        // 如果没有传入 pool，使用默认的全局 pool
-        // 这里简化处理，实际使用时应该通过依赖注入传入
-        let pool = match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&std::env::var("DATABASE_URL").unwrap_or_default())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                error!("数据库连接失败: {}", e);
-                return ToolExecuteResult::fail(&format!("数据库连接失败: {}", e));
-            }
-        };
-
         let result = match query_type {
-            "stats_overview" => self.get_stats_overview(&pool, tenant_id).await,
-            "active_groups" => self.get_active_groups(&pool, tenant_id, limit).await,
-            "monitors_list" => self.get_monitors_list(&pool, limit).await,
-            "recent_senders" => self.get_recent_senders(&pool, tenant_id, limit).await,
-            "recent_messages" => self.get_recent_messages(&pool, tenant_id, limit).await,
-            "group_ad_messages" => self.get_group_ad_messages(&pool, group_id, limit).await,
-            "potential_users" => self.get_potential_users(&pool, limit).await,
+            "stats_overview" => self.get_stats_overview(&self.pool, tenant_id).await,
+            "active_groups" => self.get_active_groups(&self.pool, tenant_id, limit).await,
+            "monitors_list" => self.get_monitors_list(&self.pool, tenant_id, limit).await,
+            "recent_senders" => self.get_recent_senders(&self.pool, tenant_id, limit).await,
+            "recent_messages" => self.get_recent_messages(&self.pool, tenant_id, limit).await,
+            "group_ad_messages" => {
+                self.get_group_ad_messages(&self.pool, tenant_id, group_id, limit)
+                    .await
+            }
+            "potential_users" => self.get_potential_users(&self.pool, tenant_id, limit).await,
             _ => Err(anyhow::anyhow!("未知查询类型: {}", query_type)),
         };
 
@@ -125,7 +124,7 @@ impl SystemQueryTool {
     ) -> Result<(Value, String), anyhow::Error> {
         // 获取群组数量
         let group_count: i64 = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)::bigint FROM tracked_groups WHERE tenant_id = $1",
+            "SELECT COUNT(*)::bigint FROM groups.tracked_groups WHERE tenant_id = $1",
         )
         .bind(tenant_id)
         .fetch_one(pool)
@@ -141,8 +140,9 @@ impl SystemQueryTool {
 
         // 获取活跃监听地址数量
         let monitor_count: i64 = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)::bigint FROM address_monitors WHERE is_active = true",
+            "SELECT COUNT(*)::bigint FROM address_monitors WHERE tenant_id = $1 AND is_active = true",
         )
+        .bind(tenant_id)
         .fetch_one(pool)
         .await?;
 
@@ -164,8 +164,8 @@ impl SystemQueryTool {
         limit: i32,
     ) -> Result<(Value, String), anyhow::Error> {
         let rows = sqlx::query(
-            "SELECT group_id, group_title, is_monitored, member_count, updated_at \
-             FROM tracked_groups \
+            "SELECT group_id, group_title, is_monitored, 0::integer AS member_count, updated_at \
+             FROM groups.tracked_groups \
              WHERE tenant_id = $1 \
              ORDER BY updated_at DESC \
              LIMIT $2",
@@ -198,31 +198,45 @@ impl SystemQueryTool {
     async fn get_monitors_list(
         &self,
         pool: &PgPool,
+        tenant_id: &str,
         limit: i32,
     ) -> Result<(Value, String), anyhow::Error> {
         // 先检查表结构
         let has_inflow = sqlx::query_scalar::<_, Option<String>>(
             "SELECT column_name FROM information_schema.columns \
-             WHERE table_name = 'address_monitors' AND column_name = 'inflow_20'",
+             WHERE table_schema = 'public' AND table_name = 'address_monitors' AND column_name = 'inflow_20'",
         )
         .fetch_optional(pool)
         .await?
         .is_some();
 
-        let inflow_expr = if has_inflow { "inflow_20" } else { "0 AS inflow_20" };
-        let outflow_expr = if has_inflow { "outflow_20" } else { "0 AS outflow_20" };
-        let profit_expr = if has_inflow { "profit_20" } else { "0 AS profit_20" };
+        let inflow_expr = if has_inflow {
+            "inflow_20"
+        } else {
+            "0 AS inflow_20"
+        };
+        let outflow_expr = if has_inflow {
+            "outflow_20"
+        } else {
+            "0 AS outflow_20"
+        };
+        let profit_expr = if has_inflow {
+            "profit_20"
+        } else {
+            "0 AS profit_20"
+        };
 
         let query = format!(
             "SELECT monitor_id, address, network, remark, {} as inflow, {} as outflow, {} as profit \
              FROM address_monitors \
-             WHERE is_active = true \
+             WHERE tenant_id = $1 AND is_active = true \
              ORDER BY monitor_id DESC \
-             LIMIT $1",
+             LIMIT $2",
             inflow_expr, outflow_expr, profit_expr
         );
 
         let rows = sqlx::query(&query)
+            .bind(tenant_id)
             .bind(limit)
             .fetch_all(pool)
             .await?;
@@ -295,7 +309,7 @@ impl SystemQueryTool {
     ) -> Result<(Value, String), anyhow::Error> {
         let rows = sqlx::query(
             "SELECT id as msg_id, from_userid, to_userid, content, msg_type, timestamp \
-             FROM chat_messages \
+             FROM chat.messages \
              WHERE is_deleted = false AND tenant_id = $1 \
              ORDER BY timestamp DESC \
              LIMIT $2",
@@ -329,13 +343,14 @@ impl SystemQueryTool {
     async fn get_group_ad_messages(
         &self,
         pool: &PgPool,
+        tenant_id: &str,
         group_id: Option<i64>,
         limit: i32,
     ) -> Result<(Value, String), anyhow::Error> {
         // 先检查表结构是否有 is_advertising 字段
         let has_ad_field: bool = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
-             WHERE table_name = 'group_messages' AND column_name = 'is_advertising')",
+             WHERE table_schema = 'groups' AND table_name = 'group_messages' AND column_name = 'is_advertising')",
         )
         .fetch_one(pool)
         .await?;
@@ -348,31 +363,39 @@ impl SystemQueryTool {
         }
 
         let mut query = String::from(
-            "SELECT msg_id, group_id, user_id, username, content, msg_type, \
-             COALESCE(is_advertising, 0) as is_advertising, COALESCE(ad_score, 0) as ad_score, timestamp \
+            "SELECT tg_msg_id, group_id, user_id, username, content, msg_type, \
+             COALESCE(is_advertising, false) as is_advertising, COALESCE(ad_score, 0) as ad_score, timestamp \
              FROM groups.group_messages \
-             WHERE COALESCE(is_advertising, 0) = 1",
+             WHERE tenant_id = $1 AND COALESCE(is_advertising, false) = true",
         );
 
-        if let Some(gid) = group_id {
-            query.push_str(&format!(" AND group_id = {}", gid));
+        if group_id.is_some() {
+            query.push_str(" AND group_id = $2");
         }
 
-        query.push_str(&format!(" ORDER BY timestamp DESC LIMIT {}", limit));
+        query.push_str(if group_id.is_some() {
+            " ORDER BY timestamp DESC LIMIT $3"
+        } else {
+            " ORDER BY timestamp DESC LIMIT $2"
+        });
 
-        let rows = sqlx::query(&query).fetch_all(pool).await?;
+        let mut request = sqlx::query(&query).bind(tenant_id);
+        if let Some(group_id) = group_id {
+            request = request.bind(group_id);
+        }
+        let rows = request.bind(limit).fetch_all(pool).await?;
 
         let ads: Vec<Value> = rows
             .iter()
             .map(|row| {
                 serde_json::json!({
-                    "msg_id": row.get::<i64, _>("msg_id"),
+                    "msg_id": row.get::<Option<i64>, _>("tg_msg_id"),
                     "group_id": row.get::<i64, _>("group_id"),
                     "user_id": row.get::<Option<i64>, _>("user_id").unwrap_or(0),
                     "username": row.get::<Option<String>, _>("username").unwrap_or_default(),
                     "content": row.get::<Option<String>, _>("content").unwrap_or_default(),
                     "msg_type": row.get::<Option<String>, _>("msg_type").unwrap_or_else(|| "text".to_string()),
-                    "is_advertising": row.get::<i32, _>("is_advertising") != 0,
+                    "is_advertising": row.get::<bool, _>("is_advertising"),
                     "ad_score": row.get::<i32, _>("ad_score"),
                     "timestamp": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("timestamp"),
                 })
@@ -389,29 +412,29 @@ impl SystemQueryTool {
     async fn get_potential_users(
         &self,
         pool: &PgPool,
+        tenant_id: &str,
         limit: i32,
     ) -> Result<(Value, String), anyhow::Error> {
         // 先检查表是否存在
         let table_exists: bool = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
-             WHERE table_name = 'potential_users')",
+             WHERE table_schema = 'tenant_saas' AND table_name = 'potential_users')",
         )
         .fetch_one(pool)
         .await?;
 
         if !table_exists {
-            return Ok((
-                serde_json::json!([]),
-                "潜在用户表不存在".to_string(),
-            ));
+            return Ok((serde_json::json!([]), "潜在用户表不存在".to_string()));
         }
 
         let rows = sqlx::query(
-            "SELECT user_id, username, source_group, profile_tags, first_seen, last_active \
-             FROM potential_users \
-             ORDER BY last_active DESC \
-             LIMIT $1",
+            "SELECT user_id, username, group_id AS source_group, profile_tags, created_at AS first_seen, updated_at AS last_active \
+             FROM tenant_saas.potential_users \
+             WHERE tenant_id = $1 \
+             ORDER BY updated_at DESC \
+             LIMIT $2",
         )
+        .bind(tenant_id)
         .bind(limit)
         .fetch_all(pool)
         .await?;

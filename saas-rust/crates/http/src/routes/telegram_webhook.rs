@@ -21,6 +21,7 @@ use crate::state::AppState;
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_integrations::telegram::{AnswerCallbackQueryParams, TelegramClient, TelegramConfig};
 use tgbot_repos::message_repo;
+use tgbot_services::ad_text::ad_text_hash;
 
 // ---------------------------------------------------------------------------
 // Update model — mirrors Telegram Bot API Update object
@@ -756,6 +757,7 @@ struct InboundContent {
     content: Option<String>,
     msg_type: String,
     file_id: Option<String>,
+    media_unique_id: Option<String>,
 }
 
 struct TrackedGroupPolicy {
@@ -917,6 +919,12 @@ async fn handle_incoming_message(
             let Some(inbound) = inbound else {
                 return Ok(());
             };
+            let ad_text_hash = inbound
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ad_text_hash);
             let quoted_text = message
                 .get("reply_to_message")
                 .and_then(|reply| reply.get("text").or_else(|| reply.get("caption")))
@@ -924,8 +932,9 @@ async fn handle_incoming_message(
             if edited {
                 sqlx::query(
                     "UPDATE groups.group_messages SET content = $4, msg_type = $5, file_id = $6, \
-                     quoted_tg_msg_id = $7, quoted_text = $8, message_ts = COALESCE($9, message_ts), \
-                     timestamp = COALESCE(to_timestamp($9), timestamp) \
+                     media_unique_id = $7, ad_text_hash = $8, quoted_tg_msg_id = $9, \
+                     quoted_text = $10, message_ts = COALESCE($11, message_ts), \
+                     timestamp = COALESCE(to_timestamp($11), timestamp) \
                      WHERE group_id = $1 AND tg_msg_id = $2 AND tenant_id = $3",
                 )
                 .bind(chat_id)
@@ -934,6 +943,8 @@ async fn handle_incoming_message(
                 .bind(inbound.content.as_deref())
                 .bind(&inbound.msg_type)
                 .bind(inbound.file_id.as_deref())
+                .bind(inbound.media_unique_id.as_deref())
+                .bind(ad_text_hash.as_deref())
                 .bind(reply_to_message_id)
                 .bind(quoted_text)
                 .bind(message_ts)
@@ -944,11 +955,12 @@ async fn handle_incoming_message(
                 sqlx::query(
                     "INSERT INTO groups.group_messages \
                      (group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, \
-                      file_id, quoted_tg_msg_id, quoted_text, tenant_id, message_ts, timestamp) \
-                     SELECT $1, $2, $3, $4, 'user', $5, $6, $7, $8, $9, $10, $11, \
-                            COALESCE(to_timestamp($11), now()) \
+                      file_id, media_unique_id, ad_text_hash, quoted_tg_msg_id, quoted_text, \
+                      tenant_id, message_ts, timestamp) \
+                     SELECT $1, $2, $3, $4, 'user', $5, $6, $7, $8, $9, $10, $11, $12, $13, \
+                            COALESCE(to_timestamp($13), now()) \
                      WHERE NOT EXISTS (SELECT 1 FROM groups.group_messages \
-                       WHERE group_id = $1 AND tg_msg_id = $4 AND tenant_id = $10)",
+                       WHERE group_id = $1 AND tg_msg_id = $4 AND tenant_id = $12)",
                 )
                 .bind(chat_id)
                 .bind(user_id)
@@ -957,6 +969,8 @@ async fn handle_incoming_message(
                 .bind(inbound.content.as_deref())
                 .bind(&inbound.msg_type)
                 .bind(inbound.file_id.as_deref())
+                .bind(inbound.media_unique_id.as_deref())
+                .bind(ad_text_hash.as_deref())
                 .bind(reply_to_message_id)
                 .bind(quoted_text)
                 .bind(&entry.tenant_id)
@@ -1211,6 +1225,7 @@ fn extract_inbound_content(message: &Value) -> Option<InboundContent> {
             content: Some(text.to_string()),
             msg_type: "text".into(),
             file_id: None,
+            media_unique_id: None,
         });
     }
     let caption = message
@@ -1225,6 +1240,11 @@ fn extract_inbound_content(message: &Value) -> Option<InboundContent> {
                 .iter()
                 .rev()
                 .find_map(|item| item.get("file_id").and_then(Value::as_str))
+                .map(str::to_string),
+            media_unique_id: photo
+                .iter()
+                .rev()
+                .find_map(|item| item.get("file_unique_id").and_then(Value::as_str))
                 .map(str::to_string),
         });
     }
@@ -1247,6 +1267,10 @@ fn extract_inbound_content(message: &Value) -> Option<InboundContent> {
                 msg_type: msg_type.into(),
                 file_id: media
                     .get("file_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                media_unique_id: media
+                    .get("file_unique_id")
                     .and_then(Value::as_str)
                     .map(str::to_string),
             });
@@ -1538,17 +1562,22 @@ mod channel_subscription_tests {
                 content: Some("hello".into()),
                 msg_type: "text".into(),
                 file_id: None,
+                media_unique_id: None,
             })
         );
         assert_eq!(
             extract_inbound_content(&json!({
                 "caption": "image",
-                "photo": [{ "file_id": "small" }, { "file_id": "large" }],
+                "photo": [
+                    { "file_id": "small", "file_unique_id": "same-photo" },
+                    { "file_id": "large", "file_unique_id": "same-photo" }
+                ],
             })),
             Some(InboundContent {
                 content: Some("image".into()),
                 msg_type: "photo".into(),
                 file_id: Some("large".into()),
+                media_unique_id: Some("same-photo".into()),
             })
         );
     }

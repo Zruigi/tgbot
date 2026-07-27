@@ -42,13 +42,14 @@
 //! ```
 
 pub mod ad_governance_worker;
-pub mod ai_worker;
 pub mod channel_reminder_worker;
 pub mod group_message_policy_worker;
+#[cfg(feature = "legacy-workers")]
 pub mod group_policy_worker;
 pub mod job_queue;
-pub mod monitor_worker;
+#[cfg(feature = "legacy-workers")]
 pub mod ocr_worker;
+#[cfg(feature = "legacy-workers")]
 pub mod payment_worker;
 pub mod push_task_worker;
 pub mod scheduler;
@@ -57,25 +58,36 @@ pub mod telegram_command_worker;
 
 // Re-export commonly used types
 pub use ad_governance_worker::AdGovernanceWorker;
+#[cfg(feature = "legacy-workers")]
+pub mod ai_worker;
+#[cfg(feature = "legacy-workers")]
+pub mod monitor_worker;
+
+#[cfg(feature = "legacy-workers")]
 pub use ai_worker::{AiWorker, AnalysisType};
 pub use channel_reminder_worker::{
     cleanup_expired_channel_reminders, ChannelReminderCleanupSummary,
 };
 pub use group_message_policy_worker::GroupMessagePolicyWorker;
+#[cfg(feature = "legacy-workers")]
 pub use group_policy_worker::GroupPolicyWorker;
 pub use job_queue::{ClaimedJob, EnqueueOpts, Job, JobStatus, JobType};
+#[cfg(feature = "legacy-workers")]
 pub use monitor_worker::{MonitorTaskType, MonitorWorker};
+#[cfg(feature = "legacy-workers")]
 pub use ocr_worker::{OcrTaskType, OcrWorker};
+#[cfg(feature = "legacy-workers")]
 pub use payment_worker::{PaymentTaskType, PaymentWorker};
 pub use push_task_worker::{PushTaskWorker, TelegramClientResolver};
+#[cfg(feature = "legacy-workers")]
+pub use scheduler::{run_cron_checks, schedule_monitor_checks};
 pub use scheduler::{
-    run_cron_checks, schedule_group_policy_syncs, schedule_monitor_checks, schedule_push_tasks,
-    Dispatcher, Scheduler, SchedulerConfig, Worker,
+    schedule_group_policy_syncs, schedule_push_tasks, Dispatcher, Scheduler, SchedulerConfig,
+    Worker,
 };
 pub use telegram_auto_reply_worker::TelegramAutoReplyWorker;
 pub use telegram_command_worker::TelegramCommandWorker;
 
-use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 

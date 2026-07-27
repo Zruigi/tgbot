@@ -12,7 +12,10 @@ pub async fn send_broadcast_to_users(
     do_translate: bool,
 ) -> Result<Value> {
     let total = user_ids.len();
-    info!("Broadcast to {} users queued (translate={})", total, do_translate);
+    info!(
+        "Broadcast to {} users queued (translate={})",
+        total, do_translate
+    );
 
     // Actual Telegram delivery is handled by push_task_worker
     // via the job queue scheduler.
@@ -32,7 +35,10 @@ pub async fn send_broadcast_to_chats(
     do_translate: bool,
 ) -> Result<Value> {
     let total = chat_ids.len();
-    info!("Broadcast to {} chats queued (translate={})", total, do_translate);
+    info!(
+        "Broadcast to {} chats queued (translate={})",
+        total, do_translate
+    );
 
     // Actual Telegram delivery is handled by push_task_worker
     // via the job queue scheduler.
@@ -46,10 +52,7 @@ pub async fn send_broadcast_to_chats(
 }
 
 /// Execute a push task immediately.
-pub async fn execute_push_task(
-    pool: &PgPool,
-    task_id: i64,
-) -> Result<Value> {
+pub async fn execute_push_task(pool: &PgPool, task_id: i64) -> Result<Value> {
     let task = sqlx::query("SELECT * FROM push_tasks WHERE id = $1")
         .bind(task_id)
         .fetch_optional(pool)

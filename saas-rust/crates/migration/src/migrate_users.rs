@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::PgPool;
 
-use crate::sqlite_reader::{SqliteConfig, SqliteAdminInbox, SqliteUser, SqliteReader};
+use crate::sqlite_reader::{SqliteAdminInbox, SqliteConfig, SqliteReader, SqliteUser};
 
 /// Virtual assistant UIDs that should be excluded from admin_inbox
 const VIRTUAL_ASSISTANT_IDS: &[i64] = &[0, -99999, 900000001];
@@ -89,10 +89,7 @@ fn is_virtual_assistant(user_id: i64) -> bool {
 }
 
 /// Migrate a list of users
-async fn migrate_user_list(
-    users: &[SqliteUser],
-    pg_pool: &PgPool,
-) -> Result<UserStats> {
+async fn migrate_user_list(users: &[SqliteUser], pg_pool: &PgPool) -> Result<UserStats> {
     let mut stats = UserStats {
         total_source: users.len() as i64,
         migrated: 0,
@@ -122,10 +119,7 @@ async fn migrate_user_list(
 }
 
 /// Migrate a single user
-async fn migrate_single_user(
-    sqlite_user: &SqliteUser,
-    pg_pool: &PgPool,
-) -> Result<()> {
+async fn migrate_single_user(sqlite_user: &SqliteUser, pg_pool: &PgPool) -> Result<()> {
     let created_at = parse_timestamp(&sqlite_user.created_at)?;
 
     sqlx::query(
@@ -137,7 +131,7 @@ async fn migrate_single_user(
         ) VALUES ($1, $2, $3)
         ON CONFLICT (user_id) DO UPDATE SET
             email = COALESCE(EXCLUDED.email, chat.users.email)
-        "#
+        "#,
     )
     .bind(sqlite_user.user_id)
     .bind(&sqlite_user.email)
@@ -183,7 +177,11 @@ async fn migrate_admin_inbox_list(
                     stats.skipped += 1;
                 } else {
                     stats.errors += 1;
-                    tracing::debug!("Failed to migrate admin_inbox entry {}: {}", entry.from_userid, e);
+                    tracing::debug!(
+                        "Failed to migrate admin_inbox entry {}: {}",
+                        entry.from_userid,
+                        e
+                    );
                 }
             }
         }
@@ -217,7 +215,7 @@ async fn migrate_single_admin_inbox(
             last_active = EXCLUDED.last_active,
             avatar_file_id = COALESCE(EXCLUDED.avatar_file_id, chat.admin_inbox.avatar_file_id),
             updated_at = now()
-        "#
+        "#,
     )
     .bind(sqlite_entry.from_userid)
     .bind(&sqlite_entry.from_username)
@@ -266,12 +264,10 @@ pub async fn verify_user_migration(
     let sqlite_reader = SqliteReader::new(sqlite_config)?;
     let source_users = sqlite_reader.read_users()?.len() as i64;
 
-    let target_users: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM chat.users"
-    )
-    .fetch_one(pg_pool)
-    .await
-    .context("Failed to count users in PostgreSQL")?;
+    let target_users: i64 = sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM chat.users")
+        .fetch_one(pg_pool)
+        .await
+        .context("Failed to count users in PostgreSQL")?;
 
     // For admin_inbox, count source entries excluding virtual assistants
     let source_admin_inbox_raw = sqlite_reader.read_admin_inbox()?;
@@ -280,12 +276,11 @@ pub async fn verify_user_migration(
         .filter(|entry| !is_virtual_assistant(entry.from_userid))
         .count() as i64;
 
-    let target_admin_inbox: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM chat.admin_inbox"
-    )
-    .fetch_one(pg_pool)
-    .await
-    .context("Failed to count admin_inbox in PostgreSQL")?;
+    let target_admin_inbox: i64 =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM chat.admin_inbox")
+            .fetch_one(pg_pool)
+            .await
+            .context("Failed to count admin_inbox in PostgreSQL")?;
 
     // Count how many virtual assistant entries were excluded
     let virtual_assistant_excluded = source_admin_inbox_raw

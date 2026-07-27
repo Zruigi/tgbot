@@ -42,7 +42,10 @@ mod tests {
             normalize_ad_text("  Hello   https://example.com/x  World "),
             "hello [link] world"
         );
-        assert_eq!(normalize_ad_text("加我 @Spammer123 详谈"), "加我 [link] 详谈");
+        assert_eq!(
+            normalize_ad_text("加我 @Spammer123 详谈"),
+            "加我 [link] 详谈"
+        );
         assert_eq!(normalize_ad_text("t.me/joinchat/abc 进群"), "[link] 进群");
     }
 
@@ -58,10 +61,16 @@ mod tests {
         // Python: hashlib.md5("".encode()).hexdigest()
         assert_eq!(ad_text_hash(""), "d41d8cd98f00b204e9800998ecf8427e");
         // Python: ad_text_hash("Hello   World") == md5("hello world")
-        assert_eq!(ad_text_hash("Hello   World"), "5eb63bbbe01eeed093cb22bb8f5acdc3");
+        assert_eq!(
+            ad_text_hash("Hello   World"),
+            "5eb63bbbe01eeed093cb22bb8f5acdc3"
+        );
         // Python: ad_text_hash("看 https://t.me/x 详情") == md5("看 [link] 详情")
         // 中文 UTF-8 编码路径也必须一致
-        assert_eq!(ad_text_hash("看 https://t.me/x 详情"), ad_text_hash("看 t.me/y 详情"));
+        assert_eq!(
+            ad_text_hash("看 https://t.me/x 详情"),
+            ad_text_hash("看 t.me/y 详情")
+        );
     }
 
     #[test]

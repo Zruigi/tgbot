@@ -57,6 +57,9 @@ pub async fn update_status(
     Json(body): Json<UpdateStatusRequest>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
+    if matches!(scope.role, Role::MerchantViewer) {
+        return Err(ApiError::Forbidden);
+    }
     let (tenant_id, merchant_id) = scope.require_merchant()?;
     let row = sqlx::query(
         "UPDATE merchants SET status = $3, onboarding_completed = COALESCE($4, onboarding_completed), updated_at = now() WHERE tenant_id = $1 AND id = $2 RETURNING *",

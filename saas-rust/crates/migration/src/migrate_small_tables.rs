@@ -44,9 +44,12 @@ pub async fn migrate_small_tables(
 
     tracing::info!(
         "Small tables: plans({}/{} migrated), address_monitors({}/{}), monitor_transactions({}/{})",
-        stats.plans.migrated, stats.plans.total_source,
-        stats.address_monitors.migrated, stats.address_monitors.total_source,
-        stats.monitor_transactions.migrated, stats.monitor_transactions.total_source,
+        stats.plans.migrated,
+        stats.plans.total_source,
+        stats.address_monitors.migrated,
+        stats.address_monitors.total_source,
+        stats.monitor_transactions.migrated,
+        stats.monitor_transactions.total_source,
     );
 
     Ok(stats)
@@ -66,7 +69,16 @@ async fn migrate_plans(conn: &rusqlite::Connection, pg_pool: &PgPool) -> Result<
          FROM plans ORDER BY id",
     )?;
 
-    let rows: Vec<(String, String, Option<f64>, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>)> = stmt
+    let rows: Vec<(
+        String,
+        String,
+        Option<f64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = stmt
         .query_map([], |r| {
             Ok((
                 r.get(0)?,
@@ -82,9 +94,24 @@ async fn migrate_plans(conn: &rusqlite::Connection, pg_pool: &PgPool) -> Result<
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let total_source = rows.len() as i64;
-    let mut stats = TableStats { total_source, migrated: 0, skipped: 0, errors: 0 };
+    let mut stats = TableStats {
+        total_source,
+        migrated: 0,
+        skipped: 0,
+        errors: 0,
+    };
 
-    for (plan_code, plan_name, price_usdt, duration_days, features_json, status, created_at, updated_at) in rows {
+    for (
+        plan_code,
+        plan_name,
+        price_usdt,
+        duration_days,
+        features_json,
+        status,
+        created_at,
+        updated_at,
+    ) in rows
+    {
         let created = created_at.as_deref().and_then(|s| parse_timestamp(s).ok());
         let updated = updated_at.as_deref().and_then(|s| parse_timestamp(s).ok());
 
@@ -130,28 +157,71 @@ async fn migrate_plans(conn: &rusqlite::Connection, pg_pool: &PgPool) -> Result<
 //           profit_20 created_at updated_at  (PK monitor_id)
 // ---------------------------------------------------------------------------
 
-async fn migrate_address_monitors(conn: &rusqlite::Connection, pg_pool: &PgPool) -> Result<TableStats> {
+async fn migrate_address_monitors(
+    conn: &rusqlite::Connection,
+    pg_pool: &PgPool,
+) -> Result<TableStats> {
     let mut stmt = conn.prepare(
         "SELECT monitor_id, user_id, address, network, last_tx_timestamp, is_active,
                 remark, risk_level, risk_note, created_at, owner_type, tenant_id
          FROM address_monitors ORDER BY monitor_id",
     )?;
 
-    let rows: Vec<(i64, Option<i64>, String, Option<String>, Option<i64>, Option<bool>,
-                   Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = stmt
+    let rows: Vec<(
+        i64,
+        Option<i64>,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<bool>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = stmt
         .query_map([], |r| {
             Ok((
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
-                r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let total_source = rows.len() as i64;
-    let mut stats = TableStats { total_source, migrated: 0, skipped: 0, errors: 0 };
+    let mut stats = TableStats {
+        total_source,
+        migrated: 0,
+        skipped: 0,
+        errors: 0,
+    };
 
-    for (monitor_id, user_id, address, network, last_tx_ts, is_active,
-         remark, risk_level, risk_note, created_at, _owner_type, tenant_id) in rows {
+    for (
+        monitor_id,
+        user_id,
+        address,
+        network,
+        last_tx_ts,
+        is_active,
+        remark,
+        risk_level,
+        risk_note,
+        created_at,
+        _owner_type,
+        tenant_id,
+    ) in rows
+    {
         let created = created_at.as_deref().and_then(|s| parse_timestamp(s).ok());
         let tenant = tenant_id.unwrap_or_else(|| "default".to_string());
 
@@ -202,7 +272,10 @@ async fn migrate_address_monitors(conn: &rusqlite::Connection, pg_pool: &PgPool)
 //           is_energy_fee created_at updated_at  (PK tx_id)
 // ---------------------------------------------------------------------------
 
-async fn migrate_monitor_transactions(conn: &rusqlite::Connection, pg_pool: &PgPool) -> Result<TableStats> {
+async fn migrate_monitor_transactions(
+    conn: &rusqlite::Connection,
+    pg_pool: &PgPool,
+) -> Result<TableStats> {
     let mut stmt = conn.prepare(
         "SELECT tx_id, monitor_id, user_id, address, network, direction, amount,
                 token_symbol, tx_timestamp, counterparty, risk_level, risk_note,
@@ -210,25 +283,79 @@ async fn migrate_monitor_transactions(conn: &rusqlite::Connection, pg_pool: &PgP
          FROM monitor_transactions ORDER BY tx_id",
     )?;
 
-    let rows: Vec<(String, i64, Option<i64>, Option<String>, Option<String>, Option<String>,
-                   Option<f64>, Option<String>, Option<i64>, Option<String>, Option<String>,
-                   Option<String>, Option<String>, Option<String>, Option<String>,
-                   Option<String>, Option<String>, Option<String>)> = stmt
+    let rows: Vec<(
+        String,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<f64>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = stmt
         .query_map([], |r| {
             Ok((
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
-                r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
-                r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?, r.get(16)?, r.get(17)?,
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+                r.get(13)?,
+                r.get(14)?,
+                r.get(15)?,
+                r.get(16)?,
+                r.get(17)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let total_source = rows.len() as i64;
-    let mut stats = TableStats { total_source, migrated: 0, skipped: 0, errors: 0 };
+    let mut stats = TableStats {
+        total_source,
+        migrated: 0,
+        skipped: 0,
+        errors: 0,
+    };
 
-    for (tx_id, monitor_id, user_id, address, network, direction, amount,
-         token_symbol, tx_timestamp, counterparty, risk_level, risk_note,
-         created_at, income_reason, expense_reason, payer, payee, tenant_id) in rows {
+    for (
+        tx_id,
+        monitor_id,
+        user_id,
+        address,
+        network,
+        direction,
+        amount,
+        token_symbol,
+        tx_timestamp,
+        counterparty,
+        risk_level,
+        risk_note,
+        created_at,
+        income_reason,
+        expense_reason,
+        payer,
+        payee,
+        tenant_id,
+    ) in rows
+    {
         let created = created_at.as_deref().and_then(|s| parse_timestamp(s).ok());
         let tenant = tenant_id.unwrap_or_else(|| "default".to_string());
         // tx_timestamp 是 unix 时间戳(秒), 转为 timestamptz
@@ -304,7 +431,12 @@ mod tests {
 
     #[test]
     fn stats_accounting() {
-        let s = TableStats { total_source: 10, migrated: 9, skipped: 1, errors: 0 };
+        let s = TableStats {
+            total_source: 10,
+            migrated: 9,
+            skipped: 1,
+            errors: 0,
+        };
         assert_eq!(s.total_source, s.migrated + s.skipped + s.errors);
     }
 

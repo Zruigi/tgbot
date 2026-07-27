@@ -1,18 +1,12 @@
 BEGIN;
 
--- 兼容 shim:原生 PG 无 Supabase 的 authenticated/anon 角色,补齐以保证本文件
--- 在 vanilla PG(beta)与真 Supabase 上均可幂等执行
-DO $do$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'authenticated') THEN
-    CREATE ROLE authenticated NOLOGIN;
-  END IF;
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'anon') THEN
-    CREATE ROLE anon NOLOGIN;
-  END IF;
-END $do$;
+-- Supabase provisions authenticated/anon outside application migrations. A vanilla
+-- PostgreSQL test environment must do the same before running this file. Keeping
+-- role lifecycle out of the migration lets it run under a NOCREATEROLE deploy role.
 
 -- Create SECURITY DEFINER helper function to break the RLS recursion on saas_user_roles
--- This function is owned by postgres and reads saas_user_roles with row_security OFF
+-- The deploy role must own auth.saas_user_roles (or have BYPASSRLS); the helper
+-- then reads it with row_security OFF without granting callers direct table access.
 CREATE OR REPLACE FUNCTION auth.is_platform_admin(user_id_param uuid)
 RETURNS boolean
 LANGUAGE sql
@@ -28,7 +22,7 @@ AS $$
   );
 $$;
 
-GRANT EXECUTE ON FUNCTION auth.is_platform_admin(uuid) TO PUBLIC;
+REVOKE ALL ON FUNCTION auth.is_platform_admin(uuid) FROM PUBLIC;
 
 -- Create SECURITY DEFINER helper function to check if user is platform admin (for current user)
 CREATE OR REPLACE FUNCTION auth.current_user_is_platform_admin()
@@ -41,7 +35,8 @@ AS $$
   SELECT auth.is_platform_admin(auth.uid());
 $$;
 
-GRANT EXECUTE ON FUNCTION auth.current_user_is_platform_admin() TO PUBLIC;
+REVOKE ALL ON FUNCTION auth.current_user_is_platform_admin() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION auth.current_user_is_platform_admin() TO authenticated;
 
 -- Drop and recreate the saas_user_roles policy to use the helper function instead of direct subquery
 -- This breaks the RLS recursion cycle

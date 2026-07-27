@@ -3,9 +3,9 @@
 //! Provides spot and futures price queries via Binance API,
 //! with inline keyboard for adding price alerts.
 
-use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, MessageId};
 use teloxide::payloads::SendMessageSetters;
+use teloxide::prelude::*;
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode};
 
 use crate::handlers::HandlerResult;
 
@@ -188,8 +188,5 @@ pub async fn fetch_ticker(symbol: &str, price_type: PriceType) -> anyhow::Result
         .or_else(|| resp.get("priceChangePercent").and_then(|v| v.as_f64()))
         .unwrap_or(0.0);
 
-    Ok(TickerResult {
-        last_price,
-        change,
-    })
+    Ok(TickerResult { last_price, change })
 }

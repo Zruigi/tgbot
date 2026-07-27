@@ -20,22 +20,29 @@ use crate::state::AppState;
 pub async fn tool_finance_query(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
-    let _scope = resolve_scope(&state, &headers).await?;
-    info!("agent_tool: finance_query called");
+    use tgbot_agent::schema::{AgentContext, Tool};
+    use tgbot_agent::tools::finance_query::FinanceQueryTool;
 
-    // Finance service not yet ported. Return placeholder compatible with Python.
-    Ok(Json(json!({
-        "success": true,
-        "status": "ok",
-        "data": {
-            "by_currency": [],
-            "total_base_fiat": 0.0,
-            "as_of": chrono::Utc::now().to_rfc3339(),
-        },
-        "message": "财务数据服务尚未接入 Rust 后端"
-    })))
+    let scope = resolve_scope(&state, &headers).await?;
+    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    info!("agent_tool: finance_query called");
+    let mut context = AgentContext::new(0);
+    context
+        .metadata
+        .insert("tenant_id".into(), json!(tenant_id));
+    context
+        .metadata
+        .insert("merchant_id".into(), json!(merchant_id.to_string()));
+    let tool = FinanceQueryTool::with_pool(Arc::new(state.db()?.clone()));
+    let result = tool.execute(&body, &context).await;
+    let status = if result.success { "ok" } else { "error" };
+    let mut response = result.to_json_value();
+    if let Some(object) = response.as_object_mut() {
+        object.insert("status".into(), json!(status));
+    }
+    Ok(Json(response))
 }
 
 pub async fn tool_system_query(
@@ -43,13 +50,45 @@ pub async fn tool_system_query(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
-    let _scope = resolve_scope(&state, &headers).await?;
+    use tgbot_domain::models::Role;
+
+    let scope = resolve_scope(&state, &headers).await?;
+    // System queries are always tenant-scoped.  A platform administrator must
+    // name the tenant explicitly; accepting an omitted tenant here would turn
+    // this direct database tool into a cross-tenant read primitive.
+    let tenant_id = match scope.role {
+        Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer => {
+            scope.tenant_id.clone().ok_or(ApiError::Forbidden)?
+        }
+        Role::PlatformAdmin => body
+            .get("tenant_id")
+            .or_else(|| {
+                body.get("context")
+                    .and_then(|context| context.get("tenant_id"))
+            })
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| ApiError::BadRequest("tenant_id required for platform admin".into()))?,
+    };
 
     use tgbot_agent::schema::{AgentContext, Tool};
     use tgbot_agent::tools::system_query::SystemQueryTool;
 
     let tool = Arc::new(SystemQueryTool::new(Arc::new(state.db()?.clone())));
-    let context = AgentContext::new(0);
+    let mut context = AgentContext::new(0);
+    context
+        .metadata
+        .insert("tenant_id".into(), json!(tenant_id));
+    context
+        .metadata
+        .insert("role".into(), json!(scope.role.as_str()));
+    if let Some(merchant_id) = scope.merchant_id {
+        context
+            .metadata
+            .insert("merchant_id".into(), json!(merchant_id.to_string()));
+    }
     let result = tool.execute(&body, &context).await;
     Ok(Json(serde_json::to_value(&result).unwrap_or(
         json!({"status": "error", "message": "serialization failed"}),
@@ -67,7 +106,10 @@ pub async fn tool_telegram_sdk_query(
     info!("agent_tool: telegram_sdk_query called");
 
     // Get tenant_id: from scope if merchant, or from request body if platform admin
-    let tenant_id = if matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer) {
+    let tenant_id = if matches!(
+        scope.role,
+        Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer
+    ) {
         scope.tenant_id.clone()
     } else {
         body.get("tenant_id")
@@ -76,7 +118,10 @@ pub async fn tool_telegram_sdk_query(
             .map(|s| s.to_string())
     };
 
-    let (_bot_id, telegram) = match state.tenant_telegram(tenant_id.as_deref().unwrap_or("")).await {
+    let (_bot_id, telegram) = match state
+        .tenant_telegram(tenant_id.as_deref().unwrap_or(""))
+        .await
+    {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to get telegram client: {}", e);
@@ -100,9 +145,7 @@ pub async fn tool_telegram_sdk_query(
         .unwrap_or(true);
 
     match operation {
-        "message_existence_probe" => {
-            message_existence_probe(&telegram, &body).await
-        }
+        "message_existence_probe" => message_existence_probe(&telegram, &body).await,
         _ => {
             // chat_capabilities, bound_chat_capabilities, bot_visibility_status
             inspect_chats(&telegram, &body, include_admins).await
@@ -123,7 +166,10 @@ pub async fn tool_query_ad_clusters(
     let pool = state.db()?;
 
     // Get tenant_id: from scope if merchant, or from request body if platform admin
-    let tenant_id = if matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer) {
+    let tenant_id = if matches!(
+        scope.role,
+        Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer
+    ) {
         scope.tenant_id.clone()
     } else {
         body.get("tenant_id")
@@ -198,12 +244,18 @@ pub async fn tool_delete_ad_cluster(
         })));
     }
 
-    info!("agent_tool: delete_ad_cluster called for cluster_id={}", cluster_id);
+    info!(
+        "agent_tool: delete_ad_cluster called for cluster_id={}",
+        cluster_id
+    );
 
     let pool = state.db()?;
 
     // Get tenant_id: from scope if merchant, or from request body if platform admin
-    let tenant_id = if matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer) {
+    let tenant_id = if matches!(
+        scope.role,
+        Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer
+    ) {
         scope.tenant_id.clone()
     } else {
         body.get("tenant_id")
@@ -251,14 +303,12 @@ pub async fn tool_delete_ad_cluster(
         .unwrap_or_default();
 
     // Find matching cluster
-    let matched = clusters
-        .iter()
-        .find(|c| {
-            c.get("cluster_id")
-                .and_then(|id| id.as_str())
-                .map(|id| id == cluster_id)
-                .unwrap_or(false)
-        });
+    let matched = clusters.iter().find(|c| {
+        c.get("cluster_id")
+            .and_then(|id| id.as_str())
+            .map(|id| id == cluster_id)
+            .unwrap_or(false)
+    });
 
     // Safety gate 1: Cluster must exist (404)
     let cluster = match matched {
@@ -305,7 +355,10 @@ pub async fn tool_delete_ad_cluster(
         .unwrap_or(false);
 
     // Get telegram client
-    let (_bot_id, telegram) = match state.tenant_telegram(tenant_id.as_deref().unwrap_or("")).await {
+    let (_bot_id, telegram) = match state
+        .tenant_telegram(tenant_id.as_deref().unwrap_or(""))
+        .await
+    {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to get telegram client: {}", e);
@@ -319,7 +372,8 @@ pub async fn tool_delete_ad_cluster(
     };
 
     // Execute deletion - delete_cluster_messages returns Value directly
-    let result = ad_pipeline::delete_cluster_messages(pool, &telegram, &refs, dry_run, ban_senders).await;
+    let result =
+        ad_pipeline::delete_cluster_messages(pool, &telegram, &refs, dry_run, ban_senders).await;
     Ok(Json(result))
 }
 
@@ -374,7 +428,9 @@ async fn message_existence_probe(
     {
         Ok(msg) => {
             // Delete the forwarded message to clean up
-            let _ = telegram.delete_message(staging_chat_id, msg.message_id).await;
+            let _ = telegram
+                .delete_message(staging_chat_id, msg.message_id)
+                .await;
             Ok(Json(json!({
                 "success": true,
                 "data_complete": true,
@@ -482,18 +538,9 @@ async fn inspect_single_chat(
     // Get chat info
     if let Ok(chat) = telegram.get_chat(chat_id).await {
         if let Ok(chat_json) = serde_json::to_value(&chat) {
-            item["chat_type"] = chat_json
-                .get("type")
-                .cloned()
-                .unwrap_or(Value::Null);
-            item["title"] = chat_json
-                .get("title")
-                .cloned()
-                .unwrap_or(Value::Null);
-            item["username"] = chat_json
-                .get("username")
-                .cloned()
-                .unwrap_or(Value::Null);
+            item["chat_type"] = chat_json.get("type").cloned().unwrap_or(Value::Null);
+            item["title"] = chat_json.get("title").cloned().unwrap_or(Value::Null);
+            item["username"] = chat_json.get("username").cloned().unwrap_or(Value::Null);
         }
     } else {
         item["errors"]
@@ -509,10 +556,7 @@ async fn inspect_single_chat(
         // Get bot's status in chat
         if let Ok(member) = telegram.get_chat_member(chat_id, bot.id).await {
             if let Ok(member_json) = serde_json::to_value(&member) {
-                item["bot_status"] = member_json
-                    .get("status")
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                item["bot_status"] = member_json.get("status").cloned().unwrap_or(Value::Null);
                 if let Some(perms) = member_json.as_object() {
                     let mut permissions = json!({
                         "status": item["bot_status"].clone()
@@ -576,9 +620,7 @@ async fn inspect_single_chat(
         .unwrap_or(0);
 
     item["success"] = json!(errors == 0);
-    item["data_complete"] = json!(
-        item.get("bot_status").is_some() && errors == 0
-    );
+    item["data_complete"] = json!(item.get("bot_status").is_some() && errors == 0);
 
     Ok(item)
 }
@@ -657,6 +699,10 @@ mod tests {
         });
 
         assert!(!error_response.get("success").unwrap().as_bool().unwrap());
-        assert!(!error_response.get("action_taken").unwrap().as_bool().unwrap());
+        assert!(!error_response
+            .get("action_taken")
+            .unwrap()
+            .as_bool()
+            .unwrap());
     }
 }

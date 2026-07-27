@@ -62,7 +62,7 @@ impl SqliteReader {
                 feature_version, created_at, updated_at
             FROM merchants
             ORDER BY id
-            "#
+            "#,
         )?;
 
         let merchants = stmt
@@ -110,7 +110,7 @@ impl SqliteReader {
             FROM messages
             ORDER BY msg_id
             LIMIT ?1 OFFSET ?2
-            "#
+            "#,
         )?;
 
         let messages = stmt
@@ -148,7 +148,8 @@ impl SqliteReader {
 
     /// Count total messages in SQLite
     pub fn count_messages(&self) -> Result<i64> {
-        let count: i64 = self.conn
+        let count: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .context("Failed to count messages")?;
         Ok(count)
@@ -169,7 +170,7 @@ impl SqliteReader {
                 verify_channel_id, verify_questions, tenant_id
             FROM tracked_groups
             ORDER BY group_id
-            "#
+            "#,
         )?;
 
         let groups = stmt
@@ -209,7 +210,7 @@ impl SqliteReader {
             FROM group_members
             WHERE group_id = ?1
             ORDER BY id
-            "#
+            "#,
         )?;
 
         let members = stmt
@@ -246,7 +247,7 @@ impl SqliteReader {
                 is_verified, verified_at, avatar_file_id, tenant_id
             FROM group_members
             ORDER BY group_id, id
-            "#
+            "#,
         )?;
 
         let members = stmt
@@ -276,7 +277,8 @@ impl SqliteReader {
 
     /// Count total groups in SQLite
     pub fn count_groups(&self) -> Result<i64> {
-        let count: i64 = self.conn
+        let count: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM tracked_groups", [], |row| row.get(0))
             .context("Failed to count groups")?;
         Ok(count)
@@ -284,7 +286,8 @@ impl SqliteReader {
 
     /// Count total group members in SQLite
     pub fn count_group_members(&self) -> Result<i64> {
-        let count: i64 = self.conn
+        let count: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM group_members", [], |row| row.get(0))
             .context("Failed to count group members")?;
         Ok(count)
@@ -295,7 +298,11 @@ impl SqliteReader {
     // ========================================================================
 
     /// Read group messages from SQLite with pagination
-    pub fn read_group_messages(&self, limit: usize, offset: usize) -> Result<Vec<SqliteGroupMessage>> {
+    pub fn read_group_messages(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SqliteGroupMessage>> {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT
@@ -308,7 +315,7 @@ impl SqliteReader {
             FROM group_messages
             ORDER BY msg_id
             LIMIT ?1 OFFSET ?2
-            "#
+            "#,
         )?;
 
         let messages = stmt
@@ -351,7 +358,8 @@ impl SqliteReader {
 
     /// Count total group messages in SQLite
     pub fn count_group_messages(&self) -> Result<i64> {
-        let count: i64 = self.conn
+        let count: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM group_messages", [], |row| row.get(0))
             .context("Failed to count group messages")?;
         Ok(count)
@@ -369,7 +377,7 @@ impl SqliteReader {
                 user_id, email, created_at
             FROM users
             ORDER BY user_id
-            "#
+            "#,
         )?;
 
         let users = stmt
@@ -389,7 +397,8 @@ impl SqliteReader {
 
     /// Count total users in SQLite
     pub fn count_users(&self) -> Result<i64> {
-        let count: i64 = self.conn
+        let count: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
             .context("Failed to count users")?;
         Ok(count)
@@ -404,7 +413,7 @@ impl SqliteReader {
                 from_username, avatar_file_id, tenant_id
             FROM admin_inbox
             ORDER BY from_userid
-            "#
+            "#,
         )?;
 
         let entries = stmt
@@ -428,7 +437,8 @@ impl SqliteReader {
 
     /// Count total admin inbox entries in SQLite
     pub fn count_admin_inbox(&self) -> Result<i64> {
-        let count: i64 = self.conn
+        let count: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM admin_inbox", [], |row| row.get(0))
             .context("Failed to count admin inbox")?;
         Ok(count)

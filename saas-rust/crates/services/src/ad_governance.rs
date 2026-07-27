@@ -11,7 +11,7 @@
 //! - Tiered actions (warn/delete/mute) computed server-side
 //! - Every action idempotent via action_key (UNIQUE constraint in DB)
 //! - Warning dedup via 5-column PK window
-//! - Per-group locking (tokio mutex map)
+//! - Per-group locking (database row locks)
 //! - tenant_id scoping on every query
 
 use anyhow::{anyhow, Result};
@@ -21,10 +21,11 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use tokio::sync::Mutex;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -39,21 +40,14 @@ static MEDIA_PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
     ).unwrap()
 });
 
-static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)https?://\S+|t\.me/\S+|@\w{3,}").unwrap()
-});
+static URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)https?://\S+|t\.me/\S+|@\w{3,}").unwrap());
 
-static CONTACT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"@[A-Za-z0-9_]{4,32}").unwrap()
-});
+static CONTACT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@[A-Za-z0-9_]{4,32}").unwrap());
 
-static NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\d{5,}").unwrap()
-});
+static NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{5,}").unwrap());
 
-static SPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\s+").unwrap()
-});
+static SPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
 // ============================================================================
 // Type Definitions
@@ -161,40 +155,23 @@ pub struct GroupInfo {
 
 pub struct AdGovernanceService {
     pool: Arc<PgPool>,
-    // Per-group locks: (tenant_id, group_id) -> Mutex
-    group_locks: Arc<Mutex<HashMap<(String, i64), Arc<Mutex<()>>>>>,
 }
 
 impl AdGovernanceService {
     pub fn new(pool: Arc<PgPool>) -> Self {
-        Self {
-            pool,
-            group_locks: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// Get or create a lock for a specific group.
-    async fn get_group_lock(&self, tenant_id: &str, group_id: i64) -> Arc<Mutex<()>> {
-        let key = (tenant_id.to_string(), group_id);
-        let mut locks = self.group_locks.lock().await;
-        locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        Self { pool }
     }
 
     /// List tracked groups for a tenant (simplified version without Telegram bot checks).
-    pub async fn list_groups(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<GroupInfo>> {
+    pub async fn list_groups(&self, tenant_id: &str) -> Result<Vec<GroupInfo>> {
         let rows = sqlx::query(
             r#"
             SELECT g.group_id, COALESCE(g.group_title, '') as title,
                    COALESCE(g.chat_type, 'supergroup') as chat_type,
                    COALESCE(COUNT(m.id), 0) as message_count
             FROM groups.tracked_groups g
-            LEFT JOIN chat.messages m ON m.group_id = g.group_id AND m.tenant_id = g.tenant_id
+            LEFT JOIN groups.group_messages m
+              ON m.group_id = g.group_id AND m.tenant_id = g.tenant_id AND NOT m.is_deleted
             WHERE g.tenant_id = $1
             GROUP BY g.group_id, g.group_title, g.chat_type
             ORDER BY g.updated_at DESC
@@ -212,8 +189,8 @@ impl AdGovernanceService {
                 chat_type: row.get("chat_type"),
                 message_count: row.get::<i64, _>("message_count") as i32,
                 bot_status: "unknown".to_string(), // Simplified: requires Telegram API
-                can_delete_messages: false,          // Simplified: requires Telegram API
-                can_restrict_members: false,         // Simplified: requires Telegram API
+                can_delete_messages: false,        // Simplified: requires Telegram API
+                can_restrict_members: false,       // Simplified: requires Telegram API
             })
             .collect())
     }
@@ -228,7 +205,7 @@ impl AdGovernanceService {
         group_id: i64,
         requested_by: &str,
         group_title: Option<&str>,
-        _dry_run: bool,  // Ignored: first scan always dry_run=true
+        _dry_run: bool, // Ignored: first scan always dry_run=true
         activate_policy: bool,
         source: &str,
     ) -> Result<AdScanJob> {
@@ -240,9 +217,11 @@ impl AdGovernanceService {
         let message_count: i32 = sqlx::query_scalar(
             r#"
             SELECT COALESCE(COUNT(*), 0)::int
-            FROM chat.messages
+            FROM groups.group_messages
             WHERE tenant_id = $1 AND group_id = $2
-                AND sender_type = 'user' AND COALESCE(content, '') != ''
+              AND sender_type = 'user' AND NOT is_deleted
+              AND (NULLIF(btrim(COALESCE(content, '')), '') IS NOT NULL
+                   OR NULLIF(btrim(COALESCE(media_unique_id, '')), '') IS NOT NULL)
             "#,
         )
         .bind(tenant_id)
@@ -313,8 +292,10 @@ impl AdGovernanceService {
             warning_sender_count: row.get("warning_sender_count"),
             muted_sender_count: row.get("muted_sender_count"),
             failure_count: row.get("failure_count"),
-            summary: serde_json::from_str(row.get::<Option<&str>, _>("summary_json").unwrap_or("{}"))
-                .unwrap_or(json!({})),
+            summary: serde_json::from_str(
+                row.get::<Option<&str>, _>("summary_json").unwrap_or("{}"),
+            )
+            .unwrap_or(json!({})),
             error: row.get("error"),
             created_at: row.get("created_at"),
             started_at: row.get("started_at"),
@@ -348,7 +329,9 @@ impl AdGovernanceService {
         // Filter by tier if specified
         match tier {
             Some("delete") => {
-                query.push_str(" AND action_tier IN ('similar_delete', 'exact_delete', 'exact_delete_mute')");
+                query.push_str(
+                    " AND action_tier IN ('similar_delete', 'exact_delete', 'exact_delete_mute')",
+                );
             }
             Some("pending") => {
                 query.push_str(" AND classification = 'pending'");
@@ -394,23 +377,81 @@ impl AdGovernanceService {
 
     /// Cancel a job (only if it's in prepared or queued state).
     pub async fn cancel_job(&self, tenant_id: &str, job_id: &str) -> Result<AdScanJob> {
-        let job = self.get_job(tenant_id, job_id).await?;
-
-        if !matches!(job.status.as_str(), "prepared" | "queued") {
-            return Ok(job);
-        }
-
-        sqlx::query(
+        let mut transaction = self.pool.begin().await?;
+        let scan_status = sqlx::query_scalar::<_, String>(
             r#"
-            UPDATE groups.ad_scan_jobs
-            SET status = 'cancelled', finished_at = now()
+            SELECT status
+            FROM groups.ad_scan_jobs
             WHERE job_id = $1 AND tenant_id = $2
+            FOR UPDATE
             "#,
         )
         .bind(job_id)
         .bind(tenant_id)
-        .execute(self.pool.as_ref())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| anyhow!("ad scan job not found or access denied"))?;
+
+        let queue_statuses = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status
+            FROM job_queue
+            WHERE tenant_id = $1 AND job_type = 'ad_scan_job'
+              AND payload ->> 'job_id' = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(job_id)
+        .fetch_all(&mut *transaction)
         .await?;
+
+        let disposition = cancellation_disposition(&scan_status, &queue_statuses)?;
+        match disposition {
+            CancellationDisposition::LeaveUnchanged => {
+                transaction.rollback().await?;
+                return self.get_job(tenant_id, job_id).await;
+            }
+            CancellationDisposition::CancelScanAndQueue
+            | CancellationDisposition::CancelQueueOnly => {}
+        }
+
+        // `dead` is an existing terminal queue status and is never selected by
+        // the pending-job claim query. The diagnostic makes operator-initiated
+        // cancellation distinguishable from exhausted retries.
+        sqlx::query(
+            r#"
+            UPDATE job_queue
+            SET status = 'dead', last_error = 'cancelled by ad governance request',
+                completed_at = now(), updated_at = now()
+            WHERE tenant_id = $1 AND job_type = 'ad_scan_job'
+              AND payload ->> 'job_id' = $2 AND status = 'pending'
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if disposition == CancellationDisposition::CancelScanAndQueue {
+            let result = sqlx::query(
+                r#"
+                UPDATE groups.ad_scan_jobs
+                SET status = 'cancelled', error = NULL, finished_at = now()
+                WHERE job_id = $1 AND tenant_id = $2 AND status IN ('prepared', 'queued')
+                "#,
+            )
+            .bind(job_id)
+            .bind(tenant_id)
+            .execute(&mut *transaction)
+            .await?;
+
+            if result.rows_affected() != 1 {
+                return Err(anyhow!("ad scan cancellation lost its status guard"));
+            }
+        }
+
+        transaction.commit().await?;
 
         self.get_job(tenant_id, job_id).await
     }
@@ -449,69 +490,77 @@ impl AdGovernanceService {
 
     /// Start a scan job (transitions prepared → queued → scanning).
     pub async fn start_job(&self, tenant_id: &str, job_id: &str) -> Result<AdScanJob> {
-        let job = self.get_job(tenant_id, job_id).await?;
+        // Serialize start and cancel on the scan row. Without this lock a
+        // stale start request could enqueue work after a concurrent cancel.
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT status, group_id, source
+            FROM groups.ad_scan_jobs
+            WHERE job_id = $1 AND tenant_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(job_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| anyhow!("ad scan job not found or access denied"))?;
+        let status: String = row.get("status");
+        let group_id: i64 = row.get("group_id");
+        let source: String = row.get("source");
 
-        if !matches!(job.status.as_str(), "prepared" | "queued") {
-            return Ok(job);
+        if !matches!(status.as_str(), "prepared" | "queued") {
+            transaction.rollback().await?;
+            return self.get_job(tenant_id, job_id).await;
         }
 
-        if job.status == "prepared" {
-            sqlx::query(
-                "UPDATE groups.ad_scan_jobs SET status = 'queued' WHERE job_id = $1 AND status = 'prepared'",
+        if status == "prepared" {
+            let result = sqlx::query(
+                "UPDATE groups.ad_scan_jobs SET status = 'queued' \
+                 WHERE job_id = $1 AND tenant_id = $2 AND status = 'prepared'",
             )
             .bind(job_id)
-            .execute(self.pool.as_ref())
+            .bind(tenant_id)
+            .execute(&mut *transaction)
             .await?;
+            if result.rows_affected() != 1 {
+                return Err(anyhow!("ad scan start lost its status guard"));
+            }
         }
 
-        // Enqueue the job for worker processing
-        // This will be handled by the worker subscribed to scan jobs
+        sqlx::query(
+            r#"
+            INSERT INTO job_queue
+                (tenant_id, job_type, payload, priority, max_attempts, run_at, status)
+            SELECT $1, 'ad_scan_job',
+                   jsonb_build_object(
+                       'job_id', $2::text,
+                       'tenant_id', $1::text,
+                       'group_id', $3::bigint,
+                       'source', $4::text,
+                       'recent_only', false
+                   ),
+                   5, 3, now(), 'pending'
+            WHERE NOT EXISTS (
+                SELECT 1 FROM job_queue queued
+                WHERE queued.tenant_id = $1
+                  AND queued.job_type = 'ad_scan_job'
+                  AND queued.payload ->> 'job_id' = $2
+                  AND queued.status IN ('pending', 'running', 'completed')
+            )
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(job_id)
+        .bind(group_id)
+        .bind(source)
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
 
         self.get_job(tenant_id, job_id).await
-    }
-
-    /// Update job progress/status (called by worker).
-    #[instrument(skip(self))]
-    async fn set_job(
-        &self,
-        job_id: &str,
-        updates: &[(String, Value)],
-    ) -> Result<()> {
-        let mut query = String::from("UPDATE groups.ad_scan_jobs SET ");
-        let mut values: Vec<Value> = vec![];
-        let mut param_idx = 1;
-
-        for (key, _) in updates.iter() {
-            if param_idx > 1 {
-                query.push_str(", ");
-            }
-            query.push_str(&format!("{} = ${}", key, param_idx));
-            param_idx += 1;
-        }
-
-        query.push_str(" WHERE job_id = $");
-        query.push_str(&param_idx.to_string());
-
-        let mut q = sqlx::query(&query);
-        for (_, value) in updates.iter() {
-            // Bind each value — this is simplified; in production use proper binding
-            match value {
-                Value::String(s) => q = q.bind(s.clone()),
-                Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        q = q.bind(i);
-                    } else if let Some(f) = n.as_f64() {
-                        q = q.bind(f);
-                    }
-                }
-                Value::Bool(b) => q = q.bind(*b),
-                _ => q = q.bind(value.to_string()),
-            }
-        }
-        q = q.bind(job_id);
-
-        q.execute(self.pool.as_ref()).await?;
-        Ok(())
     }
 
     /// Enable policy for a group (only after scan completion and explicit confirm).
@@ -541,6 +590,80 @@ impl AdGovernanceService {
         Ok(())
     }
 
+    /// Atomically mark a successfully scanned job complete and, when explicitly
+    /// requested, enable the matching group's policy. Keeping these writes in
+    /// one transaction prevents a job from being reported as completed when
+    /// policy activation failed (or vice versa).
+    pub async fn finalize_successful_scan(
+        &self,
+        tenant_id: &str,
+        job_id: &str,
+        group_id: i64,
+        summary: &Value,
+        confirmed_clusters: i32,
+        activate_policy: bool,
+        activated_by: Option<&str>,
+    ) -> Result<()> {
+        let activated_by = if activate_policy {
+            Some(
+                activated_by
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow!("activate_policy requires a non-empty requested_by"))?,
+            )
+        } else {
+            None
+        };
+
+        let mut transaction = self.pool.begin().await?;
+
+        if let Some(actor) = activated_by {
+            sqlx::query(
+                r#"
+                INSERT INTO groups.ad_group_policies
+                    (tenant_id, group_id, is_enabled, activated_by, activated_at)
+                VALUES ($1, $2, true, $3, now())
+                ON CONFLICT (tenant_id, group_id) DO UPDATE SET
+                    is_enabled = true,
+                    activated_by = EXCLUDED.activated_by,
+                    activated_at = now(),
+                    updated_at = now()
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(group_id)
+            .bind(actor)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let result = sqlx::query(
+            r#"
+            UPDATE groups.ad_scan_jobs
+            SET status = 'completed', progress = 100, summary_json = $1,
+                confirmed_clusters = $2, error = NULL, finished_at = now()
+            WHERE job_id = $3 AND tenant_id = $4 AND group_id = $5
+              AND status IN ('scanning', 'classifying')
+            "#,
+        )
+        .bind(summary.to_string())
+        .bind(confirmed_clusters)
+        .bind(job_id)
+        .bind(tenant_id)
+        .bind(group_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if result.rows_affected() != 1 {
+            return Err(anyhow!(
+                "scan job finalization rejected by tenant/group/status guard"
+            ));
+        }
+
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Check if policy is enabled for a group.
     pub async fn policy_enabled(&self, tenant_id: &str, group_id: i64) -> Result<bool> {
         let is_enabled: bool = sqlx::query_scalar(
@@ -555,11 +678,16 @@ impl AdGovernanceService {
         Ok(is_enabled)
     }
 
-    /// Record an action in the audit log.
-    /// action_key ensures idempotency: duplicate keys are ignored.
+    /// Record an action before any external side effect.
+    ///
+    /// New executable actions start in `planned`; `executed_at` remains NULL
+    /// until `mark_action_executed` succeeds. A duplicate already in a terminal
+    /// state is treated as an idempotent no-op, while an unresolved duplicate
+    /// fails closed instead of risking a repeated Telegram side effect.
     pub async fn record_action(
         &self,
         tenant_id: &str,
+        job_id: &str,
         group_id: i64,
         cluster_id: &str,
         action_type: &str,
@@ -567,36 +695,154 @@ impl AdGovernanceService {
         payload: &Value,
         error: Option<&str>,
         dry_run: bool,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
+        if tenant_id.trim().is_empty() || job_id.trim().is_empty() {
+            return Err(anyhow!("action requires non-empty tenant_id and job_id"));
+        }
+
         // SAFETY: action_key is UNIQUE in DB, preventing duplicate actions
         let timestamp = chrono::Utc::now().timestamp() / 86400; // Daily window
         let action_key = format!(
             "{}:{}:{}:{}:{}:{}",
             tenant_id, group_id, cluster_id, action_type, target_id, timestamp
         );
+        let status = action_initial_status(error, dry_run);
 
-        let result = sqlx::query(
+        let inserted = sqlx::query_scalar::<_, String>(
             r#"
             INSERT INTO groups.ad_governance_actions
-                (action_key, tenant_id, group_id, cluster_id, action_type, target_id,
-                 status, dry_run, payload_json, error, executed_at)
-            VALUES ($1, $2, $3, $4, $5, $6, 'completed', $7, $8, $9, now())
+                (action_key, job_id, tenant_id, group_id, cluster_id, action_type,
+                 target_id, status, dry_run, payload_json, error, executed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL)
             ON CONFLICT (action_key) DO NOTHING
+            RETURNING action_key
             "#,
         )
         .bind(&action_key)
+        .bind(job_id)
         .bind(tenant_id)
         .bind(group_id)
         .bind(cluster_id)
         .bind(action_type)
         .bind(target_id)
+        .bind(status)
         .bind(dry_run)
         .bind(payload.to_string())
         .bind(error)
+        .fetch_optional(self.pool.as_ref())
+        .await?;
+
+        if inserted.is_some() {
+            return Ok(inserted);
+        }
+
+        let existing_status = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status
+            FROM groups.ad_governance_actions
+            WHERE action_key = $1 AND job_id = $2 AND tenant_id = $3 AND group_id = $4
+            "#,
+        )
+        .bind(&action_key)
+        .bind(job_id)
+        .bind(tenant_id)
+        .bind(group_id)
+        .fetch_optional(self.pool.as_ref())
+        .await?
+        .ok_or_else(|| anyhow!("action key collided outside the scoped job"))?;
+
+        match existing_status.as_str() {
+            "executed" | "skipped" | "dry_run" => Ok(None),
+            _ => Err(anyhow!(
+                "action already exists in unresolved status: {}",
+                existing_status
+            )),
+        }
+    }
+
+    pub async fn mark_action_executed(
+        &self,
+        tenant_id: &str,
+        job_id: &str,
+        group_id: i64,
+        action_key: &str,
+    ) -> Result<()> {
+        self.transition_planned_action(tenant_id, job_id, group_id, action_key, "executed", None)
+            .await
+    }
+
+    pub async fn mark_action_failed(
+        &self,
+        tenant_id: &str,
+        job_id: &str,
+        group_id: i64,
+        action_key: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.transition_planned_action(
+            tenant_id,
+            job_id,
+            group_id,
+            action_key,
+            "failed",
+            Some(error),
+        )
+        .await
+    }
+
+    pub async fn mark_action_skipped(
+        &self,
+        tenant_id: &str,
+        job_id: &str,
+        group_id: i64,
+        action_key: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.transition_planned_action(
+            tenant_id,
+            job_id,
+            group_id,
+            action_key,
+            "skipped",
+            Some(reason),
+        )
+        .await
+    }
+
+    async fn transition_planned_action(
+        &self,
+        tenant_id: &str,
+        job_id: &str,
+        group_id: i64,
+        action_key: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            r#"
+            UPDATE groups.ad_governance_actions
+            SET status = $1, error = $2,
+                executed_at = CASE WHEN $1 = 'executed' THEN now() ELSE NULL END
+            WHERE action_key = $3 AND job_id = $4 AND tenant_id = $5 AND group_id = $6
+              AND status = 'planned'
+            "#,
+        )
+        .bind(status)
+        .bind(error)
+        .bind(action_key)
+        .bind(job_id)
+        .bind(tenant_id)
+        .bind(group_id)
         .execute(self.pool.as_ref())
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() != 1 {
+            return Err(anyhow!(
+                "action transition rejected by tenant/job/group/status guard"
+            ));
+        }
+
+        Ok(())
     }
 
     /// Claim warning senders for dedup (5-column PK window).
@@ -669,10 +915,14 @@ impl AdGovernanceService {
             };
 
             let content = row.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let media_id = row.get("media_unique_id").and_then(|v| v.as_str()).unwrap_or("");
+            let media_id = row
+                .get("media_unique_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             let normalized = normalize_content(content);
-            let is_media_only = !media_id.is_empty() && MEDIA_PLACEHOLDER_RE.is_match(&normalized);
+            let is_media_only = !media_id.is_empty()
+                && (normalized.is_empty() || MEDIA_PLACEHOLDER_RE.is_match(&normalized));
 
             let exact_basis = if is_media_only {
                 format!("{}|media:{}", normalized, media_id)
@@ -693,11 +943,27 @@ impl AdGovernanceService {
             let entry = by_hash.entry(exact_hash.clone()).or_insert_with(|| {
                 let mut cluster = HashMap::new();
                 cluster.insert("exact_hash".to_string(), Value::String(exact_hash.clone()));
-                cluster.insert("fingerprint_hash".to_string(), Value::String(fingerprint_hash.clone()));
-                cluster.insert("template_hash".to_string(), Value::String(template_hash.clone()));
-                cluster.insert("representative_text".to_string(), Value::String(content.to_string()));
+                cluster.insert(
+                    "fingerprint_hash".to_string(),
+                    Value::String(fingerprint_hash.clone()),
+                );
+                cluster.insert(
+                    "template_hash".to_string(),
+                    Value::String(template_hash.clone()),
+                );
+                cluster.insert(
+                    "representative_text".to_string(),
+                    Value::String(content.to_string()),
+                );
                 cluster.insert("is_media_only".to_string(), Value::Bool(is_media_only));
-                cluster.insert("media_signature".to_string(), Value::String(if is_media_only { media_id.to_string() } else { "".to_string() }));
+                cluster.insert(
+                    "media_signature".to_string(),
+                    Value::String(if is_media_only {
+                        media_id.to_string()
+                    } else {
+                        "".to_string()
+                    }),
+                );
                 cluster.insert("rows".to_string(), Value::Array(vec![]));
                 cluster.insert("max_stored_score".to_string(), Value::Number(0.into()));
                 cluster.insert("stored_ad".to_string(), Value::Bool(false));
@@ -760,6 +1026,7 @@ fn md5_hash(value: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+#[cfg(test)]
 fn text_similarity(left: &str, right: &str) -> f64 {
     if left == right {
         return 1.0;
@@ -776,6 +1043,68 @@ fn text_similarity(left: &str, right: &str) -> f64 {
     (2.0 * intersection as f64) / (a.len() + b.len()) as f64
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancellationDisposition {
+    CancelScanAndQueue,
+    CancelQueueOnly,
+    LeaveUnchanged,
+}
+
+fn cancellation_disposition(
+    scan_status: &str,
+    queue_statuses: &[String],
+) -> Result<CancellationDisposition> {
+    // Once execution has started, this service deliberately rejects
+    // cooperative cancellation rather than writing a misleading cancelled
+    // state that the current worker cannot observe atomically.
+    if matches!(scan_status, "scanning" | "classifying") {
+        return Ok(CancellationDisposition::LeaveUnchanged);
+    }
+
+    for queue_status in queue_statuses {
+        match queue_status.as_str() {
+            "pending" | "failed" | "dead" => {}
+            "running" => {
+                return Err(anyhow!(
+                    "ad scan queue item is already running; cancellation rejected"
+                ));
+            }
+            "completed" => {
+                return Err(anyhow!(
+                    "ad scan queue item is already completed; cancellation rejected"
+                ));
+            }
+            status => {
+                return Err(anyhow!(
+                    "ad scan queue item has unsupported status: {}",
+                    status
+                ));
+            }
+        }
+    }
+
+    if matches!(scan_status, "prepared" | "queued") {
+        Ok(CancellationDisposition::CancelScanAndQueue)
+    } else if matches!(scan_status, "cancelled" | "completed" | "failed") {
+        // Repair any stale pending queue row without rewriting the terminal
+        // scan result.
+        Ok(CancellationDisposition::CancelQueueOnly)
+    } else {
+        Ok(CancellationDisposition::LeaveUnchanged)
+    }
+}
+
+fn action_initial_status(error: Option<&str>, dry_run: bool) -> &'static str {
+    if error.is_some() {
+        "failed"
+    } else if dry_run {
+        "dry_run"
+    } else {
+        "planned"
+    }
+}
+
+#[cfg(test)]
 fn ngrams(value: &str) -> HashSet<String> {
     let compact = value.replace(" ", "");
     let size = 3;
@@ -814,6 +1143,60 @@ mod tests {
         let key1 = format!("tenant1:123:cluster1:warn:user1:{}", timestamp);
         let key2 = format!("tenant1:123:cluster1:warn:user1:{}", timestamp);
         assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_action_status_is_never_completed_at_insert_time() {
+        assert_eq!(action_initial_status(None, false), "planned");
+        assert_eq!(action_initial_status(None, true), "dry_run");
+        assert_eq!(
+            action_initial_status(Some("permission denied"), false),
+            "failed"
+        );
+        assert_ne!(action_initial_status(None, false), "completed");
+    }
+
+    #[test]
+    fn test_cancel_pending_queue_and_scan_together() {
+        assert_eq!(
+            cancellation_disposition("queued", &["pending".to_string()]).unwrap(),
+            CancellationDisposition::CancelScanAndQueue
+        );
+        assert_eq!(
+            cancellation_disposition("prepared", &[]).unwrap(),
+            CancellationDisposition::CancelScanAndQueue
+        );
+    }
+
+    #[test]
+    fn test_cancel_repairs_stale_pending_queue_for_terminal_scan() {
+        assert_eq!(
+            cancellation_disposition("cancelled", &["pending".to_string()]).unwrap(),
+            CancellationDisposition::CancelQueueOnly
+        );
+        assert_eq!(
+            cancellation_disposition("completed", &["pending".to_string()]).unwrap(),
+            CancellationDisposition::CancelQueueOnly
+        );
+    }
+
+    #[test]
+    fn test_cancel_rejects_queue_already_claimed_by_worker() {
+        let error = cancellation_disposition("queued", &["running".to_string()])
+            .expect_err("running queue item must not be reported as cancelled");
+        assert!(error.to_string().contains("already running"));
+    }
+
+    #[test]
+    fn test_running_scan_is_left_unchanged() {
+        assert_eq!(
+            cancellation_disposition("scanning", &["running".to_string()]).unwrap(),
+            CancellationDisposition::LeaveUnchanged
+        );
+        assert_eq!(
+            cancellation_disposition("classifying", &["running".to_string()]).unwrap(),
+            CancellationDisposition::LeaveUnchanged
+        );
     }
 
     #[test]
@@ -897,7 +1280,7 @@ mod tests {
     fn test_normalize_content() {
         let text = "  Hello   World  ";
         let result = normalize_content(text);
-        assert_eq!(result, "hello world");  // Multiple spaces collapsed to single space
+        assert_eq!(result, "hello world"); // Multiple spaces collapsed to single space
     }
 
     #[test]

@@ -27,7 +27,15 @@ bash scripts/beta-check.sh
 bash scripts/beta-runtime-check.sh
 ```
 
-运行时门禁会从空库按文档顺序执行两遍迁移，启动独立 Rust 服务、本机模拟 LLM 与模拟 Telegram API，并验证租户隔离、Webhook 私聊/群消息/编辑消息和成员状态入库、私聊命令与租户自动回复、聊天与广播文本/图片投递、广播按钮和失败汇总、频道提醒到期删除、定时推送调度、文件代理、Webhook 密钥、动态路由、金额精度、核销审计、PDF/XLSX 下载、AI Chat/OpenAI 兼容接口、AI Skills、广告识别、潜客捕获与筛选、群组同步分配和群管理 Telegram 操作。测试进程通过 `HTTP_RATE_LIMIT_REQUESTS_PER_MINUTE=1000` 扩大完整回归容量，生产默认值仍为每 IP 每分钟 100 次。
+运行时门禁会从空库按清单顺序执行两遍全部 22 个迁移文件（最高编号 `0026`），启动独立 Rust 服务、本机模拟 LLM 与模拟 Telegram API，并验证租户隔离、Webhook 私聊/群消息/编辑消息和成员状态入库、实时广告扫描 outbox、私聊命令与租户自动回复、聊天与广播文本/图片投递、广播按钮和失败汇总、频道提醒到期删除、定时推送调度、文件代理、Webhook 密钥、动态路由、金额精度、核销审计、PDF/XLSX 下载、AI Chat/OpenAI 兼容接口、AI Skills、广告识别、潜客捕获与筛选、群组同步分配和群管理 Telegram 操作。迁移后执行只读 schema 断言，验证治理核心表（`groups.ad_group_policies`、`groups.ad_scan_jobs`、`groups.ad_governance_clusters` 等）、实时 outbox trigger 和 0024 修复函数（`auth.is_platform_admin`、`auth.current_user_is_platform_admin`）存在。测试进程通过 `HTTP_RATE_LIMIT_REQUESTS_PER_MINUTE=1000` 扩大完整回归容量，生产默认值仍为每 IP 每分钟 100 次。
+
+2026-07-27 本地证据：`scripts/beta-check.sh` 通过；运行时报告
+`target/beta-reports/runtime-gate-report.json` 通过，包含 102 条前端方法/路径契约和 47 条静态-only 契约的状态码、响应形状、角色和租户隔离矩阵。运行时仅使用临时 PostgreSQL、模拟 LLM/Telegram 和本地测试凭据，不代表真实 Bot 或生产数据库验收；编译仍有既有 warning。
+
+占位与死代码的正式发布可达性记录见
+`docs/rust-refactor/STUB-REACHABILITY-AUDIT.md`；默认 `tgbot-app` 不编译历史
+standalone Bot、空内容生成/BscScan 模块或未注册的旧 Worker。启用相应
+`legacy-*` feature 只用于单独审计，不能作为上线能力证据。
 
 ## 首批迁移范围
 
@@ -57,17 +65,19 @@ Webhook 私聊已接入 `/start`、`/help` 命令自动回复，支持 Bot 用�
 
 ## 命令审计与 Polling 清理
 
-`bot-polling.rs` 已清理为仅支持 `/start` 和 `/help`，与共享的 `tgbot_services::telegram_commands` 统一（不再使用 `teloxide::BotCommands` 派生宏）。占位 `/status` 和 `/echo` 命令已被移除，`/help` 不再声称"More coming soon…"。
+`bot-polling.rs` 已清理为仅支持 `/start` 和 `/help`，与共享的 `tgbot_services::telegram_commands` 统一（不再使用 `teloxide::BotCommands` 派生宏）。占位 `/status` 和 `/echo` 命令已被移除，`/help` 不再声称"More coming soon…"。该二进制只有显式使用 `--features dev-polling` 才会构建，并且运行时仍要求独立的 `TELEGRAM_POLLING_ENABLED=true`；正式发布只构建 `--bin tgbot-app`。未接通业务处理的 `/start payload` 会明确返回未执行，不再静默当作普通 `/start`。
 
-Polling 二进制使用 `TELEGRAM_COMMANDS_ENABLED` 门禁默认为 fail-closed：除非环境变量设置为 `true`，否则启动时立即退出。此二进制不含租户隔离，仅用于本地开发/测试。
+Polling 二进制使用 `TELEGRAM_POLLING_ENABLED` 门禁默认为 fail-closed：除非环境变量设置为 `true`，否则启动时立即退出。此二进制不含租户隔离，仅用于本地开发/测试。
+
+Polling 启动后通过 Telegram `getMe` 解析当前 Bot 用户名，并直接使用共享 `TelegramCommand`，因此 `/start payload` 不会在二次转换中丢失。普通文本静默、当前 Bot 的未知命令回复安全提示、发给其他 Bot 的命令不回复。
 
 `tgbot_services::feature_gate` 已从占位替换为基于 `current_setting()` 的真实 SQL 查询实现，并带有单元测试。
 
 ## 上线前剩余门禁
 
-1. 将运行时测试扩展到前端使用的全部 94 条 API 契约。
-2. 对比 Python 与 Rust 的关键响应结构、状态码、分页和权限结果。
+1. 将 102 条契约矩阵补齐为真实测试 Bot/前端语义回归；当前本地矩阵已覆盖状态码、响应形状、角色和租户隔离，47 条因无安全本地副作用而保留 static-only。
+2. 用验收记录对比 Python 与 Rust 的关键响应结构、状态码、分页和权限结果。
 3. 使用测试 Bot 验证 Webhook、Polling、群管理、文件、AI 和支付流程；广播已通过本机 Telegram 契约桩验证，仍需真实测试 Bot 验收。
-4. 清除或完成仍存在的 stub/TODO 功能；任何用户可触达的 stub 都阻止上线。
+4. 继续清除或完成可达 stub/TODO；当前旧广告管线已落库/聚合，无法在 Beta 提供真实运行时数据的接口必须返回明确错误而非空成功。
 5. 先灰度代理少量测试租户，保留 Python 回退路径和数据库回滚点。
 6. 对照 Python 生产语义确认其余真实命令，并接入菜单和回调。当前 `/start`、`/help` 与通用自动回复已使用耐久 Outbox，但 Telegram Bot API 不提供业务幂等键：若 Telegram 已接收发送、进程却在出站消息落库前崩溃，重试仍可能重复回复，此窗口需在 Beta 压测和运行审计中继续跟踪。

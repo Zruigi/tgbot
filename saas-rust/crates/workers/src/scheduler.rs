@@ -23,7 +23,6 @@
 //! ```
 
 use anyhow::Result;
-use chrono::Utc;
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
@@ -531,7 +530,7 @@ pub async fn schedule_group_policy_syncs(pool: &PgPool) -> Result<usize> {
         .with_max_attempts(2);
 
         match job_queue::enqueue(pool, opts).await {
-            Ok(job_id) => {
+            Ok(_job_id) => {
                 enqueued += 1;
             }
             Err(e) => {
@@ -544,6 +543,7 @@ pub async fn schedule_group_policy_syncs(pool: &PgPool) -> Result<usize> {
 }
 
 /// Check for wallet/monitor entries that need to be checked and enqueue jobs.
+#[cfg(feature = "legacy-workers")]
 #[instrument(skip(pool))]
 pub async fn schedule_monitor_checks(pool: &PgPool) -> Result<usize> {
     let rows = sqlx::query(
@@ -555,29 +555,38 @@ pub async fn schedule_monitor_checks(pool: &PgPool) -> Result<usize> {
         LIMIT 50
         "#,
     )
-    .fetch_optional(pool)
-    .await;
+    .fetch_all(pool)
+    .await?;
 
-    // The wallet_monitors table may not exist yet; silently skip if so.
-    match rows {
-        Ok(Some(_)) | Ok(None) => {
-            // If the table exists, we'd iterate over rows here.
-            // For now, return 0 as the monitor infrastructure is still stub.
-            Ok(0)
-        }
-        Err(_) => {
-            // Table doesn't exist yet, skip.
-            Ok(0)
-        }
+    let mut enqueued = 0;
+    for row in rows {
+        let monitor_id: i64 = row.try_get("id")?;
+        let tenant_id: String = row.try_get("tenant_id")?;
+        let address: String = row.try_get("address")?;
+        let opts = job_queue::EnqueueOpts::new(
+            JobType::MonitorCheck,
+            json!({
+                "tenant_id": tenant_id,
+                "monitor_id": monitor_id,
+                "address": address,
+                "monitor_task_type": "wallet_balance"
+            }),
+        )
+        .with_priority(1)
+        .with_max_attempts(3);
+        job_queue::enqueue(pool, opts).await?;
+        enqueued += 1;
     }
+    Ok(enqueued)
 }
 
 /// Run all cron-based scheduling checks.
-pub async fn run_cron_checks(pool: &PgPool) -> (usize, usize, usize) {
-    let push = schedule_push_tasks(pool).await.unwrap_or(0);
-    let group = schedule_group_policy_syncs(pool).await.unwrap_or(0);
-    let monitor = schedule_monitor_checks(pool).await.unwrap_or(0);
-    (push, group, monitor)
+#[cfg(feature = "legacy-workers")]
+pub async fn run_cron_checks(pool: &PgPool) -> Result<(usize, usize, usize)> {
+    let push = schedule_push_tasks(pool).await?;
+    let group = schedule_group_policy_syncs(pool).await?;
+    let monitor = schedule_monitor_checks(pool).await?;
+    Ok((push, group, monitor))
 }
 
 // ---------------------------------------------------------------------------

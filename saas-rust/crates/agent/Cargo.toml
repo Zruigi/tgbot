@@ -3,6 +3,10 @@ name = "tgbot-agent"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+legacy-stubs = []
+
 [dependencies]
 tgbot-domain = { workspace = true }
 tgbot-services = { workspace = true }

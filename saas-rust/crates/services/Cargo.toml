@@ -3,6 +3,13 @@ name = "tgbot-services"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# These modules are retained only for historical source compatibility. They
+# contain no implementation and are deliberately excluded from the Beta/app
+# release graph; enabling this feature requires an explicit legacy audit.
+legacy-stubs = []
+
 [dependencies]
 tgbot-domain = { workspace = true }
 tgbot-repos = { workspace = true }
