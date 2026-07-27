@@ -459,6 +459,7 @@ env -u AD_AUTO_ENFORCE_ENABLED -u AD_DELETE_ENABLED \
   INTERNAL_SAAS_SECRET=beta-local-secret \
   LITELLM_BASE_URL=http://127.0.0.1:18091 \
   LITELLM_API_KEY=beta-mock \
+  LITELLM_MODEL_CATALOG=gemini-2.5-flash-lite,gemini-2.5-pro,gpt-4o-mini \
   TELEGRAM_API_BASE_URL=http://127.0.0.1:18092 \
   TELEGRAM_WEBHOOK_BASE_URL=http://127.0.0.1:18090 \
   TELEGRAM_AUTO_REPLIES_ENABLED=true \
@@ -775,6 +776,9 @@ SQL
 platform_merchants_response=$(curl -sS "${platform_headers[@]}" "$base_url/api/platform/merchants")
 jq -e '.status == "ok" and (.data | type == "array") and (.total | type == "number") and .total >= 2' \
   <<<"$platform_merchants_response" >/dev/null
+curl -fsS "${platform_headers[@]}" "$base_url/api/platform/runtime_statuses" \
+  | jq -e '.status == "ok" and (.data | type == "array") and (.total | type == "number") and .source == "rust_webhook_registry" and (.worker_telemetry_available | type == "boolean") and all(.data[]; (.source == "rust_webhook_registry" and (.worker_telemetry_available | type == "boolean")))' \
+  >/dev/null
 platform_owner_merchants_status=$(curl -sS -o "$contract_response" -w '%{http_code}' "${headers[@]}" "$base_url/api/platform/merchants")
 [[ "$platform_owner_merchants_status" == 403 ]]
 platform_merchant_response=$(curl -fsS "${platform_headers[@]}" -X POST -H 'content-type: application/json' \
@@ -843,6 +847,9 @@ curl -fsS "${other_headers[@]}" "$base_url/api/users" \
   | jq -e '.total == 2 and ([.data[].tenant_id] | unique) == ["other-tenant"]' >/dev/null
 curl -fsS "${headers[@]}" "$base_url/api/messages/30001?page=1" \
   | jq -e '.total == 1 and .data[0].content == "beta inbound" and .data[0].tg_msg_id == 450' >/dev/null
+assert_http_status 400 "${platform_headers[@]}" "$base_url/api/messages/30001"
+curl -fsS "${platform_headers[@]}" "$base_url/api/messages/30001?tenant_id=beta-local" \
+  | jq -e '.status == "ok" and (.data | type == "array") and .total == 1' >/dev/null
 cross_chat_status=$(curl -sS -o /dev/null -w '%{http_code}' "${headers[@]}" \
   "$base_url/api/messages/40001")
 [[ "$cross_chat_status" == 403 ]]
@@ -891,7 +898,13 @@ curl -fsS "${headers[@]}" -H 'content-type: application/json' \
 
 curl -fsS "${headers[@]}" -H 'content-type: application/json' \
   -d '{"content":"hello beta","user_id":-99999,"model":"beta-mock"}' \
-  "$base_url/api/ai/chat" | jq -e '.reply == "mock:hello beta"' >/dev/null
+  "$base_url/api/ai/chat" | jq -e '.reply == "mock:hello beta" and .data.executed == false' >/dev/null
+assert_http_status 400 "${headers[@]}" -X POST -H 'content-type: application/json' \
+  -d '{"content":"   "}' "$base_url/api/ai/chat"
+ad_scan_response=$(curl -sS "${headers[@]}" -H 'content-type: application/json' \
+  -d '{"content":"全量扫描广告","user_id":-10001}' "$base_url/api/ai/chat")
+jq -e '.status == "ok" and .data.executed == false and (.tool_results.list_ad_scan_groups.data.groups | type == "array") and all(.tool_results.list_ad_scan_groups.data.groups[]; .capabilities_known == false and .capabilities_source == "not_checked")' \
+  <<<"$ad_scan_response" >/dev/null
 curl -fsS "${headers[@]}" "$base_url/api/merchant/ai/usage?days=7" \
   | jq -e '.data.summary.total_requests == 2 and .data.summary.total_tokens == 14' >/dev/null
 curl -fsS "${headers[@]}" -H 'content-type: application/json' \
@@ -901,6 +914,10 @@ curl -fsS "${headers[@]}" -H 'content-type: application/json' \
 curl -fsS "${headers[@]}" -H 'content-type: application/json' \
   -d '{"model":"beta-mock","input":"exec beta"}' "$base_url/api/openai/exec" \
   | jq -e '.output == "mock:exec beta" and .output_text == "mock:exec beta" and .model == "beta-mock" and .sandbox_id == "default" and .usage.total_tokens == 7' >/dev/null
+curl -fsS "${headers[@]}" -H 'content-type: application/json' \
+  -d '{"operation":"message_existence_probe","chat_id":-10001,"tg_msg_id":601,"staging_chat_id":-30001}' \
+  "$base_url/api/agent/tools/telegram-sdk-query" \
+  | jq -e '.success == false and .data_complete == false and .data.exists == null and .data.error_kind == "telegram_api_error"' >/dev/null
 curl -fsS "${headers[@]}" "$base_url/api/openai/models" \
   | jq -e '.status == "ok" and any(.data[]; .id == "gpt-4o-mini" and .object == "model")' >/dev/null
 curl -fsS "${headers[@]}" -H 'content-type: application/json' \

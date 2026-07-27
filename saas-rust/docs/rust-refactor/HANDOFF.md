@@ -44,7 +44,7 @@ cargo check
 1. **编译警告** ~30 个 - 除无用的 import 外无风险
 2. 真实测试 Bot 尚未完成 Webhook、群管理、文件、AI、支付和失败重试验收。
 3. `advertisements`/`ad-pipeline` 兼容路由现在查询 `groups.group_messages` 并按租户聚合；缺少真实数据时返回证据字段，不返回伪造空成功。
-4. 运行时状态快照目前明确返回 501（使用 worker telemetry），不再伪造空列表。
+4. 运行时状态快照现在返回基于 PostgreSQL 商户配置和 Rust Webhook BotRegistry 的真实快照；响应明确标记 `source=rust_webhook_registry` 与 `worker_telemetry_available=false`，因此不冒充逐租户 worker telemetry。
 
 ## 下一步任务
 

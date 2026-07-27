@@ -407,9 +407,71 @@ pub async fn runtime_statuses(
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     scope.require_platform()?;
-    Err(ApiError::NotImplemented(
-        "runtime_statuses_not_available_use_worker_telemetry".into(),
-    ))
+
+    let pool = state
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("runtime status requires PostgreSQL".into()))?;
+    let rows = sqlx::query(
+        "SELECT id::text AS merchant_id, tenant_id, bot_id, bot_username, status, runtime_version, config_version, feature_version FROM merchants ORDER BY updated_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    let registered = state.bot_registry.list_entries().await;
+
+    let data: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            let merchant_id: String = row.get("merchant_id");
+            let tenant_id: String = row.get("tenant_id");
+            let bot_id: Option<i64> = row.get("bot_id");
+            let bot_username: Option<String> = row.get("bot_username");
+            let merchant_status: String = row.get("status");
+            let disabled = matches!(
+                merchant_status.as_str(),
+                "disabled" | "suspended" | "inactive" | "deleted"
+            );
+            let active = bot_id.is_some_and(|id| {
+                registered
+                    .iter()
+                    .any(|entry| entry.bot_id == id && entry.tenant_id == tenant_id)
+            });
+            let (status, reason) = if disabled {
+                ("disabled", "merchant_disabled")
+            } else if active {
+                ("running", "active_webhook_registry")
+            } else if bot_id.is_none() {
+                ("stopped", "bot_not_configured")
+            } else {
+                ("stopped", "bot_not_loaded")
+            };
+
+            json!({
+                "merchant_id": merchant_id,
+                "tenant_id": tenant_id,
+                "bot_id": bot_id,
+                "bot_username": bot_username,
+                "merchant_status": merchant_status,
+                "status": status,
+                "reason": reason,
+                "source": "rust_webhook_registry",
+                "worker_enabled": state.worker_enabled,
+                "worker_telemetry_available": false,
+                "runtime_version": row.get::<i32, _>("runtime_version"),
+                "config_version": row.get::<i32, _>("config_version"),
+                "feature_version": row.get::<i32, _>("feature_version"),
+            })
+        })
+        .collect();
+
+    let total = data.len();
+    Ok(Json(json!({
+        "status": "ok",
+        "data": data,
+        "total": total,
+        "source": "rust_webhook_registry",
+        "worker_telemetry_available": false,
+    })))
 }
 
 // POST /api/platform/subscriptions/downgrade - Run subscription downgrade for expired subscriptions

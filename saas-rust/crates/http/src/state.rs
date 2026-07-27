@@ -23,6 +23,10 @@ pub struct AppState {
     pub grant_store: GrantStore,
     /// Registry of active Telegram bots, keyed by bot_id.
     pub bot_registry: BotRegistry,
+    /// True when the formal app started its PostgreSQL-backed scheduler.
+    /// This is deliberately a coarse readiness signal; per-merchant telemetry
+    /// is reported separately by the runtime-status endpoint.
+    pub worker_enabled: bool,
     /// Update dispatcher for routing Telegram updates to handlers.
     pub update_dispatcher: Option<Arc<UpdateDispatcher>>,
 }

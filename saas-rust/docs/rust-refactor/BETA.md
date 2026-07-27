@@ -30,7 +30,11 @@ bash scripts/beta-runtime-check.sh
 运行时门禁会从空库按清单顺序执行两遍全部 22 个迁移文件（最高编号 `0026`），启动独立 Rust 服务、本机模拟 LLM 与模拟 Telegram API，并验证租户隔离、Webhook 私聊/群消息/编辑消息和成员状态入库、实时广告扫描 outbox、私聊命令与租户自动回复、聊天与广播文本/图片投递、广播按钮和失败汇总、频道提醒到期删除、定时推送调度、文件代理、Webhook 密钥、动态路由、金额精度、核销审计、PDF/XLSX 下载、AI Chat/OpenAI 兼容接口、AI Skills、广告识别、潜客捕获与筛选、群组同步分配和群管理 Telegram 操作。迁移后执行只读 schema 断言，验证治理核心表（`groups.ad_group_policies`、`groups.ad_scan_jobs`、`groups.ad_governance_clusters` 等）、实时 outbox trigger 和 0024 修复函数（`auth.is_platform_admin`、`auth.current_user_is_platform_admin`）存在。测试进程通过 `HTTP_RATE_LIMIT_REQUESTS_PER_MINUTE=1000` 扩大完整回归容量，生产默认值仍为每 IP 每分钟 100 次。
 
 2026-07-27 本地证据：`scripts/beta-check.sh` 通过；运行时报告
-`target/beta-reports/runtime-gate-report.json` 通过，包含 102 条前端方法/路径契约和 47 条静态-only 契约的状态码、响应形状、角色和租户隔离矩阵。运行时仅使用临时 PostgreSQL、模拟 LLM/Telegram 和本地测试凭据，不代表真实 Bot 或生产数据库验收；编译仍有既有 warning。
+`target/beta-reports/runtime-gate-report.json` 通过，前端 102 条 method/path
+契约均有本地请求 trace（`runtime_request_seen=102`、`static_only=0`），并由
+命名矩阵断言状态码、响应形状、角色和租户隔离。请求 trace 只证明请求被发出，
+不能替代真实 Bot 的语义验收。运行时仅使用临时 PostgreSQL、模拟 LLM/Telegram
+和本地测试凭据，不代表真实 Bot 或生产数据库验收；编译仍有既有 warning。
 
 占位与死代码的正式发布可达性记录见
 `docs/rust-refactor/STUB-REACHABILITY-AUDIT.md`；默认 `tgbot-app` 不编译历史
@@ -75,7 +79,7 @@ Polling 启动后通过 Telegram `getMe` 解析当前 Bot 用户名，并直接�
 
 ## 上线前剩余门禁
 
-1. 将 102 条契约矩阵补齐为真实测试 Bot/前端语义回归；当前本地矩阵已覆盖状态码、响应形状、角色和租户隔离，47 条因无安全本地副作用而保留 static-only。
+1. 将本地 102 条契约矩阵的关键响应结构、状态码、分页、权限和副作用与真实测试 Bot/前端语义回归对照；本地请求覆盖已是 102/102，但 mock 不能替代真实 Telegram、LLM 和支付供应商。
 2. 用验收记录对比 Python 与 Rust 的关键响应结构、状态码、分页和权限结果。
 3. 使用测试 Bot 验证 Webhook、Polling、群管理、文件、AI 和支付流程；广播已通过本机 Telegram 契约桩验证，仍需真实测试 Bot 验收。
 4. 继续清除或完成可达 stub/TODO；当前旧广告管线已落库/聚合，无法在 Beta 提供真实运行时数据的接口必须返回明确错误而非空成功。

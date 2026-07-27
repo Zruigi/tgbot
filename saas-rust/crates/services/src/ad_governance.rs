@@ -147,6 +147,10 @@ pub struct GroupInfo {
     pub bot_status: String,
     pub can_delete_messages: bool,
     pub can_restrict_members: bool,
+    /// Telegram capabilities are not inferred from database membership rows.
+    /// Consumers must check this flag before offering destructive actions.
+    pub capabilities_known: bool,
+    pub capabilities_source: String,
 }
 
 // ============================================================================
@@ -167,13 +171,13 @@ impl AdGovernanceService {
         let rows = sqlx::query(
             r#"
             SELECT g.group_id, COALESCE(g.group_title, '') as title,
-                   COALESCE(g.chat_type, 'supergroup') as chat_type,
+                   'supergroup'::text as chat_type,
                    COALESCE(COUNT(m.id), 0) as message_count
             FROM groups.tracked_groups g
             LEFT JOIN groups.group_messages m
               ON m.group_id = g.group_id AND m.tenant_id = g.tenant_id AND NOT m.is_deleted
             WHERE g.tenant_id = $1
-            GROUP BY g.group_id, g.group_title, g.chat_type
+            GROUP BY g.group_id, g.group_title
             ORDER BY g.updated_at DESC
             "#,
         )
@@ -191,6 +195,8 @@ impl AdGovernanceService {
                 bot_status: "unknown".to_string(), // Simplified: requires Telegram API
                 can_delete_messages: false,        // Simplified: requires Telegram API
                 can_restrict_members: false,       // Simplified: requires Telegram API
+                capabilities_known: false,
+                capabilities_source: "not_checked".to_string(),
             })
             .collect())
     }

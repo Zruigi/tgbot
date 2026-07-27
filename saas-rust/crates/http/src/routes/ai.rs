@@ -279,7 +279,7 @@ fn successful_agent_response(
         "job": job,
         "data": {
             "reply": reply,
-            "executed": true,
+            "executed": action_taken,
             "action_taken": action_taken,
         },
     }))
@@ -629,13 +629,7 @@ pub async fn ai_chat(
 
     let content = body.content.as_deref().unwrap_or("").trim();
     if content.is_empty() {
-        return Ok(Json(json!({
-            "status": "ok",
-            "reply": "请输入消息内容",
-            "tool_calls_made": [],
-            "tool_results": {},
-            "data": { "reply": "请输入消息内容" },
-        })));
+        return Err(ApiError::BadRequest("消息内容不能为空".into()));
     }
 
     let user_id = body.user_id.unwrap_or(0);
@@ -879,7 +873,11 @@ pub async fn ai_chat(
             "reply": intent.reply_content,
             "tool_calls_made": [],
             "tool_results": {},
-            "data": { "reply": intent.reply_content },
+            "data": {
+                "reply": intent.reply_content,
+                "executed": false,
+                "action_taken": false,
+            },
         })));
     }
 
@@ -1062,14 +1060,35 @@ pub async fn list_openai_models(
 ) -> ApiResult<Json<Value>> {
     let _scope = resolve_scope(&_state, &headers).await?;
 
-    Ok(Json(json!({
-        "status": "ok",
-        "data": [
-            { "id": "gemini-2.5-flash-lite", "object": "model", "created": 1700000000, "owned_by": "google" },
-            { "id": "gemini-2.5-pro", "object": "model", "created": 1700000000, "owned_by": "google" },
-            { "id": "gpt-4o-mini", "object": "model", "created": 1700000000, "owned_by": "openai" },
-        ],
-    })))
+    let mut seen = std::collections::HashSet::new();
+    let models: Vec<Value> = std::env::var("LITELLM_MODEL_CATALOG")
+        .ok()
+        .into_iter()
+        .flat_map(|catalog| {
+            catalog
+                .split(',')
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|model| seen.insert(model.clone()))
+        .map(|id| {
+            json!({
+                "id": id,
+                "object": "model",
+                "owned_by": "configured",
+            })
+        })
+        .collect();
+
+    if models.is_empty() {
+        return Err(ApiError::ServiceUnavailable(
+            "model catalog is not configured (set LITELLM_MODEL_CATALOG)".into(),
+        ));
+    }
+
+    Ok(Json(json!({"status": "ok", "data": models})))
 }
 
 // ---------------------------------------------------------------------------
@@ -1848,6 +1867,8 @@ mod tests {
 
         assert_eq!(response["status"], "ok");
         assert_eq!(response["tool_calls_made"], json!(["query_ad_clusters"]));
+        assert_eq!(response["data"]["executed"], false);
+        assert_eq!(response["data"]["action_taken"], false);
         assert_eq!(
             response["tool_results"]["query_ad_clusters"]["success"],
             true

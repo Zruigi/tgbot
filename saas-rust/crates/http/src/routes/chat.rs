@@ -40,6 +40,8 @@ use crate::state::AppState;
 #[derive(Debug, Deserialize)]
 pub struct PageQuery {
     pub page: Option<i64>,
+    #[serde(alias = "tenantId")]
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,23 +148,43 @@ pub async fn get_messages(
         }
     }
 
-    // Resolve bot_id for the query
-    let bot_id = resolve_bot_id_for_scope(&state, &scope).await?;
+    // Resolve bot_id for the query. Platform administrators must explicitly
+    // select a tenant; the old bot_id=0 sentinel silently returned an empty
+    // success response and could hide a missing tenant context.
+    let (bot_id, history_tenant_id) = if scope.role == Role::PlatformAdmin {
+        let tenant_id = q
+            .tenant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|tenant_id| !tenant_id.is_empty())
+            .ok_or_else(|| {
+                ApiError::BadRequest("tenant_id is required for platform chat history".into())
+            })?;
+        let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("tenant has no bot configured".into()))?;
+        (Some(bot_id), Some(tenant_id.to_owned()))
+    } else {
+        (
+            resolve_bot_id_for_scope(&state, &scope).await?,
+            scope.tenant_id.clone(),
+        )
+    };
 
     let messages = if let Some(bid) = bot_id {
         user_repo::get_chat_history(
             state.db()?,
             user_id,
             bid,
-            scope.tenant_id.as_deref(),
+            history_tenant_id.as_deref(),
             limit,
             offset,
         )
         .await?
     } else {
-        // Platform admin: try to find the bot_id from the merchant context
-        // If not available, use user_id=0 as a sentinel (will return empty)
-        user_repo::get_chat_history(state.db()?, user_id, 0, None, limit, offset).await?
+        return Err(ApiError::BadRequest(
+            "chat history requires a tenant bot context".into(),
+        ));
     };
 
     let total = messages.len();

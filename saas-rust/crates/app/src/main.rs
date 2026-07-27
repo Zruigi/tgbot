@@ -155,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
             .start()
     });
 
+    let worker_enabled = worker_handle.is_some();
     let state = AppState {
         config: config.clone(),
         pool,
@@ -164,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         csrf_store: CsrfStore::new(),
         grant_store: GrantStore::new(),
         bot_registry,
+        worker_enabled,
         update_dispatcher: Some(dispatcher),
     };
 

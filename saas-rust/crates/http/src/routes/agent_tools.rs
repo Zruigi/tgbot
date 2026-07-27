@@ -445,17 +445,19 @@ async fn message_existence_probe(
             })))
         }
         Err(e) => Ok(Json(json!({
-            "success": true,
-            "data_complete": true,
-            "evidence_count": 1,
+            "success": false,
+            "status": "error",
+            "data_complete": false,
+            "evidence_count": 0,
             "data": {
                 "chat_id": chat_id,
                 "tg_msg_id": tg_msg_id,
-                "exists": false,
+                "exists": null,
                 "source": "telegram_bot_api.forwardMessage",
+                "error_kind": "telegram_api_error",
                 "error": format!("{}", e)
             },
-            "message": "消息存在性探测完成：该消息无法被 forwardMessage 读取，可能已删除或 bot 无权限"
+            "message": "消息存在性探测失败：无法区分消息不存在、权限不足或 Telegram 网络错误"
         }))),
     }
 }
