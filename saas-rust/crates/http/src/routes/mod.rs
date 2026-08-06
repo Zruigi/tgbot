@@ -32,6 +32,8 @@ pub fn router() -> Router<AppState> {
         // Health
         .route("/healthz", get(session::health))
         .route("/api/health", get(session::health))
+        .route("/readyz", get(session::readiness))
+        .route("/api/ready", get(session::readiness))
         // Auth routes - Login, OTP, CSRF Token, TMA login
         .route("/api/login", post(auth::login))
         .route("/api/login/otp", post(auth::login_otp))

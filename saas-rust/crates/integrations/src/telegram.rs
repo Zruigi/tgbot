@@ -169,6 +169,17 @@ pub struct SendMessageParams {
     pub reply_to_message_id: Option<i64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct EditMessageTextParams {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parse_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_markup: Option<Value>,
+}
+
 /// Parameters for `sendPhoto`.
 #[derive(Clone, Debug, Serialize)]
 pub struct SendPhotoParams {
@@ -180,6 +191,8 @@ pub struct SendPhotoParams {
     pub parse_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_markup: Option<Value>,
 }
 
 /// Parameters for `sendDocument`.
@@ -327,6 +340,10 @@ impl TelegramClient {
     /// Send a text message.
     pub async fn send_message(&self, params: SendMessageParams) -> Result<Message> {
         self.request("sendMessage", params).await
+    }
+
+    pub async fn edit_message_text(&self, params: EditMessageTextParams) -> Result<Message> {
+        self.request("editMessageText", params).await
     }
 
     /// Send a photo.
@@ -503,8 +520,6 @@ impl TelegramClient {
 
     /// Answer a callback query (dismiss the loading animation).
     pub async fn answer_callback_query(&self, params: AnswerCallbackQueryParams) -> Result<()> {
-        #[derive(Serialize, Debug)]
-        struct Empty {}
         self.request("answerCallbackQuery", params)
             .await
             .map(|_: Value| ())
@@ -652,5 +667,29 @@ mod tests {
         assert_eq!(json["chat_id"], 12345);
         assert_eq!(json["text"], "Hello");
         assert_eq!(json["parse_mode"], "Markdown");
+    }
+
+    #[test]
+    fn test_edit_message_text_params_serialization() {
+        let params = EditMessageTextParams {
+            chat_id: 12345,
+            message_id: 678,
+            text: "Updated".into(),
+            parse_mode: None,
+            reply_markup: Some(json!({
+                "inline_keyboard": [[{
+                    "text": "Refresh",
+                    "callback_data": "wallet_my_list"
+                }]]
+            })),
+        };
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["chat_id"], 12345);
+        assert_eq!(json["message_id"], 678);
+        assert_eq!(json["text"], "Updated");
+        assert_eq!(
+            json["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "wallet_my_list"
+        );
     }
 }

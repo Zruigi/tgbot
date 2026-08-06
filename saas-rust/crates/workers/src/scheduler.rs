@@ -23,6 +23,7 @@
 //! ```
 
 use anyhow::Result;
+use chrono::Utc;
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
@@ -33,6 +34,8 @@ use tracing::{error, info, instrument, warn};
 use crate::job_queue::{self, ClaimedJob, JobType};
 use crate::push_task_worker::TelegramClientResolver;
 use crate::WorkerHandle;
+use tgbot_domain::worker_telemetry::{WorkerTelemetry, WorkerTelemetrySnapshot};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -55,6 +58,8 @@ pub struct SchedulerConfig {
     pub job_retention_days: i32,
     /// How often to check cron-based recurring tasks.
     pub cron_check_interval: Duration,
+    /// How often to persist worker liveness and job counters.
+    pub heartbeat_interval: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -67,7 +72,14 @@ impl Default for SchedulerConfig {
             maintenance_interval: Duration::from_secs(300),
             job_retention_days: 7,
             cron_check_interval: Duration::from_secs(60),
+            heartbeat_interval: Duration::from_secs(10),
         }
+    }
+}
+
+impl SchedulerConfig {
+    pub fn effective_worker_concurrency(&self) -> usize {
+        self.worker_concurrency.max(1)
     }
 }
 
@@ -106,25 +118,32 @@ impl Dispatcher {
     }
 
     /// Dispatch a claimed job to the appropriate worker.
-    pub async fn dispatch(&self, pool: &PgPool, claimed: &ClaimedJob) {
+    pub async fn dispatch(&self, pool: &PgPool, claimed: &ClaimedJob, telemetry: &WorkerTelemetry) {
         let job_id = claimed.job.id;
         let job_type = &claimed.job.job_type;
+        let tenant_id = &claimed.job.tenant_id;
 
         match self.find_worker(job_type) {
             Some(worker) => {
                 info!(job_id, job_type, "dispatching job to worker");
                 match worker.process(pool, claimed).await {
                     Ok(()) => {
-                        if let Err(e) = job_queue::complete_job(pool, job_id).await {
+                        if let Err(e) =
+                            job_queue::complete_job(pool, job_id, claimed.claim_id).await
+                        {
                             error!(job_id, error = %e, "failed to mark job completed");
                         }
+                        telemetry.mark_completed(tenant_id);
                     }
                     Err(e) => {
                         let err_str = e.to_string();
                         error!(job_id, job_type, error = %err_str, "job processing failed");
-                        if let Err(e2) = job_queue::fail_job(pool, job_id, &err_str).await {
+                        if let Err(e2) =
+                            job_queue::fail_job(pool, job_id, claimed.claim_id, &err_str).await
+                        {
                             error!(job_id, error = %e2, "failed to mark job as failed");
                         }
+                        telemetry.mark_failed(tenant_id);
                     }
                 }
             }
@@ -133,11 +152,17 @@ impl Dispatcher {
                     job_id,
                     job_type, "no worker registered for job type, marking dead"
                 );
-                if let Err(e) =
-                    job_queue::fail_job(pool, job_id, "no worker registered for job type").await
+                if let Err(e) = job_queue::fail_job(
+                    pool,
+                    job_id,
+                    claimed.claim_id,
+                    "no worker registered for job type",
+                )
+                .await
                 {
                     error!(job_id, error = %e, "failed to mark unknown-type job as failed");
                 }
+                telemetry.mark_failed(tenant_id);
             }
         }
     }
@@ -152,8 +177,11 @@ pub struct Scheduler {
     pool: PgPool,
     config: SchedulerConfig,
     dispatcher: Arc<Dispatcher>,
+    telemetry: WorkerTelemetry,
+    worker_id: String,
     job_type_filters: Vec<String>,
     push_task_cron: bool,
+    address_monitor_cron: bool,
     channel_reminder_cleanup: Option<(Arc<dyn TelegramClientResolver>, Duration)>,
 }
 
@@ -163,8 +191,11 @@ impl Scheduler {
             pool,
             config,
             dispatcher: Arc::new(dispatcher),
+            telemetry: WorkerTelemetry::default(),
+            worker_id: Uuid::new_v4().to_string(),
             job_type_filters: Vec::new(),
             push_task_cron: false,
+            address_monitor_cron: false,
             channel_reminder_cleanup: None,
         }
     }
@@ -177,8 +208,18 @@ impl Scheduler {
         self
     }
 
+    pub fn with_telemetry(mut self, telemetry: WorkerTelemetry) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
     pub fn with_push_task_cron(mut self) -> Self {
         self.push_task_cron = true;
+        self
+    }
+
+    pub fn with_address_monitor_cron(mut self) -> Self {
+        self.address_monitor_cron = true;
         self
     }
 
@@ -194,6 +235,7 @@ impl Scheduler {
     /// Start the scheduler as a set of background tokio tasks.
     /// Returns a `WorkerHandle` that can be used to shut down the scheduler.
     pub fn start(self) -> WorkerHandle {
+        self.telemetry.mark_scheduler_started();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Channel for sending claimed jobs from the poller to worker tasks.
@@ -202,19 +244,43 @@ impl Scheduler {
         let pool = self.pool.clone();
         let config = self.config.clone();
         let job_type_filters = self.job_type_filters.clone();
+        let worker_concurrency = self.config.effective_worker_concurrency();
+        let telemetry = self.telemetry.clone();
+        let heartbeat_pool = self.pool.clone();
+        let heartbeat_id = self.worker_id.clone();
+        let heartbeat_interval = self.config.heartbeat_interval;
+        let heartbeat_telemetry = self.telemetry.clone();
+        let heartbeat_shutdown = shutdown_rx.clone();
 
         // --- Poller task ---
         let poller_shutdown = shutdown_rx.clone();
         let poller_handle = tokio::spawn(async move {
-            Self::run_poller(pool, config, job_type_filters, job_tx, poller_shutdown).await;
+            Self::run_poller(
+                pool,
+                config,
+                job_type_filters,
+                job_tx,
+                telemetry,
+                poller_shutdown,
+            )
+            .await;
         });
 
         // --- Worker pool tasks ---
         let pool_clone = self.pool.clone();
         let dispatcher_clone = self.dispatcher.clone();
         let worker_shutdown = shutdown_rx.clone();
+        let telemetry = self.telemetry.clone();
         let worker_handle = tokio::spawn(async move {
-            Self::run_worker_pool(pool_clone, dispatcher_clone, job_rx, worker_shutdown).await;
+            Self::run_worker_pool(
+                pool_clone,
+                dispatcher_clone,
+                worker_concurrency,
+                job_rx,
+                telemetry,
+                worker_shutdown,
+            )
+            .await;
         });
 
         // --- Maintenance task ---
@@ -225,13 +291,33 @@ impl Scheduler {
             Self::run_maintenance(maint_pool, maint_config, maint_shutdown).await;
         });
 
-        let mut tasks = vec![poller_handle, worker_handle, maint_handle];
+        let heartbeat_handle = tokio::spawn(async move {
+            Self::run_heartbeat(
+                heartbeat_pool,
+                heartbeat_id,
+                heartbeat_telemetry,
+                heartbeat_interval,
+                heartbeat_shutdown,
+            )
+            .await;
+        });
+
+        let mut tasks = vec![poller_handle, worker_handle, maint_handle, heartbeat_handle];
         if self.push_task_cron {
             let cron_pool = self.pool.clone();
             let cron_interval = self.config.cron_check_interval;
             let cron_shutdown = shutdown_rx.clone();
             tasks.push(tokio::spawn(async move {
                 Self::run_push_task_cron(cron_pool, cron_interval, cron_shutdown).await;
+            }));
+        }
+        if self.address_monitor_cron {
+            let monitor_pool = self.pool.clone();
+            let monitor_interval = self.config.cron_check_interval;
+            let monitor_shutdown = shutdown_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                Self::run_address_monitor_cron(monitor_pool, monitor_interval, monitor_shutdown)
+                    .await;
             }));
         }
         if let Some((telegram_resolver, cleanup_interval)) = self.channel_reminder_cleanup {
@@ -251,12 +337,41 @@ impl Scheduler {
         WorkerHandle { shutdown_tx, tasks }
     }
 
+    async fn run_heartbeat(
+        pool: PgPool,
+        worker_id: String,
+        telemetry: WorkerTelemetry,
+        heartbeat_interval: Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        info!(worker_id = %worker_id, ?heartbeat_interval, "worker heartbeat started");
+        let mut interval = tokio::time::interval(heartbeat_interval);
+
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!(worker_id = %worker_id, "worker heartbeat shutting down");
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    let snapshot = telemetry.snapshot();
+                    if let Err(error) = persist_worker_telemetry(&pool, &worker_id, &snapshot).await {
+                        error!(worker_id = %worker_id, %error, "failed to persist worker heartbeat");
+                    }
+                }
+            }
+        }
+    }
+
     /// Poller loop: periodically claim pending jobs and send them to workers.
     async fn run_poller(
         pool: PgPool,
         config: SchedulerConfig,
         job_type_filters: Vec<String>,
         job_tx: mpsc::Sender<ClaimedJob>,
+        telemetry: WorkerTelemetry,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
         info!(
@@ -274,20 +389,26 @@ impl Scheduler {
                     }
                 }
                 _ = interval.tick() => {
+                    telemetry.mark_poll_started();
                     match job_queue::claim_jobs(
                         &pool,
                         &job_type_filters,
                         config.claim_batch_size,
                     ).await {
                         Ok(jobs) => {
+                            telemetry.mark_poll_succeeded();
                             for job in jobs {
+                                let tenant_id = job.job.tenant_id.clone();
+                                telemetry.mark_claimed(&tenant_id);
                                 if job_tx.send(job).await.is_err() {
+                                    telemetry.mark_dropped(&tenant_id);
                                     info!("worker pool dropped, stopping poller");
                                     return;
                                 }
                             }
                         }
                         Err(e) => {
+                            telemetry.mark_poll_failed();
                             error!(error = %e, "failed to claim jobs from queue");
                         }
                     }
@@ -314,6 +435,30 @@ impl Scheduler {
                 _ = interval.tick() => {
                     if let Err(error) = schedule_push_tasks(&pool).await {
                         error!(%error, "failed to schedule push tasks");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_address_monitor_cron(
+        pool: PgPool,
+        check_interval: Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        info!(?check_interval, "address monitor cron started");
+        let mut interval = tokio::time::interval(check_interval);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("address monitor cron shutting down");
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = schedule_address_monitor_checks(&pool).await {
+                        error!(%error, "failed to schedule address monitor checks");
                     }
                 }
             }
@@ -353,11 +498,13 @@ impl Scheduler {
     async fn run_worker_pool(
         pool: PgPool,
         dispatcher: Arc<Dispatcher>,
+        worker_concurrency: usize,
         mut job_rx: mpsc::Receiver<ClaimedJob>,
+        telemetry: WorkerTelemetry,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
         info!("scheduler worker pool started");
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(4)); // default concurrency
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_concurrency));
 
         loop {
             tokio::select! {
@@ -372,10 +519,11 @@ impl Scheduler {
                         Some(claimed) => {
                             let pool = pool.clone();
                             let dispatcher = dispatcher.clone();
+                            let telemetry = telemetry.clone();
                             let permit = semaphore.clone().acquire_owned().await;
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                dispatcher.dispatch(&pool, &claimed).await;
+                                dispatcher.dispatch(&pool, &claimed, &telemetry).await;
                             });
                         }
                         None => {
@@ -421,6 +569,89 @@ impl Scheduler {
             }
         }
     }
+}
+
+async fn persist_worker_telemetry(
+    pool: &PgPool,
+    worker_id: &str,
+    snapshot: &WorkerTelemetrySnapshot,
+) -> Result<()> {
+    let now = Utc::now();
+    let started_at = snapshot.global.scheduler_started_at.unwrap_or(now);
+    let mut transaction = pool.begin().await?;
+
+    sqlx::query(
+        "INSERT INTO platform.worker_runtime_heartbeats (
+             worker_id, started_at, last_seen_at, scheduler_started_at,
+             last_poll_at, last_successful_poll_at, last_poll_error_at,
+             total_polls, total_claimed_jobs, total_completed_jobs,
+             total_failed_jobs, in_flight_jobs
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (worker_id) DO UPDATE SET
+             started_at = EXCLUDED.started_at,
+             last_seen_at = EXCLUDED.last_seen_at,
+             scheduler_started_at = EXCLUDED.scheduler_started_at,
+             last_poll_at = EXCLUDED.last_poll_at,
+             last_successful_poll_at = EXCLUDED.last_successful_poll_at,
+             last_poll_error_at = EXCLUDED.last_poll_error_at,
+             total_polls = EXCLUDED.total_polls,
+             total_claimed_jobs = EXCLUDED.total_claimed_jobs,
+             total_completed_jobs = EXCLUDED.total_completed_jobs,
+             total_failed_jobs = EXCLUDED.total_failed_jobs,
+             in_flight_jobs = EXCLUDED.in_flight_jobs",
+    )
+    .bind(worker_id)
+    .bind(started_at)
+    .bind(now)
+    .bind(snapshot.global.scheduler_started_at)
+    .bind(snapshot.global.last_poll_at)
+    .bind(snapshot.global.last_successful_poll_at)
+    .bind(snapshot.global.last_poll_error_at)
+    .bind(counter(snapshot.global.total_polls))
+    .bind(counter(snapshot.global.total_claimed_jobs))
+    .bind(counter(snapshot.global.total_completed_jobs))
+    .bind(counter(snapshot.global.total_failed_jobs))
+    .bind(counter(snapshot.global.in_flight_jobs))
+    .execute(&mut *transaction)
+    .await?;
+
+    for (tenant_id, tenant) in &snapshot.tenants {
+        sqlx::query(
+            "INSERT INTO platform.worker_tenant_heartbeats (
+                 worker_id, tenant_id, last_seen_at, claimed_jobs,
+                 completed_jobs, failed_jobs, in_flight_jobs,
+                 last_claimed_at, last_completed_at, last_failed_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (worker_id, tenant_id) DO UPDATE SET
+                 last_seen_at = EXCLUDED.last_seen_at,
+                 claimed_jobs = EXCLUDED.claimed_jobs,
+                 completed_jobs = EXCLUDED.completed_jobs,
+                 failed_jobs = EXCLUDED.failed_jobs,
+                 in_flight_jobs = EXCLUDED.in_flight_jobs,
+                 last_claimed_at = EXCLUDED.last_claimed_at,
+                 last_completed_at = EXCLUDED.last_completed_at,
+                 last_failed_at = EXCLUDED.last_failed_at",
+        )
+        .bind(worker_id)
+        .bind(tenant_id)
+        .bind(now)
+        .bind(counter(tenant.claimed_jobs))
+        .bind(counter(tenant.completed_jobs))
+        .bind(counter(tenant.failed_jobs))
+        .bind(counter(tenant.in_flight_jobs))
+        .bind(tenant.last_claimed_at)
+        .bind(tenant.last_completed_at)
+        .bind(tenant.last_failed_at)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    transaction.commit().await?;
+    Ok(())
+}
+
+fn counter(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +773,66 @@ pub async fn schedule_group_policy_syncs(pool: &PgPool) -> Result<usize> {
     Ok(enqueued)
 }
 
+/// Check formal `address_monitors` entries and enqueue tenant-scoped jobs.
+#[instrument(skip(pool))]
+pub async fn schedule_address_monitor_checks(pool: &PgPool) -> Result<usize> {
+    let rows = sqlx::query(
+        r#"
+        SELECT m.monitor_id, m.tenant_id, m.address, m.network
+        FROM address_monitors m
+        WHERE m.is_active = true
+          AND m.updated_at < now() - interval '30 seconds'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM job_queue queued
+              WHERE queued.job_type = 'monitor_check'
+                AND queued.tenant_id = m.tenant_id
+                AND queued.payload ->> 'tenant_id' = m.tenant_id
+                AND queued.payload ->> 'monitor_id' = m.monitor_id::text
+                AND queued.status IN ('pending', 'running')
+          )
+        ORDER BY m.updated_at ASC
+        LIMIT 50
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut enqueued = 0;
+    for row in rows {
+        let monitor_id: i64 = row.try_get("monitor_id")?;
+        let tenant_id: String = row.try_get("tenant_id")?;
+        let address: String = row.try_get("address")?;
+        let network: String = row.try_get("network")?;
+        let opts = job_queue::EnqueueOpts::new(
+            JobType::MonitorCheck,
+            json!({
+                "tenant_id": tenant_id,
+                "monitor_id": monitor_id,
+                "address": address,
+                "network": network,
+            }),
+        )
+        .with_priority(1)
+        .with_max_attempts(3);
+
+        match job_queue::enqueue(pool, opts).await {
+            Ok(job_id) => {
+                info!(
+                    monitor_id,
+                    tenant_id, job_id, "enqueued address monitor check"
+                );
+                enqueued += 1;
+            }
+            Err(error) => {
+                error!(monitor_id, tenant_id, %error, "failed to enqueue address monitor check");
+            }
+        }
+    }
+
+    Ok(enqueued)
+}
+
 /// Check for wallet/monitor entries that need to be checked and enqueue jobs.
 #[cfg(feature = "legacy-workers")]
 #[instrument(skip(pool))]
@@ -603,6 +894,17 @@ mod tests {
         assert_eq!(config.poll_interval, Duration::from_secs(5));
         assert_eq!(config.claim_batch_size, 20);
         assert_eq!(config.worker_concurrency, 4);
+        assert_eq!(config.effective_worker_concurrency(), 4);
         assert_eq!(config.stale_job_timeout_minutes, 30);
+        assert_eq!(config.heartbeat_interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn zero_worker_concurrency_is_clamped_to_one() {
+        let config = SchedulerConfig {
+            worker_concurrency: 0,
+            ..SchedulerConfig::default()
+        };
+        assert_eq!(config.effective_worker_concurrency(), 1);
     }
 }

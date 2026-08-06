@@ -14,10 +14,14 @@ use crate::tools::detect_advertising::DetectAdvertisingTool;
 use crate::tools::finance_query::FinanceQueryTool;
 use crate::tools::n8n_workflow::N8NWorkflowTool;
 use crate::tools::ocr::OcrTool;
+use crate::tools::query_ad_clusters::QueryAdClustersTool;
 use crate::tools::query_recent_ad_messages::QueryRecentAdMessagesTool;
+use crate::tools::skill_manage::SkillManageTool;
+use crate::tools::system_query::SystemQueryTool;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -85,6 +89,11 @@ impl ToolRegistry {
     /// 获取所有工具名
     pub fn names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
+    }
+
+    pub fn retain_names(&mut self, allowed_names: &[&str]) {
+        self.tools
+            .retain(|tool_name, _| allowed_names.iter().any(|allowed| *allowed == tool_name));
     }
 
     /// 获取所有工具的 LLM function calling schema
@@ -409,6 +418,17 @@ impl AIAgent {
                     .log_action(tool_name, &args, &result_value, ctx.user_id);
             }
 
+            if !has_dangerous
+                && all_results.len() == 1
+                && all_results[0].tool_name == "system_query"
+                && all_results[0].success
+            {
+                if let Some(result) = all_results[0].result.as_ref() {
+                    final_text = format_system_query_result(result);
+                    break;
+                }
+            }
+
             // 将工具结果加入 messages，让 LLM 总结回复
             let results_summary = self.format_tool_results(&all_results);
 
@@ -637,26 +657,26 @@ impl AIAgent {
 
         match self.llm_caller.call(messages, model, tools).await {
             Ok(mut result) => {
-                // 尝试从返回文本中解析 function calling（显式标记模式）
-                // 2.2d: 先 trim 再检查前缀（容忍前导/尾随空白，deb8eaf）
-                let mut tool_calls: Vec<ToolCall> = Vec::new();
-                let stripped_text = result.text.trim();
-                if stripped_text.starts_with("__TOOL_CALL__") {
-                    let json_str = &stripped_text["__TOOL_CALL__".len()..];
-                    match serde_json::from_str::<Value>(json_str) {
-                        Ok(parsed) => {
-                            if let Some(arr) = parsed.as_array() {
-                                for item in arr {
-                                    if let Some(tc) = parse_tool_call_value(item) {
-                                        tool_calls.push(tc);
+                let mut tool_calls = result.tool_calls.clone();
+                if tool_calls.is_empty() {
+                    let stripped_text = result.text.trim();
+                    if stripped_text.starts_with("__TOOL_CALL__") {
+                        let json_str = &stripped_text["__TOOL_CALL__".len()..];
+                        match serde_json::from_str::<Value>(json_str) {
+                            Ok(parsed) => {
+                                if let Some(arr) = parsed.as_array() {
+                                    for item in arr {
+                                        if let Some(tc) = parse_tool_call_value(item) {
+                                            tool_calls.push(tc);
+                                        }
                                     }
+                                } else if let Some(tc) = parse_tool_call_value(&parsed) {
+                                    tool_calls.push(tc);
                                 }
-                            } else if let Some(tc) = parse_tool_call_value(&parsed) {
-                                tool_calls.push(tc);
                             }
-                        }
-                        Err(e) => {
-                            warn!("Tool call JSON 解析失败，当作纯文本: {}", e);
+                            Err(e) => {
+                                warn!("Tool call JSON 解析失败，当作纯文本: {}", e);
+                            }
                         }
                     }
                 }
@@ -791,6 +811,10 @@ impl AIAgent {
                 vec![
                     "系统状态",
                     "系统概览",
+                    "机器人绑定",
+                    "绑定聊天",
+                    "绑定群",
+                    "绑定频道",
                     "有多少群",
                     "群组统计",
                     "系统信息",
@@ -803,6 +827,18 @@ impl AIAgent {
                     "广告消息",
                     "群广告",
                     "疑似广告",
+                ],
+            );
+            m.insert(
+                "query_ad_clusters",
+                vec![
+                    "广告聚合",
+                    "广告簇",
+                    "广告聚类",
+                    "查广告簇",
+                    "查重复广告",
+                    "重复广告",
+                    "聚合广告",
                 ],
             );
             m.insert(
@@ -923,6 +959,26 @@ impl AIAgent {
             "detect_advertising" => {
                 serde_json::json!({"text": text, "context_type": "private_message"})
             }
+            "query_ad_clusters" => {
+                let mut params = serde_json::json!({
+                    "status": "pending",
+                    "limit": 20,
+                    "window_minutes": 60,
+                });
+                if let Ok(group_pattern) =
+                    regex::Regex::new(r"(?i)(?:group_id|chat_id|群|群组)\s*[:：=]?\s*(-?\d{5,})")
+                {
+                    if let Some(captures) = group_pattern.captures(text) {
+                        if let Some(group_id) = captures
+                            .get(1)
+                            .and_then(|value| value.as_str().parse::<i64>().ok())
+                        {
+                            params["group_id"] = serde_json::json!(group_id);
+                        }
+                    }
+                }
+                params
+            }
             "telegram_sdk_query" => {
                 // 4c3f1dc: 数字 group_id 优先于群名解析
                 if let Ok(re) =
@@ -974,6 +1030,10 @@ impl AIAgent {
                     serde_json::json!({"query_type": "group_ad_messages", "limit": 20})
                 } else if text.contains("潜在用户") {
                     serde_json::json!({"query_type": "potential_users", "limit": 10})
+                } else if text.contains("绑定")
+                    && (text.contains("群") || text.contains("频道") || text.contains("聊天"))
+                {
+                    serde_json::json!({"query_type": "bound_chats", "limit": 50})
                 } else if text.contains("监听")
                     || text.contains("地址列表")
                     || text.contains("监控地址")
@@ -1217,6 +1277,169 @@ impl AIAgent {
 
         format!("工具执行结果:\n{}", parts.join("\n"))
     }
+}
+
+fn format_system_query_result(result: &Value) -> String {
+    if !result
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        return format!(
+            "系统查询失败：{}",
+            result
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("未知错误")
+        );
+    }
+
+    let Some(data) = result.get("data") else {
+        return result
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("系统查询完成。")
+            .to_string();
+    };
+
+    if let Some(object) = data.as_object() {
+        if object.contains_key("total_count") {
+            let group_count = object
+                .get("group_count")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let channel_count = object
+                .get("channel_count")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let broadcast_only_count = object
+                .get("broadcast_only_group_count")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let mut lines = vec![format!(
+                "当前绑定群组 {} 个，频道 {} 个。",
+                group_count, channel_count
+            )];
+            if broadcast_only_count > 0 {
+                lines.push(format!("另有仅广播目标群 {} 个。", broadcast_only_count));
+            }
+            append_chat_preview(&mut lines, "群组：", object.get("groups"));
+            append_chat_preview(&mut lines, "频道：", object.get("channels"));
+            append_chat_preview(
+                &mut lines,
+                "仅广播目标群：",
+                object.get("broadcast_only_groups"),
+            );
+            return lines.join("\n");
+        }
+
+        let summary = object
+            .iter()
+            .filter(|(_, value)| value.is_string() || value.is_number() || value.is_boolean())
+            .map(|(key, value)| format!("{}={}", key, scalar_value(value)))
+            .collect::<Vec<_>>();
+        let heading = result
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("系统查询完成");
+        return if summary.is_empty() {
+            heading.to_string()
+        } else {
+            format!("{}\n{}", heading, summary.join("，"))
+        };
+    }
+
+    if let Some(items) = data.as_array() {
+        let evidence_count = result
+            .get("evidence_count")
+            .and_then(Value::as_i64)
+            .or_else(|| result.get("count").and_then(Value::as_i64))
+            .unwrap_or(items.len() as i64);
+        if evidence_count <= 0 {
+            return result
+                .get("limitation")
+                .and_then(Value::as_str)
+                .or_else(|| result.get("message").and_then(Value::as_str))
+                .unwrap_or("当前没有可用的已落库数据。")
+                .to_string();
+        }
+
+        let mut lines = vec![result
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("查询到 {} 条记录", evidence_count))];
+        for item in items.iter().take(10) {
+            let Some(item) = item.as_object() else {
+                continue;
+            };
+            let title = ["group_title", "title", "username", "user_id"]
+                .iter()
+                .find_map(|key| item.get(*key).filter(|value| !value.is_null()))
+                .map(scalar_value)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "记录".to_string());
+            let content = item
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .replace('\n', " ")
+                .chars()
+                .take(80)
+                .collect::<String>();
+            if content.is_empty() {
+                lines.push(format!("- {}", title));
+            } else {
+                lines.push(format!("- {}: {}", title, content));
+            }
+        }
+        return lines.join("\n");
+    }
+
+    result
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("系统查询完成。")
+        .to_string()
+}
+
+fn append_chat_preview(lines: &mut Vec<String>, prefix: &str, value: Option<&Value>) {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    let previews = items
+        .iter()
+        .take(20)
+        .filter_map(|item| {
+            let object = item.as_object()?;
+            let title = ["title", "chat_title", "username", "user_id"]
+                .iter()
+                .find_map(|key| object.get(*key).filter(|value| !value.is_null()))
+                .map(scalar_value)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "未命名".to_string());
+            let chat_id = object
+                .get("chat_id")
+                .map(scalar_value)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "未知".to_string());
+            Some(format!("{} ({})", title, chat_id))
+        })
+        .collect::<Vec<_>>();
+    if !previews.is_empty() {
+        lines.push(format!("{}{}", prefix, previews.join("、")));
+    }
+}
+
+fn scalar_value(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1469,13 +1692,21 @@ pub fn default_tool_registry() -> ToolRegistry {
 pub fn default_tool_registry_with_telegram(
     telegram_client: Option<Arc<tgbot_integrations::telegram::TelegramClient>>,
 ) -> ToolRegistry {
-    default_tool_registry_with_pool_and_telegram(None, telegram_client)
+    default_tool_registry_with_pool_telegram_and_llm(None, telegram_client, None)
 }
 
 /// 创建包含内置工具的 ToolRegistry，包含 pool 和可选的 Telegram 客户端（用于需要数据库的工具）
 pub fn default_tool_registry_with_pool_and_telegram(
     pool: Option<Arc<::sqlx::PgPool>>,
     telegram_client: Option<Arc<tgbot_integrations::telegram::TelegramClient>>,
+) -> ToolRegistry {
+    default_tool_registry_with_pool_telegram_and_llm(pool, telegram_client, None)
+}
+
+pub fn default_tool_registry_with_pool_telegram_and_llm(
+    pool: Option<Arc<::sqlx::PgPool>>,
+    telegram_client: Option<Arc<tgbot_integrations::telegram::TelegramClient>>,
+    llm: Option<Arc<tgbot_integrations::litellm::LiteLLMClient>>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     // 从独立模块加载的工具
@@ -1485,10 +1716,22 @@ pub fn default_tool_registry_with_pool_and_telegram(
         registry.register(Arc::new(FinanceQueryTool::new()));
     }
     // 注册 BroadcastMessageTool，传入可选的 Telegram 客户端
-    if let (Some(pool), Some(client)) = (pool.as_ref(), telegram_client.clone()) {
+    if let (Some(pool), Some(client), Some(llm)) =
+        (pool.as_ref(), telegram_client.clone(), llm.clone())
+    {
+        registry.register(Arc::new(BroadcastMessageTool::with_pool_telegram_and_llm(
+            pool.clone(),
+            client,
+            llm,
+        )));
+    } else if let (Some(pool), Some(client)) = (pool.as_ref(), telegram_client.clone()) {
         registry.register(Arc::new(BroadcastMessageTool::with_pool_and_telegram(
             pool.clone(),
             client,
+        )));
+    } else if let (Some(client), Some(llm)) = (telegram_client.clone(), llm.clone()) {
+        registry.register(Arc::new(BroadcastMessageTool::with_telegram_and_llm(
+            client, llm,
         )));
     } else if let Some(client) = telegram_client.clone() {
         registry.register(Arc::new(BroadcastMessageTool::with_telegram(client)));
@@ -1498,14 +1741,17 @@ pub fn default_tool_registry_with_pool_and_telegram(
     registry.register(Arc::new(DetectAdvertisingTool));
     registry.register(Arc::new(ContentGeneratorTool));
     // SUB-015: AI Tools - ocr/n8n/system_query/skill_manage
-    registry.register(Arc::new(OcrTool::with_default_config().unwrap_or_else(
-        |_| {
-            // 如果配置失败，创建一个使用默认配置的 client
-            let config = tgbot_integrations::paddleocr::PaddleOCRConfig::default();
-            let client = tgbot_integrations::paddleocr::PaddleOCRClient::new(config).unwrap();
-            OcrTool::new(Arc::new(client))
-        },
-    )));
+    let ocr = OcrTool::with_default_config().unwrap_or_else(|_| {
+        let config = tgbot_integrations::paddleocr::PaddleOCRConfig::default();
+        let client = tgbot_integrations::paddleocr::PaddleOCRClient::new(config).unwrap();
+        OcrTool::new(Arc::new(client))
+    });
+    let ocr = if let Some(client) = telegram_client.clone() {
+        ocr.with_telegram_client(client)
+    } else {
+        ocr
+    };
+    registry.register(Arc::new(ocr));
     registry.register(Arc::new(
         N8NWorkflowTool::with_default_config().unwrap_or_else(|_| {
             let config = tgbot_integrations::n8n::N8NConfig::default();
@@ -1516,6 +1762,13 @@ pub fn default_tool_registry_with_pool_and_telegram(
 
     // Ad deletion tools (spec-2.2b): require pool
     if let Some(pool) = pool {
+        registry.register(Arc::new(SystemQueryTool::new(pool.clone())));
+        registry.register(Arc::new(QueryAdClustersTool::new(pool.clone())));
+        let project_root = std::env::var_os("TGBOT_PROJECT_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        registry.register(Arc::new(SkillManageTool::new(pool.clone(), project_root)));
         if let Some(client) = telegram_client {
             registry.register(Arc::new(QueryRecentAdMessagesTool::new(pool.clone())));
             registry.register(Arc::new(DeleteRecentAdMessagesTool::with_telegram(
@@ -1526,10 +1779,6 @@ pub fn default_tool_registry_with_pool_and_telegram(
             registry.register(Arc::new(DeleteRecentAdMessagesTool::new(pool)));
         }
     }
-
-    // 注意：SystemQueryTool 和 SkillManageTool 需要数据库连接
-    // 在实际使用时应通过依赖注入传入正确的 pool
-    // 这里暂时不注册，调用方需要手动注入
     registry
 }
 
@@ -1551,6 +1800,40 @@ mod tests {
             Ok(LlmCallResult {
                 text: "这是一个模拟回复".into(),
                 tool_calls: vec![],
+            })
+        }
+    }
+
+    struct NativeToolCallLlmCaller;
+
+    #[async_trait]
+    impl LlmCaller for NativeToolCallLlmCaller {
+        async fn call(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _tools: &[Value],
+        ) -> Result<LlmCallResult, anyhow::Error> {
+            if messages.iter().any(|message| {
+                message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("[工具执行结果]"))
+            }) {
+                return Ok(LlmCallResult {
+                    text: "执行完成".into(),
+                    tool_calls: vec![],
+                });
+            }
+
+            Ok(LlmCallResult {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    function: ToolCallFunction {
+                        name: "confirm_action".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
             })
         }
     }
@@ -1659,6 +1942,22 @@ mod tests {
 
         assert!(!response.text.is_empty());
         assert!(!response.requires_confirmation);
+    }
+
+    #[tokio::test]
+    async fn test_process_message_preserves_native_tool_calls() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ConfirmActionTool));
+        let agent = AIAgent::new(Arc::new(NativeToolCallLlmCaller), Arc::new(tools));
+
+        let mut ctx = AgentContext::new(1);
+        let response = agent
+            .process_message("执行测试动作", &mut ctx, DEFAULT_MODEL)
+            .await;
+
+        assert_eq!(response.tool_calls_made, vec!["confirm_action"]);
+        assert!(response.is_action_taken);
+        assert_eq!(response.text, "执行完成");
     }
 
     #[test]
@@ -1824,6 +2123,16 @@ mod tests {
         assert!(registry.get("generate_content").is_some());
     }
 
+    #[test]
+    fn test_tool_registry_can_retain_an_explicit_allowlist() {
+        let mut registry = default_tool_registry();
+        registry.retain_names(&["detect_advertising"]);
+
+        assert!(registry.get("detect_advertising").is_some());
+        assert!(registry.get("broadcast_message").is_none());
+        assert!(registry.get("n8n_workflow").is_none());
+    }
+
     // === 2.2d 确定性路由测试 ===
 
     #[test]
@@ -1887,5 +2196,51 @@ mod tests {
         let args = agent.build_fallback_args("telegram_sdk_query", "查看机器人权限");
         assert_eq!(args["operation"], "bound_chat_capabilities");
         assert_eq!(args["limit"], 50);
+    }
+
+    #[test]
+    fn test_system_query_fallback_bound_chats() {
+        let llm = Arc::new(MockLlmCaller);
+        let tools = Arc::new(default_tool_registry());
+        let agent = AIAgent::new(llm, tools);
+        let args = agent.build_fallback_args("system_query", "机器人绑定了哪些群和频道");
+        assert_eq!(args["query_type"], "bound_chats");
+        assert_eq!(args["limit"], 50);
+    }
+
+    #[test]
+    fn test_system_query_bound_chats_formatting() {
+        let result = serde_json::json!({
+            "success": true,
+            "message": "机器人绑定聊天：群组 2 个，频道 1 个",
+            "data": {
+                "group_count": 2,
+                "channel_count": 1,
+                "broadcast_only_group_count": 1,
+                "total_count": 4,
+                "groups": [{"title": "群一", "chat_id": -10001}],
+                "channels": [{"chat_title": "频道一", "chat_id": -30001}],
+                "broadcast_only_groups": [{"username": "only_group", "chat_id": -40001}]
+            }
+        });
+        let formatted = format_system_query_result(&result);
+        assert!(formatted.contains("当前绑定群组 2 个，频道 1 个。"));
+        assert!(formatted.contains("另有仅广播目标群 1 个。"));
+        assert!(formatted.contains("群组：群一 (-10001)"));
+        assert!(formatted.contains("频道：频道一 (-30001)"));
+        assert!(formatted.contains("仅广播目标群：only_group (-40001)"));
+    }
+
+    #[test]
+    fn test_system_query_list_formatting_is_bounded() {
+        let long_content = "a".repeat(100);
+        let result = serde_json::json!({
+            "success": true,
+            "data": [{"group_title": "群一", "content": long_content}],
+            "message": "查询到 1 条记录"
+        });
+        let formatted = format_system_query_result(&result);
+        assert_eq!(formatted.lines().nth(1).unwrap().chars().count(), 86);
+        assert!(formatted.ends_with(&"a".repeat(80)));
     }
 }

@@ -47,9 +47,10 @@ impl Tool for SystemQueryTool {
                         "recent_messages",
                         "group_ad_messages",
                         "user_stats",
-                        "potential_users"
+                        "potential_users",
+                        "bound_chats"
                     ],
-                    "description": "查询类型：stats_overview=统计概览, active_groups=活跃群组, monitors_list=监听列表, recent_senders=最近发消息用户, recent_messages=最近消息, group_ad_messages=群广告消息, user_stats=用户统计, potential_users=潜在用户"
+                    "description": "查询类型：stats_overview=统计概览, active_groups=活跃群组, monitors_list=监听列表, recent_senders=最近发消息用户, recent_messages=最近消息, group_ad_messages=群广告消息, user_stats=用户统计, potential_users=潜在用户, bound_chats=机器人绑定聊天"
                 },
                 "limit": {
                     "type": "integer",
@@ -102,6 +103,7 @@ impl Tool for SystemQueryTool {
                     .await
             }
             "potential_users" => self.get_potential_users(&self.pool, tenant_id, limit).await,
+            "bound_chats" => self.get_bound_chats(&self.pool, tenant_id, limit).await,
             _ => Err(anyhow::anyhow!("未知查询类型: {}", query_type)),
         };
 
@@ -164,9 +166,12 @@ impl SystemQueryTool {
         limit: i32,
     ) -> Result<(Value, String), anyhow::Error> {
         let rows = sqlx::query(
-            "SELECT group_id, group_title, is_monitored, 0::integer AS member_count, updated_at \
-             FROM groups.tracked_groups \
-             WHERE tenant_id = $1 \
+            "SELECT tg.group_id, tg.group_title, tg.is_monitored, \
+                    (SELECT COUNT(*)::bigint FROM groups.group_members gm \
+                     WHERE gm.group_id = tg.group_id AND gm.tenant_id = tg.tenant_id) AS member_count, \
+                    tg.updated_at \
+             FROM groups.tracked_groups tg \
+             WHERE tg.tenant_id = $1 \
              ORDER BY updated_at DESC \
              LIMIT $2",
         )
@@ -182,7 +187,7 @@ impl SystemQueryTool {
                     "group_id": row.get::<i64, _>("group_id"),
                     "group_title": row.get::<Option<String>, _>("group_title").unwrap_or_default(),
                     "is_monitored": row.get::<Option<bool>, _>("is_monitored").unwrap_or(false),
-                    "member_count": row.get::<Option<i32>, _>("member_count").unwrap_or(0),
+                    "member_count": row.get::<Option<i64>, _>("member_count").unwrap_or(0),
                     "updated_at": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("updated_at"),
                 })
             })
@@ -191,6 +196,145 @@ impl SystemQueryTool {
         Ok((
             serde_json::json!(groups),
             format!("活跃群组列表 (前{}个)", groups.len()),
+        ))
+    }
+
+    async fn get_bound_chats(
+        &self,
+        pool: &PgPool,
+        tenant_id: &str,
+        limit: i32,
+    ) -> Result<(Value, String), anyhow::Error> {
+        let tracked_rows = sqlx::query(
+            "SELECT group_id, group_title, updated_at \
+             FROM groups.tracked_groups \
+             WHERE tenant_id = $1 \
+             ORDER BY updated_at DESC",
+        )
+        .bind(tenant_id)
+        .fetch_all(pool)
+        .await?;
+
+        let tracked_ids: std::collections::HashSet<i64> = tracked_rows
+            .iter()
+            .filter_map(|row| row.try_get::<i64, _>("group_id").ok())
+            .collect();
+        let limit = limit as usize;
+        let groups_all: Vec<Value> = tracked_rows
+            .iter()
+            .filter_map(|row| {
+                let chat_id = row.try_get::<i64, _>("group_id").ok()?;
+                let title = row
+                    .try_get::<Option<String>, _>("group_title")
+                    .ok()
+                    .flatten();
+                let updated_at = row
+                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("updated_at")
+                    .ok()
+                    .flatten();
+                Some(serde_json::json!({
+                    "chat_id": chat_id,
+                    "title": title,
+                    "chat_title": title,
+                    "chat_type": "supergroup",
+                    "username": Value::Null,
+                    "updated_at": updated_at,
+                }))
+            })
+            .collect();
+
+        let target_rows = sqlx::query(
+            "SELECT chat_id, chat_title, chat_type, chat_username, member_count, updated_at \
+             FROM broadcast.broadcast_targets \
+             WHERE tenant_id = $1 \
+             ORDER BY updated_at DESC",
+        )
+        .bind(tenant_id)
+        .fetch_all(pool)
+        .await?;
+
+        let mut channels = Vec::new();
+        let mut broadcast_only_groups = Vec::new();
+        for row in target_rows {
+            let Some(chat_id) = row.try_get::<i64, _>("chat_id").ok() else {
+                continue;
+            };
+            if tracked_ids.contains(&chat_id) {
+                continue;
+            }
+            let chat_type = row
+                .try_get::<Option<String>, _>("chat_type")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "group".to_string());
+            let title = row
+                .try_get::<Option<String>, _>("chat_title")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let username = row
+                .try_get::<Option<String>, _>("chat_username")
+                .ok()
+                .flatten();
+            let member_count = row
+                .try_get::<Option<i32>, _>("member_count")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let updated_at = row
+                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("updated_at")
+                .ok()
+                .flatten();
+            let item = serde_json::json!({
+                "chat_id": chat_id,
+                "title": title,
+                "chat_title": title,
+                "chat_type": chat_type,
+                "username": username,
+                "member_count": member_count,
+                "updated_at": updated_at,
+            });
+            if chat_type.eq_ignore_ascii_case("channel") {
+                channels.push(item);
+            } else {
+                broadcast_only_groups.push(item);
+            }
+        }
+
+        let group_count = groups_all.len();
+        let channel_count = channels.len();
+        let broadcast_only_group_count = broadcast_only_groups.len();
+        let total_count = group_count + channel_count + broadcast_only_group_count;
+        let data_complete =
+            group_count <= limit && channel_count <= limit && broadcast_only_group_count <= limit;
+        let groups = groups_all.into_iter().take(limit).collect::<Vec<_>>();
+        channels.truncate(limit);
+        broadcast_only_groups.truncate(limit);
+
+        let mut message = format!(
+            "机器人绑定聊天：群组 {} 个，频道 {} 个",
+            group_count, channel_count
+        );
+        if broadcast_only_group_count > 0 {
+            message.push_str(&format!(
+                "，另有仅广播目标群 {} 个",
+                broadcast_only_group_count
+            ));
+        }
+
+        Ok((
+            serde_json::json!({
+                "group_count": group_count,
+                "channel_count": channel_count,
+                "broadcast_only_group_count": broadcast_only_group_count,
+                "total_count": total_count,
+                "evidence_count": total_count,
+                "data_complete": data_complete,
+                "groups": groups,
+                "channels": channels,
+                "broadcast_only_groups": broadcast_only_groups,
+            }),
+            message,
         ))
     }
 

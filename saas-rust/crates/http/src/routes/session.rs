@@ -9,6 +9,24 @@ pub async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok", "service": "tgbot-rust"}))
 }
 
+pub async fn readiness(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let pool = state
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("postgresql_unavailable".into()))?;
+    sqlx::query("SELECT 1")
+        .execute(pool)
+        .await
+        .map_err(|_| ApiError::ServiceUnavailable("postgresql_unavailable".into()))?;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "service": "tgbot-rust",
+        "database": "postgresql",
+        "workers": state.worker_enabled,
+    })))
+}
+
 /// GET /api/session/context - Get current session context
 pub async fn session_context_get(
     State(state): State<AppState>,

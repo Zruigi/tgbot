@@ -6,19 +6,16 @@ use axum::{
     response::Response,
     Json,
 };
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Datelike, NaiveDate};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::{Column, Row, TypeInfo};
+use sqlx::Row;
 use std::io::{Cursor, Write};
 use tgbot_domain::error::{ApiError, ApiResult};
-use tgbot_domain::scope::Scope;
 use uuid::Uuid;
 
 use crate::auth::resolve_scope;
-use crate::routes::monitor::{
-    get_period_boundaries, row_to_json as base_row_to_json, rows_to_json,
-};
+use crate::routes::monitor::{get_period_boundaries, rows_to_json};
 use crate::state::AppState;
 
 // Helper to convert Uuid to i64 (takes lower 64 bits)
@@ -104,10 +101,6 @@ pub struct TransactionPnlItem {
 // Helper Functions
 // ============================================================================
 
-fn row_to_json(row: sqlx::postgres::PgRow) -> Value {
-    base_row_to_json(row)
-}
-
 fn parse_timestamp(value: &str) -> Option<i64> {
     value
         .parse::<i64>()
@@ -158,7 +151,7 @@ pub async fn get_summary(
     Query(q): Query<FinanceSummaryQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     let days = q.days.unwrap_or(30);
     let (start_ms, end_ms) = resolve_time_bounds(
@@ -306,7 +299,7 @@ pub async fn reconcile(
     Json(body): Json<ReconcileRequest>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     // Validate ledger_id
     let ledger_uuid = Uuid::parse_str(&body.ledger_id)
@@ -322,7 +315,7 @@ pub async fn reconcile(
     .await?
     .ok_or_else(|| ApiError::NotFound("ledger_not_found".into()))?;
 
-    let ledger_user_id: i64 = ledger_row.try_get("user_id")?;
+    let _ledger_user_id: i64 = ledger_row.try_get("user_id")?;
     let current_status: String = ledger_row.try_get("reconciled_status")?;
 
     if current_status == "RECONCILED" {
@@ -347,10 +340,11 @@ pub async fn reconcile(
 
     // Update the ledger
     sqlx::query(
-        "UPDATE finance_ledgers SET account_id = $1, reconciled_status = 'RECONCILED', updated_at = now() WHERE ledger_id = $2",
+        "UPDATE finance_ledgers SET account_id = $1, reconciled_status = 'RECONCILED', updated_at = now() WHERE ledger_id = $2 AND tenant_id = $3",
     )
     .bind(account_id)
     .bind(ledger_uuid)
+    .bind(&tenant_id)
     .execute(&mut *tx)
     .await?;
 
@@ -486,7 +480,7 @@ pub async fn generate_report(
     Json(body): Json<GenerateReportRequest>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (_tenant_id, _merchant_id) = scope.require_merchant()?;
 
     let transactions = body.transactions.unwrap_or_default();
 

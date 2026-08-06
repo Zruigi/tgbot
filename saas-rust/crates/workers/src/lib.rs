@@ -42,6 +42,7 @@
 //! ```
 
 pub mod ad_governance_worker;
+pub mod address_monitor_worker;
 pub mod channel_reminder_worker;
 pub mod group_message_policy_worker;
 #[cfg(feature = "legacy-workers")]
@@ -58,6 +59,7 @@ pub mod telegram_command_worker;
 
 // Re-export commonly used types
 pub use ad_governance_worker::AdGovernanceWorker;
+pub use address_monitor_worker::{AddressMonitorAlertWorker, AddressMonitorWorker};
 #[cfg(feature = "legacy-workers")]
 pub mod ai_worker;
 #[cfg(feature = "legacy-workers")]
@@ -82,8 +84,8 @@ pub use push_task_worker::{PushTaskWorker, TelegramClientResolver};
 #[cfg(feature = "legacy-workers")]
 pub use scheduler::{run_cron_checks, schedule_monitor_checks};
 pub use scheduler::{
-    schedule_group_policy_syncs, schedule_push_tasks, Dispatcher, Scheduler, SchedulerConfig,
-    Worker,
+    schedule_address_monitor_checks, schedule_group_policy_syncs, schedule_push_tasks, Dispatcher,
+    Scheduler, SchedulerConfig, Worker,
 };
 pub use telegram_auto_reply_worker::TelegramAutoReplyWorker;
 pub use telegram_command_worker::TelegramCommandWorker;

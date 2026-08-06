@@ -6,26 +6,14 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
-use tgbot_integrations::telegram::TelegramClient;
 
 pub struct QueryRecentAdMessagesTool {
     pool: Arc<PgPool>,
-    telegram_client: Option<Arc<TelegramClient>>,
 }
 
 impl QueryRecentAdMessagesTool {
     pub fn new(pool: Arc<PgPool>) -> Self {
-        Self {
-            pool,
-            telegram_client: None,
-        }
-    }
-
-    pub fn with_telegram(pool: Arc<PgPool>, client: Arc<TelegramClient>) -> Self {
-        Self {
-            pool,
-            telegram_client: Some(client),
-        }
+        Self { pool }
     }
 }
 

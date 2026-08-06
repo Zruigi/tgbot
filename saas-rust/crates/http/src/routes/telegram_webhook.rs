@@ -19,9 +19,18 @@ use crate::auth::resolve_scope;
 use crate::secret_crypto::SecretCipher;
 use crate::state::AppState;
 use tgbot_domain::error::{ApiError, ApiResult};
-use tgbot_integrations::telegram::{AnswerCallbackQueryParams, TelegramClient, TelegramConfig};
-use tgbot_repos::message_repo;
+use tgbot_integrations::telegram::{
+    AnswerCallbackQueryParams, EditMessageTextParams, TelegramClient, TelegramConfig,
+};
+use tgbot_repos::{audit_repo, message_repo};
 use tgbot_services::ad_text::ad_text_hash;
+use tgbot_services::telegram_preferences::{
+    language_menu_reply, localized_start_menu_reply, parse_language_callback, set_telegram_locale,
+    telegram_locale, LanguageCallback,
+};
+use tgbot_services::telegram_wallet::{
+    wallet_admin_list_reply_for_locale, wallet_list_reply_for_locale, wallet_monitor_prompt,
+};
 
 // ---------------------------------------------------------------------------
 // Update model — mirrors Telegram Bot API Update object
@@ -339,8 +348,9 @@ pub async fn webhook_handler(
             }
             Err(e) => {
                 error!(bot_id, update_id, error = %e, "Handler returned error");
-                // We still return 200 to Telegram to avoid retries
-                // but log the error for monitoring
+                return Err(ApiError::ServiceUnavailable(
+                    "webhook processing failed; Telegram should retry".into(),
+                ));
             }
         }
     } else {
@@ -348,9 +358,11 @@ pub async fn webhook_handler(
             bot_id,
             update_id, "No update dispatcher configured, dropping update"
         );
+        return Err(ApiError::ServiceUnavailable(
+            "webhook dispatcher unavailable; Telegram should retry".into(),
+        ));
     }
 
-    // Always return 200 OK to Telegram Bot API
     Ok(Json(json!({})))
 }
 
@@ -617,7 +629,8 @@ pub async fn install_default_handlers(
         .on(UpdateKind::Message, move |update, entry| {
             let pool = message_pool.clone();
             async move {
-                if let (Some(message), Some(pool)) = (&update.message, pool.as_ref()) {
+                let pool = require_webhook_pool(pool.as_ref())?;
+                if let Some(message) = &update.message {
                     handle_incoming_message(pool, &entry, message, false).await?;
                 }
                 if let Some(msg) = &update.message {
@@ -645,7 +658,8 @@ pub async fn install_default_handlers(
         .on(UpdateKind::EditedMessage, move |update, entry| {
             let pool = edited_message_pool.clone();
             async move {
-                if let (Some(message), Some(pool)) = (&update.edited_message, pool.as_ref()) {
+                let pool = require_webhook_pool(pool.as_ref())?;
+                if let Some(message) = &update.edited_message {
                     handle_incoming_message(pool, &entry, message, true).await?;
                 }
                 Ok(())
@@ -660,19 +674,65 @@ pub async fn install_default_handlers(
             let pool = callback_pool.clone();
             let telegram_api_base_url = telegram_api_base_url.clone();
             async move {
+                let pool = require_webhook_pool(pool.as_ref())?;
                 if handle_channel_subscription_callback(
                     &update,
                     &entry,
-                    pool.as_ref(),
+                    Some(pool),
                     &telegram_api_base_url,
                 )
                 .await?
                 {
                     return Ok(());
                 }
+                if handle_language_callback(&update, &entry, Some(pool), &telegram_api_base_url)
+                    .await?
+                {
+                    return Ok(());
+                }
+                if handle_wallet_callback(&update, &entry, Some(pool), &telegram_api_base_url)
+                    .await?
+                {
+                    return Ok(());
+                }
                 if let Some(cq) = &update.callback_query {
                     let data = cq.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                    info!(bot_id = entry.bot_id, data, "Received callback query");
+                    let callback_chat_id = cq
+                        .get("message")
+                        .and_then(|message| message.get("chat"))
+                        .and_then(|chat| chat.get("id"))
+                        .and_then(Value::as_i64);
+                    let telegram_user_id = cq
+                        .get("from")
+                        .and_then(|from| from.get("id"))
+                        .and_then(Value::as_i64);
+                    if let Some(callback_id) = cq.get("id").and_then(Value::as_str) {
+                        let _ = audit_repo::log_unsupported_telegram_callback(
+                            pool,
+                            &entry.tenant_id,
+                            callback_id,
+                            data,
+                            callback_chat_id,
+                            telegram_user_id,
+                        )
+                        .await;
+                        if let Err(error) = acknowledge_unsupported_callback(
+                            &entry,
+                            callback_id,
+                            &telegram_api_base_url,
+                        )
+                        .await
+                        {
+                            warn!(
+                                bot_id = entry.bot_id,
+                                error, "Failed to acknowledge unsupported callback query"
+                            );
+                        }
+                    }
+                    warn!(
+                        bot_id = entry.bot_id,
+                        data, "Unsupported Telegram callback query"
+                    );
                 }
                 Ok(())
             }
@@ -685,10 +745,9 @@ pub async fn install_default_handlers(
         .on(UpdateKind::ChatJoinRequest, move |update, entry| {
             let pool = join_request_pool.clone();
             async move {
+                let pool = require_webhook_pool(pool.as_ref())?;
                 if let Some(jr) = &update.chat_join_request {
-                    if let Some(pool) = pool.as_ref() {
-                        handle_chat_join_request(pool, &entry, jr).await?;
-                    }
+                    handle_chat_join_request(pool, &entry, jr).await?;
                     let chat_id = jr.get("chat").and_then(|c| c.get("id"));
                     let from = jr.get("from").and_then(|f| f.get("id"));
                     info!(
@@ -709,10 +768,9 @@ pub async fn install_default_handlers(
         .on(UpdateKind::MyChatMember, move |update, entry| {
             let pool = my_chat_member_pool.clone();
             async move {
+                let pool = require_webhook_pool(pool.as_ref())?;
                 if let Some(cm) = &update.my_chat_member {
-                    if let Some(pool) = pool.as_ref() {
-                        handle_chat_member_update(pool, &entry, cm, true).await?;
-                    }
+                    handle_chat_member_update(pool, &entry, cm, true).await?;
                     let chat_id = cm.get("chat").and_then(|c| c.get("id"));
                     info!(
                         bot_id = entry.bot_id,
@@ -730,7 +788,8 @@ pub async fn install_default_handlers(
         .on(UpdateKind::ChatMember, move |update, entry| {
             let pool = chat_member_pool.clone();
             async move {
-                if let (Some(member), Some(pool)) = (&update.chat_member, pool.as_ref()) {
+                let pool = require_webhook_pool(pool.as_ref())?;
+                if let Some(member) = &update.chat_member {
                     handle_chat_member_update(pool, &entry, member, false).await?;
                 }
                 Ok(())
@@ -899,7 +958,11 @@ async fn handle_incoming_message(
         "group" | "supergroup" => {
             let group_title =
                 optional_nonempty_string(chat, "title").unwrap_or_else(|| "Unknown".into());
-            let group_policy = claim_or_refresh_group(pool, entry, chat_id, &group_title).await?;
+            let Some(group_policy) =
+                claim_or_refresh_group(pool, entry, chat_id, &group_title).await?
+            else {
+                return Ok(());
+            };
             upsert_group_member(
                 pool,
                 &entry.tenant_id,
@@ -990,7 +1053,7 @@ async fn claim_or_refresh_group(
     entry: &BotEntry,
     group_id: i64,
     group_title: &str,
-) -> Result<TrackedGroupPolicy, String> {
+) -> Result<Option<TrackedGroupPolicy>, String> {
     let row = sqlx::query(
         "INSERT INTO groups.tracked_groups (group_id, group_title, tenant_id, first_seen, updated_at) \
          VALUES ($1, $2, $3, now(), now()) \
@@ -1003,13 +1066,20 @@ async fn claim_or_refresh_group(
     .bind(&entry.tenant_id)
     .fetch_optional(pool)
     .await
-    .map_err(|_| "failed to refresh tracked group".to_string())?
-    .ok_or_else(|| "group belongs to another tenant".to_string())?;
-    Ok(TrackedGroupPolicy {
+    .map_err(|_| "failed to refresh tracked group".to_string())?;
+    let Some(row) = row else {
+        debug!(
+            group_id,
+            tenant_id = %entry.tenant_id,
+            "Ignoring Telegram update for a group owned by another tenant"
+        );
+        return Ok(None);
+    };
+    Ok(Some(TrackedGroupPolicy {
         is_monitored: row
             .try_get("is_monitored")
             .map_err(|_| "tracked group has invalid monitor state".to_string())?,
-    })
+    }))
 }
 
 async fn upsert_chat_user(
@@ -1136,7 +1206,12 @@ async fn handle_chat_join_request(
         .and_then(Value::as_i64)
         .ok_or_else(|| "join request has no group id".to_string())?;
     let group_title = optional_nonempty_string(chat, "title").unwrap_or_else(|| "Unknown".into());
-    claim_or_refresh_group(pool, entry, group_id, &group_title).await?;
+    if claim_or_refresh_group(pool, entry, group_id, &group_title)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
     let user = request
         .get("from")
         .ok_or_else(|| "join request has no user".to_string())?;
@@ -1181,7 +1256,12 @@ async fn handle_chat_member_update(
         .and_then(Value::as_str)
         .unwrap_or("left");
     if is_bot_update {
-        claim_or_refresh_group(pool, entry, group_id, &group_title).await?;
+        if claim_or_refresh_group(pool, entry, group_id, &group_title)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
         if matches!(telegram_status, "left" | "kicked") {
             sqlx::query(
                 "UPDATE groups.tracked_groups SET is_monitored = false, updated_at = now() \
@@ -1195,7 +1275,12 @@ async fn handle_chat_member_update(
         }
         return Ok(());
     }
-    claim_or_refresh_group(pool, entry, group_id, &group_title).await?;
+    if claim_or_refresh_group(pool, entry, group_id, &group_title)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
     let user = member
         .get("user")
         .ok_or_else(|| "member update has no user".to_string())?;
@@ -1296,6 +1381,10 @@ fn persisted_member_status(member: &Value) -> &'static str {
     }
 }
 
+fn require_webhook_pool(pool: Option<&sqlx::PgPool>) -> Result<&sqlx::PgPool, String> {
+    pool.ok_or_else(|| "webhook persistence unavailable".to_string())
+}
+
 fn optional_nonempty_string(value: &Value, field: &str) -> Option<String> {
     value
         .get(field)
@@ -1303,6 +1392,367 @@ fn optional_nonempty_string(value: &Value, field: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WalletCallback {
+    List,
+    AdminList,
+    Add,
+    BackToStart,
+    Deactivate(i64),
+    AdminDeactivate(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalletCallbackMode {
+    User,
+    Admin,
+}
+
+fn parse_wallet_callback(data: &str) -> Option<WalletCallback> {
+    match data {
+        "wallet_my_list" => return Some(WalletCallback::List),
+        "wallet_admin_all" => return Some(WalletCallback::AdminList),
+        "wallet_monitor" => return Some(WalletCallback::Add),
+        "back_to_start" => return Some(WalletCallback::BackToStart),
+        _ => {}
+    }
+    let (mode, monitor_id) = if let Some(monitor_id) = data.strip_prefix("uw_u_") {
+        (WalletCallbackMode::User, monitor_id)
+    } else if let Some(monitor_id) = data.strip_prefix("uw_a_") {
+        (WalletCallbackMode::Admin, monitor_id)
+    } else {
+        return None;
+    };
+    if monitor_id.is_empty() || !monitor_id.chars().all(|value| value.is_ascii_digit()) {
+        return None;
+    }
+    monitor_id
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .map(|monitor_id| match mode {
+            WalletCallbackMode::User => WalletCallback::Deactivate(monitor_id),
+            WalletCallbackMode::Admin => WalletCallback::AdminDeactivate(monitor_id),
+        })
+}
+
+async fn handle_wallet_callback(
+    update: &TelegramUpdate,
+    entry: &BotEntry,
+    pool: Option<&sqlx::PgPool>,
+    telegram_api_base_url: &str,
+) -> Result<bool, String> {
+    let Some(callback) = update.callback_query.as_ref() else {
+        return Ok(false);
+    };
+    let Some(data) = callback.get("data").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(action) = parse_wallet_callback(data) else {
+        return Ok(false);
+    };
+    let callback_id = callback
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "wallet callback has no id".to_string())?;
+    let telegram = TelegramClient::new(TelegramConfig {
+        bot_token: entry.bot_token.clone(),
+        api_base_url: telegram_api_base_url.to_string(),
+        timeout_secs: 30,
+    })
+    .map_err(|_| "failed to initialize Telegram client".to_string())?;
+    let user_id = callback
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0);
+    let message = callback.get("message");
+    let callback_chat_id = message
+        .and_then(|message| message.get("chat"))
+        .and_then(|chat| chat.get("id"))
+        .and_then(Value::as_i64);
+    let message_id = message
+        .and_then(|message| message.get("message_id"))
+        .and_then(Value::as_i64);
+    let Some(user_id) = user_id else {
+        answer_wallet_callback(&telegram, callback_id, "请求无效", true).await?;
+        return Ok(true);
+    };
+    if callback_chat_id != Some(user_id) {
+        answer_wallet_callback(&telegram, callback_id, "请在私聊中操作", true).await?;
+        return Ok(true);
+    }
+    let Some(message_id) = message_id else {
+        answer_wallet_callback(&telegram, callback_id, "请求无效", true).await?;
+        return Ok(true);
+    };
+    let Some(pool) = pool else {
+        answer_wallet_callback(&telegram, callback_id, "服务暂不可用", true).await?;
+        return Err("wallet callback requires PostgreSQL".into());
+    };
+    let locale = telegram_locale(pool, &entry.tenant_id, user_id)
+        .await
+        .map_err(|_| "failed to load Telegram language preference".to_string())?;
+    if matches!(&action, WalletCallback::Add) {
+        let enabled: bool = sqlx::query_scalar(
+            "SELECT COALESCE(current_setting('tgbot.telegram_wallet_monitors_enabled', true), 'false') = 'true'",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|_| "failed to read wallet monitor feature gate".to_string())?;
+        if !enabled {
+            answer_wallet_callback(&telegram, callback_id, "地址监听功能未启用", true).await?;
+            return Ok(true);
+        }
+    }
+    if matches!(
+        &action,
+        WalletCallback::AdminList | WalletCallback::AdminDeactivate(_)
+    ) {
+        let is_admin: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM merchants
+                 WHERE tenant_id = $1 AND owner_tg_user_id = $2
+             ) OR EXISTS (
+                 SELECT 1
+                 FROM tenant_memberships membership
+                 JOIN auth.users user_record ON user_record.id = membership.user_id
+                 WHERE membership.tenant_id = $1
+                   AND user_record.tg_user_id = $2
+                   AND membership.role IN ('merchant_owner', 'merchant_admin')
+             )",
+        )
+        .bind(&entry.tenant_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|_| "failed to verify wallet admin permission".to_string())?;
+        if !is_admin {
+            answer_wallet_callback(&telegram, callback_id, "权限不足", true).await?;
+            return Ok(true);
+        }
+    }
+    let (text, reply_markup) = match action {
+        WalletCallback::List => {
+            wallet_list_reply_for_locale(pool, &entry.tenant_id, user_id, &locale)
+                .await
+                .map_err(|_| "failed to load wallet monitor list".to_string())?
+        }
+        WalletCallback::AdminList => {
+            wallet_admin_list_reply_for_locale(pool, &entry.tenant_id, &locale)
+                .await
+                .map_err(|_| "failed to load tenant wallet monitor list".to_string())?
+        }
+        WalletCallback::Add => {
+            let prompt = wallet_monitor_prompt(&locale);
+            let back_label = if locale == "en" {
+                "Back to my monitors"
+            } else {
+                "返回我的监听"
+            };
+            (
+                prompt,
+                Some(json!({
+                    "inline_keyboard": [[{
+                        "text": back_label,
+                        "callback_data": "wallet_my_list"
+                    }]]
+                })),
+            )
+        }
+        WalletCallback::BackToStart => localized_start_menu_reply(
+            callback
+                .get("from")
+                .and_then(|from| from.get("first_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("朋友"),
+            &locale,
+        ),
+        WalletCallback::Deactivate(monitor_id) => {
+            let deactivated = sqlx::query(
+                "UPDATE address_monitors SET is_active = false, updated_at = now() \
+                 WHERE monitor_id = $1 AND tenant_id = $2 AND user_id = $3 AND is_active = true \
+                 RETURNING monitor_id",
+            )
+            .bind(monitor_id)
+            .bind(&entry.tenant_id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| "failed to deactivate wallet monitor".to_string())?;
+            if deactivated.is_none() {
+                answer_wallet_callback(&telegram, callback_id, "未找到可取消的监听", true).await?;
+                return Ok(true);
+            }
+            wallet_list_reply_for_locale(pool, &entry.tenant_id, user_id, &locale)
+                .await
+                .map_err(|_| "failed to reload wallet monitor list".to_string())?
+        }
+        WalletCallback::AdminDeactivate(monitor_id) => {
+            let deactivated = sqlx::query(
+                "UPDATE address_monitors SET is_active = false, updated_at = now() \
+                 WHERE monitor_id = $1 AND tenant_id = $2 AND is_active = true \
+                 RETURNING monitor_id",
+            )
+            .bind(monitor_id)
+            .bind(&entry.tenant_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| "failed to deactivate tenant wallet monitor".to_string())?;
+            if deactivated.is_none() {
+                answer_wallet_callback(&telegram, callback_id, "未找到可取消的监听", true).await?;
+                return Ok(true);
+            }
+            wallet_admin_list_reply_for_locale(pool, &entry.tenant_id, &locale)
+                .await
+                .map_err(|_| "failed to reload tenant wallet monitor list".to_string())?
+        }
+    };
+    telegram
+        .edit_message_text(EditMessageTextParams {
+            chat_id: user_id,
+            message_id,
+            text,
+            parse_mode: None,
+            reply_markup,
+        })
+        .await
+        .map_err(|_| "Telegram wallet menu update failed".to_string())?;
+    answer_wallet_callback(&telegram, callback_id, "", false).await?;
+    Ok(true)
+}
+
+async fn handle_language_callback(
+    update: &TelegramUpdate,
+    entry: &BotEntry,
+    pool: Option<&sqlx::PgPool>,
+    telegram_api_base_url: &str,
+) -> Result<bool, String> {
+    let Some(callback) = update.callback_query.as_ref() else {
+        return Ok(false);
+    };
+    let Some(data) = callback.get("data").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(action) = parse_language_callback(data) else {
+        return Ok(false);
+    };
+    let callback_id = callback
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "language callback has no id".to_string())?;
+    let telegram = TelegramClient::new(TelegramConfig {
+        bot_token: entry.bot_token.clone(),
+        api_base_url: telegram_api_base_url.to_string(),
+        timeout_secs: 30,
+    })
+    .map_err(|_| "failed to initialize Telegram client".to_string())?;
+    let user_id = callback
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0);
+    let message = callback.get("message");
+    let callback_chat_id = message
+        .and_then(|message| message.get("chat"))
+        .and_then(|chat| chat.get("id"))
+        .and_then(Value::as_i64);
+    let message_id = message
+        .and_then(|message| message.get("message_id"))
+        .and_then(Value::as_i64);
+    let Some(user_id) = user_id else {
+        answer_language_callback(&telegram, callback_id, "请求无效", true).await?;
+        return Ok(true);
+    };
+    if callback_chat_id != Some(user_id) {
+        answer_language_callback(&telegram, callback_id, "请在私聊中操作", true).await?;
+        return Ok(true);
+    }
+    let Some(message_id) = message_id else {
+        answer_language_callback(&telegram, callback_id, "请求无效", true).await?;
+        return Ok(true);
+    };
+    let Some(pool) = pool else {
+        answer_language_callback(&telegram, callback_id, "服务暂不可用", true).await?;
+        return Err("language callback requires PostgreSQL".into());
+    };
+
+    let (text, reply_markup, answer_text) = match action {
+        LanguageCallback::Menu => {
+            let locale = telegram_locale(pool, &entry.tenant_id, user_id)
+                .await
+                .map_err(|_| "failed to load Telegram language preference".to_string())?;
+            let (text, reply_markup) = language_menu_reply(&locale);
+            (text, reply_markup, "")
+        }
+        LanguageCallback::Set(locale) => {
+            let locale = set_telegram_locale(pool, &entry.tenant_id, user_id, locale)
+                .await
+                .map_err(|_| "failed to save Telegram language preference".to_string())?;
+            let (text, reply_markup) = localized_start_menu_reply(
+                callback
+                    .get("from")
+                    .and_then(|from| from.get("first_name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("朋友"),
+                &locale,
+            );
+            let answer_text = if locale == "en" {
+                "Language updated"
+            } else {
+                "语言已更新"
+            };
+            (text, reply_markup, answer_text)
+        }
+    };
+    telegram
+        .edit_message_text(EditMessageTextParams {
+            chat_id: user_id,
+            message_id,
+            text,
+            parse_mode: None,
+            reply_markup,
+        })
+        .await
+        .map_err(|_| "Telegram language menu update failed".to_string())?;
+    answer_language_callback(&telegram, callback_id, answer_text, false).await?;
+    Ok(true)
+}
+
+async fn answer_language_callback(
+    telegram: &TelegramClient,
+    callback_id: &str,
+    text: &str,
+    show_alert: bool,
+) -> Result<(), String> {
+    telegram
+        .answer_callback_query(AnswerCallbackQueryParams {
+            callback_query_id: callback_id.to_string(),
+            text: (!text.is_empty()).then(|| text.to_string()),
+            show_alert: Some(show_alert),
+        })
+        .await
+        .map_err(|_| "Telegram callback acknowledgement failed".to_string())
+}
+
+async fn answer_wallet_callback(
+    telegram: &TelegramClient,
+    callback_id: &str,
+    text: &str,
+    show_alert: bool,
+) -> Result<(), String> {
+    telegram
+        .answer_callback_query(AnswerCallbackQueryParams {
+            callback_query_id: callback_id.to_string(),
+            text: (!text.is_empty()).then(|| text.to_string()),
+            show_alert: Some(show_alert),
+        })
+        .await
+        .map_err(|_| "Telegram callback acknowledgement failed".to_string())
 }
 
 async fn handle_channel_subscription_callback(
@@ -1317,7 +1767,7 @@ async fn handle_channel_subscription_callback(
     let Some(data) = callback.get("data").and_then(Value::as_str) else {
         return Ok(false);
     };
-    if !data.starts_with("subscribe_") {
+    if !data.starts_with("subscribe_") && !data.starts_with("unmute_verify:") {
         return Ok(false);
     }
 
@@ -1332,7 +1782,8 @@ async fn handle_channel_subscription_callback(
         timeout_secs: 30,
     })
     .map_err(|_| "failed to initialize Telegram client".to_string())?;
-    let parsed = parse_channel_subscription_callback(data);
+    let parsed =
+        parse_channel_subscription_callback(data).or_else(|| parse_unmute_verify_callback(data));
     let user_id = callback
         .get("from")
         .and_then(|from| from.get("id"))
@@ -1347,7 +1798,8 @@ async fn handle_channel_subscription_callback(
         .and_then(Value::as_i64);
     let (group_id, channel_id, user_id) = match (parsed, user_id) {
         (Some((group_id, channel_id)), Some(user_id))
-            if user_id > 0 && callback_chat_id == Some(group_id) =>
+            if user_id > 0
+                && (callback_chat_id == Some(group_id) || callback_chat_id == Some(user_id)) =>
         {
             (group_id, channel_id, user_id)
         }
@@ -1429,19 +1881,21 @@ async fn handle_channel_subscription_callback(
     .map_err(|_| "failed to persist channel verification".to_string())?;
     answer_subscription_callback(&telegram, callback_id, "✅ 验证成功！您已被解禁", true).await?;
 
-    if let Some(message_id) = message_id {
-        if telegram.delete_message(group_id, message_id).await.is_ok() {
-            sqlx::query(
-                "UPDATE groups.channel_reminders SET is_deleted = true \
+    if callback_chat_id == Some(group_id) {
+        if let Some(message_id) = message_id {
+            if telegram.delete_message(group_id, message_id).await.is_ok() {
+                sqlx::query(
+                    "UPDATE groups.channel_reminders SET is_deleted = true \
                  WHERE group_id = $1 AND user_id = $2 AND message_id = $3 AND tenant_id = $4",
-            )
-            .bind(group_id)
-            .bind(user_id)
-            .bind(message_id)
-            .bind(&entry.tenant_id)
-            .execute(pool)
-            .await
-            .map_err(|_| "failed to mark channel reminder deleted".to_string())?;
+                )
+                .bind(group_id)
+                .bind(user_id)
+                .bind(message_id)
+                .bind(&entry.tenant_id)
+                .execute(pool)
+                .await
+                .map_err(|_| "failed to mark channel reminder deleted".to_string())?;
+            }
         }
     }
 
@@ -1456,6 +1910,19 @@ fn parse_channel_subscription_callback(data: &str) -> Option<(i64, i64)> {
     let group_id = parts.next()?.parse().ok()?;
     let channel_id = parts.next()?.parse().ok()?;
     if parts.next().is_some() {
+        return None;
+    }
+    Some((group_id, channel_id))
+}
+
+fn parse_unmute_verify_callback(data: &str) -> Option<(i64, i64)> {
+    let mut parts = data.split(':');
+    if parts.next()? != "unmute_verify" {
+        return None;
+    }
+    let group_id = parts.next()?.parse().ok()?;
+    let channel_id = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || group_id == 0 || channel_id == 0 {
         return None;
     }
     Some((group_id, channel_id))
@@ -1488,6 +1955,27 @@ async fn answer_subscription_callback(
         .map_err(|_| "Telegram callback acknowledgement failed".to_string())
 }
 
+async fn acknowledge_unsupported_callback(
+    entry: &BotEntry,
+    callback_id: &str,
+    telegram_api_base_url: &str,
+) -> Result<(), String> {
+    let telegram = TelegramClient::new(TelegramConfig {
+        bot_token: entry.bot_token.clone(),
+        api_base_url: telegram_api_base_url.to_string(),
+        timeout_secs: 30,
+    })
+    .map_err(|_| "failed to initialize Telegram client".to_string())?;
+    telegram
+        .answer_callback_query(AnswerCallbackQueryParams {
+            callback_query_id: callback_id.to_string(),
+            text: Some("当前 Beta 暂不支持此操作".to_string()),
+            show_alert: Some(true),
+        })
+        .await
+        .map_err(|_| "Telegram callback acknowledgement failed".to_string())
+}
+
 #[cfg(test)]
 mod channel_subscription_tests {
     use super::*;
@@ -1508,6 +1996,55 @@ mod channel_subscription_tests {
         );
         assert_eq!(
             parse_channel_subscription_callback("unrelated_-10001_-30001"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_strict_wallet_callbacks() {
+        assert_eq!(
+            parse_wallet_callback("wallet_my_list"),
+            Some(WalletCallback::List)
+        );
+        assert_eq!(
+            parse_wallet_callback("wallet_admin_all"),
+            Some(WalletCallback::AdminList)
+        );
+        assert_eq!(
+            parse_wallet_callback("wallet_monitor"),
+            Some(WalletCallback::Add)
+        );
+        assert_eq!(
+            parse_wallet_callback("back_to_start"),
+            Some(WalletCallback::BackToStart)
+        );
+        assert_eq!(
+            parse_wallet_callback("uw_u_42"),
+            Some(WalletCallback::Deactivate(42))
+        );
+        assert_eq!(parse_wallet_callback("uw_u_0"), None);
+        assert_eq!(parse_wallet_callback("uw_u_-1"), None);
+        assert_eq!(parse_wallet_callback("uw_u_42_extra"), None);
+        assert_eq!(
+            parse_wallet_callback("uw_a_42"),
+            Some(WalletCallback::AdminDeactivate(42))
+        );
+        assert_eq!(parse_wallet_callback("uw_a_0"), None);
+        assert_eq!(parse_wallet_callback("uw_a_42_extra"), None);
+    }
+
+    #[test]
+    fn parses_legacy_unmute_verify_callback() {
+        assert_eq!(
+            parse_unmute_verify_callback("unmute_verify:-10001:-30001"),
+            Some((-10001, -30001))
+        );
+        assert_eq!(
+            parse_unmute_verify_callback("unmute_verify:bad:-30001"),
+            None
+        );
+        assert_eq!(
+            parse_unmute_verify_callback("unmute_verify:-10001:-30001:extra"),
             None
         );
     }
@@ -1580,6 +2117,36 @@ mod channel_subscription_tests {
                 media_unique_id: Some("same-photo".into()),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn webhook_persistence_failure_is_reported_without_postgres() {
+        let dispatcher = UpdateDispatcher::new();
+        install_default_handlers(&dispatcher, None, "http://127.0.0.1".to_string()).await;
+        let update: TelegramUpdate = serde_json::from_value(json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "from": {"id": 2, "is_bot": false},
+                "chat": {"id": 2, "type": "private"},
+                "date": 1,
+                "text": "database outage"
+            }
+        }))
+        .expect("test update should deserialize");
+        let result = dispatcher
+            .dispatch(
+                update,
+                BotEntry {
+                    bot_id: 7,
+                    bot_token: "test-token".to_string(),
+                    tenant_id: "tenant-beta".to_string(),
+                    merchant_id: "merchant-beta".to_string(),
+                    bot_username: Some("beta_bot".to_string()),
+                },
+            )
+            .await;
+        assert_eq!(result, Err("webhook persistence unavailable".to_string()));
     }
 
     #[test]

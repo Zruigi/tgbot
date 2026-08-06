@@ -5,6 +5,7 @@ use crate::routes::telegram_webhook::{BotRegistry, UpdateDispatcher};
 use std::sync::Arc;
 use tgbot_domain::config::Config;
 use tgbot_domain::error::{ApiError, ApiResult};
+use tgbot_domain::worker_telemetry::WorkerTelemetry;
 use tgbot_integrations::litellm::LiteLLMClient;
 use tgbot_integrations::supabase_rest::SupabaseRestClient;
 use tgbot_integrations::telegram::{TelegramClient, TelegramConfig};
@@ -27,6 +28,8 @@ pub struct AppState {
     /// This is deliberately a coarse readiness signal; per-merchant telemetry
     /// is reported separately by the runtime-status endpoint.
     pub worker_enabled: bool,
+    /// In-process scheduler telemetry exposed to platform status checks.
+    pub worker_telemetry: WorkerTelemetry,
     /// Update dispatcher for routing Telegram updates to handlers.
     pub update_dispatcher: Option<Arc<UpdateDispatcher>>,
 }

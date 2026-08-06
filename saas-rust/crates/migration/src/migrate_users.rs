@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::PgPool;
 
+use crate::migration_audit::MigrationFailure;
 use crate::sqlite_reader::{SqliteAdminInbox, SqliteConfig, SqliteReader, SqliteUser};
 
 /// Virtual assistant UIDs that should be excluded from admin_inbox
@@ -35,6 +36,7 @@ pub struct UserStats {
     pub migrated: i64,
     pub skipped: i64,
     pub errors: i64,
+    pub failures: Vec<MigrationFailure>,
 }
 
 /// Statistics for admin_inbox migration
@@ -45,6 +47,7 @@ pub struct AdminInboxStats {
     pub skipped: i64,
     pub errors: i64,
     pub virtual_assistant_excluded: i64,
+    pub failures: Vec<MigrationFailure>,
 }
 
 /// Migrate users and admin inbox from SQLite to PostgreSQL
@@ -95,6 +98,7 @@ async fn migrate_user_list(users: &[SqliteUser], pg_pool: &PgPool) -> Result<Use
         migrated: 0,
         skipped: 0,
         errors: 0,
+        failures: Vec::new(),
     };
 
     for user in users {
@@ -111,6 +115,11 @@ async fn migrate_user_list(users: &[SqliteUser], pg_pool: &PgPool) -> Result<Use
                     stats.errors += 1;
                     tracing::error!("Failed to migrate user {}: {}", user.user_id, e);
                 }
+                stats.failures.push(MigrationFailure::new(
+                    "users",
+                    format!("user_id={}", user.user_id),
+                    error_str,
+                ));
             }
         }
     }
@@ -154,6 +163,7 @@ async fn migrate_admin_inbox_list(
         skipped: 0,
         errors: 0,
         virtual_assistant_excluded: 0,
+        failures: Vec::new(),
     };
 
     for entry in entries {
@@ -183,6 +193,14 @@ async fn migrate_admin_inbox_list(
                         e
                     );
                 }
+                stats.failures.push(MigrationFailure::new(
+                    "admin_inbox",
+                    format!(
+                        "from_userid={}::tenant_id={}",
+                        entry.from_userid, entry.tenant_id
+                    ),
+                    error_str,
+                ));
             }
         }
     }
@@ -369,6 +387,7 @@ mod tests {
             skipped: 0,
             errors: 0,
             virtual_assistant_excluded: 1,
+            failures: Vec::new(),
         };
 
         assert_eq!(

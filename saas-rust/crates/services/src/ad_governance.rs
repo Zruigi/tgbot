@@ -220,6 +220,17 @@ impl AdGovernanceService {
         let final_dry_run = true;
         let job_id = format!("scan_{}", Uuid::new_v4().to_string().replace("-", ""));
 
+        let group_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM groups.tracked_groups WHERE tenant_id = $1 AND group_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(group_id)
+        .fetch_one(self.pool.as_ref())
+        .await?;
+        if !group_exists {
+            return Err(anyhow!("ad scan group not found or access denied"));
+        }
+
         let message_count: i32 = sqlx::query_scalar(
             r#"
             SELECT COALESCE(COUNT(*), 0)::int

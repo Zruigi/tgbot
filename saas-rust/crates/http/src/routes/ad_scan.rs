@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tgbot_domain::error::{ApiError, ApiResult};
+use tgbot_domain::models::Role;
 use tgbot_services::ad_governance::AdGovernanceService;
 
 use crate::auth::resolve_scope;
@@ -27,6 +28,17 @@ fn map_ad_scan_error(error: anyhow::Error) -> ApiError {
         ApiError::NotFound("ad_scan_not_found".into())
     } else {
         ApiError::Anyhow(error)
+    }
+}
+
+fn require_ad_scan_write(role: &Role) -> ApiResult<()> {
+    if matches!(
+        role,
+        Role::MerchantOwner | Role::MerchantAdmin | Role::PlatformAdmin
+    ) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
     }
 }
 
@@ -87,6 +99,7 @@ pub async fn create_ad_scan(
     Json(payload): Json<CreateAdScanRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let scope = resolve_scope(&state, &headers).await?;
+    require_ad_scan_write(&scope.role)?;
     let (tenant_id, _) = scope.require_merchant()?;
 
     // Validate group_id
@@ -119,6 +132,19 @@ pub async fn create_ad_scan(
         "status": "ok",
         "job": job,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ad_scan_writes_require_owner_or_admin_scope() {
+        assert!(require_ad_scan_write(&Role::PlatformAdmin).is_ok());
+        assert!(require_ad_scan_write(&Role::MerchantOwner).is_ok());
+        assert!(require_ad_scan_write(&Role::MerchantAdmin).is_ok());
+        assert!(require_ad_scan_write(&Role::MerchantViewer).is_err());
+    }
 }
 
 /// GET /api/agent/ad-scans/{job_id}
@@ -180,6 +206,7 @@ pub async fn confirm_ad_scan(
     Json(payload): Json<ConfirmAdScanRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let scope = resolve_scope(&state, &headers).await?;
+    require_ad_scan_write(&scope.role)?;
     let (tenant_id, _) = scope.require_merchant()?;
 
     let dry_run = payload.dry_run.unwrap_or(true);

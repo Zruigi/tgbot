@@ -8,6 +8,7 @@
 //!   GET  /api/openai/models       — List available models
 //!   POST /api/openai/chat/completions — OpenAI-compatible chat
 
+use async_trait::async_trait;
 use axum::{
     extract::{Path as AxumPath, Query, State},
     http::HeaderMap,
@@ -19,20 +20,25 @@ use sqlx::Row;
 use std::{
     collections::BTreeMap,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tgbot_agent::contextual_command::resolve_contextual_command;
+use tgbot_agent::core::{default_tool_registry_with_pool_telegram_and_llm, AIAgent, LlmCaller};
 use tgbot_agent::deletion_guard::{is_agent_cancellation_text, is_agent_confirmation_text};
-use tgbot_agent::schema::AgentContext;
+use tgbot_agent::schema::{
+    AgentContext, AgentResponse, ChatMessage as AgentChatMessage, LlmCallResult, ToolCall,
+    ToolCallFunction,
+};
 use tgbot_agent::session::{get_session_store, AgentSession};
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_domain::models::Role;
-use tgbot_integrations::litellm::{ChatCompletionRequest, ChatMessage};
+use tgbot_integrations::litellm::{ChatCompletionRequest, ChatMessage, LiteLLMClient};
 use tgbot_services::{
     ad_governance::{AdGovernanceCluster, AdGovernanceService, AdScanJob, GroupInfo},
     ad_pipeline,
     ad_text::ad_text_hash,
 };
+use tracing::warn;
 
 use crate::auth::resolve_scope;
 use crate::state::AppState;
@@ -117,17 +123,271 @@ pub struct AdPipelineQuery {
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/ai/chat — Structured Intent Router
-// Calls LLM in JSON mode (temperature 0, 15s timeout) to analyze user intent
-// Routes to ad query tool if needed, otherwise returns direct reply
+// POST /api/ai/chat — tenant-scoped AI Agent chat
+// Preserves the frontend response shape while routing general chat through AIAgent.
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-pub struct IntentAnalysis {
-    need_tool: bool,
-    tool_name: Option<String>, // fixed to "query_ad_clusters"
-    group_id: Option<String>,  // advisory only, overridden by system chat_id
-    reply_content: String,     // direct reply or waiting prompt
+#[derive(Default)]
+struct AgentUsage {
+    model: Option<String>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Clone)]
+struct LiteLlmAgentCaller {
+    client: LiteLLMClient,
+    usage: Arc<Mutex<AgentUsage>>,
+}
+
+#[async_trait]
+impl LlmCaller for LiteLlmAgentCaller {
+    async fn call(
+        &self,
+        messages: &[AgentChatMessage],
+        model: &str,
+        tools: &[Value],
+    ) -> Result<LlmCallResult, anyhow::Error> {
+        let request = ChatCompletionRequest {
+            model: model.to_string(),
+            messages: messages
+                .iter()
+                .map(|message| ChatMessage {
+                    role: message.role.clone(),
+                    content: message.content.clone().unwrap_or_default(),
+                })
+                .collect(),
+            temperature: None,
+            max_tokens: None,
+            response_format: None,
+            extra: if tools.is_empty() {
+                Value::Null
+            } else {
+                json!({"tools": tools, "tool_choice": "auto"})
+            },
+        };
+        let response = self.client.chat_completion(&request).await?;
+        if let Ok(mut usage) = self.usage.lock() {
+            usage.model = response.model.clone().or_else(|| Some(model.to_string()));
+            if let Some(response_usage) = response.usage.as_ref() {
+                usage.prompt_tokens = usage
+                    .prompt_tokens
+                    .saturating_add(response_usage.prompt_tokens.unwrap_or_default());
+                usage.completion_tokens = usage
+                    .completion_tokens
+                    .saturating_add(response_usage.completion_tokens.unwrap_or_default());
+                usage.total_tokens = usage
+                    .total_tokens
+                    .saturating_add(response_usage.total_tokens.unwrap_or_default());
+            }
+        }
+
+        let choice = response
+            .choices
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("LiteLLM returned no choices"))?;
+        let tool_calls = choice
+            .message
+            .tool_calls
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(parse_agent_tool_call)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(LlmCallResult {
+            text: choice.message.content.clone().unwrap_or_default(),
+            tool_calls,
+        })
+    }
+}
+
+fn parse_agent_tool_call(value: &Value) -> Result<ToolCall, anyhow::Error> {
+    let function = value
+        .get("function")
+        .ok_or_else(|| anyhow::anyhow!("LiteLLM returned a tool call without function"))?;
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("LiteLLM returned a tool call without a name"))?;
+    let arguments = function
+        .get("arguments")
+        .map(|arguments| {
+            arguments
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| arguments.to_string())
+        })
+        .unwrap_or_else(|| "{}".into());
+    Ok(ToolCall {
+        function: ToolCallFunction {
+            name: name.to_string(),
+            arguments,
+        },
+    })
+}
+
+async fn build_agent(
+    state: &AppState,
+    role: &Role,
+    tenant_id: Option<&str>,
+) -> ApiResult<(AIAgent, Arc<Mutex<AgentUsage>>)> {
+    let usage = Arc::new(Mutex::new(AgentUsage::default()));
+    let pool = Arc::new(state.db()?.clone());
+    let telegram_client = match tenant_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "platform")
+    {
+        Some(tenant_id) => match state.tenant_telegram(tenant_id).await {
+            Ok((_, telegram)) => Some(Arc::new(telegram)),
+            Err(error) => {
+                warn!(tenant_id, %error, "AI agent Telegram client unavailable; write tools remain fail-closed");
+                None
+            }
+        },
+        None => None,
+    };
+    let mut tools = default_tool_registry_with_pool_telegram_and_llm(
+        Some(pool),
+        telegram_client,
+        Some(Arc::new(state.llm.clone())),
+    );
+    tools.retain_names(&[
+        "finance_query",
+        "broadcast_message",
+        "detect_advertising",
+        "generate_content",
+        "system_query",
+        "query_ad_clusters",
+        "query_recent_ad_messages",
+        "delete_recent_ad_messages",
+    ]);
+    if matches!(role, Role::MerchantViewer) {
+        tools.retain_names(&[
+            "finance_query",
+            "detect_advertising",
+            "generate_content",
+            "system_query",
+            "query_ad_clusters",
+        ]);
+    } else if matches!(
+        role,
+        Role::PlatformAdmin | Role::MerchantOwner | Role::MerchantAdmin
+    ) {
+        tools.retain_names(&[
+            "finance_query",
+            "broadcast_message",
+            "detect_advertising",
+            "generate_content",
+            "system_query",
+            "query_ad_clusters",
+            "skill_manage",
+            "query_recent_ad_messages",
+            "delete_recent_ad_messages",
+        ]);
+    }
+    let caller = LiteLlmAgentCaller {
+        client: state.llm.clone(),
+        usage: Arc::clone(&usage),
+    };
+    Ok((AIAgent::new(Arc::new(caller), Arc::new(tools)), usage))
+}
+
+fn refresh_agent_context_scope(
+    context: &mut AgentContext,
+    role: &Role,
+    tenant_id: &str,
+    merchant_id: Option<String>,
+    user_id: i64,
+    chat_id: Option<i64>,
+) {
+    context.user_id = user_id;
+    context
+        .metadata
+        .insert("tenant_id".into(), json!(tenant_id));
+    context
+        .metadata
+        .insert("merchant_id".into(), json!(merchant_id));
+    context
+        .metadata
+        .insert("role".into(), json!(format!("{role:?}")));
+    context.metadata.insert("user_id".into(), json!(user_id));
+    context.metadata.insert("chat_id".into(), json!(chat_id));
+    context.metadata.insert("group_id".into(), json!(chat_id));
+}
+
+fn take_agent_usage(usage: &Arc<Mutex<AgentUsage>>) -> AgentUsage {
+    usage
+        .lock()
+        .map(|mut usage| std::mem::take(&mut *usage))
+        .unwrap_or_default()
+}
+
+async fn record_agent_usage(
+    state: &AppState,
+    user_id: i64,
+    tenant_id: &str,
+    feature_key: &str,
+    model: &str,
+    usage: AgentUsage,
+) {
+    if usage.total_tokens == 0 && usage.prompt_tokens == 0 && usage.completion_tokens == 0 {
+        return;
+    }
+    let model = usage.model.as_deref().unwrap_or(model);
+    let prompt_tokens = i64::try_from(usage.prompt_tokens).unwrap_or(i64::MAX);
+    let completion_tokens = i64::try_from(usage.completion_tokens).unwrap_or(i64::MAX);
+    let total_token_count = if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        usage.prompt_tokens.saturating_add(usage.completion_tokens)
+    };
+    let total_tokens = i64::try_from(total_token_count).unwrap_or(i64::MAX);
+    let Ok(pool) = state.db() else {
+        return;
+    };
+    let _ = sqlx::query(
+        "INSERT INTO ai_usage_logs (channel, user_id, tenant_id, feature_key, result_status, endpoint, model, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind("web_chat")
+    .bind(user_id)
+    .bind(tenant_id)
+    .bind(feature_key)
+    .bind("success")
+    .bind("ai_chat")
+    .bind(model)
+    .bind(prompt_tokens)
+    .bind(completion_tokens)
+    .bind(total_tokens)
+    .bind(0.0f64)
+    .execute(pool)
+    .await;
+}
+
+fn agent_response_json(response: &AgentResponse, pending_preserved: bool) -> Json<Value> {
+    let llm_failed = response.text.starts_with("[LLM 错误]");
+    let failed = llm_failed || pending_preserved;
+    let requires_confirmation = response.requires_confirmation || pending_preserved;
+    Json(json!({
+        "status": if failed { "error" } else { "ok" },
+        "reply": response.text,
+        "tool_calls_made": response.tool_calls_made,
+        "tool_results": response.tool_results,
+        "is_action_taken": response.is_action_taken,
+        "requires_confirmation": requires_confirmation,
+        "action_summary": response.action_summary,
+        "confidence": response.confidence,
+        "data": {
+            "reply": response.text,
+            "executed": response.is_action_taken,
+            "action_taken": response.is_action_taken,
+            "pending_preserved": pending_preserved,
+        },
+    }))
 }
 
 fn normalized_nonempty(value: Option<&str>) -> Option<String> {
@@ -285,6 +545,7 @@ fn successful_agent_response(
     }))
 }
 
+#[cfg(test)]
 fn fail_closed_tool_response(message: &str, reply: &str) -> Json<Value> {
     Json(json!({
         "status": "error",
@@ -670,26 +931,25 @@ pub async fn ai_chat(
     // 1. Get or create session
     let session_store = get_session_store();
     let merchant_id_str = scope.merchant_id.as_ref().map(|m| m.to_string());
-    let session_key = AgentSession::session_key(tenant_id, user_id, merchant_id_str.as_deref());
+    let actor_key = scope.actor_key.as_deref().ok_or(ApiError::Unauthorized)?;
+    let session_key = AgentSession::session_key_with_actor(
+        tenant_id,
+        actor_key,
+        user_id,
+        merchant_id_str.as_deref(),
+    );
 
-    let mut session = session_store.get(&session_key).unwrap_or_else(|| {
-        let mut ctx = AgentContext::new(user_id);
-        // Initialize metadata
-        ctx.metadata.insert("tenant_id".into(), json!(tenant_id));
-        ctx.metadata.insert(
-            "merchant_id".into(),
-            scope
-                .merchant_id
-                .as_ref()
-                .map(|m| json!(m.to_string()))
-                .unwrap_or(Value::Null),
-        );
-        ctx.metadata
-            .insert("role".into(), json!(format!("{:?}", scope.role)));
-        ctx.metadata.insert("chat_id".into(), json!(real_chat_id));
-        ctx.metadata.insert("group_id".into(), json!(real_chat_id));
-        AgentSession::new(ctx)
-    });
+    let mut session = session_store
+        .get(&session_key)
+        .unwrap_or_else(|| AgentSession::new(AgentContext::new(user_id)));
+    refresh_agent_context_scope(
+        &mut session.ctx,
+        &scope.role,
+        tenant_id,
+        merchant_id_str,
+        user_id,
+        real_chat_id,
+    );
 
     session.update_timestamp();
 
@@ -717,22 +977,41 @@ pub async fn ai_chat(
     // =========================================================================
     if let Some(pending) = session.pending.take() {
         if is_agent_confirmation_text(&truncated_input) {
-            // This route does not own an initialized AIAgent/tool registry yet. Keep the
-            // operation pending and fail closed instead of claiming it was executed.
-            session.pending = Some(pending);
+            let (agent, _) = match build_agent(&state, &scope.role, Some(tenant_id)).await {
+                Ok(agent) => agent,
+                Err(_) => {
+                    session.pending = Some(pending);
+                    session_store.update(&session_key, session);
+                    return Ok(Json(json!({
+                        "status": "error",
+                        "reply": "确认执行环境暂不可用，本次未执行任何操作。待确认操作仍已保留，可输入“取消”撤销。",
+                        "tool_calls_made": [],
+                        "tool_results": {},
+                        "data": {
+                            "reply": "确认执行环境暂不可用，本次未执行任何操作。待确认操作仍已保留，可输入“取消”撤销。",
+                            "executed": false,
+                            "pending_preserved": true
+                        },
+                    })));
+                }
+            };
+            let response = agent.confirm_and_execute(&pending, &session.ctx).await;
+            let pending_preserved = !response.is_action_taken;
+            if pending_preserved {
+                session.pending = Some(pending);
+            }
+            session
+                .ctx
+                .conversation_history
+                .push(AgentChatMessage::user(&truncated_input));
+            session
+                .ctx
+                .conversation_history
+                .push(AgentChatMessage::assistant(&response.text));
+            session.ctx.trim_history(40);
+            session.update_timestamp();
             session_store.update(&session_key, session);
-
-            return Ok(Json(json!({
-                "status": "error",
-                "reply": "确认执行链路暂不可用，本次未执行任何操作。待确认操作仍已保留，可输入“取消”撤销。",
-                "tool_calls_made": [],
-                "tool_results": {},
-                "data": {
-                    "reply": "确认执行链路暂不可用，本次未执行任何操作。待确认操作仍已保留，可输入“取消”撤销。",
-                    "executed": false,
-                    "pending_preserved": true
-                },
-            })));
+            return Ok(agent_response_json(&response, pending_preserved));
         } else {
             // Not a confirmation, restore pending and continue
             session.pending = Some(pending);
@@ -760,173 +1039,41 @@ pub async fn ai_chat(
     // Save session with any metadata updates
     session_store.update(&session_key, session.clone());
 
-    // =========================================================================
-    // STRUCTURED INTENT ANALYSIS — Original flow
-    // =========================================================================
-
-    // Structured intent analysis via LLM (JSON mode, temperature 0, 15s timeout)
-    // System prompt guides LLM to output JSON with specific structure
-    let intent_prompt = format!(
-        r#"分析用户意图，返回 JSON 对象：
-{{"need_tool": false|true, "tool_name": "query_ad_clusters"|null, "group_id": "群ID"|null, "reply_content": "直接回复或等待提示"}}
-
-用户消息: {}"#,
-        routed_input // Use routed input (expanded contextual commands)
-    );
-
-    // Structured intent analysis: LLM in JSON mode, temperature 0, 15s timeout
-    let intent_request = ChatCompletionRequest {
-        model: "gemini-2.5-flash-lite".into(),
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: intent_prompt,
-        }],
-        temperature: Some(0.0), // Deterministic output (temperature 0, spec-2.2b)
-        max_tokens: None,
-        response_format: None,
-        extra: Value::Null,
-    };
-
-    let response = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        state.llm.chat_completion(&intent_request),
-    )
-    .await
-    {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(_)) | Err(_) => {
-            // Timeout or LLM error → degrade gracefully
-            return Ok(Json(json!({
-                "status": "ok",
-                "reply": "抱歉，处理过程中出现了问题。请重新尝试。",
-                "tool_calls_made": [],
-                "tool_results": {},
-                "data": { "reply": "抱歉，处理过程中出现了问题。请重新尝试。" },
-            })));
-        }
-    };
-
-    let reply_text = response
-        .choices
-        .first()
-        .and_then(|choice| choice.message.content.clone())
-        .unwrap_or_default();
-
-    // Parse IntentAnalysis JSON (fail-closed on parse error)
-    let intent: IntentAnalysis = match serde_json::from_str(&reply_text) {
-        Ok(parsed) => parsed,
+    let model = body.model.as_deref().unwrap_or("gemini-2.5-flash-lite");
+    let (agent, usage) = match build_agent(&state, &scope.role, Some(tenant_id)).await {
+        Ok(agent) => agent,
         Err(_) => {
-            // JSON parse failure → friendly degraded reply, no tool execution
             return Ok(Json(json!({
-                "status": "ok",
-                "reply": "抱歉，我在处理您的请求时遇到了问题。请尝试用更清晰的方式重新表述。",
+                "status": "error",
+                "reply": "AI 执行环境暂不可用，本次未执行任何操作。",
                 "tool_calls_made": [],
                 "tool_results": {},
-                "data": { "reply": "抱歉，我在处理您的请求时遇到了问题。请尝试用更清晰的方式重新表述。" },
+                "data": {
+                    "reply": "AI 执行环境暂不可用，本次未执行任何操作。",
+                    "executed": false,
+                },
             })));
         }
     };
-
-    // Log usage
-    let prompt_tokens = response
-        .usage
-        .as_ref()
-        .and_then(|usage| usage.prompt_tokens)
-        .and_then(|value| i64::try_from(value).ok())
-        .unwrap_or_else(|| (truncated_input.len() / 4) as i64);
-    let completion_tokens = response
-        .usage
-        .as_ref()
-        .and_then(|usage| usage.completion_tokens)
-        .and_then(|value| i64::try_from(value).ok())
-        .unwrap_or_else(|| (reply_text.len() / 4) as i64);
-    let total_tokens = response
-        .usage
-        .as_ref()
-        .and_then(|usage| usage.total_tokens)
-        .and_then(|value| i64::try_from(value).ok())
-        .unwrap_or(prompt_tokens + completion_tokens);
-    let usage_model = response.model.as_deref().unwrap_or(&intent_request.model);
-    let _ = sqlx::query(
-        "INSERT INTO ai_usage_logs (channel, user_id, tenant_id, feature_key, result_status, endpoint, model, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
+    let response = agent
+        .process_message(&routed_input, &mut session.ctx, model)
+        .await;
+    if response.requires_confirmation {
+        session.set_pending(response.clone());
+    }
+    session.update_timestamp();
+    session_store.update(&session_key, session);
+    let usage = take_agent_usage(&usage);
+    record_agent_usage(
+        &state,
+        user_id,
+        tenant_id,
+        body.feature_key.as_deref().unwrap_or("general"),
+        model,
+        usage,
     )
-    .bind("web_chat")
-    .bind(user_id)
-    .bind(tenant_id)
-    .bind(body.feature_key.as_deref().unwrap_or("general"))
-    .bind("success")
-    .bind("ai_chat")
-    .bind(usage_model)
-    .bind(prompt_tokens)
-    .bind(completion_tokens)
-    .bind(total_tokens)
-    .bind(0.0f64)
-    .execute(state.db()?)
     .await;
-
-    // Route based on intent analysis
-    if !intent.need_tool {
-        // Direct reply, no tool execution
-        return Ok(Json(json!({
-            "status": "ok",
-            "reply": intent.reply_content,
-            "tool_calls_made": [],
-            "tool_results": {},
-            "data": {
-                "reply": intent.reply_content,
-                "executed": false,
-                "action_taken": false,
-            },
-        })));
-    }
-
-    let Some(effective_tool_name) = intent.tool_name.as_deref() else {
-        return Ok(fail_closed_tool_response(
-            "AI requested a tool without naming one; no tool was executed",
-            "需要调用工具，但未提供有效工具名；本次未执行任何操作。",
-        ));
-    };
-
-    if effective_tool_name != "query_ad_clusters" {
-        return Ok(fail_closed_tool_response(
-            &format!("unsupported AI tool: {effective_tool_name}"),
-            "请求的工具未注册，本次未执行任何操作。",
-        ));
-    }
-
-    // Override group_id with real system chat_id (prompt injection defense)
-    let effective_group_id =
-        real_chat_id.or_else(|| intent.group_id.as_ref().and_then(|s| s.parse::<i64>().ok()));
-    let action_tenant_id = ad_scan_tenant_id(scope.tenant_id.as_deref(), &scope.role, &body)?;
-    let result = ad_pipeline::query_clusters(
-        state.db()?,
-        Some(&action_tenant_id),
-        effective_group_id,
-        "pending",
-        20,
-        60,
-    )
-    .await?;
-    let tool_message = result
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("广告聚合查询已执行")
-        .to_string();
-    let reply = if intent.reply_content.trim().is_empty() {
-        tool_message.as_str()
-    } else {
-        intent.reply_content.trim()
-    };
-    let tool_result = tool_result(&tool_message, result, false);
-    Ok(successful_agent_response(
-        reply,
-        effective_tool_name,
-        tool_result,
-        vec![],
-        None,
-        false,
-    ))
+    Ok(agent_response_json(&response, false))
 }
 
 // ---------------------------------------------------------------------------
@@ -1811,6 +1958,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_native_tool_call_arguments_in_string_or_object_form() {
+        let string_arguments = parse_agent_tool_call(&json!({
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "finance_query", "arguments": "{\"action\":\"summary\"}"}
+        }))
+        .expect("string arguments should parse");
+        assert_eq!(string_arguments.function.name, "finance_query");
+        assert_eq!(
+            string_arguments.function.parse_arguments()["action"],
+            "summary"
+        );
+
+        let object_arguments = parse_agent_tool_call(&json!({
+            "function": {"name": "detect_advertising", "arguments": {"text": "beta"}}
+        }))
+        .expect("object arguments should parse");
+        assert_eq!(object_arguments.function.parse_arguments()["text"], "beta");
+    }
+
+    #[test]
     fn platform_ad_action_requires_explicit_tenant_and_merchant_scope_wins() {
         let request: AiChatRequest = serde_json::from_value(json!({
             "content": "执行操作",
@@ -1881,5 +2049,35 @@ mod tests {
         assert!(is_ad_scan_intent(" 全量扫描广告 "));
         assert!(is_ad_scan_intent("检查广告"));
         assert!(!is_ad_scan_intent("请介绍一下广告治理功能"));
+    }
+
+    #[test]
+    fn refresh_agent_context_scope_replaces_stale_authoritative_metadata() {
+        let mut context = AgentContext::new(7);
+        context
+            .metadata
+            .insert("tenant_id".into(), json!("stale-tenant"));
+        context
+            .metadata
+            .insert("merchant_id".into(), json!("stale-merchant"));
+        context.metadata.insert("chat_id".into(), json!(-1001));
+        context.metadata.insert("group_id".into(), json!(-1001));
+
+        refresh_agent_context_scope(
+            &mut context,
+            &Role::MerchantViewer,
+            "tenant-current",
+            None,
+            42,
+            Some(-1002),
+        );
+
+        assert_eq!(context.user_id, 42);
+        assert_eq!(context.metadata["tenant_id"], json!("tenant-current"));
+        assert_eq!(context.metadata["merchant_id"], Value::Null);
+        assert_eq!(context.metadata["role"], json!("MerchantViewer"));
+        assert_eq!(context.metadata["user_id"], json!(42));
+        assert_eq!(context.metadata["chat_id"], json!(-1002));
+        assert_eq!(context.metadata["group_id"], json!(-1002));
     }
 }

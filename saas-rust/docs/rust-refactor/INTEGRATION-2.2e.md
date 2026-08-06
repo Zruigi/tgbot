@@ -351,7 +351,7 @@ be used as the current release status.
 - `crates/workers/src/lib.rs` — pub mod ad_governance_worker
 
 **Current evidence**:
-- `scripts/beta-runtime-check.sh` runs migrations through `0026` twice and
+- `scripts/beta-runtime-check.sh` runs migrations through `0031` twice and
   records the local matrix in
   `target/beta-reports/runtime-gate-report.json`.
 - `target/beta-reports/frontend-runtime-contract-report.json` records 102/102

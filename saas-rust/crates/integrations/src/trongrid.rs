@@ -266,6 +266,40 @@ impl TronGridClient {
         Ok(json.get("data").cloned().unwrap_or(Value::Array(vec![])))
     }
 
+    pub async fn get_trc20_transactions(
+        &self,
+        address: &str,
+        token_contract: &str,
+        limit: usize,
+    ) -> Result<Value> {
+        let url = format!(
+            "{}/v1/accounts/{}/transactions/trc20",
+            self.config.base_url, address
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[
+                ("limit", limit.clamp(1, 200).to_string()),
+                ("contract_address", token_contract.to_string()),
+                ("order_by", "block_timestamp,desc".to_string()),
+            ])
+            .header("TRON-PRO-API-KEY", &self.config.api_key)
+            .send()
+            .await
+            .context("TronGrid TRC20 transaction request failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            warn!(status = %status, "TronGrid TRC20 transaction request returned an error");
+            return Err(anyhow!("TronGrid TRC20 transaction request failed"));
+        }
+        let json: Value = resp
+            .json()
+            .await
+            .context("failed to parse TronGrid TRC20 transaction response")?;
+        Ok(json.get("data").cloned().unwrap_or(Value::Array(vec![])))
+    }
+
     /// Get a specific transaction by ID.
     pub async fn get_transaction(&self, tx_id: &str) -> Result<Value> {
         let url = format!("{}/v1/transactions/{}", self.config.base_url, tx_id);

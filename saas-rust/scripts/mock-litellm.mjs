@@ -23,7 +23,12 @@ const server = http.createServer((request, response) => {
       const systemInput = String(messages.find((message) => message?.role === 'system')?.content || '')
       const intentPrefix = '分析用户意图，返回 JSON 对象：'
       const userMessageMarker = '用户消息: '
+      const nativeToolRequest = messages.some((message) =>
+        message?.role === 'user' && String(message?.content || '').trim() === 'query clusters beta')
+      const hasToolResult = messages.some((message) =>
+        String(message?.content || '').includes('[工具执行结果]'))
       let content = `mock:${input}`
+      let toolCalls = []
       if (systemInput.includes('You are an ad classifier')) {
         const arrayStart = input.indexOf('[')
         const clusters = arrayStart >= 0 ? JSON.parse(input.slice(arrayStart)) : []
@@ -33,6 +38,18 @@ const server = http.createServer((request, response) => {
           confidence: 0.95,
           reason: 'beta runtime deterministic ad classification'
         })))
+      } else if (nativeToolRequest && !hasToolResult) {
+        content = null
+        toolCalls = [{
+          id: 'call_beta_query_ad_clusters',
+          type: 'function',
+          function: {
+            name: 'query_ad_clusters',
+            arguments: JSON.stringify({ status: 'pending', limit: 20, window_minutes: 60 })
+          }
+        }]
+      } else if (nativeToolRequest && hasToolResult) {
+        content = 'mock:query clusters beta'
       } else if (input.startsWith(intentPrefix)) {
         const markerIndex = input.lastIndexOf(userMessageMarker)
         const userMessage = markerIndex >= 0
@@ -50,7 +67,11 @@ const server = http.createServer((request, response) => {
         object: 'chat.completion',
         created: 1700000000,
         model: body.model || 'beta-mock',
-        choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) },
+          finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop'
+        }],
         usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 }
       })
       response.writeHead(200, { 'content-type': 'application/json' }).end(payload)

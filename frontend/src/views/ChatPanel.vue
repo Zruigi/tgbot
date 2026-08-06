@@ -196,6 +196,32 @@
                 </span>
               </div>
             </div>
+            <div v-if="isAiAssistantUserId(msg.from_userid) && getAgentUiActions(msg).length"
+                 class="flex flex-wrap gap-2 max-w-[94%] sm:max-w-[86%] md:max-w-[74%]">
+              <button v-for="action in getAgentUiActions(msg)" :key="action.id + JSON.stringify(action.payload || {})"
+                      @click="handleAgentUiAction(action)"
+                      :disabled="agentActionBusy[actionBusyKey(action)]"
+                      class="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold border rounded-lg disabled:opacity-50"
+                      :class="action.style === 'danger'
+                        ? 'border-rose-300 text-rose-600 bg-rose-50 hover:bg-rose-100'
+                        : action.style === 'primary'
+                          ? 'border-primary/30 text-primary bg-primary/5 hover:bg-primary/10'
+                          : 'border-outline-variant/30 text-slate-600 bg-surface-container hover:bg-surface-container-high'">
+                <span class="material-symbols-outlined text-sm">{{ action.icon || 'touch_app' }}</span>
+                <span>{{ action.label }}</span>
+                <span v-if="action.description" class="font-normal opacity-70">{{ action.description }}</span>
+              </button>
+            </div>
+            <div v-if="isAiAssistantUserId(msg.from_userid) && isAgentJobRunning(getAgentJob(msg))"
+                 class="w-[min(32rem,94%)] px-3 py-2 border border-primary/15 bg-primary/5 rounded-lg">
+              <div class="flex items-center justify-between text-xs font-bold text-primary mb-1.5">
+                <span>{{ agentJobStatusText(getAgentJob(msg)) }}</span>
+                <span>{{ Number(getAgentJob(msg)?.progress || 0) }}%</span>
+              </div>
+              <div class="h-1.5 bg-primary/10 rounded-full overflow-hidden">
+                <div class="h-full bg-primary transition-all duration-300" :style="{ width: `${Number(getAgentJob(msg)?.progress || 0)}%` }"></div>
+              </div>
+            </div>
             <div class="hidden md:flex absolute top-1/2 -translate-y-1/2 right-0 items-center gap-1">
               <button @click="prepareReply(msg)"
                       class="p-1.5 rounded-lg border"
@@ -293,9 +319,15 @@ const chatStore = useChatStore()
 const themeStore = useThemeStore()
 const router = useRouter()
 const AI_ASSISTANT_USER_ID = -99999
+const LEGACY_AI_ASSISTANT_USER_IDS = new Set([900000001])
 
 function isAiAssistantUserId(userId: unknown): boolean {
   return Number(userId) === AI_ASSISTANT_USER_ID
+}
+
+function isVirtualAssistantUserId(userId: unknown): boolean {
+  const normalized = Number(userId)
+  return normalized === AI_ASSISTANT_USER_ID || LEGACY_AI_ASSISTANT_USER_IDS.has(normalized)
 }
 
 // ★ AI 正在输入/输出状态（独立于消息状态，用于全局UI提示）
@@ -317,6 +349,8 @@ const enableTranslation = ref(true)
 const longPressTimer = ref<ReturnType<typeof setTimeout> | null>(null)
 const mobileActionMsg = ref<any | null>(null)
 let pollTimer: ReturnType<typeof setInterval>|null = null
+const agentActionBusy = reactive<Record<string, boolean>>({})
+const agentJobPollers = new Map<string, ReturnType<typeof setInterval>>()
 
 const avatarUrl = computed(() => {
   const aid = chatStore.getSelectedUserAvatar()
@@ -325,13 +359,19 @@ const avatarUrl = computed(() => {
   return resolveMediaUrl(chatStore.fileUrls[aid] || '')
 })
 
-const normalizedUsers = computed(() =>
-  (chatStore.users || []).map((u: any) => ({
-    ...u,
-    from_userid: Number(u.from_userid ?? u.user_id ?? 0),
-    from_username: u.from_username ?? u.username ?? ''
-  }))
-)
+const normalizedUsers = computed(() => {
+  const usersById = new Map<number, any>()
+  for (const rawUser of chatStore.users || []) {
+    const userId = Number(rawUser.from_userid ?? rawUser.user_id ?? 0)
+    if (!userId || isVirtualAssistantUserId(userId) || usersById.has(userId)) continue
+    usersById.set(userId, {
+      ...rawUser,
+      from_userid: userId,
+      from_username: rawUser.from_username ?? rawUser.username ?? ''
+    })
+  }
+  return [...usersById.values()]
+})
 
 // Agent Assistant contact - fixed entry
 const agentAssistantContact = {
@@ -513,6 +553,8 @@ watch(() => chatStore.users, (list) => {
 onMounted(() => { fetchUsers(); loadConfig(); pollTimer = setInterval(pollLatestMessages, 15000) })
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
+  for (const timer of agentJobPollers.values()) clearInterval(timer)
+  agentJobPollers.clear()
   clearLongPressTimer()
 })
 
@@ -613,6 +655,10 @@ async function fetchMessages() {
   await chatStore.fetchMessages(chatStore.selectedUserId, 1)
   cleanupPendingMediaPreviews(chatStore.messages)
   triggerAutoLoadForMessages(chatStore.messages)
+  for (const msg of chatStore.messages) {
+    const job = getAgentJob(msg)
+    if (isAgentJobRunning(job)) startAgentJobPolling(String(job.job_id), msg)
+  }
   msgPage.value = 1
   hasMoreMessages.value = (chatStore.messages.length >= BACKEND_PAGE_SIZE)
   await nextTick()
@@ -894,6 +940,103 @@ function getMsgStatus(msg: any) {
   return msg.from_userid !== chatStore.selectedUserId ? 'sent' : 'received'
 }
 
+function getAgentUiPayload(msg: any): any {
+  if (msg?.ui_actions || msg?.job) return { ui_actions: msg.ui_actions || [], job: msg.job || null }
+  const raw = msg?.agent_ui_json
+  if (!raw) return { ui_actions: [], job: null }
+  if (typeof raw === 'object') return raw
+  try { return JSON.parse(String(raw)) } catch { return { ui_actions: [], job: null } }
+}
+
+function getAgentUiActions(msg: any): any[] {
+  const actions = getAgentUiPayload(msg)?.ui_actions
+  return Array.isArray(actions) ? actions : []
+}
+
+function getAgentJob(msg: any): any {
+  return getAgentUiPayload(msg)?.job || null
+}
+
+function isAgentJobRunning(job: any): boolean {
+  return Boolean(job && ['prepared', 'queued', 'scanning', 'classifying'].includes(String(job.status || '')))
+}
+
+function agentJobStatusText(job: any): string {
+  const labels: Record<string, string> = {
+    prepared: '等待确认', queued: '等待扫描', scanning: '正在聚类历史消息', classifying: '正在判断未知文本簇'
+  }
+  return labels[String(job?.status || '')] || '处理中'
+}
+
+function actionBusyKey(action: any): string {
+  return `${String(action?.id || '')}:${JSON.stringify(action?.payload || {})}`
+}
+
+function appendAgentApiResponse(res: any): any {
+  const content = String(res?.reply ?? res?.data?.reply ?? '')
+  const msg: any = {
+    msg_id: Date.now() + Math.floor(Math.random() * 1000),
+    from_userid: AI_ASSISTANT_USER_ID,
+    to_userid: 0,
+    content,
+    timestamp: new Date().toISOString(),
+    status: 'received',
+    type: 'text',
+    msg_type: 'text',
+    ui_actions: Array.isArray(res?.ui_actions) ? res.ui_actions : [],
+    job: res?.job || null,
+  }
+  chatStore.messages = [...chatStore.messages, msg]
+  if (isAgentJobRunning(msg.job)) startAgentJobPolling(String(msg.job.job_id), msg)
+  nextTick(() => scrollToBottom())
+  return msg
+}
+
+async function handleAgentUiAction(action: any, silent = false) {
+  const key = actionBusyKey(action)
+  if (agentActionBusy[key]) return
+  agentActionBusy[key] = true
+  try {
+    const res = await apiJson('/api/ai/chat', 'POST', {
+      userId: AI_ASSISTANT_USER_ID,
+      content: silent ? '查看扫描结果' : String(action?.label || '执行操作'),
+      agent_action: { id: action?.id, payload: action?.payload || {} },
+    }, { isAiCall: true })
+    if (res?.status !== 'ok') throw new Error(res?.message || 'Agent 操作失败')
+    appendAgentApiResponse(res)
+    setTimeout(() => fetchMessages(), 800)
+  } catch (error: any) {
+    chatStore.messages = [...chatStore.messages, {
+      msg_id: Date.now(), from_userid: AI_ASSISTANT_USER_ID, to_userid: 0,
+      content: `[错误] ${error?.message || 'Agent 操作失败'}`,
+      timestamp: new Date().toISOString(), status: 'error', type: 'text', msg_type: 'text',
+    }]
+  } finally {
+    agentActionBusy[key] = false
+  }
+}
+
+function startAgentJobPolling(jobId: string, targetMsg: any) {
+  if (!jobId || agentJobPollers.has(jobId)) return
+  const timer = setInterval(async () => {
+    try {
+      const response = await fetch(`/api/agent/ad-scans/${encodeURIComponent(jobId)}`, { headers: authH() })
+      const data = await response.json()
+      if (!response.ok || data?.status !== 'ok') return
+      targetMsg.job = data.job
+      chatStore.messages = chatStore.messages.map((msg: any) => msg.msg_id === targetMsg.msg_id ? { ...msg, job: data.job } : msg)
+      if (['completed', 'partial', 'failed', 'cancelled'].includes(String(data.job?.status || ''))) {
+        clearInterval(timer)
+        agentJobPollers.delete(jobId)
+        if (['completed', 'partial'].includes(String(data.job?.status || ''))) {
+          await handleAgentUiAction({ id: 'get_ad_scan_result', payload: { job_id: jobId }, label: '查看扫描结果' }, true)
+        }
+      }
+    } catch {}
+  }, 2000)
+  agentJobPollers.set(jobId, timer)
+}
+
 async function sendMessage() {
   if (!chatStore.selectedUserId || (!inputText.value.trim() && !selectedImage.value)) return
   const sentContent = inputText.value.trim()
@@ -1049,9 +1192,14 @@ async function sendMessageAsync(
             timestamp: new Date().toISOString(),
             status: 'received',
             type: aiMsgType,
-            msg_type: aiMsgType
+            msg_type: aiMsgType,
+            ui_actions: Array.isArray((res as any).ui_actions) ? (res as any).ui_actions : [],
+            job: (res as any).job || null,
           }
           chatStore.messages = [...chatStore.messages, aiMsg]
+          if (isAgentJobRunning((aiMsg as any).job)) {
+            startAgentJobPolling(String((aiMsg as any).job.job_id), aiMsg)
+          }
           await nextTick()
           scrollToBottom()
 

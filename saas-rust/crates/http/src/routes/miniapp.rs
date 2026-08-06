@@ -1,9 +1,5 @@
 // MiniApp routes - Bootstrap, Context, Logout/Revoke
-use axum::{
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
-    Json,
-};
+use axum::{extract::State, http::HeaderMap, Json};
 use chrono::{FixedOffset, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -96,80 +92,12 @@ fn normalize_entry_intent(value: Option<&str>) -> String {
     intent
 }
 
-fn normalize_role_hint(value: Option<&str>) -> String {
-    let role = value.unwrap_or("platform_admin").to_lowercase();
-    if !["platform_admin", "merchant_owner"].contains(&role.as_str()) {
-        return "platform_admin".to_string();
-    }
-    role
-}
-
 fn identity_label(role: &str) -> &'static str {
     match role {
         "platform_admin" => "平台管理员",
         "merchant_owner" => "商户管理员",
         _ => "未注册用户",
     }
-}
-
-fn resolve_identity_scope(
-    entry_intent: &str,
-    is_platform_admin: bool,
-    has_merchant: bool,
-    last_scope: &str,
-) -> (String, String) {
-    let normalized_intent = normalize_entry_intent(Some(entry_intent));
-    let normalized_last = normalize_role_hint(Some(last_scope));
-
-    if normalized_intent == "merchant_console" {
-        if has_merchant {
-            return (
-                "merchant_owner".to_string(),
-                "merchant_console_entry".to_string(),
-            );
-        }
-        if is_platform_admin {
-            return (
-                "platform_admin".to_string(),
-                "merchant_entry_fallback_platform".to_string(),
-            );
-        }
-    }
-
-    if normalized_intent == "admin_console" {
-        if is_platform_admin {
-            return (
-                "platform_admin".to_string(),
-                "admin_console_entry".to_string(),
-            );
-        }
-        if has_merchant {
-            return (
-                "merchant_owner".to_string(),
-                "admin_entry_fallback_merchant".to_string(),
-            );
-        }
-    }
-
-    if is_platform_admin && has_merchant {
-        return (
-            normalized_last.clone(),
-            "dual_identity_last_scope".to_string(),
-        );
-    }
-    if is_platform_admin {
-        return (
-            "platform_admin".to_string(),
-            "platform_identity".to_string(),
-        );
-    }
-    if has_merchant {
-        return (
-            "merchant_owner".to_string(),
-            "merchant_identity".to_string(),
-        );
-    }
-    ("unregistered".to_string(), "unregistered".to_string())
 }
 
 fn build_landing_payload(
@@ -256,11 +184,15 @@ pub async fn bootstrap(
             if otp_data.expire_at > now {
                 otp_store.remove(&otp).await;
                 let session_token = crate::routes::auth::issue_session_token(
+                    &state.config.session_secret,
                     &otp_data.role,
                     &otp_data.tenant_id,
                     otp_data.merchant_id,
                     otp_data.issued_for.as_deref(),
-                );
+                )
+                .ok_or_else(|| {
+                    ApiError::ServiceUnavailable("session signing unavailable".into())
+                })?;
                 token = Some(session_token.clone());
                 session = Some(json!({
                     "role": otp_data.role,
@@ -275,11 +207,13 @@ pub async fn bootstrap(
         let grant_store = state.grant_store.clone();
         if let Some(grant_data) = grant_store.get(&grant).await {
             let session_token = crate::routes::auth::issue_session_token(
+                &state.config.session_secret,
                 &grant_data.role_hint,
                 &grant_data.tenant_id,
                 grant_data.merchant_id,
                 Some(&grant_data.issued_for),
-            );
+            )
+            .ok_or_else(|| ApiError::ServiceUnavailable("session signing unavailable".into()))?;
             token = Some(session_token.clone());
             session = Some(json!({
                 "role": grant_data.role_hint,

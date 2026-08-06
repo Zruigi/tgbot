@@ -342,7 +342,9 @@ pub async fn send_channel_reminder(
     }
     let channel_link = normalize_channel_link(&body.channel_link)?;
     let verify_channel_id = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT verify_channel_id FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+        "SELECT verify_channel_id FROM groups.tracked_groups \
+         WHERE group_id = $1 AND tenant_id = $2 \
+           AND verify_enabled = true AND verify_type = 'channel'",
     )
     .bind(body.group_id)
     .bind(tenant_id)

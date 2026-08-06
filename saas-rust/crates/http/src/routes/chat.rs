@@ -247,6 +247,7 @@ pub async fn send_message(
                         caption: (!content.is_empty()).then(|| content.clone()),
                         parse_mode: None,
                         reply_to_message_id: body.reply_to_msg_id,
+                        reply_markup: None,
                     })
                     .await
             }

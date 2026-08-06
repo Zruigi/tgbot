@@ -107,7 +107,10 @@ pub async fn rate_limit_middleware(request: Request<Body>, next: Next) -> Respon
 
     // Skip rate limiting for health checks
     let path = request.uri().path();
-    if path == "/healthz" || path == "/api/health" || path == "/ws" {
+    if matches!(
+        path,
+        "/healthz" | "/api/health" | "/readyz" | "/api/ready" | "/ws"
+    ) {
         return next.run(request).await;
     }
 

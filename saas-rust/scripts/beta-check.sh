@@ -10,6 +10,14 @@ if ! git -C "$repository_root" diff --quiet origin/master -- frontend static; th
   exit 1
 fi
 
+bash "$script_directory/check-migration-manifest.sh"
+
+formal_feature_graph=$(cargo tree -p tgbot-app -e features --manifest-path "$rust_root/Cargo.toml")
+if grep -Eq 'legacy-(bot|workers|stubs)' <<<"$formal_feature_graph"; then
+  echo "Beta gate failed: formal tgbot-app graph enables a legacy feature." >&2
+  exit 1
+fi
+
 node "$script_directory/check-api-parity.mjs" \
   --report "$rust_root/target/beta-reports/api-static-registration.json"
 cargo test --manifest-path "$rust_root/Cargo.toml" \

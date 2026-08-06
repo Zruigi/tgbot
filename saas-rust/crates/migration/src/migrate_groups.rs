@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::PgPool;
 
+use crate::migration_audit::MigrationFailure;
 use crate::sqlite_reader::{SqliteConfig, SqliteGroup, SqliteGroupMember, SqliteReader};
 
 /// Migration statistics for groups
@@ -22,6 +23,7 @@ pub struct GroupStats {
     pub migrated: i64,
     pub skipped: i64,
     pub errors: i64,
+    pub failures: Vec<MigrationFailure>,
 }
 
 /// Statistics for group members migration
@@ -31,6 +33,7 @@ pub struct GroupMemberStats {
     pub migrated: i64,
     pub skipped: i64,
     pub errors: i64,
+    pub failures: Vec<MigrationFailure>,
 }
 
 /// Migrate groups from SQLite to PostgreSQL
@@ -75,6 +78,7 @@ async fn migrate_group_list(groups: &[SqliteGroup], pg_pool: &PgPool) -> Result<
         migrated: 0,
         skipped: 0,
         errors: 0,
+        failures: Vec::new(),
     };
 
     for group in groups {
@@ -91,6 +95,11 @@ async fn migrate_group_list(groups: &[SqliteGroup], pg_pool: &PgPool) -> Result<
                     stats.errors += 1;
                     tracing::error!("Failed to migrate group {}: {}", group.group_id, e);
                 }
+                stats.failures.push(MigrationFailure::new(
+                    "groups",
+                    format!("group_id={}::tenant_id={}", group.group_id, group.tenant_id),
+                    error_str,
+                ));
             }
         }
     }
@@ -169,6 +178,7 @@ async fn migrate_member_list(
         migrated: 0,
         skipped: 0,
         errors: 0,
+        failures: Vec::new(),
     };
 
     for member in members {
@@ -184,6 +194,14 @@ async fn migrate_member_list(
                     stats.errors += 1;
                     tracing::debug!("Failed to migrate member {}: {}", member.id, e);
                 }
+                stats.failures.push(MigrationFailure::new(
+                    "group_members",
+                    format!(
+                        "id={}::user_id={}::group_id={}::tenant_id={}",
+                        member.id, member.user_id, member.group_id, member.tenant_id
+                    ),
+                    error_str,
+                ));
             }
         }
     }

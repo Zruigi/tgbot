@@ -82,9 +82,12 @@ fn validate_http_url(field: &str, value: &str) -> ApiResult<()> {
 }
 
 fn mask_secret(value: &str, prefix: usize, suffix: usize) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
     let characters: Vec<char> = value.chars().collect();
-    if characters.len() <= prefix + suffix {
-        return value.to_string();
+    if characters.len() <= prefix.saturating_add(suffix) {
+        return "...".to_string();
     }
     format!(
         "{}...{}",
@@ -146,12 +149,7 @@ pub async fn get_config(
     let translation_engine = setting("translation_engine", "llm".into());
 
     // Get bot token masked
-    let bot_token = &state.config.bot_token;
-    let bot_token_masked = if bot_token.len() > 10 {
-        format!("{}...", &bot_token[..10])
-    } else {
-        bot_token.clone()
-    };
+    let bot_token_masked = mask_secret(&state.config.bot_token, 0, 0);
 
     // Get admin_id from environment
     let admin_id: i64 = std::env::var("ADMIN_ID")
@@ -176,6 +174,23 @@ pub async fn get_config(
             "admin_id": admin_id,
         }
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_secret;
+
+    #[test]
+    fn mask_secret_never_returns_short_secret() {
+        assert_eq!(mask_secret("short", 8, 4), "...");
+        assert_eq!(mask_secret("", 8, 4), "");
+        assert_eq!(mask_secret("1234567890:secret", 0, 0), "...");
+    }
+
+    #[test]
+    fn mask_secret_preserves_only_requested_edges_for_long_values() {
+        assert_eq!(mask_secret("abcdefghijklmnop", 2, 2), "ab...op");
+    }
 }
 
 // POST /api/config - Save system configuration
@@ -407,7 +422,8 @@ pub async fn vertex_oneclick_config(
             "model_infer_url": model_infer_url,
             "model_list_url": model_list_url,
             "openai_chat_url": openai_chat_url,
-            "relay_api_key": relay_api_key,
+            "relay_api_key": "",
+            "relay_api_key_configured": true,
             "relay_api_key_masked": relay_masked,
             "model": model,
             "vertex_api_key_masked": vertex_masked,

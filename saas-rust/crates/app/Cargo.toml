@@ -6,6 +6,7 @@ edition.workspace = true
 [features]
 default = []
 dev-polling = ["dep:teloxide"]
+beta-test-tools = ["dep:reqwest"]
 
 [[bin]]
 name = "tgbot-app"
@@ -15,6 +16,16 @@ path = "src/main.rs"
 name = "bot-polling"
 path = "src/bin/bot-polling.rs"
 required-features = ["dev-polling"]
+
+[[bin]]
+name = "beta-seed-test-bot"
+path = "src/bin/beta-seed-test-bot.rs"
+required-features = ["beta-test-tools"]
+
+[[bin]]
+name = "beta-real-bot-bridge"
+path = "src/bin/beta-real-bot-bridge.rs"
+required-features = ["beta-test-tools"]
 
 [dependencies]
 tgbot-http = { workspace = true }
@@ -34,6 +45,8 @@ tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
 sqlx = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 teloxide = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }

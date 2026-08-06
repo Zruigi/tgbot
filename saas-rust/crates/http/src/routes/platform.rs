@@ -7,9 +7,9 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{Column, Row, TypeInfo};
+use std::collections::HashMap;
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_domain::models::{CreateMerchantRequest, Merchant, OrderIdRequest, UpsertPlanRequest};
-use tgbot_domain::scope::Scope;
 use uuid::Uuid;
 
 use crate::auth::resolve_scope;
@@ -418,6 +418,70 @@ pub async fn runtime_statuses(
     .fetch_all(pool)
     .await?;
     let registered = state.bot_registry.list_entries().await;
+    let telemetry = state.worker_telemetry.snapshot();
+    let in_process_worker_telemetry_available =
+        state.worker_enabled && telemetry.global.scheduler_started_at.is_some();
+    let durable_global = sqlx::query(
+        "SELECT worker_id, started_at, last_seen_at, scheduler_started_at,
+                last_poll_at, last_successful_poll_at, last_poll_error_at,
+                total_polls, total_claimed_jobs, total_completed_jobs,
+                total_failed_jobs, in_flight_jobs
+         FROM platform.worker_runtime_heartbeats
+         WHERE last_seen_at >= now() - interval '2 minutes'
+         ORDER BY last_seen_at DESC
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let durable_tenant_rows = sqlx::query(
+        "SELECT DISTINCT ON (tenant_id)
+                tenant_id, worker_id, last_seen_at, claimed_jobs,
+                completed_jobs, failed_jobs, in_flight_jobs,
+                last_claimed_at, last_completed_at, last_failed_at
+         FROM platform.worker_tenant_heartbeats
+         WHERE last_seen_at >= now() - interval '2 minutes'
+         ORDER BY tenant_id, last_seen_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    let durable_tenant_telemetry: HashMap<String, Value> = durable_tenant_rows
+        .into_iter()
+        .map(|row| {
+            let tenant_id: String = row.get("tenant_id");
+            let value = json!({
+                "tenant_id": &tenant_id,
+                "worker_id": row.get::<String, _>("worker_id"),
+                "last_seen_at": row.get::<DateTime<Utc>, _>("last_seen_at"),
+                "claimed_jobs": row.get::<i64, _>("claimed_jobs"),
+                "completed_jobs": row.get::<i64, _>("completed_jobs"),
+                "failed_jobs": row.get::<i64, _>("failed_jobs"),
+                "in_flight_jobs": row.get::<i64, _>("in_flight_jobs"),
+                "last_claimed_at": row.get::<Option<DateTime<Utc>>, _>("last_claimed_at"),
+                "last_completed_at": row.get::<Option<DateTime<Utc>>, _>("last_completed_at"),
+                "last_failed_at": row.get::<Option<DateTime<Utc>>, _>("last_failed_at"),
+            });
+            (tenant_id, value)
+        })
+        .collect();
+    let durable_worker_telemetry_available = durable_global.is_some();
+    let worker_telemetry_available =
+        in_process_worker_telemetry_available && durable_worker_telemetry_available;
+    let durable_worker_telemetry = durable_global.as_ref().map(|row| {
+        json!({
+            "worker_id": row.get::<String, _>("worker_id"),
+            "started_at": row.get::<DateTime<Utc>, _>("started_at"),
+            "last_seen_at": row.get::<DateTime<Utc>, _>("last_seen_at"),
+            "scheduler_started_at": row.get::<Option<DateTime<Utc>>, _>("scheduler_started_at"),
+            "last_poll_at": row.get::<Option<DateTime<Utc>>, _>("last_poll_at"),
+            "last_successful_poll_at": row.get::<Option<DateTime<Utc>>, _>("last_successful_poll_at"),
+            "last_poll_error_at": row.get::<Option<DateTime<Utc>>, _>("last_poll_error_at"),
+            "total_polls": row.get::<i64, _>("total_polls"),
+            "total_claimed_jobs": row.get::<i64, _>("total_claimed_jobs"),
+            "total_completed_jobs": row.get::<i64, _>("total_completed_jobs"),
+            "total_failed_jobs": row.get::<i64, _>("total_failed_jobs"),
+            "in_flight_jobs": row.get::<i64, _>("in_flight_jobs"),
+        })
+    }).unwrap_or(Value::Null);
 
     let data: Vec<Value> = rows
         .into_iter()
@@ -427,6 +491,8 @@ pub async fn runtime_statuses(
             let bot_id: Option<i64> = row.get("bot_id");
             let bot_username: Option<String> = row.get("bot_username");
             let merchant_status: String = row.get("status");
+            let durable_tenant_telemetry_available =
+                durable_tenant_telemetry.contains_key(&tenant_id);
             let disabled = matches!(
                 merchant_status.as_str(),
                 "disabled" | "suspended" | "inactive" | "deleted"
@@ -456,7 +522,14 @@ pub async fn runtime_statuses(
                 "reason": reason,
                 "source": "rust_webhook_registry",
                 "worker_enabled": state.worker_enabled,
-                "worker_telemetry_available": false,
+                "in_process_worker_telemetry_available": in_process_worker_telemetry_available,
+                "worker_telemetry_available": worker_telemetry_available,
+                "worker_telemetry": telemetry.tenants.get(&tenant_id).cloned().unwrap_or_default(),
+                "durable_worker_telemetry_available": durable_tenant_telemetry_available,
+                "durable_worker_telemetry": durable_tenant_telemetry
+                    .get(&tenant_id)
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 "runtime_version": row.get::<i32, _>("runtime_version"),
                 "config_version": row.get::<i32, _>("config_version"),
                 "feature_version": row.get::<i32, _>("feature_version"),
@@ -470,7 +543,12 @@ pub async fn runtime_statuses(
         "data": data,
         "total": total,
         "source": "rust_webhook_registry",
-        "worker_telemetry_available": false,
+        "in_process_worker_telemetry_available": in_process_worker_telemetry_available,
+        "worker_telemetry_available": worker_telemetry_available,
+        "worker_telemetry": telemetry.global,
+        "durable_worker_telemetry_available": durable_worker_telemetry_available,
+        "durable_worker_telemetry_source": "postgres_worker_runtime_heartbeats",
+        "durable_worker_telemetry": durable_worker_telemetry,
     })))
 }
 

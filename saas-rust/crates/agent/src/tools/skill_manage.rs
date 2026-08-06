@@ -88,7 +88,13 @@ impl Tool for SkillManageTool {
             .metadata
             .get("tenant_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("default");
+            .map(str::trim)
+            .filter(|tenant_id| !tenant_id.is_empty());
+        let Some(tenant_id) = tenant_id else {
+            return ToolExecuteResult::fail(
+                "skill_manage requires an explicit tenant scope; refusing an unscoped operation",
+            );
+        };
 
         info!("技能管理操作: action={}", action);
 
@@ -153,7 +159,7 @@ impl SkillManageTool {
     async fn list_skills(&self, tenant_id: &str) -> Result<(Value, String), anyhow::Error> {
         let rows = sqlx::query(
             "SELECT id, name, description, prompt_template, source, is_enabled, created_at, updated_at \
-             FROM ai_custom_skills \
+             FROM tenant_saas.ai_custom_skills \
              WHERE tenant_id = $1 AND (source IS NULL OR source != 'builtin_fs') \
              ORDER BY name \
              LIMIT 50",
@@ -198,7 +204,7 @@ impl SkillManageTool {
 
         sqlx::query(
             r#"
-            INSERT INTO ai_custom_skills (name, description, prompt_template, source, is_enabled, tenant_id, created_at, updated_at)
+            INSERT INTO tenant_saas.ai_custom_skills (name, description, prompt_template, source, is_enabled, tenant_id, created_at, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (name, tenant_id) DO UPDATE SET
                 description = EXCLUDED.description,
@@ -242,7 +248,7 @@ impl SkillManageTool {
         let now = chrono::Utc::now();
 
         let result = sqlx::query(
-            "UPDATE ai_custom_skills SET is_enabled = $1, updated_at = $2 \
+            "UPDATE tenant_saas.ai_custom_skills SET is_enabled = $1, updated_at = $2 \
              WHERE name = $3 AND tenant_id = $4",
         )
         .bind(is_enabled)
@@ -318,7 +324,7 @@ impl SkillManageTool {
                         let now = chrono::Utc::now();
                         let result = sqlx::query(
                             r#"
-                            INSERT INTO ai_custom_skills (name, description, prompt_template, source, is_enabled, tenant_id, created_at, updated_at)
+                            INSERT INTO tenant_saas.ai_custom_skills (name, description, prompt_template, source, is_enabled, tenant_id, created_at, updated_at)
                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                             ON CONFLICT (name, tenant_id) DO NOTHING
                             "#,
@@ -366,25 +372,40 @@ impl SkillManageTool {
 
         let mut dirs = Vec::new();
 
+        let project_root = self
+            .project_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.project_root.clone());
+
         if !env_dirs.is_empty() {
             for p in env_dirs.split(',') {
                 let p = p.trim();
-                if p.is_empty() {
+                if p.is_empty()
+                    || PathBuf::from(p).is_absolute()
+                    || PathBuf::from(p)
+                        .components()
+                        .any(|component| component == std::path::Component::ParentDir)
+                {
                     continue;
                 }
-                let path = if PathBuf::from(p).is_absolute() {
-                    PathBuf::from(p)
-                } else {
-                    self.project_root.join(p)
+                let candidate = project_root.join(p);
+                let Ok(path) = candidate.canonicalize() else {
+                    continue;
                 };
-                dirs.push(path);
+                if path.starts_with(&project_root) && path.is_dir() {
+                    dirs.push(path);
+                }
             }
         }
 
         // 默认添加 skills 目录
-        let default_dir = self.project_root.join("skills");
-        if !dirs.iter().any(|d| d == &default_dir) {
-            dirs.push(default_dir);
+        let default_dir = project_root.join("skills");
+        if let Ok(default_dir) = default_dir.canonicalize() {
+            if default_dir.starts_with(&project_root)
+                && !dirs.iter().any(|directory| directory == &default_dir)
+            {
+                dirs.push(default_dir);
+            }
         }
 
         dirs
@@ -410,5 +431,31 @@ impl SkillManageTool {
             }
             Err(_) => "本地技能模板".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::AgentContext;
+    use sqlx::postgres::PgPoolOptions;
+
+    #[tokio::test]
+    async fn rejects_an_unscoped_operation_before_database_access() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1:1/beta_unused")
+            .expect("lazy pool should be constructible");
+        let result = SkillManageTool::new(Arc::new(pool), PathBuf::from("."))
+            .execute(
+                &serde_json::json!({"action": "list"}),
+                &AgentContext::new(1),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("explicit tenant scope")));
     }
 }

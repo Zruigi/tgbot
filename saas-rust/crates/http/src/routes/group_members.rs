@@ -143,7 +143,7 @@ pub async fn list_members(
     let rows = sqlx::query(
         r#"
         SELECT * FROM groups.group_members
-        WHERE tenant_id = $1
+        WHERE ($1::text IS NULL OR tenant_id = $1)
           AND ($2::bigint IS NULL OR group_id = $2)
           AND ($3::text IS NULL OR status = $3)
           AND ($4::boolean IS NULL OR is_verified = $4)
@@ -178,19 +178,7 @@ pub async fn get_permissions(
     Query(q): Query<PermissionsQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let tenant_id = resolve_tenant_id(&scope)?;
-
-    // Verify the group belongs to this tenant
-    let group_owned =
-        sqlx::query("SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2")
-            .bind(q.group_id)
-            .bind(tenant_id)
-            .fetch_optional(state.db()?)
-            .await?;
-
-    if group_owned.is_none() {
-        return Err(ApiError::NotFound("group_not_found".into()));
-    }
+    let tenant_id = resolve_group_tenant_id(&state, &scope, q.group_id).await?;
 
     // If user_id is specified, return that member's permissions
     if let Some(user_id) = q.user_id {
@@ -203,7 +191,7 @@ pub async fn get_permissions(
         )
         .bind(q.group_id)
         .bind(user_id)
-        .bind(tenant_id)
+        .bind(&tenant_id)
         .fetch_optional(state.db()?)
         .await?;
 
@@ -218,7 +206,7 @@ pub async fn get_permissions(
         "SELECT COUNT(*)::bigint FROM groups.group_members WHERE group_id = $1 AND tenant_id = $2 AND status = 'active'",
     )
     .bind(q.group_id)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .fetch_one(state.db()?)
     .await?;
 
@@ -226,7 +214,7 @@ pub async fn get_permissions(
         "SELECT COUNT(*)::bigint FROM groups.group_members WHERE group_id = $1 AND tenant_id = $2 AND is_verified = true",
     )
     .bind(q.group_id)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .fetch_one(state.db()?)
     .await?;
 
@@ -252,7 +240,7 @@ pub async fn member_action(
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
-    let tenant_id = resolve_tenant_id(&scope)?;
+    let tenant_id = resolve_group_tenant_id(&state, &scope, body.group_id).await?;
     let valid_actions = ["kick", "ban", "mute", "unmute", "verify", "unverify"];
     if !valid_actions.contains(&body.action.as_str()) {
         return Err(ApiError::BadRequest(format!(
@@ -260,11 +248,10 @@ pub async fn member_action(
             valid_actions.join(", ")
         )));
     }
-    ensure_group_owned(&state, tenant_id, body.group_id).await?;
-    ensure_member_exists(&state, tenant_id, body.group_id, body.user_id).await?;
+    ensure_member_exists(&state, &tenant_id, body.group_id, body.user_id).await?;
 
     if matches!(body.action.as_str(), "kick" | "ban" | "mute" | "unmute") {
-        let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+        let (_, telegram) = state.tenant_telegram(&tenant_id).await?;
         ensure_regular_telegram_member(&telegram, body.group_id, body.user_id).await?;
         execute_telegram_member_action(
             &telegram,
@@ -282,7 +269,7 @@ pub async fn member_action(
         )
         .bind(body.group_id)
         .bind(body.user_id)
-        .bind(tenant_id)
+        .bind(&tenant_id)
         .execute(state.db()?)
         .await?
         .rows_affected(),
@@ -291,7 +278,7 @@ pub async fn member_action(
         )
         .bind(body.group_id)
         .bind(body.user_id)
-        .bind(tenant_id)
+        .bind(&tenant_id)
         .execute(state.db()?)
         .await?
         .rows_affected(),
@@ -309,7 +296,7 @@ pub async fn member_action(
             .bind(status)
             .bind(body.group_id)
             .bind(body.user_id)
-            .bind(tenant_id)
+            .bind(&tenant_id)
             .execute(state.db()?)
             .await?
             .rows_affected()
@@ -343,7 +330,7 @@ pub async fn member_action_batch(
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
 
-    let tenant_id = resolve_tenant_id(&scope)?;
+    let tenant_id = resolve_group_tenant_id(&state, &scope, body.group_id).await?;
 
     let valid_actions = ["kick", "ban", "mute", "unmute", "verify", "unverify"];
     if !valid_actions.contains(&body.action.as_str()) {
@@ -360,8 +347,6 @@ pub async fn member_action_batch(
         return Err(ApiError::BadRequest("batch size cannot exceed 100".into()));
     }
 
-    ensure_group_owned(&state, tenant_id, body.group_id).await?;
-
     let requested_ids: Vec<i64> = body
         .user_ids
         .iter()
@@ -377,7 +362,7 @@ pub async fn member_action_batch(
         "SELECT user_id FROM groups.group_members WHERE group_id = $1 AND tenant_id = $2 AND user_id = ANY($3)",
     )
     .bind(body.group_id)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .bind(&requested_ids)
     .fetch_all(state.db()?)
     .await?
@@ -387,7 +372,7 @@ pub async fn member_action_batch(
     let mut failed = Vec::new();
 
     if matches!(body.action.as_str(), "kick" | "ban" | "mute" | "unmute") {
-        let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+        let (_, telegram) = state.tenant_telegram(&tenant_id).await?;
         for user_id in &requested_ids {
             if !existing_ids.contains(user_id) {
                 failed.push(json!({ "user_id": user_id, "reason": "member_not_found" }));
@@ -435,7 +420,7 @@ pub async fn member_action_batch(
             "UPDATE groups.group_members SET is_verified = true, verified_at = now(), status = 'active', updated_at = now() WHERE group_id = $1 AND tenant_id = $2 AND user_id = ANY($3)",
         )
         .bind(body.group_id)
-        .bind(tenant_id)
+        .bind(&tenant_id)
         .bind(&success_ids)
         .execute(state.db()?)
         .await?
@@ -445,7 +430,7 @@ pub async fn member_action_batch(
             "UPDATE groups.group_members SET is_verified = false, verified_at = NULL, updated_at = now() WHERE group_id = $1 AND tenant_id = $2 AND user_id = ANY($3)",
         )
         .bind(body.group_id)
-        .bind(tenant_id)
+        .bind(&tenant_id)
         .bind(&success_ids)
         .execute(state.db()?)
         .await?
@@ -463,7 +448,7 @@ pub async fn member_action_batch(
         )
         .bind(status)
         .bind(body.group_id)
-        .bind(tenant_id)
+        .bind(&tenant_id)
         .bind(&success_ids)
         .execute(state.db()?)
         .await?
@@ -502,7 +487,7 @@ pub async fn admin_batch(
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
 
-    let tenant_id = resolve_tenant_id(&scope)?;
+    let tenant_id = resolve_group_tenant_id(&state, &scope, body.group_id).await?;
 
     if body.user_ids.is_empty() {
         return Err(ApiError::BadRequest("user_ids cannot be empty".into()));
@@ -516,8 +501,6 @@ pub async fn admin_batch(
             "action must be promote or demote".into(),
         ));
     }
-
-    ensure_group_owned(&state, tenant_id, body.group_id).await?;
 
     let new_status = if body.action == "promote" {
         "admin"
@@ -536,13 +519,13 @@ pub async fn admin_batch(
         "SELECT user_id FROM groups.group_members WHERE group_id = $1 AND tenant_id = $2 AND user_id = ANY($3)",
     )
     .bind(body.group_id)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .bind(&requested_ids)
     .fetch_all(state.db()?)
     .await?
     .into_iter()
     .collect();
-    let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+    let (_, telegram) = state.tenant_telegram(&tenant_id).await?;
     let mut success_ids = Vec::new();
     let mut failed = Vec::new();
     for user_id in &requested_ids {
@@ -579,7 +562,7 @@ pub async fn admin_batch(
         )
         .bind(new_status)
         .bind(body.group_id)
-        .bind(tenant_id)
+        .bind(&tenant_id)
         .bind(&success_ids)
         .execute(state.db()?)
         .await?
@@ -618,11 +601,10 @@ pub async fn promote_admin(
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
 
-    let tenant_id = resolve_tenant_id(&scope)?;
+    let tenant_id = resolve_group_tenant_id(&state, &scope, body.group_id).await?;
 
-    ensure_group_owned(&state, tenant_id, body.group_id).await?;
-    ensure_member_exists(&state, tenant_id, body.group_id, body.user_id).await?;
-    let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+    ensure_member_exists(&state, &tenant_id, body.group_id, body.user_id).await?;
+    let (_, telegram) = state.tenant_telegram(&tenant_id).await?;
     ensure_not_group_creator(&telegram, body.group_id, body.user_id).await?;
     telegram
         .promote_chat_member(
@@ -643,7 +625,7 @@ pub async fn promote_admin(
     )
     .bind(body.group_id)
     .bind(body.user_id)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .fetch_optional(state.db()?)
     .await?;
 
@@ -669,11 +651,10 @@ pub async fn demote_admin(
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
 
-    let tenant_id = resolve_tenant_id(&scope)?;
+    let tenant_id = resolve_group_tenant_id(&state, &scope, body.group_id).await?;
 
-    ensure_group_owned(&state, tenant_id, body.group_id).await?;
-    ensure_member_exists(&state, tenant_id, body.group_id, body.user_id).await?;
-    let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+    ensure_member_exists(&state, &tenant_id, body.group_id, body.user_id).await?;
+    let (_, telegram) = state.tenant_telegram(&tenant_id).await?;
     ensure_not_group_creator(&telegram, body.group_id, body.user_id).await?;
     telegram
         .promote_chat_member(body.group_id, body.user_id, admin_permissions(false, None))
@@ -690,7 +671,7 @@ pub async fn demote_admin(
     )
     .bind(body.group_id)
     .bind(body.user_id)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .fetch_optional(state.db()?)
     .await?;
 
@@ -718,59 +699,29 @@ pub async fn list_group_messages(
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
 
-    let tenant_id = if matches!(
-        scope.role,
-        Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer
-    ) {
-        scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?
-    } else {
-        ""
-    };
+    let tenant_id = resolve_tenant_id(&scope)?;
 
-    let rows = if tenant_id.is_empty() {
-        // Platform admin: no tenant filter
-        sqlx::query(
-            r#"
-            SELECT * FROM groups.group_messages
-            WHERE group_id = $1
-              AND ($2::bigint IS NULL OR user_id = $2)
-              AND ($3::text IS NULL OR msg_type = $3)
-              AND ($4::boolean IS NULL OR is_advertising = $4)
-            ORDER BY timestamp DESC
-            LIMIT $5 OFFSET $6
-            "#,
-        )
-        .bind(q.group_id)
-        .bind(q.user_id)
-        .bind(q.msg_type)
-        .bind(q.is_advertising)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(state.db()?)
-        .await?
-    } else {
-        // Merchant-scoped: filter by tenant_id
-        sqlx::query(
-            r#"
-            SELECT * FROM groups.group_messages
-            WHERE group_id = $1 AND tenant_id = $2
-              AND ($3::bigint IS NULL OR user_id = $3)
-              AND ($4::text IS NULL OR msg_type = $4)
-              AND ($5::boolean IS NULL OR is_advertising = $5)
-            ORDER BY timestamp DESC
-            LIMIT $6 OFFSET $7
-            "#,
-        )
-        .bind(q.group_id)
-        .bind(tenant_id)
-        .bind(q.user_id)
-        .bind(q.msg_type)
-        .bind(q.is_advertising)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(state.db()?)
-        .await?
-    };
+    let rows = sqlx::query(
+        r#"
+        SELECT * FROM groups.group_messages
+        WHERE group_id = $1
+          AND ($2::text IS NULL OR tenant_id = $2)
+          AND ($3::bigint IS NULL OR user_id = $3)
+          AND ($4::text IS NULL OR msg_type = $4)
+          AND ($5::boolean IS NULL OR is_advertising = $5)
+        ORDER BY timestamp DESC
+        LIMIT $6 OFFSET $7
+        "#,
+    )
+    .bind(q.group_id)
+    .bind(tenant_id)
+    .bind(q.user_id)
+    .bind(q.msg_type)
+    .bind(q.is_advertising)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(state.db()?)
+    .await?;
 
     let total = rows.len();
     Ok(Json(json!({
@@ -792,19 +743,7 @@ pub async fn send_group_message(
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
 
-    let tenant_id = resolve_tenant_id(&scope)?;
-
-    // Verify the group belongs to this tenant
-    let group_owned =
-        sqlx::query("SELECT 1 FROM tracked_groups WHERE group_id = $1 AND tenant_id = $2")
-            .bind(body.group_id)
-            .bind(tenant_id)
-            .fetch_optional(state.db()?)
-            .await?;
-
-    if group_owned.is_none() {
-        return Err(ApiError::NotFound("group_not_found".into()));
-    }
+    let tenant_id = resolve_group_tenant_id(&state, &scope, body.group_id).await?;
 
     if body.content.trim().is_empty() && body.file_id.as_deref().unwrap_or("").trim().is_empty() {
         return Err(ApiError::BadRequest("content or file_id required".into()));
@@ -830,7 +769,7 @@ pub async fn send_group_message(
             ));
         }
     }
-    let (bot_id, telegram) = state.tenant_telegram(tenant_id).await?;
+    let (bot_id, telegram) = state.tenant_telegram(&tenant_id).await?;
     let sent = if let Some(file_id) = file_id {
         telegram
             .send_photo(SendPhotoParams {
@@ -839,6 +778,7 @@ pub async fn send_group_message(
                 caption: (!content.is_empty()).then(|| content.to_string()),
                 parse_mode: Some("HTML".into()),
                 reply_to_message_id: body.reply_to_tg_msg_id,
+                reply_markup: None,
             })
             .await
             .map_err(ApiError::Anyhow)?
@@ -878,7 +818,7 @@ pub async fn send_group_message(
     .bind(sent.message_id)
     .bind(body.reply_to_tg_msg_id)
     .bind(quoted_text)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .bind(sent.date)
     .fetch_one(state.db()?)
     .await?;
@@ -906,14 +846,14 @@ pub async fn reply_group_message(
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
 
-    let tenant_id = resolve_tenant_id(&scope)?;
+    let tenant_id = resolve_group_tenant_id(&state, &scope, body.group_id).await?;
 
     // Find the original message to get the group_id
     let orig = sqlx::query(
         "SELECT group_id, content FROM groups.group_messages WHERE tg_msg_id = $1 AND tenant_id = $2",
     )
     .bind(body.tg_msg_id)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .fetch_optional(state.db()?)
     .await?;
 
@@ -932,9 +872,8 @@ pub async fn reply_group_message(
         return Err(ApiError::BadRequest("content required".into()));
     }
 
-    ensure_group_owned(&state, tenant_id, body.group_id).await?;
     let quoted_text: String = orig_content.unwrap_or_default().chars().take(200).collect();
-    let (bot_id, telegram) = state.tenant_telegram(tenant_id).await?;
+    let (bot_id, telegram) = state.tenant_telegram(&tenant_id).await?;
     let sent = telegram
         .send_message(SendMessageParams {
             chat_id: body.group_id,
@@ -961,7 +900,7 @@ pub async fn reply_group_message(
     .bind(sent.message_id)
     .bind(body.tg_msg_id)
     .bind(&quoted_text)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .bind(sent.date)
     .fetch_one(state.db()?)
     .await?;
@@ -989,12 +928,11 @@ pub async fn delete_group_message(
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
 
-    let tenant_id = resolve_tenant_id(&scope)?;
+    let tenant_id = resolve_group_tenant_id(&state, &scope, body.group_id).await?;
 
     if body.msg_id.is_none() && body.tg_msg_id.is_none() {
         return Err(ApiError::BadRequest("msg_id or tg_msg_id required".into()));
     }
-    ensure_group_owned(&state, tenant_id, body.group_id).await?;
     let row = sqlx::query(
         r#"
         SELECT id, tg_msg_id
@@ -1007,7 +945,7 @@ pub async fn delete_group_message(
         "#,
     )
     .bind(body.group_id)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .bind(body.msg_id)
     .bind(body.tg_msg_id)
     .fetch_optional(state.db()?)
@@ -1017,7 +955,7 @@ pub async fn delete_group_message(
     let tg_msg_id: i64 = row
         .try_get::<Option<i64>, _>("tg_msg_id")?
         .ok_or_else(|| ApiError::BadRequest("message has no Telegram id".into()))?;
-    let (_, telegram) = state.tenant_telegram(tenant_id).await?;
+    let (_, telegram) = state.tenant_telegram(&tenant_id).await?;
     telegram
         .delete_message(body.group_id, tg_msg_id)
         .await
@@ -1027,7 +965,7 @@ pub async fn delete_group_message(
     )
     .bind(msg_id)
     .bind(body.group_id)
-    .bind(tenant_id)
+    .bind(&tenant_id)
     .execute(state.db()?)
     .await?;
 
@@ -1041,19 +979,21 @@ pub async fn delete_group_message(
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn ensure_group_owned(state: &AppState, tenant_id: &str, group_id: i64) -> ApiResult<()> {
-    let owned = sqlx::query_scalar::<_, i32>(
-        "SELECT 1 FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2",
+async fn resolve_group_tenant_id(
+    state: &AppState,
+    scope: &tgbot_domain::scope::Scope,
+    group_id: i64,
+) -> ApiResult<String> {
+    let tenant_hint = resolve_tenant_id(scope)?;
+    sqlx::query_scalar::<_, String>(
+        "SELECT tenant_id FROM groups.tracked_groups \
+         WHERE group_id = $1 AND ($2::text IS NULL OR tenant_id = $2)",
     )
     .bind(group_id)
-    .bind(tenant_id)
+    .bind(tenant_hint)
     .fetch_optional(state.db()?)
-    .await?;
-    if owned.is_some() {
-        Ok(())
-    } else {
-        Err(ApiError::NotFound("group_not_found".into()))
-    }
+    .await?
+    .ok_or_else(|| ApiError::NotFound("group_not_found".into()))
 }
 
 async fn ensure_member_exists(
@@ -1233,17 +1173,12 @@ fn admin_permissions(promote: bool, custom: Option<&Value>) -> Value {
     Value::Object(permissions)
 }
 
-/// Resolve the tenant_id from the scope. Platform admins get an empty string
-/// which means "no tenant filter" (they can see everything).
-fn resolve_tenant_id(scope: &tgbot_domain::scope::Scope) -> Result<&str, ApiError> {
-    if matches!(
-        scope.role,
-        Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer
-    ) {
-        scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)
-    } else {
-        // Platform admin: no tenant filter
-        Ok("")
+fn resolve_tenant_id(scope: &tgbot_domain::scope::Scope) -> Result<Option<&str>, ApiError> {
+    match &scope.role {
+        Role::PlatformAdmin => Ok(None),
+        Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer => {
+            Ok(Some(scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?))
+        }
     }
 }
 
@@ -1256,5 +1191,43 @@ fn require_write_access(scope: &tgbot_domain::scope::Scope) -> Result<(), ApiErr
         Ok(())
     } else {
         Err(ApiError::Forbidden)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope(role: Role, tenant_id: Option<&str>) -> tgbot_domain::scope::Scope {
+        tgbot_domain::scope::Scope {
+            authenticated: true,
+            user_id: None,
+            actor_key: None,
+            role: role.clone(),
+            actor_role: role,
+            tenant_id: tenant_id.map(str::to_string),
+            merchant_id: None,
+        }
+    }
+
+    #[test]
+    fn platform_scope_uses_no_tenant_filter() {
+        assert_eq!(
+            resolve_tenant_id(&scope(Role::PlatformAdmin, None)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn merchant_scope_keeps_tenant_filter() {
+        assert_eq!(
+            resolve_tenant_id(&scope(Role::MerchantAdmin, Some("tenant-a"))).unwrap(),
+            Some("tenant-a")
+        );
+    }
+
+    #[test]
+    fn merchant_scope_without_tenant_is_forbidden() {
+        assert!(resolve_tenant_id(&scope(Role::MerchantAdmin, None)).is_err());
     }
 }

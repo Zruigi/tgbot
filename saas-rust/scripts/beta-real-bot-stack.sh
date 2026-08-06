@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_directory=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+rust_root=$(cd "$script_directory/.." && pwd)
+local_app="$script_directory/beta-local-app.sh"
+seed_binary="$rust_root/target/release/beta-seed-test-bot"
+bridge_binary="$rust_root/target/release/beta-real-bot-bridge"
+app_binary="$rust_root/target/release/tgbot-app"
+state_directory=/tmp/tgbot-beta-real-bot
+env_file="$state_directory/runtime.env"
+app_pid_file="$state_directory/app.pid"
+bridge_pid_file="$state_directory/bridge.pid"
+bridge_heartbeat_file="$state_directory/bridge.heartbeat"
+app_log="$state_directory/app.log"
+bridge_log="$state_directory/bridge.log"
+database_url="postgresql://ubuntu@127.0.0.1:15432/tgbot_rust_beta"
+app_url="http://127.0.0.1:18090"
+
+require_tools() {
+  for tool in awk bash cat chmod curl date env grep kill mkdir openssl ps rm sleep seq readlink stat; do
+    command -v "$tool" >/dev/null || {
+      printf 'Beta real Bot stack requires command: %s\n' "$tool" >&2
+      exit 1
+    }
+  done
+}
+
+enabled() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+assert_test_gate() {
+  enabled "${BETA_TEST_BOT_ENABLED:-}" || {
+    printf 'Refusing real test Bot stack; set BETA_TEST_BOT_ENABLED=true explicitly\n' >&2
+    exit 1
+  }
+  [[ -n "${BOT_TOKEN:-}" ]] || {
+    printf 'Refusing real test Bot stack; inject BOT_TOKEN into this process environment\n' >&2
+    exit 1
+  }
+}
+
+pid_from_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  local pid
+  pid=$(cat "$file")
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+is_expected_process() {
+  local pid="$1"
+  local expected="$2"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" >/dev/null 2>&1 || return 1
+  ps -p "$pid" -o args= | grep -Fq "$expected"
+}
+
+stop_pid_file() {
+  local file="$1"
+  local expected="$2"
+  local pid
+  pid=$(pid_from_file "$file") || return 0
+  if is_expected_process "$pid" "$expected"; then
+    kill "$pid" >/dev/null 2>&1 || true
+    for _ in $(seq 1 20); do
+      if ! kill -0 "$pid" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.25
+    done
+  fi
+  rm -f "$file"
+}
+
+write_runtime_env() {
+  local internal_secret session_secret encryption_key
+  internal_secret=$(openssl rand -hex 32)
+  session_secret=$(openssl rand -hex 32)
+  encryption_key=$(openssl rand -hex 32)
+  mkdir -p "$state_directory"
+  umask 077
+  {
+    printf 'DATABASE_URL=%q\n' "$database_url"
+    printf 'INTERNAL_SAAS_SECRET=%q\n' "$internal_secret"
+    printf 'SAAS_SESSION_SECRET=%q\n' "$session_secret"
+    printf 'TGBOT_SECRET_ENCRYPTION_KEY=%q\n' "$encryption_key"
+    printf 'TELEGRAM_API_BASE_URL=%q\n' "${BETA_TELEGRAM_API_BASE_URL:-https://api.telegram.org}"
+  } >"$env_file"
+}
+
+load_runtime_env() {
+  [[ -r "$env_file" ]] || {
+    printf 'Missing Beta real Bot runtime state: %s\n' "$env_file" >&2
+    exit 1
+  }
+  set -a
+  . "$env_file"
+  set +a
+}
+
+bridge_heartbeat_fresh() {
+  [[ -f "$bridge_heartbeat_file" ]] || return 1
+  local heartbeat_timestamp current_timestamp
+  heartbeat_timestamp=$(stat -c '%Y' "$bridge_heartbeat_file" 2>/dev/null) || return 1
+  current_timestamp=$(date +%s)
+  [[ "$heartbeat_timestamp" =~ ^[0-9]+$ ]] || return 1
+  (( current_timestamp >= heartbeat_timestamp && current_timestamp - heartbeat_timestamp <= 90 ))
+}
+
+build_tools() {
+  if [[ ! -x "$seed_binary" || ! -x "$bridge_binary" || ! -x "$app_binary" ]]; then
+    env -u BOT_TOKEN cargo build --release --features beta-test-tools \
+      --bin tgbot-app --bin beta-seed-test-bot --bin beta-real-bot-bridge
+  fi
+}
+
+wait_for_app() {
+  for _ in $(seq 1 30); do
+    if curl -fsS --max-time 1 "$app_url/api/ready" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  printf 'Beta app did not become ready; inspect %s\n' "$app_log" >&2
+  return 1
+}
+
+start() {
+  assert_test_gate
+  if [[ -f "$app_pid_file" || -f "$bridge_pid_file" ]]; then
+    printf 'Beta real Bot stack already has state; run status or stop first\n' >&2
+    exit 1
+  fi
+  bash "$local_app" migrate
+  build_tools
+  write_runtime_env
+  load_runtime_env
+  env -i PATH="$PATH" HOME=/home/ubuntu \
+    BETA_TEST_BOT_ENABLED=true BOT_TOKEN="$BOT_TOKEN" \
+    BETA_TEST_TENANT_ID="${BETA_TEST_TENANT_ID:-beta-real-test-bot}" \
+    BETA_TEST_MERCHANT_ID="${BETA_TEST_MERCHANT_ID:-77777777-7777-4777-8777-777777777777}" \
+    DATABASE_URL="$DATABASE_URL" TGBOT_SECRET_ENCRYPTION_KEY="$TGBOT_SECRET_ENCRYPTION_KEY" \
+    TELEGRAM_API_BASE_URL="$TELEGRAM_API_BASE_URL" RUST_LOG=warn "$seed_binary"
+  : >"$app_log"
+  (
+    cd /tmp
+    exec env -i PATH="$PATH" HOME=/home/ubuntu \
+      DATABASE_URL="$DATABASE_URL" SAAS_BIND_ADDR="127.0.0.1:18090" \
+      SAAS_DB_MAX_CONNECTIONS=4 SAAS_ALLOW_REST_ONLY=false \
+      INTERNAL_SAAS_SECRET="$INTERNAL_SAAS_SECRET" SAAS_SESSION_SECRET="$SAAS_SESSION_SECRET" \
+      TGBOT_SECRET_ENCRYPTION_KEY="$TGBOT_SECRET_ENCRYPTION_KEY" \
+      SUPABASE_URL=http://127.0.0.1:18092 SUPABASE_SERVICE_ROLE_KEY=beta-local-placeholder \
+      LITELLM_BASE_URL=http://127.0.0.1:18091 LITELLM_API_KEY=beta-local-placeholder \
+      TELEGRAM_API_BASE_URL="$TELEGRAM_API_BASE_URL" TELEGRAM_COMMANDS_ENABLED=true \
+      TELEGRAM_AUTO_REPLIES_ENABLED=true TELEGRAM_WALLET_MONITORS_ENABLED=false \
+      CORS_ALLOWED_ORIGIN='*' RUST_LOG=info "$app_binary"
+  ) >>"$app_log" 2>&1 &
+  printf '%s\n' "$!" >"$app_pid_file"
+  wait_for_app
+  : >"$bridge_log"
+  rm -f "$bridge_heartbeat_file"
+  (
+    cd /tmp
+    exec env -i PATH="$PATH" HOME=/home/ubuntu \
+      BETA_TEST_BOT_ENABLED=true BOT_TOKEN="$BOT_TOKEN" \
+      TGBOT_SECRET_ENCRYPTION_KEY="$TGBOT_SECRET_ENCRYPTION_KEY" \
+      TELEGRAM_API_BASE_URL="$TELEGRAM_API_BASE_URL" \
+      BETA_LOCAL_WEBHOOK_URL='http://127.0.0.1:18090/telegram/webhook/{bot_id}' \
+      BETA_BRIDGE_HEARTBEAT_FILE="$bridge_heartbeat_file" \
+      BETA_CLEAR_WEBHOOK="${BETA_CLEAR_WEBHOOK:-false}" RUST_LOG=info "$bridge_binary"
+  ) >>"$bridge_log" 2>&1 &
+  printf '%s\n' "$!" >"$bridge_pid_file"
+  sleep 1
+  if ! is_expected_process "$(cat "$bridge_pid_file")" "$bridge_binary"; then
+    printf 'Beta real Bot bridge exited; inspect %s\n' "$bridge_log" >&2
+    exit 1
+  fi
+  printf 'Beta real Bot stack is running; app=%s bridge_log=%s\n' "$app_url" "$bridge_log"
+}
+
+status() {
+  local app_state=stopped bridge_state=stopped
+  local pid
+  if curl -fsS --max-time 1 "$app_url/healthz" >/dev/null 2>&1; then
+    app_state=running
+  elif pid=$(pid_from_file "$app_pid_file") && is_expected_process "$pid" "$app_binary"; then
+    app_state=starting
+  fi
+  if pid=$(pid_from_file "$bridge_pid_file") && is_expected_process "$pid" "$bridge_binary"; then
+    bridge_state=running
+  elif bridge_heartbeat_fresh; then
+    bridge_state=running
+  elif [[ -f "$bridge_log" ]] && grep -Fq 'Beta real Bot bridge started' "$bridge_log"; then
+    bridge_state=unverified
+  fi
+  printf 'app=%s bridge=%s\n' "$app_state" "$bridge_state"
+  if curl -fsS --max-time 1 "$app_url/healthz" >/dev/null 2>&1; then
+    printf 'app_health=ok\n'
+  else
+    printf 'app_health=unavailable\n'
+  fi
+}
+
+stop() {
+  stop_pid_file "$bridge_pid_file" "$bridge_binary"
+  stop_pid_file "$app_pid_file" "$app_binary"
+  rm -f "$bridge_heartbeat_file"
+  rm -f "$env_file"
+  printf 'Beta real Bot stack stopped; local database retained\n'
+}
+
+webhook_probe() {
+  assert_test_gate
+  load_runtime_env
+  local token bot_id digest webhook_secret probe_id http_code
+  token="$BOT_TOKEN"
+  bot_id="${token%%:*}"
+  [[ "$bot_id" =~ ^[0-9]+$ ]] || {
+    printf 'BOT_TOKEN has invalid bot id\n' >&2
+    exit 1
+  }
+  digest=$(printf 'telegram-webhook\0%s\0%s' "$bot_id" "$token" \
+    | openssl dgst -sha256 -hmac "$TGBOT_SECRET_ENCRYPTION_KEY" \
+    | awk '{print $2}')
+  webhook_secret="wh_${digest}"
+  probe_id=$(( $(date +%s) + 900000000 ))
+  http_code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+    -H "x-telegram-bot-api-secret-token: $webhook_secret" \
+    -H 'content-type: application/json' \
+    -d "{\"update_id\":$probe_id}" \
+    "$app_url/telegram/webhook/$bot_id")
+  printf 'Beta real Bot valid webhook probe HTTP %s\n' "$http_code"
+  [[ "$http_code" == 200 ]]
+}
+
+require_tools
+if [[ $# -eq 0 ]]; then
+  command=status
+else
+  command=$1
+fi
+case "$command" in
+  start) start ;;
+  status) status ;;
+  stop) stop ;;
+  probe) webhook_probe ;;
+  *) printf 'Usage: %s {start|status|probe|stop}\n' "$0" >&2; exit 2 ;;
+esac

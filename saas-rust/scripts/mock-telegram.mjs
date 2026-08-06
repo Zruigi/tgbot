@@ -23,6 +23,16 @@ const server = http.createServer((request, response) => {
     return
   }
 
+  if (request.method === 'GET' && request.url?.startsWith('/v1/accounts/') && request.url.includes('/transactions/trc20')) {
+    response.writeHead(200, { 'content-type': 'application/json' }).end('{"data":[]}')
+    return
+  }
+
+  if (request.method === 'GET' && request.url?.startsWith('/bscscan?')) {
+    response.writeHead(200, { 'content-type': 'application/json' }).end('{"status":"1","message":"OK","result":[]}')
+    return
+  }
+
   if (request.method === 'GET' && request.url === '/calls') {
     response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(calls))
     return
@@ -41,7 +51,7 @@ const server = http.createServer((request, response) => {
     return
   }
 
-  const match = request.url?.match(/^\/bot(\d+):([^/]+)\/(getMe|setWebhook|sendMessage|sendPhoto|getFile|getChat|getChatMember|getChatMemberCount|banChatMember|unbanChatMember|restrictChatMember|promoteChatMember|deleteMessage|answerCallbackQuery)$/)
+  const match = request.url?.match(/^\/bot(\d+):([^/]+)\/(getMe|setWebhook|sendMessage|sendPhoto|editMessageText|getFile|getChat|getChatMember|getChatMemberCount|getChatAdministrators|banChatMember|unbanChatMember|restrictChatMember|promoteChatMember|deleteMessage|answerCallbackQuery)$/)
   if (request.method !== 'POST' || !match) {
     response.writeHead(404).end()
     return
@@ -93,7 +103,7 @@ const server = http.createServer((request, response) => {
       const body = JSON.parse(rawBody)
       const chatId = Number(body.chat_id)
       const userId = Number(body.user_id)
-      const status = userId === 30002 ? 'administrator' : userId === 30003 ? 'creator' : 'member'
+      const status = userId === 30002 ? 'administrator' : userId === 30003 ? 'creator' : userId === 30006 ? 'left' : 'member'
       calls.push({ bot_id: Number(botId), method, chat_id: chatId, user_id: userId })
       response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
         ok: true,
@@ -110,6 +120,19 @@ const server = http.createServer((request, response) => {
       calls.push({ bot_id: Number(botId), method, chat_id: chatId })
       response.writeHead(200, { 'content-type': 'application/json' })
         .end(JSON.stringify({ ok: true, result: 42 }))
+      return
+    }
+    if (method === 'getChatAdministrators') {
+      const body = JSON.parse(rawBody)
+      const chatId = Number(body.chat_id)
+      calls.push({ bot_id: Number(botId), method, chat_id: chatId })
+      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+        ok: true,
+        result: [
+          { status: 'creator', user: { id: Number(botId), is_bot: true, first_name: 'Beta Bot' } },
+          { status: 'administrator', user: { id: 30002, is_bot: false, first_name: 'Beta Admin' } },
+        ],
+      }))
       return
     }
     if (['banChatMember', 'unbanChatMember', 'restrictChatMember', 'promoteChatMember'].includes(method)) {
@@ -159,6 +182,36 @@ const server = http.createServer((request, response) => {
       })
       response.writeHead(200, { 'content-type': 'application/json' })
         .end(JSON.stringify({ ok: true, result: true }))
+      return
+    }
+    if (method === 'editMessageText') {
+      let body
+      try {
+        body = JSON.parse(rawBody)
+      } catch {
+        response.writeHead(400).end()
+        return
+      }
+      const chatId = Number(body.chat_id)
+      const messageId = Number(body.message_id)
+      calls.push({
+        bot_id: Number(botId),
+        method,
+        chat_id: chatId,
+        message_id: messageId,
+        text: String(body.text || ''),
+        reply_markup: body.reply_markup || null,
+      })
+      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+        ok: true,
+        result: {
+          message_id: messageId,
+          from: { id: Number(botId), is_bot: true, first_name: 'Beta Bot', username: 'beta_bot_' + botId },
+          chat: { id: chatId, type: chatId < 0 ? 'supergroup' : 'private' },
+          date: 1700000000,
+          text: String(body.text || ''),
+        },
+      }))
       return
     }
     if (method === 'sendMessage') {

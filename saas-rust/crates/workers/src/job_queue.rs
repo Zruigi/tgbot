@@ -50,6 +50,7 @@ pub enum JobType {
     AiProcess,
     OcrProcess,
     MonitorCheck,
+    MonitorAlert,
     PaymentProcess,
     Custom(String),
 }
@@ -65,6 +66,7 @@ impl JobType {
             JobType::AiProcess => "ai_process",
             JobType::OcrProcess => "ocr_process",
             JobType::MonitorCheck => "monitor_check",
+            JobType::MonitorAlert => "monitor_alert",
             JobType::PaymentProcess => "payment_process",
             JobType::Custom(s) => s,
         }
@@ -80,6 +82,7 @@ impl JobType {
             "ai_process" => JobType::AiProcess,
             "ocr_process" => JobType::OcrProcess,
             "monitor_check" => JobType::MonitorCheck,
+            "monitor_alert" => JobType::MonitorAlert,
             "payment_process" => JobType::PaymentProcess,
             other => JobType::Custom(other.to_string()),
         }
@@ -298,9 +301,9 @@ pub async fn enqueue_batch(pool: &PgPool, opts_list: Vec<EnqueueOpts>) -> Result
 /// Claim up to `limit` pending jobs that are ready to run.
 ///
 /// Uses `SELECT … FOR UPDATE SKIP LOCKED` to ensure exactly-once claiming
-/// across concurrent workers.  Each claimed job gets a `claim_id` (UUID)
-/// stored in `started_at` row slot as a simple ownership marker; the
-/// `complete_job` / `fail_job` functions verify this token before updating.
+/// across concurrent workers. Each claimed job gets a persisted `claim_id`
+/// ownership marker; the `complete_job` / `fail_job` functions verify this
+/// token before updating.
 #[instrument(skip(pool))]
 pub async fn claim_jobs(
     pool: &PgPool,
@@ -314,6 +317,7 @@ pub async fn claim_jobs(
             SET status = 'running',
                 attempts = attempts + 1,
                 started_at = now(),
+                claim_id = gen_random_uuid(),
                 updated_at = now()
             WHERE id IN (
                 SELECT id FROM job_queue
@@ -325,7 +329,7 @@ pub async fn claim_jobs(
             )
             RETURNING id, tenant_id, job_type, payload, priority, status, attempts,
                       max_attempts, run_at, started_at, completed_at,
-                      last_error, created_at, updated_at
+                      last_error, created_at, updated_at, claim_id
             "#,
         )
         .bind(limit)
@@ -338,6 +342,7 @@ pub async fn claim_jobs(
             SET status = 'running',
                 attempts = attempts + 1,
                 started_at = now(),
+                claim_id = gen_random_uuid(),
                 updated_at = now()
             WHERE id IN (
                 SELECT id FROM job_queue
@@ -350,7 +355,7 @@ pub async fn claim_jobs(
             )
             RETURNING id, tenant_id, job_type, payload, priority, status, attempts,
                       max_attempts, run_at, started_at, completed_at,
-                      last_error, created_at, updated_at
+                      last_error, created_at, updated_at, claim_id
             "#,
         )
         .bind(job_types)
@@ -375,6 +380,7 @@ pub async fn claim_jobs(
         let last_error: Option<String> = row.try_get("last_error")?;
         let created_at: DateTime<Utc> = row.try_get("created_at")?;
         let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+        let claim_id: Uuid = row.try_get("claim_id")?;
 
         let job = Job {
             id,
@@ -393,7 +399,6 @@ pub async fn claim_jobs(
             updated_at,
         };
 
-        let claim_id = Uuid::new_v4();
         claimed.push(ClaimedJob { job, claim_id });
     }
 
@@ -403,17 +408,19 @@ pub async fn claim_jobs(
 
 /// Mark a job as completed.
 #[instrument(skip(pool))]
-pub async fn complete_job(pool: &PgPool, job_id: i64) -> Result<()> {
+pub async fn complete_job(pool: &PgPool, job_id: i64, claim_id: Uuid) -> Result<()> {
     let result = sqlx::query(
         r#"
         UPDATE job_queue
         SET status = 'completed',
             completed_at = now(),
+            claim_id = NULL,
             updated_at = now()
-        WHERE id = $1 AND status = 'running'
+        WHERE id = $1 AND status = 'running' AND claim_id = $2
         "#,
     )
     .bind(job_id)
+    .bind(claim_id)
     .execute(pool)
     .await?;
 
@@ -426,10 +433,13 @@ pub async fn complete_job(pool: &PgPool, job_id: i64) -> Result<()> {
 /// Mark a job as failed.  If attempts < max_attempts, the job is reset to
 /// `pending` so the scheduler can re-claim it.  Otherwise it is marked `dead`.
 #[instrument(skip(pool))]
-pub async fn fail_job(pool: &PgPool, job_id: i64, error: &str) -> Result<()> {
+pub async fn fail_job(pool: &PgPool, job_id: i64, claim_id: Uuid, error: &str) -> Result<()> {
     // Read current attempts
-    let row = sqlx::query("SELECT attempts, max_attempts FROM job_queue WHERE id = $1")
+    let row = sqlx::query(
+        "SELECT attempts, max_attempts FROM job_queue WHERE id = $1 AND status = 'running' AND claim_id = $2",
+    )
         .bind(job_id)
+        .bind(claim_id)
         .fetch_optional(pool)
         .await?;
 
@@ -450,13 +460,15 @@ pub async fn fail_job(pool: &PgPool, job_id: i64, error: &str) -> Result<()> {
             SET status = 'pending',
                 run_at = now() + ($2 || ' seconds')::interval,
                 last_error = $3,
+                claim_id = NULL,
                 updated_at = now()
-            WHERE id = $1
+            WHERE id = $1 AND status = 'running' AND claim_id = $4
             "#,
         )
         .bind(job_id)
         .bind(backoff_secs.to_string())
         .bind(error)
+        .bind(claim_id)
         .execute(pool)
         .await?;
         debug!(
@@ -471,12 +483,14 @@ pub async fn fail_job(pool: &PgPool, job_id: i64, error: &str) -> Result<()> {
             SET status = 'dead',
                 last_error = $2,
                 completed_at = now(),
+                claim_id = NULL,
                 updated_at = now()
-            WHERE id = $1
+            WHERE id = $1 AND status = 'running' AND claim_id = $3
             "#,
         )
         .bind(job_id)
         .bind(error)
+        .bind(claim_id)
         .execute(pool)
         .await?;
         debug!(job_id, "job marked dead after max attempts");
@@ -495,6 +509,7 @@ pub async fn requeue_stale_jobs(pool: &PgPool, timeout_minutes: i32) -> Result<u
         UPDATE job_queue
         SET status = 'pending',
             run_at = now() + interval '30 seconds',
+            claim_id = NULL,
             updated_at = now()
         WHERE status = 'running'
           AND started_at < now() - ($1 || ' minutes')::interval
@@ -694,6 +709,7 @@ mod tests {
             JobType::AiProcess,
             JobType::OcrProcess,
             JobType::MonitorCheck,
+            JobType::MonitorAlert,
             JobType::PaymentProcess,
             JobType::Custom("my_custom_type".into()),
         ];

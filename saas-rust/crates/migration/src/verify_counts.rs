@@ -17,6 +17,7 @@ pub struct MigrationVerificationReport {
     pub group_messages: GroupMessageVerification,
     pub users: UserVerification,
     pub admin_inbox: AdminInboxVerification,
+    pub small_tables: SmallTablesVerification,
     pub overall: OverallVerification,
 }
 
@@ -78,6 +79,23 @@ pub struct AdminInboxVerification {
     pub details: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmallTablesVerification {
+    pub plans: TableVerification,
+    pub address_monitors: TableVerification,
+    pub monitor_transactions: TableVerification,
+    pub is_valid: bool,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableVerification {
+    pub source_count: i64,
+    pub target_count: i64,
+    pub is_valid: bool,
+    pub details: String,
+}
+
 /// Overall verification summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverallVerification {
@@ -112,6 +130,8 @@ pub async fn verify_all_counts(
     // Verify admin inbox
     let admin_inbox_verification = verify_admin_inbox(sqlite_config, pg_pool).await?;
 
+    let small_tables_verification = verify_small_tables(sqlite_config, pg_pool).await?;
+
     // Calculate overall verification
     let total_source = merchant_verification.source_count
         + message_verification.source_count
@@ -119,7 +139,10 @@ pub async fn verify_all_counts(
         + group_verification.source_members
         + group_message_verification.source_count
         + user_verification.source_count
-        + admin_inbox_verification.source_count;
+        + admin_inbox_verification.source_count
+        + small_tables_verification.plans.source_count
+        + small_tables_verification.address_monitors.source_count
+        + small_tables_verification.monitor_transactions.source_count;
 
     let total_target = merchant_verification.target_count
         + message_verification.target_count
@@ -127,14 +150,18 @@ pub async fn verify_all_counts(
         + group_verification.target_members
         + group_message_verification.target_count
         + user_verification.target_count
-        + admin_inbox_verification.target_count;
+        + admin_inbox_verification.target_count
+        + small_tables_verification.plans.target_count
+        + small_tables_verification.address_monitors.target_count
+        + small_tables_verification.monitor_transactions.target_count;
 
     let all_valid = merchant_verification.is_valid
         && message_verification.is_valid
         && group_verification.is_valid
         && group_message_verification.is_valid
         && user_verification.is_valid
-        && admin_inbox_verification.is_valid;
+        && admin_inbox_verification.is_valid
+        && small_tables_verification.is_valid;
 
     let summary = if all_valid {
         format!(
@@ -161,6 +188,9 @@ pub async fn verify_all_counts(
         if !admin_inbox_verification.is_valid {
             issues.push("admin_inbox mismatch");
         }
+        if !small_tables_verification.is_valid {
+            issues.push("small tables mismatch");
+        }
         format!(
             "Verification failed: {}. Source: {}, Target: {}",
             issues.join(", "),
@@ -183,12 +213,78 @@ pub async fn verify_all_counts(
         group_messages: group_message_verification,
         users: user_verification,
         admin_inbox: admin_inbox_verification,
+        small_tables: small_tables_verification,
         overall,
     };
 
     tracing::info!("Verification complete: {}", report.overall.summary);
 
     Ok(report)
+}
+
+async fn verify_small_tables(
+    sqlite_config: &SqliteConfig,
+    pg_pool: &PgPool,
+) -> Result<SmallTablesVerification> {
+    let sqlite_reader = SqliteReader::new(sqlite_config)?;
+    let plans = verify_table(
+        "plans",
+        sqlite_reader.count_plans()?,
+        "SELECT COUNT(*)::bigint FROM subscription_plans",
+        pg_pool,
+    )
+    .await?;
+    let address_monitors = verify_table(
+        "address_monitors",
+        sqlite_reader.count_address_monitors()?,
+        "SELECT COUNT(*)::bigint FROM address_monitors",
+        pg_pool,
+    )
+    .await?;
+    let monitor_transactions = verify_table(
+        "monitor_transactions",
+        sqlite_reader.count_monitor_transactions()?,
+        "SELECT COUNT(*)::bigint FROM monitor_transactions",
+        pg_pool,
+    )
+    .await?;
+    let is_valid = plans.is_valid && address_monitors.is_valid && monitor_transactions.is_valid;
+    let details = format!(
+        "Plans: {}; Address monitors: {}; Monitor transactions: {}",
+        plans.details, address_monitors.details, monitor_transactions.details
+    );
+
+    tracing::info!("Small table verification: {}", details);
+    Ok(SmallTablesVerification {
+        plans,
+        address_monitors,
+        monitor_transactions,
+        is_valid,
+        details,
+    })
+}
+
+async fn verify_table(
+    name: &str,
+    source_count: i64,
+    target_query: &str,
+    pg_pool: &PgPool,
+) -> Result<TableVerification> {
+    let target_count = sqlx::query_scalar::<_, i64>(target_query)
+        .fetch_one(pg_pool)
+        .await?;
+    let is_valid = source_count == target_count;
+    let details = if is_valid {
+        format!("{name}: source={source_count}, target={target_count}")
+    } else {
+        format!("{name}: MISMATCH source={source_count}, target={target_count}")
+    };
+    Ok(TableVerification {
+        source_count,
+        target_count,
+        is_valid,
+        details,
+    })
 }
 
 /// Verify merchant migration counts
@@ -210,7 +306,10 @@ async fn verify_merchants(
     .fetch_one(pg_pool)
     .await?;
 
-    let is_valid = source_count == target_count || migrated_count == source_count;
+    // A source-sized migrated subset is not enough: extra target rows can hide
+    // duplicate or stale data. Migration acceptance requires exact table
+    // counts, while the migrated_count remains diagnostic evidence.
+    let is_valid = source_count == target_count && migrated_count == source_count;
 
     let details = if is_valid {
         format!(
@@ -248,14 +347,13 @@ async fn verify_messages(
             .fetch_one(pg_pool)
             .await?;
 
-    // Allow some tolerance for messages (they may have been partially migrated before)
-    let is_valid = target_count >= source_count - (source_count / 10); // Allow 10% difference
+    // A count deficit is a migration gap, not an acceptable tolerance. Any
+    // intentional omission must be represented by a durable, row-level audit
+    // record and accepted separately by the release owner.
+    let is_valid = source_count == target_count;
 
     let details = if is_valid {
-        format!(
-            "Source: {}, Target: {} (within acceptable range)",
-            source_count, target_count
-        )
+        format!("Source: {}, Target: {}", source_count, target_count)
     } else {
         format!(
             "MISMATCH - Source: {}, Target: {}",
@@ -488,13 +586,10 @@ pub struct QuickVerifyResult {
 
 impl QuickVerifyResult {
     pub fn is_healthy(&self) -> bool {
-        // Allow some tolerance for messages
-        let msg_valid = self.target_messages >= self.source_messages - (self.source_messages / 10);
-
-        self.target_merchants >= self.source_merchants
-            && msg_valid
-            && self.target_groups >= self.source_groups
-            && self.target_group_members >= self.source_group_members
+        self.target_merchants == self.source_merchants
+            && self.target_messages == self.source_messages
+            && self.target_groups == self.source_groups
+            && self.target_group_members == self.source_group_members
     }
 }
 
@@ -518,18 +613,48 @@ mod tests {
     }
 
     #[test]
-    fn test_quick_verify_healthy_with_tolerance() {
+    fn test_quick_verify_rejects_message_deficit() {
         let result = QuickVerifyResult {
             source_merchants: 10,
             target_merchants: 10,
             source_messages: 100,
-            target_messages: 95, // 5% difference, within 10% tolerance
+            target_messages: 95, // one or more source rows are missing
             source_groups: 5,
             target_groups: 5,
             source_group_members: 50,
             target_group_members: 50,
         };
-        assert!(result.is_healthy());
+        assert!(!result.is_healthy());
+    }
+
+    #[test]
+    fn test_quick_verify_rejects_unexpected_extra_messages() {
+        let result = QuickVerifyResult {
+            source_merchants: 10,
+            target_merchants: 10,
+            source_messages: 100,
+            target_messages: 101,
+            source_groups: 5,
+            target_groups: 5,
+            source_group_members: 50,
+            target_group_members: 50,
+        };
+        assert!(!result.is_healthy());
+    }
+
+    #[test]
+    fn test_quick_verify_rejects_unexpected_extra_rows() {
+        let result = QuickVerifyResult {
+            source_merchants: 10,
+            target_merchants: 11,
+            source_messages: 100,
+            target_messages: 100,
+            source_groups: 5,
+            target_groups: 6,
+            source_group_members: 50,
+            target_group_members: 51,
+        };
+        assert!(!result.is_healthy());
     }
 
     #[test]

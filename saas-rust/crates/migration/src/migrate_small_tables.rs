@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::PgPool;
 
+use crate::migration_audit::MigrationFailure;
 use crate::sqlite_reader::SqliteConfig;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -21,6 +22,7 @@ pub struct TableStats {
     pub migrated: i64,
     pub skipped: i64,
     pub errors: i64,
+    pub failures: Vec<MigrationFailure>,
 }
 
 pub async fn migrate_small_tables(
@@ -99,6 +101,7 @@ async fn migrate_plans(conn: &rusqlite::Connection, pg_pool: &PgPool) -> Result<
         migrated: 0,
         skipped: 0,
         errors: 0,
+        failures: Vec::new(),
     };
 
     for (
@@ -142,6 +145,11 @@ async fn migrate_plans(conn: &rusqlite::Connection, pg_pool: &PgPool) -> Result<
             Err(e) => {
                 stats.errors += 1;
                 tracing::warn!("plan {} failed: {}", plan_code, e);
+                stats.failures.push(MigrationFailure::new(
+                    "plans",
+                    format!("plan_code={plan_code}"),
+                    e.to_string(),
+                ));
             }
         }
     }
@@ -205,6 +213,7 @@ async fn migrate_address_monitors(
         migrated: 0,
         skipped: 0,
         errors: 0,
+        failures: Vec::new(),
     };
 
     for (
@@ -255,6 +264,11 @@ async fn migrate_address_monitors(
             Err(e) => {
                 stats.errors += 1;
                 tracing::warn!("address_monitor {} failed: {}", monitor_id, e);
+                stats.failures.push(MigrationFailure::new(
+                    "address_monitors",
+                    format!("tenant_id={tenant},monitor_id={monitor_id}"),
+                    e.to_string(),
+                ));
             }
         }
     }
@@ -269,7 +283,7 @@ async fn migrate_address_monitors(
 // PG 列:   tx_id monitor_id user_id tenant_id address network direction
 //           amount token_symbol tx_timestamp counterparty risk_level
 //           risk_note income_reason expense_reason payer payee
-//           is_energy_fee created_at updated_at  (PK tx_id)
+//           is_energy_fee created_at updated_at  (PK tenant_id, tx_id)
 // ---------------------------------------------------------------------------
 
 async fn migrate_monitor_transactions(
@@ -333,6 +347,7 @@ async fn migrate_monitor_transactions(
         migrated: 0,
         skipped: 0,
         errors: 0,
+        failures: Vec::new(),
     };
 
     for (
@@ -367,7 +382,7 @@ async fn migrate_monitor_transactions(
                    network, direction, amount, token_symbol, tx_timestamp, counterparty,
                    risk_level, risk_note, income_reason, expense_reason, payer, payee, created_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-               ON CONFLICT (tx_id) DO UPDATE SET
+               ON CONFLICT (tenant_id, tx_id) DO UPDATE SET
                    risk_level = COALESCE(EXCLUDED.risk_level, monitor_transactions.risk_level),
                    risk_note = COALESCE(EXCLUDED.risk_note, monitor_transactions.risk_note),
                    updated_at = now()"#,
@@ -398,6 +413,11 @@ async fn migrate_monitor_transactions(
             Err(e) => {
                 stats.errors += 1;
                 tracing::warn!("monitor_transaction {} failed: {}", tx_id, e);
+                stats.failures.push(MigrationFailure::new(
+                    "monitor_transactions",
+                    format!("tenant_id={tenant},tx_id={tx_id}"),
+                    e.to_string(),
+                ));
             }
         }
     }
@@ -436,6 +456,7 @@ mod tests {
             migrated: 9,
             skipped: 1,
             errors: 0,
+            failures: Vec::new(),
         };
         assert_eq!(s.total_source, s.migrated + s.skipped + s.errors);
     }

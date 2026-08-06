@@ -9,6 +9,7 @@
 
 use axum::{extract::State, http::HeaderMap, Json};
 use serde_json::{json, Value};
+use sqlx::Row;
 use std::sync::Arc;
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_services::ad_pipeline;
@@ -105,7 +106,6 @@ pub async fn tool_telegram_sdk_query(
     let scope = resolve_scope(&state, &headers).await?;
     info!("agent_tool: telegram_sdk_query called");
 
-    // Get tenant_id: from scope if merchant, or from request body if platform admin
     let tenant_id = if matches!(
         scope.role,
         Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer
@@ -115,13 +115,16 @@ pub async fn tool_telegram_sdk_query(
         body.get("tenant_id")
             .or_else(|| body.get("context").and_then(|c| c.get("tenant_id")))
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
     };
+    let tenant_id = tenant_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("tenant_id required for Telegram tool".into()))?;
 
-    let (_bot_id, telegram) = match state
-        .tenant_telegram(tenant_id.as_deref().unwrap_or(""))
-        .await
-    {
+    let (_bot_id, telegram) = match state.tenant_telegram(&tenant_id).await {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to get telegram client: {}", e);
@@ -145,10 +148,15 @@ pub async fn tool_telegram_sdk_query(
         .unwrap_or(true);
 
     match operation {
-        "message_existence_probe" => message_existence_probe(&telegram, &body).await,
+        "message_existence_probe" => {
+            message_existence_probe(state.db()?, &tenant_id, &telegram, &body).await
+        }
+        "bound_chat_capabilities" => {
+            inspect_bound_chats(state.db()?, &tenant_id, &telegram, &body, include_admins).await
+        }
         _ => {
             // chat_capabilities, bound_chat_capabilities, bot_visibility_status
-            inspect_chats(&telegram, &body, include_admins).await
+            inspect_chats(state.db()?, &tenant_id, &telegram, &body, include_admins).await
         }
     }
 }
@@ -175,8 +183,13 @@ pub async fn tool_query_ad_clusters(
         body.get("tenant_id")
             .or_else(|| body.get("context").and_then(|c| c.get("tenant_id")))
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
     };
+    let tenant_id = tenant_id
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("tenant_id required for ad cluster query".into()))?;
 
     let group_id = body
         .get("group_id")
@@ -202,7 +215,7 @@ pub async fn tool_query_ad_clusters(
 
     match ad_pipeline::query_clusters(
         pool,
-        tenant_id.as_deref(),
+        Some(&tenant_id),
         group_id,
         status,
         limit,
@@ -382,6 +395,8 @@ pub async fn tool_delete_ad_cluster(
 // ---------------------------------------------------------------------------
 
 async fn message_existence_probe(
+    pool: &sqlx::PgPool,
+    tenant_id: &str,
     telegram: &tgbot_integrations::telegram::TelegramClient,
     params: &Value,
 ) -> ApiResult<Json<Value>> {
@@ -403,25 +418,67 @@ async fn message_existence_probe(
         })));
     }
 
-    // Note: staging_chat_id support would require database lookup
-    // For now, return that we need it
-    let staging_chat_id = params.get("staging_chat_id").and_then(|v| v.as_i64());
+    let group_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM groups.tracked_groups WHERE group_id = $1 AND tenant_id = $2)",
+    )
+    .bind(chat_id)
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+    if !group_exists {
+        return Err(ApiError::NotFound("group_not_found".into()));
+    }
 
-    if staging_chat_id.is_none() {
+    let configured_staging_chat_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT config_value FROM tenant_saas.tenant_configs \
+         WHERE tenant_id = $1 AND config_key = 'revoke_sync_chat_id'",
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten()
+    .and_then(|value| value.trim().parse::<i64>().ok())
+    .filter(|value| *value != 0);
+
+    let Some(staging_chat_id) = configured_staging_chat_id else {
         return Ok(Json(json!({
             "success": false,
-            "message": "缺少 staging_chat_id 或群组未配置校对信息群，无法用 forwardMessage 探测消息是否仍存在",
+            "status": "error",
+            "data_complete": false,
+            "evidence_count": 0,
             "data": {
                 "chat_id": chat_id,
                 "tg_msg_id": tg_msg_id,
-                "source": "telegram_bot_api"
-            }
+                "exists": null,
+                "source": "tenant_saas.tenant_configs",
+                "error_kind": "staging_chat_not_configured"
+            },
+            "message": "当前租户未配置校对信息群，无法用 forwardMessage 探测消息是否仍存在"
+        })));
+    };
+
+    let requested_staging_chat_id = params.get("staging_chat_id").and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+    });
+    if requested_staging_chat_id.is_some_and(|value| value != staging_chat_id) {
+        return Ok(Json(json!({
+            "success": false,
+            "status": "error",
+            "data_complete": false,
+            "evidence_count": 0,
+            "data": {
+                "chat_id": chat_id,
+                "tg_msg_id": tg_msg_id,
+                "exists": null,
+                "source": "tenant_saas.tenant_configs",
+                "error_kind": "staging_chat_mismatch"
+            },
+            "message": "staging_chat_id 与当前租户配置不一致"
         })));
     }
 
-    let staging_chat_id = staging_chat_id.unwrap();
-
-    // Try forward message to test existence
     match telegram
         .forward_message(staging_chat_id, chat_id, tg_msg_id)
         .await
@@ -463,6 +520,8 @@ async fn message_existence_probe(
 }
 
 async fn inspect_chats(
+    pool: &sqlx::PgPool,
+    tenant_id: &str,
     telegram: &tgbot_integrations::telegram::TelegramClient,
     params: &Value,
     include_admins: bool,
@@ -487,6 +546,29 @@ async fn inspect_chats(
     let mut inspected = Vec::new();
 
     if let Some(chat_id) = explicit_chat_id {
+        let is_bound = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM groups.tracked_groups WHERE tenant_id = $1 AND group_id = $2) \
+             OR EXISTS(SELECT 1 FROM broadcast.broadcast_targets WHERE tenant_id = $1 AND chat_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(chat_id)
+        .fetch_one(pool)
+        .await?;
+        if !is_bound {
+            return Ok(Json(json!({
+                "success": false,
+                "status": "error",
+                "data_complete": false,
+                "evidence_count": 0,
+                "data": {
+                    "operation": operation,
+                    "items": [],
+                    "chat_id": chat_id,
+                    "error_kind": "chat_not_bound_to_tenant"
+                },
+                "message": "该聊天不属于当前租户，已拒绝 Telegram 查询"
+            })));
+        }
         match inspect_single_chat(telegram, chat_id, include_admins).await {
             Ok(item) => inspected.push(item),
             Err(e) => {
@@ -523,6 +605,85 @@ async fn inspect_chats(
     })))
 }
 
+async fn inspect_bound_chats(
+    pool: &sqlx::PgPool,
+    tenant_id: &str,
+    telegram: &tgbot_integrations::telegram::TelegramClient,
+    params: &Value,
+    include_admins: bool,
+) -> ApiResult<Json<Value>> {
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(50)
+        .clamp(1, 50);
+    let total_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM (\
+             SELECT group_id AS chat_id FROM groups.tracked_groups WHERE tenant_id = $1 \
+             UNION \
+             SELECT chat_id FROM broadcast.broadcast_targets WHERE tenant_id = $1 \
+         ) AS bound_chats",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+    let rows = sqlx::query(
+        "SELECT chat_id FROM (\
+             SELECT group_id AS chat_id FROM groups.tracked_groups WHERE tenant_id = $1 \
+             UNION \
+             SELECT chat_id FROM broadcast.broadcast_targets WHERE tenant_id = $1 \
+         ) AS bound_chats \
+         ORDER BY chat_id \
+         LIMIT $2",
+    )
+    .bind(tenant_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let chat_id: i64 = row.try_get("chat_id")?;
+        match inspect_single_chat(telegram, chat_id, include_admins).await {
+            Ok(item) => items.push(item),
+            Err(error) => items.push(json!({
+                "chat_id": chat_id,
+                "source": "telegram_bot_api",
+                "success": false,
+                "data_complete": false,
+                "errors": [format!("检查失败: {error}")]
+            })),
+        }
+    }
+
+    let verified_count = items
+        .iter()
+        .filter(|item| item.get("success").and_then(Value::as_bool) == Some(true))
+        .count() as i64;
+    let data_complete = total_count <= limit && verified_count == total_count;
+    let status = if data_complete { "ok" } else { "partial" };
+
+    Ok(Json(json!({
+        "success": true,
+        "status": status,
+        "data_complete": data_complete,
+        "evidence_count": verified_count,
+        "data": {
+            "operation": "bound_chat_capabilities",
+            "items": items,
+            "total_count": total_count,
+            "verified_count": verified_count,
+            "unavailable_count": total_count.saturating_sub(verified_count),
+            "limit": limit,
+            "source": "tenant_bound_chats+telegram_bot_api"
+        },
+        "count": verified_count,
+        "message": format!(
+            "Telegram SDK 已核验当前租户绑定聊天：{verified_count}/{total_count} 个"
+        )
+    })))
+}
+
 async fn inspect_single_chat(
     telegram: &tgbot_integrations::telegram::TelegramClient,
     chat_id: i64,
@@ -543,6 +704,10 @@ async fn inspect_single_chat(
             item["chat_type"] = chat_json.get("type").cloned().unwrap_or(Value::Null);
             item["title"] = chat_json.get("title").cloned().unwrap_or(Value::Null);
             item["username"] = chat_json.get("username").cloned().unwrap_or(Value::Null);
+        } else {
+            item["errors"]
+                .as_array_mut()
+                .map(|e| e.push(json!("getChat: invalid response")));
         }
     } else {
         item["errors"]
@@ -582,13 +747,29 @@ async fn inspect_single_chat(
                     }
                     item["bot_permissions"] = permissions;
                 }
+            } else {
+                item["errors"]
+                    .as_array_mut()
+                    .map(|e| e.push(json!("getChatMember: invalid response")));
             }
+        } else {
+            item["errors"]
+                .as_array_mut()
+                .map(|e| e.push(json!("getChatMember: failed to retrieve bot status")));
         }
+    } else {
+        item["errors"]
+            .as_array_mut()
+            .map(|e| e.push(json!("getMe: failed to retrieve bot")));
     }
 
     // Get member count
     if let Ok(count) = telegram.get_chat_member_count(chat_id).await {
         item["member_count"] = json!(count);
+    } else {
+        item["errors"]
+            .as_array_mut()
+            .map(|e| e.push(json!("getChatMemberCount: failed to retrieve count")));
     }
 
     // Get admin list if requested
@@ -612,6 +793,10 @@ async fn inspect_single_chat(
                 })
                 .collect();
             item["admins"] = json!(admins_list);
+        } else {
+            item["errors"]
+                .as_array_mut()
+                .map(|e| e.push(json!("getChatAdministrators: failed to retrieve admins")));
         }
     }
 

@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::PgPool;
 
+use crate::migration_audit::MigrationFailure;
 use crate::sqlite_reader::{SqliteConfig, SqliteGroupMessage, SqliteReader};
 
 /// Migration statistics for group messages
@@ -16,6 +17,7 @@ pub struct GroupMessageMigrationStats {
     pub skipped: i64,
     pub errors: i64,
     pub batch_size: usize,
+    pub failures: Vec<MigrationFailure>,
 }
 
 /// Migrate group messages from SQLite to PostgreSQL with batching
@@ -41,6 +43,7 @@ pub async fn migrate_group_messages(
         skipped: 0,
         errors: 0,
         batch_size,
+        failures: Vec::new(),
     };
 
     let mut offset = 0;
@@ -57,8 +60,10 @@ pub async fn migrate_group_messages(
         let batch_result = migrate_group_message_batch(&messages, pg_pool).await;
 
         match batch_result {
-            Ok(batch_migrated) => {
+            Ok((batch_migrated, batch_failures)) => {
                 stats.migrated += batch_migrated;
+                stats.errors += batch_failures.len() as i64;
+                stats.failures.extend(batch_failures);
                 tracing::debug!(
                     "Migrated batch: {} group messages (offset={})",
                     batch_migrated,
@@ -68,22 +73,18 @@ pub async fn migrate_group_messages(
             Err(e) => {
                 tracing::error!("Failed to migrate batch at offset {}: {}", offset, e);
                 stats.errors += messages.len() as i64;
+                let error = e.to_string();
+                stats.failures.extend(messages.iter().map(|message| {
+                    MigrationFailure::new(
+                        "group_messages",
+                        group_message_source_key(message),
+                        error.clone(),
+                    )
+                }));
             }
         }
 
         offset += batch_size;
-    }
-
-    // Get skipped count (already migrated)
-    let target_count: i64 =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM groups.group_messages")
-            .fetch_one(pg_pool)
-            .await
-            .context("Failed to count group messages in PostgreSQL")?;
-
-    // If target count is close to source, consider the rest as skipped (already migrated)
-    if target_count < stats.total_source {
-        stats.skipped = stats.total_source - stats.migrated - stats.errors;
     }
 
     tracing::info!(
@@ -100,20 +101,32 @@ pub async fn migrate_group_messages(
 async fn migrate_group_message_batch(
     messages: &[SqliteGroupMessage],
     pg_pool: &PgPool,
-) -> Result<i64> {
+) -> Result<(i64, Vec<MigrationFailure>)> {
     let mut migrated = 0;
+    let mut failures = Vec::new();
 
     for msg in messages {
         match migrate_single_group_message(msg, pg_pool).await {
             Ok(_) => migrated += 1,
             Err(e) => {
-                // Log but continue with other messages
                 tracing::warn!("Failed to migrate group message {}: {}", msg.msg_id, e);
+                failures.push(MigrationFailure::new(
+                    "group_messages",
+                    group_message_source_key(msg),
+                    e.to_string(),
+                ));
             }
         }
     }
 
-    Ok(migrated)
+    Ok((migrated, failures))
+}
+
+fn group_message_source_key(message: &SqliteGroupMessage) -> String {
+    format!(
+        "tenant_id={}::msg_id={}::group_id={}::tg_msg_id={:?}",
+        message.tenant_id, message.msg_id, message.group_id, message.tg_msg_id
+    )
 }
 
 /// Migrate a single group message from SQLite to PostgreSQL
@@ -311,6 +324,7 @@ mod tests {
             skipped: 40,
             errors: 10,
             batch_size: 100,
+            failures: Vec::new(),
         };
 
         assert_eq!(stats.total_source, 1000);

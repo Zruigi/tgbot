@@ -36,6 +36,21 @@ impl AgentSession {
         format!("{}:{}:{}", tenant_id, user_id, merchant_id.unwrap_or(""))
     }
 
+    pub fn session_key_with_actor(
+        tenant_id: &str,
+        actor_key: &str,
+        user_id: i64,
+        merchant_id: Option<&str>,
+    ) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            tenant_id,
+            actor_key,
+            user_id,
+            merchant_id.unwrap_or("")
+        )
+    }
+
     /// 更新会话时间戳
     pub fn update_timestamp(&mut self) {
         self.updated_at = current_timestamp();
@@ -94,9 +109,25 @@ impl AgentSessionStore {
         format!("{}:{}:{}", tenant_id, user_id, merchant_id.unwrap_or(""))
     }
 
+    pub fn session_key_with_actor(
+        tenant_id: &str,
+        actor_key: &str,
+        user_id: i64,
+        merchant_id: Option<&str>,
+    ) -> String {
+        AgentSession::session_key_with_actor(tenant_id, actor_key, user_id, merchant_id)
+    }
+
     /// 获取或创建会话
     pub fn get_or_create(&self, key: String, ctx: AgentContext) -> AgentSession {
         let mut sessions = self.sessions.lock().unwrap();
+        if sessions
+            .get(&key)
+            .map(AgentSession::is_expired)
+            .unwrap_or(false)
+        {
+            sessions.remove(&key);
+        }
         sessions
             .entry(key)
             .or_insert_with(|| AgentSession::new(ctx))
@@ -105,7 +136,15 @@ impl AgentSessionStore {
 
     /// 获取现有会话
     pub fn get(&self, key: &str) -> Option<AgentSession> {
-        let sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions
+            .get(key)
+            .map(AgentSession::is_expired)
+            .unwrap_or(false)
+        {
+            sessions.remove(key);
+            return None;
+        }
         sessions.get(key).cloned()
     }
 
@@ -173,6 +212,20 @@ mod tests {
 
         let key2 = AgentSessionStore::session_key("tenant1", 123, None);
         assert_eq!(key2, "tenant1:123:");
+
+        let actor_key = AgentSessionStore::session_key_with_actor(
+            "tenant1",
+            "uuid:actor-a",
+            123,
+            Some("merchant1"),
+        );
+        let other_actor_key = AgentSessionStore::session_key_with_actor(
+            "tenant1",
+            "uuid:actor-b",
+            123,
+            Some("merchant1"),
+        );
+        assert_ne!(actor_key, other_actor_key);
     }
 
     #[test]
@@ -193,5 +246,23 @@ mod tests {
             updated_at: current_timestamp(),
         };
         assert!(!session.is_expired());
+    }
+
+    #[test]
+    fn expired_store_sessions_are_not_reused() {
+        let key = "tenant:actor:123:merchant".to_string();
+        let store = AgentSessionStore {
+            sessions: Arc::new(Mutex::new(HashMap::from([(
+                key.clone(),
+                AgentSession {
+                    ctx: AgentContext::new(123),
+                    pending: None,
+                    updated_at: current_timestamp() - SESSION_TTL_SECS - 1,
+                },
+            )]))),
+        };
+
+        assert!(store.get(&key).is_none());
+        assert_eq!(store.active_count(), 0);
     }
 }

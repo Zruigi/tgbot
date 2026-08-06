@@ -9,9 +9,17 @@ read during the Beta checks.
 The committed migration progress note records run `b1c5f14` as `25,892 / 25,894`
 rows with two skips described as source-data-integrity problems. It does not
 contain the source table, primary key, error text, or a durable per-row export.
-The migration binaries currently report aggregate `migrated`, `skipped`, and
-`errors` counters; those counters are not sufficient to prove that the two
-rows are safe to omit.
+The migration binary now exits non-zero when any phase reports skipped, failed,
+or unaccounted source rows, and message rows without a legacy `trace_id` receive
+a deterministic migration identity. Full verification and `quick_verify` use
+exact source/target counts; a source-sized migrated subset does not mask extra
+target rows. Every migration phase now retains a source key and exact row
+error. When row failures, phase accounting gaps, or verification mismatches
+exist, the binary requires `MIGRATION_AUDIT_PATH` and
+`MIGRATION_AUDIT_OPERATOR` and writes a checksummed JSON report with
+`status=requires_disposition`; phase statistics are retained even when the
+gap has no row-level converter error. The report is still an audit of failed or
+unaccounted rows, not an automatic acceptance of them.
 
 Decision: the two skips are **not accepted and are not marked fixed**. Before a
 release owner accepts them, run the migration in read-only/source-snapshot mode
@@ -26,6 +34,14 @@ and export one row per skip with:
 The export must be attached to the acceptance record and the target row counts
 rechecked after any repair. Until then, the missing two rows remain an open
 launch blocker.
+
+The migration binary requires an explicit `SQLITE_DB_PATH`; it will not infer a
+source SQLite path from the Beta worktree or a sibling production directory.
+
+For a disposable/source-snapshot run, set `MIGRATION_AUDIT_PATH` to an audit
+file path, set `MIGRATION_AUDIT_OPERATOR` to the responsible operator name, and
+optionally set `MIGRATION_RUN_ID` to a stable run identifier. These variables
+must never contain a database URL, password, token, or other credential.
 
 ## BYPASSRLS role lifecycle
 

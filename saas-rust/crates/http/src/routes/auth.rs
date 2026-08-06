@@ -40,8 +40,14 @@ impl OtpStore {
     }
 
     pub async fn get(&self, otp: &str) -> Option<OtpData> {
-        let store = self.0.read().await;
-        store.get(otp).cloned()
+        let now = chrono::Utc::now().timestamp() as f64;
+        let mut store = self.0.write().await;
+        let data = store.get(otp).cloned()?;
+        if data.expire_at <= now {
+            store.remove(otp);
+            return None;
+        }
+        Some(data)
     }
 
     pub async fn remove(&self, otp: &str) -> Option<OtpData> {
@@ -104,20 +110,15 @@ impl Default for CsrfStore {
 }
 
 fn generate_secure_token(length: usize) -> String {
-    use std::iter;
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng_seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
 
-    iter::repeat_with(|| {
-        rng_seed = rng_seed.wrapping_mul(1103515245).wrapping_add(12345);
-        let idx = (rng_seed / 65536) as usize % CHARSET.len();
-        CHARSET[idx] as char
-    })
-    .take(length)
-    .collect()
+    let mut token = String::with_capacity(length);
+    while token.len() < length {
+        token.push_str(&URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes()));
+    }
+    token.truncate(length);
+    token
 }
 
 fn build_session_token_payload(
@@ -140,36 +141,39 @@ fn build_session_token_payload(
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 // Note: Exactly 32 bytes required for HMAC-SHA256 key
 type HmacSha256 = Hmac<Sha256>;
-const SESSION_SECRET_KEY: &[u8; 32] = b"01234567890123456789012345678901";
-
-// ============== FIXED: 使用真正的 HMAC-SHA256 ==============
+// ============== 使用部署专用的 HMAC-SHA256 密钥 ==============
 pub(crate) fn issue_session_token(
+    session_secret: &str,
     role: &str,
     tenant_id: &str,
     merchant_id: Option<i64>,
     issued_for: Option<&str>,
-) -> String {
+) -> Option<String> {
+    if session_secret.as_bytes().len() < 32 {
+        return None;
+    }
     let payload = build_session_token_payload(role, tenant_id, merchant_id, issued_for);
-    let payload_json = serde_json::to_string(&payload).unwrap_or_default();
+    let payload_json = serde_json::to_string(&payload).ok()?;
 
     // 使用标准 base64 编码
     let payload_b64 = BASE64.encode(payload_json.as_bytes());
 
     // 使用真正的 HMAC-SHA256 进行签名
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(SESSION_SECRET_KEY).expect("HMAC can accept key");
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(session_secret.as_bytes()).ok()?;
     mac.update(payload_b64.as_bytes());
     let signature = BASE64.encode(mac.finalize().into_bytes());
 
-    format!("{}.{}", payload_b64, signature)
+    Some(format!("{}.{}", payload_b64, signature))
 }
 
-// ============== FIXED: 使用真正的 HMAC-SHA256 验证 ==============
-pub(crate) fn verify_session_token(token: &str) -> Option<Value> {
+pub(crate) fn verify_session_token(token: &str, session_secret: &str) -> Option<Value> {
+    if session_secret.as_bytes().len() < 32 {
+        return None;
+    }
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 2 {
         return None;
@@ -179,8 +183,7 @@ pub(crate) fn verify_session_token(token: &str) -> Option<Value> {
     let signature_b64 = parts[1];
 
     // 验证 HMAC-SHA256 签名
-    let mut mac =
-        <HmacSha256 as hmac::Mac>::new_from_slice(SESSION_SECRET_KEY).expect("HMAC can accept key");
+    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(session_secret.as_bytes()).ok()?;
     mac.update(payload_b64.as_bytes());
     let expected_sig = BASE64.encode(mac.finalize().into_bytes());
 
@@ -198,6 +201,11 @@ pub(crate) fn verify_session_token(token: &str) -> Option<Value> {
         return None;
     }
     Some(payload)
+}
+
+pub(crate) fn session_actor_key(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!("session:{}", hex::encode(&digest[..16]))
 }
 
 // 恒定时间比较 - 防止时序攻击
@@ -258,7 +266,14 @@ pub async fn login(
     let expire_at = now + 300.0; // 5 minutes TTL
 
     // Store OTP with session token
-    let session_token = issue_session_token("platform_admin", "", None, Some("admin"));
+    let session_token = issue_session_token(
+        &state.config.session_secret,
+        "platform_admin",
+        "",
+        None,
+        Some("admin"),
+    )
+    .ok_or_else(|| ApiError::ServiceUnavailable("session signing unavailable".into()))?;
     let otp_data = OtpData {
         token: session_token,
         expire_at,
@@ -442,7 +457,14 @@ pub async fn login_tma(
         (role, tenant_hint.trim().to_string())
     };
 
-    let session_token = issue_session_token(&role, &tenant_id, merchant_id_hint, user_json_ref);
+    let session_token = issue_session_token(
+        &state.config.session_secret,
+        &role,
+        &tenant_id,
+        merchant_id_hint,
+        user_json_ref,
+    )
+    .ok_or_else(|| ApiError::ServiceUnavailable("session signing unavailable".into()))?;
 
     // Generate CSRF token
     let csrf_store = state.csrf_store.clone();
@@ -589,12 +611,19 @@ pub async fn generate_otp_internal(
     merchant_id: Option<i64>,
     issued_for: Option<String>,
     ttl_seconds: i64,
-) -> String {
+) -> ApiResult<String> {
     let otp = generate_secure_token(12);
     let now = chrono::Utc::now().timestamp() as f64;
     let expire_at = now + ttl_seconds as f64;
 
-    let session_token = issue_session_token(&role, &tenant_id, merchant_id, issued_for.as_deref());
+    let session_token = issue_session_token(
+        &state.config.session_secret,
+        &role,
+        &tenant_id,
+        merchant_id,
+        issued_for.as_deref(),
+    )
+    .ok_or_else(|| ApiError::ServiceUnavailable("session signing unavailable".into()))?;
 
     let otp_data = OtpData {
         token: session_token,
@@ -608,12 +637,36 @@ pub async fn generate_otp_internal(
     let otp_store = state.otp_store.clone();
     otp_store.insert(otp.clone(), otp_data).await;
 
-    otp
+    Ok(otp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_tokens_require_the_deployment_secret_and_round_trip() {
+        let secret = "beta-session-secret-012345678901234567";
+        let token = issue_session_token(secret, "merchant_owner", "tenant-a", None, Some("actor"))
+            .expect("valid secret should sign a session");
+
+        let payload = verify_session_token(&token, secret).expect("signed token should verify");
+        assert_eq!(payload["role"], "merchant_owner");
+        assert!(verify_session_token(&token, "wrong-secret-012345678901234567890").is_none());
+        assert!(
+            issue_session_token("too-short", "merchant_owner", "tenant-a", None, None).is_none()
+        );
+    }
+
+    #[test]
+    fn session_actor_key_does_not_expose_the_token() {
+        let token = "test-session-token";
+        let actor_key = session_actor_key(token);
+
+        assert!(actor_key.starts_with("session:"));
+        assert!(!actor_key.contains(token));
+        assert_ne!(actor_key, session_actor_key("another-session-token"));
+    }
 
     #[test]
     fn telegram_web_app_hash_uses_web_app_data_derived_secret() {
@@ -622,5 +675,20 @@ mod tests {
             compute_telegram_hash(data, "123456:ABCdef"),
             "183ee3a9badd18521e50eba6626fc62a3323833eb552589b9d6817a9068dfbc2"
         );
+    }
+
+    #[test]
+    fn secure_tokens_have_requested_length_and_are_not_repeated() {
+        let first = generate_secure_token(32);
+        let second = generate_secure_token(32);
+
+        assert_eq!(first.len(), 32);
+        assert_eq!(second.len(), 32);
+        assert_ne!(first, second);
+        assert!(first
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || character == '-'
+                || character == '_'));
     }
 }

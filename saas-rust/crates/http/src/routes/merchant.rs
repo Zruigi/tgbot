@@ -330,7 +330,7 @@ pub async fn ai_usage(
     let scope = resolve_scope(&state, &headers).await?;
     let (tenant_id, _merchant_id) = scope.require_merchant()?;
     let days = q.days.unwrap_or(7).clamp(1, 90);
-    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let _limit = q.limit.unwrap_or(50).clamp(1, 200);
 
     // Get summary
     let summary_row = sqlx::query(

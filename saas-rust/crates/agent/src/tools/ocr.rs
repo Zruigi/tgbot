@@ -6,17 +6,29 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 use tgbot_integrations::paddleocr::{OcrRequest, PaddleOCRClient, PaddleOCRConfig};
+use tgbot_integrations::telegram::{GetFileParams, TelegramClient};
 use tracing::{error, info};
+
+const MAX_TELEGRAM_OCR_BYTES: usize = 10 * 1024 * 1024;
 
 /// OCR 工具 - 图像文字识别
 pub struct OcrTool {
     client: Arc<PaddleOCRClient>,
+    telegram_client: Option<Arc<TelegramClient>>,
 }
 
 impl OcrTool {
     /// 创建新的 OCR 工具实例
     pub fn new(client: Arc<PaddleOCRClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            telegram_client: None,
+        }
+    }
+
+    pub fn with_telegram_client(mut self, client: Arc<TelegramClient>) -> Self {
+        self.telegram_client = Some(client);
+        self
     }
 
     /// 使用默认配置创建
@@ -98,10 +110,30 @@ impl Tool for OcrTool {
                 self.client.ocr(&req).await
             }
             "file_id" => {
-                // 文件ID需要先下载，这里先返回提示
-                return ToolExecuteResult::fail(
-                    "file_id 类型的 OCR 暂不支持，请使用 URL 或 Base64 方式",
-                );
+                let Some(telegram) = self.telegram_client.as_ref() else {
+                    return ToolExecuteResult::fail("Telegram 客户端未配置，无法下载 OCR 文件");
+                };
+                let file = match telegram
+                    .get_file(GetFileParams {
+                        file_id: source.to_string(),
+                    })
+                    .await
+                {
+                    Ok(file) => file,
+                    Err(error) => {
+                        return ToolExecuteResult::fail(&format!("Telegram 文件查询失败: {error}"));
+                    }
+                };
+                let bytes = match telegram
+                    .download_file_bytes(&file, MAX_TELEGRAM_OCR_BYTES)
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return ToolExecuteResult::fail(&format!("Telegram 文件下载失败: {error}"));
+                    }
+                };
+                self.client.ocr_image_bytes(&bytes, Some(lang)).await
             }
             _ => {
                 return ToolExecuteResult::fail(&format!("未知的 source_type: {}", source_type));
@@ -149,5 +181,28 @@ impl Tool for OcrTool {
                 ToolExecuteResult::fail(&format!("OCR 识别失败: {}", e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::Tool;
+
+    #[tokio::test]
+    async fn file_id_ocr_fails_closed_without_telegram_client() {
+        let client = Arc::new(PaddleOCRClient::new(PaddleOCRConfig::default()).unwrap());
+        let tool = OcrTool::new(client);
+        let result = tool
+            .execute(
+                &serde_json::json!({
+                    "source_type": "file_id",
+                    "source": "beta-file",
+                }),
+                &crate::schema::AgentContext::new(1),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.message.unwrap().contains("Telegram 客户端未配置"));
     }
 }

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use axum::Router;
 use std::{sync::Arc, time::Duration};
 use tgbot_domain::config::Config;
+use tgbot_domain::worker_telemetry::WorkerTelemetry;
 use tgbot_http::middleware;
 use tgbot_http::routes;
 use tgbot_http::routes::auth::{CsrfStore, OtpStore};
@@ -11,14 +12,17 @@ use tgbot_http::routes::telegram_webhook::{
     install_default_handlers, load_bots_from_db, BotRegistry, UpdateDispatcher,
 };
 use tgbot_http::state::AppState;
+use tgbot_integrations::bscscan::BscScanClient;
 use tgbot_integrations::litellm::LiteLLMClient;
 use tgbot_integrations::supabase_rest::SupabaseRestClient;
 use tgbot_integrations::telegram::{TelegramClient, TelegramConfig};
+use tgbot_integrations::trongrid::TronGridClient;
 use tgbot_repos::user_repo;
 use tgbot_workers::{
-    AdGovernanceWorker, Dispatcher as WorkerDispatcher, GroupMessagePolicyWorker, PushTaskWorker,
-    Scheduler, SchedulerConfig, TelegramAutoReplyWorker, TelegramClientResolver,
-    TelegramCommandWorker, Worker, WorkerHandle,
+    AdGovernanceWorker, AddressMonitorAlertWorker, AddressMonitorWorker,
+    Dispatcher as WorkerDispatcher, GroupMessagePolicyWorker, PushTaskWorker, Scheduler,
+    SchedulerConfig, TelegramAutoReplyWorker, TelegramClientResolver, TelegramCommandWorker,
+    Worker, WorkerHandle,
 };
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -39,14 +43,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    tgbot_http::secret_crypto::SecretCipher::from_encoded_key(&config.secret_encryption_key)
+        .map_err(|error| anyhow!("invalid TGBOT_SECRET_ENCRYPTION_KEY: {error}"))?;
 
     // --- Supabase REST client (HTTPS, always works) ---
     let supabase = SupabaseRestClient::new(&config.supabase_url, &config.supabase_service_role_key);
     let llm = LiteLLMClient::from_env()?;
 
-    // --- Try PostgreSQL pool; degrade to REST-only if blocked ---
+    // --- Connect PostgreSQL; REST-only is an explicit local diagnostic mode ---
     let telegram_auto_replies_enabled = config.telegram_auto_replies_enabled;
     let telegram_commands_enabled = config.telegram_commands_enabled;
+    let telegram_wallet_monitors_enabled = config.telegram_wallet_monitors_enabled;
     let pg_result = sqlx::postgres::PgPoolOptions::new()
         .max_connections(config.database_max_connections)
         .after_connect(move |connection, _metadata| {
@@ -70,6 +77,14 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         "false"
                     })
+                .execute(&mut *connection)
+                .await?;
+                sqlx::query("SELECT set_config('tgbot.telegram_wallet_monitors_enabled', $1, false)")
+                    .bind(if telegram_wallet_monitors_enabled {
+                        "true"
+                    } else {
+                        "false"
+                    })
                     .execute(&mut *connection)
                     .await?;
                 Ok(())
@@ -83,14 +98,23 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("PostgreSQL direct connection established");
             Some(p)
         }
-        Err(e) => {
-            tracing::warn!("PostgreSQL unavailable ({e}), running in REST-only mode");
+        Err(error) if config.allow_rest_only => {
+            tracing::warn!(
+                error = %error,
+                "PostgreSQL unavailable; running in explicitly enabled REST-only diagnostic mode"
+            );
             None
+        }
+        Err(error) => {
+            return Err(anyhow!(
+                "PostgreSQL is required for the MVP runtime; connection failed: {error}"
+            ));
         }
     };
 
     // Initialize webhook bot registry
     let bot_registry = BotRegistry::new();
+    let worker_telemetry = WorkerTelemetry::default();
 
     // Load active bots from database (PG-only)
     if let Some(ref pg) = pool {
@@ -112,6 +136,15 @@ async fn main() -> anyhow::Result<()> {
     // Spawn background rate limiter cleanup
     tokio::spawn(middleware::rate_limiter_cleanup_task());
 
+    let wallet_monitor_clients = if config.telegram_wallet_monitors_enabled {
+        Some((
+            Arc::new(TronGridClient::from_env()?),
+            Arc::new(BscScanClient::from_env()?),
+        ))
+    } else {
+        None
+    };
+
     let worker_handle = pool.as_ref().map(|pg| {
         let resolver = Arc::new(RegistryTelegramResolver {
             bot_registry: bot_registry.clone(),
@@ -125,8 +158,20 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(llm.clone()),
             )) as Arc<dyn Worker>,
         ];
+        if let Some((trongrid, bscscan)) = wallet_monitor_clients.as_ref() {
+            workers.push(
+                Arc::new(AddressMonitorWorker::new(trongrid.clone(), bscscan.clone()))
+                    as Arc<dyn Worker>,
+            );
+            workers.push(
+                Arc::new(AddressMonitorAlertWorker::new(resolver.clone())) as Arc<dyn Worker>
+            );
+        }
         if config.telegram_commands_enabled {
-            workers.push(Arc::new(TelegramCommandWorker::new(resolver.clone())) as Arc<dyn Worker>);
+            workers.push(Arc::new(TelegramCommandWorker::new(
+                resolver.clone(),
+                config.telegram_wallet_monitors_enabled,
+            )) as Arc<dyn Worker>);
         }
         if config.telegram_auto_replies_enabled {
             workers
@@ -135,8 +180,12 @@ async fn main() -> anyhow::Result<()> {
         let mut scheduler_config = SchedulerConfig::default();
         scheduler_config.poll_interval = env_duration("WORKER_POLL_INTERVAL_SECS", 5);
         scheduler_config.cron_check_interval = env_duration("PUSH_TASK_CRON_INTERVAL_SECS", 60);
+        scheduler_config.heartbeat_interval = env_duration("WORKER_HEARTBEAT_INTERVAL_SECS", 10);
+        scheduler_config.worker_concurrency =
+            env_usize("WORKER_CONCURRENCY", scheduler_config.worker_concurrency);
         let mut scheduler =
             Scheduler::new(pg.clone(), scheduler_config, WorkerDispatcher::new(workers))
+                .with_telemetry(worker_telemetry.clone())
                 .with_job_type_filter("push_task")
                 .with_job_type_filter("group_message_policy")
                 .with_job_type_filter("ad_scan_job")
@@ -146,6 +195,12 @@ async fn main() -> anyhow::Result<()> {
         }
         if config.telegram_auto_replies_enabled {
             scheduler = scheduler.with_job_type_filter("telegram_auto_reply");
+        }
+        if config.telegram_wallet_monitors_enabled {
+            scheduler = scheduler
+                .with_job_type_filter("monitor_check")
+                .with_job_type_filter("monitor_alert")
+                .with_address_monitor_cron();
         }
         scheduler
             .with_channel_reminder_cleanup(
@@ -166,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
         grant_store: GrantStore::new(),
         bot_registry,
         worker_enabled,
+        worker_telemetry,
         update_dispatcher: Some(dispatcher),
     };
 
@@ -178,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
                 config
                     .cors_allowed_origin
                     .parse::<axum::http::HeaderValue>()
-                    .unwrap(),
+                    .map_err(|error| anyhow!("invalid CORS_ALLOWED_ORIGIN: {error}"))?,
             )
             .allow_methods(Any)
             .allow_headers(Any)
@@ -242,6 +298,14 @@ fn env_duration(name: &str, default_secs: u64) -> Duration {
             .filter(|value| *value > 0)
             .unwrap_or(default_secs),
     )
+}
+
+fn env_usize(name: &str, default_value: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_value)
 }
 
 async fn shutdown_signal(worker_handle: Option<WorkerHandle>) {

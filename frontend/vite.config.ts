@@ -5,6 +5,9 @@ import { resolve } from 'path'
 // Detect Cloudflare tunnel mode via env var (set CF_TUNNEL=1 in tunnel launch script)
 const isCfTunnel = !!process.env['CF_TUNNEL']
 
+const apiProxyTarget = process.env['VITE_API_PROXY_TARGET'] || 'http://localhost:8080'
+const wsProxyTarget = apiProxyTarget.replace(/^http/, 'ws')
+
 export default defineConfig({
   plugins: [vue()],
   resolve: {
@@ -22,15 +25,15 @@ export default defineConfig({
     },
     proxy: {
       '/api/v1': {
-        target: 'http://localhost:8080',
+        target: apiProxyTarget,
         changeOrigin: true,
       },
       '/api': {
-        target: 'http://localhost:8080',
+        target: apiProxyTarget,
         changeOrigin: true,
       },
       '/ws': {
-        target: 'ws://127.0.0.1:8080',
+        target: wsProxyTarget,
         ws: true,
         // Rewrite Origin header so Cloudflare tunnel origins pass the WS handshake
         // rewriteWsOrigin is available since Vite 5.1

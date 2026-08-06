@@ -1,8 +1,12 @@
+use serde_json::{json, Value};
+
 /// 已识别的 Telegram 命令枚举。
 #[derive(Debug, Clone, PartialEq)]
 pub enum TelegramCommand {
     Start(Option<String>),
     Help,
+    Wallets,
+    WalletMonitor(Option<String>),
 }
 
 /// 命令回复，包含纯文本消息。
@@ -14,7 +18,8 @@ pub struct CommandReply {
 /// 解析私聊文本，提取命令。
 ///
 /// - 支持 `/start`、`/help`，未知命令返回 `None`。
-/// - 支持 `/start payload` 形式，payload 作为 `Start` 的附带参数。
+/// - 支持 `/start payload` 形式，payload 作为 `Start` 的附带参数；频道验证
+///   深链由 `parse_channel_start_payload` 严格解析。
 /// - 支持 `/command@bot_username` 形式；若 `@` 后用户名与 `bot_username` 不匹配，则返回 `None`。
 /// - 纯函数，不访问环境变量、数据库或网络。
 pub fn parse_telegram_command(text: &str, bot_username: &str) -> Option<TelegramCommand> {
@@ -87,8 +92,39 @@ pub fn parse_telegram_command(text: &str, bot_username: &str) -> Option<Telegram
             // /help 不支持 payload，忽略其后的内容
             Some(TelegramCommand::Help)
         }
+        "wallets" | "wallet" => Some(TelegramCommand::Wallets),
+        "wallet_monitor" | "add_wallet" => Some(TelegramCommand::WalletMonitor(
+            (!payload.is_empty()).then(|| payload.to_string()),
+        )),
         _ => None,
     }
+}
+
+/// Parse the channel-verification deep-link payload used by `/start`.
+///
+/// The payload is intentionally strict: only `channel_<group_id>_<channel_id>`
+/// is accepted, and the tenant-scoped database configuration remains the
+/// authority for whether the pair is valid.
+pub fn parse_channel_start_payload(payload: &str) -> Option<(i64, i64)> {
+    let mut parts = payload.trim().split('_');
+    if parts.next()? != "channel" {
+        return None;
+    }
+    let group_id = parts.next()?.parse::<i64>().ok()?;
+    let channel_id = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() || group_id == 0 || channel_id == 0 {
+        return None;
+    }
+    Some((group_id, channel_id))
+}
+
+pub fn parse_unmute_start_payload(payload: &str) -> Option<i64> {
+    let group_id = payload
+        .trim()
+        .strip_prefix("unmute_")?
+        .parse::<i64>()
+        .ok()?;
+    (group_id != 0).then_some(group_id)
 }
 
 /// 根据命令和用户名字构建回复文本。
@@ -104,14 +140,34 @@ pub fn build_command_reply(command: &TelegramCommand, first_name: &str) -> Comma
         }
         TelegramCommand::Start(None) => {
             format!(
-                "你好，{first_name}！欢迎使用本机器人。\n\n已实现的命令：\n/start - 开始使用机器人\n/help - 显示帮助信息"
+                "你好，{first_name}！欢迎使用本机器人。\n\n已实现的命令：\n/start - 开始使用机器人\n/help - 显示帮助信息\n/wallets - 查看地址监听"
             )
         }
         TelegramCommand::Help => {
-            "已实现的命令：\n/start - 开始使用机器人\n/help - 显示帮助信息".to_string()
+            "已实现的命令：\n/start - 开始使用机器人\n/help - 显示帮助信息\n/wallets - 查看地址监听"
+                .to_string()
+        }
+        TelegramCommand::Wallets => "正在读取当前租户的地址监听列表，请稍候。".to_string(),
+        TelegramCommand::WalletMonitor(Some(address)) => {
+            format!("正在登记地址 `{address}` 到当前租户的监听列表，请稍候。")
+        }
+        TelegramCommand::WalletMonitor(None) => {
+            "请发送 `/wallet_monitor <TRC20或BSC地址>` 添加地址监听。".to_string()
         }
     };
     CommandReply { text }
+}
+
+pub fn start_menu_reply(first_name: &str) -> (String, Option<Value>) {
+    (
+        build_command_reply(&TelegramCommand::Start(None), first_name).text,
+        Some(json!({
+            "inline_keyboard": [[{
+                "text": "📡 我的地址监听",
+                "callback_data": "wallet_my_list"
+            }]]
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +191,29 @@ mod tests {
     fn test_start_with_payload() {
         let cmd = parse_telegram_command("/start ref_abc123", BOT);
         assert_eq!(cmd, Some(TelegramCommand::Start(Some("ref_abc123".into()))));
+    }
+
+    #[test]
+    fn parses_strict_channel_start_payload() {
+        assert_eq!(
+            parse_channel_start_payload("channel_-10001_-30001"),
+            Some((-10001, -30001))
+        );
+        assert_eq!(parse_channel_start_payload("channel_bad_-30001"), None);
+        assert_eq!(
+            parse_channel_start_payload("channel_-10001_-30001_extra"),
+            None
+        );
+        assert_eq!(parse_channel_start_payload("ref_abc123"), None);
+    }
+
+    #[test]
+    fn parses_strict_unmute_start_payload() {
+        assert_eq!(parse_unmute_start_payload("unmute_-10001"), Some(-10001));
+        assert_eq!(parse_unmute_start_payload("unmute_10001"), Some(10001));
+        assert_eq!(parse_unmute_start_payload("unmute_0"), None);
+        assert_eq!(parse_unmute_start_payload("unmute_-10001_extra"), None);
+        assert_eq!(parse_unmute_start_payload("channel_-10001_-30001"), None);
     }
 
     #[test]
@@ -257,6 +336,46 @@ mod tests {
         let reply = build_command_reply(&TelegramCommand::Help, "Bob");
         assert!(reply.text.contains("/start"));
         assert!(reply.text.contains("/help"));
+        assert!(reply.text.contains("/wallets"));
+    }
+
+    #[test]
+    fn parses_wallet_command_and_alias() {
+        assert_eq!(
+            parse_telegram_command("/wallets", BOT),
+            Some(TelegramCommand::Wallets)
+        );
+        assert_eq!(
+            parse_telegram_command("/wallet@MyTestBot", BOT),
+            Some(TelegramCommand::Wallets)
+        );
+    }
+
+    #[test]
+    fn parses_wallet_monitor_command_and_alias() {
+        assert_eq!(
+            parse_telegram_command(
+                "/wallet_monitor 0x0000000000000000000000000000000000000001",
+                BOT,
+            ),
+            Some(TelegramCommand::WalletMonitor(Some(
+                "0x0000000000000000000000000000000000000001".into(),
+            )))
+        );
+        assert_eq!(
+            parse_telegram_command("/add_wallet@MyTestBot", BOT),
+            Some(TelegramCommand::WalletMonitor(None))
+        );
+    }
+
+    #[test]
+    fn start_menu_exposes_only_migrated_wallet_callback() {
+        let (text, markup) = start_menu_reply("Alice");
+        assert!(text.contains("/wallets"));
+        assert_eq!(
+            markup.expect("start menu markup")["inline_keyboard"][0][0]["callback_data"],
+            "wallet_my_list"
+        );
     }
 
     #[test]

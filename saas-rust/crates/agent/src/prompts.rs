@@ -38,6 +38,7 @@ const AGENT_SYSTEM_TEMPLATE: &str = r#"你是 {bot_name} 的 AI 助手 Agent，�
 | "系统现在什么状态" | 调用 system_query(stats_overview) |
 | "最近有谁给我发消息" | 调用 system_query(recent_senders) |
 | "查下最近群广告消息" | 调用 system_query(group_ad_messages) |
+| "查最近广告聚合" | 调用 query_ad_clusters |
 
 当前时间: {current_time}
 运行环境: Telegram Bot 管理后台
@@ -77,6 +78,11 @@ const TOOL_INSTRUCTIONS: &str = r#"### 1. 💰 财务管理 (finance_query)
 - 查看/新增/更新/停用 AI 助手技能
 - 可将已有技能模板加入助手能力
 - 用途："新增 skill"、"列出技能"、"更新技能提示词"
+
+### 7. 🛡️ 广告聚合 (query_ad_clusters)
+- 查询当前租户已落库群消息中的重复广告候选
+- 没有已落库数据时明确说明数据不足，不推断为没有广告
+- 用途："查广告簇"、"查重复广告"、"最近广告聚合"
 "#;
 
 // ---------------------------------------------------------------------------
@@ -189,7 +195,6 @@ pub fn get_agent_system_template() -> &'static str {
 mod tests {
     use super::*;
     use crate::schema::AgentContext;
-    use std::collections::HashMap;
 
     #[test]
     fn test_build_system_prompt_default() {

@@ -610,6 +610,7 @@ async fn deliver_with_retry(
                         caption: (!payload.content.is_empty()).then(|| payload.content.clone()),
                         parse_mode: Some("HTML".into()),
                         reply_to_message_id: None,
+                        reply_markup: payload.buttons.clone(),
                     })
                     .await
             }

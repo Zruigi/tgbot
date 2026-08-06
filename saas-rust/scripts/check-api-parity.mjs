@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
+import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url))
@@ -13,6 +14,28 @@ const reportArgumentIndex = process.argv.indexOf('--report')
 const reportPath = reportArgumentIndex >= 0 ? process.argv[reportArgumentIndex + 1] : null
 if (reportArgumentIndex >= 0 && !reportPath) {
   throw new Error('--report requires a file path')
+}
+
+function gitRevision(ref) {
+  try {
+    return execFileSync('git', ['-C', repositoryRoot, 'rev-parse', ref], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+  } catch {
+    return null
+  }
+}
+
+function trackedWorkingTreeStatus() {
+  try {
+    return execFileSync('git', ['-C', repositoryRoot, 'status', '--porcelain', '--untracked-files=no'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+  } catch {
+    return null
+  }
 }
 
 function sourceFiles(directory) {
@@ -173,6 +196,7 @@ if (missingMethods.length > 0) {
 console.log('All detected frontend API paths and methods are registered by the Rust router.')
 
 if (reportPath) {
+  const workingTreeStatus = trackedWorkingTreeStatus()
   const contracts = [...frontendMethods.entries()]
     .flatMap(([routePath, methods]) => [...methods].map((method) => ({
       method,
@@ -182,6 +206,14 @@ if (reportPath) {
     .sort((left, right) => `${left.path} ${left.method}`.localeCompare(`${right.path} ${right.method}`))
   const report = {
     report_type: 'frontend_rust_static_registration',
+    generated_at_utc: new Date().toISOString(),
+    head_commit: gitRevision('HEAD'),
+    production_ui_baseline: gitRevision('origin/master'),
+    rust_migration_baseline: gitRevision('origin/rust-refactor-v2'),
+    working_tree_dirty: workingTreeStatus === null ? null : workingTreeStatus.length > 0,
+    tracked_working_tree_change_count: workingTreeStatus === null || workingTreeStatus.length === 0
+      ? 0
+      : workingTreeStatus.split('\n').length,
     limitation: 'Static registration only; response schemas, status codes, pagination, role checks, and tenant isolation require runtime contract evidence.',
     frontend_path_count: frontendPaths.size,
     frontend_method_path_contract_count: frontendContractCount,

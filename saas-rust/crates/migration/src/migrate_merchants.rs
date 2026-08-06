@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::PgPool;
 
+use crate::migration_audit::MigrationFailure;
 use crate::sqlite_reader::{SqliteConfig, SqliteMerchant, SqliteReader};
 
 /// Migration statistics for merchants
@@ -16,6 +17,7 @@ pub struct MerchantMigrationStats {
     pub skipped: i64,
     pub errors: i64,
     pub details: Vec<MerchantMigrationDetail>,
+    pub failures: Vec<MigrationFailure>,
 }
 
 /// Detailed migration result for each merchant
@@ -44,6 +46,7 @@ pub async fn migrate_merchants(
         skipped: 0,
         errors: 0,
         details: Vec::new(),
+        failures: Vec::new(),
     };
 
     for merchant in source_merchants {
@@ -65,15 +68,18 @@ pub async fn migrate_merchants(
                 );
             }
             Err(e) => {
-                // Check if it's a duplicate key error (already migrated)
                 let error_str = e.to_string();
+                let source_key = format!(
+                    "legacy_merchant_id={}::tenant_id={}",
+                    merchant.id, merchant.tenant_id
+                );
                 if error_str.contains("duplicate key") || error_str.contains("unique constraint") {
                     stats.skipped += 1;
                     stats.details.push(MerchantMigrationDetail {
                         legacy_id: merchant.id,
                         tenant_id: merchant.tenant_id.clone(),
                         status: "skipped_duplicate".to_string(),
-                        error: Some("Already exists in target".to_string()),
+                        error: Some(error_str.clone()),
                     });
                 } else {
                     stats.errors += 1;
@@ -85,6 +91,9 @@ pub async fn migrate_merchants(
                     });
                     tracing::error!("Failed to migrate merchant {}: {}", merchant.id, e);
                 }
+                stats
+                    .failures
+                    .push(MigrationFailure::new("merchants", source_key, error_str));
             }
         }
     }
@@ -228,7 +237,9 @@ pub async fn verify_merchant_migration(
         source_count,
         target_count,
         migrated_count,
-        is_valid: source_count == target_count || migrated_count == source_count,
+        // Do not treat a source-sized migrated subset as proof of integrity:
+        // extra target rows must also be rejected by migration verification.
+        is_valid: source_count == target_count && migrated_count == source_count,
     };
 
     tracing::info!(

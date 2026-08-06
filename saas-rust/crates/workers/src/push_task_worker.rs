@@ -150,6 +150,7 @@ impl Worker for PushTaskWorker {
                         caption: Some(content.clone()),
                         parse_mode: None,
                         reply_to_message_id: None,
+                        reply_markup: None,
                     })
                     .await
             } else {
@@ -222,8 +223,6 @@ impl Worker for PushTaskWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_push_task_worker_job_type() {
         // We can't easily construct a TelegramClient without a real token,

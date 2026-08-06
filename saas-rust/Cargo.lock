@@ -3303,6 +3303,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "dotenvy",
+ "reqwest",
  "serde_json",
  "sqlx",
  "teloxide",
@@ -3318,6 +3319,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -3366,6 +3368,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "async-trait",
  "axum 0.7.9",
  "base64",
  "chrono",
@@ -3413,9 +3416,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "hex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tgbot-domain",
  "tgbot-repos",

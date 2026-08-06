@@ -5,11 +5,10 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{Column, Row, TypeInfo};
 use tgbot_domain::error::{ApiError, ApiResult};
-use tgbot_domain::scope::Scope;
 use uuid::Uuid;
 
 use crate::auth::resolve_scope;
@@ -222,7 +221,7 @@ pub async fn list_monitors(
     Query(q): Query<ListMonitorsQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     let active_only = q.active_only.unwrap_or(true);
     let limit = q.limit.unwrap_or(100).clamp(1, 200);
@@ -247,6 +246,7 @@ pub async fn list_monitors(
                 (SELECT SUM(CASE WHEN t.direction = 'in' THEN t.amount ELSE 0 END)
                  FROM monitor_transactions t
                  WHERE t.monitor_id = m.monitor_id
+                   AND t.tenant_id = m.tenant_id
                    AND t.tx_timestamp >= extract(epoch from now() - interval '20 days') * 1000),
                 0
             ) AS inflow_20_calc,
@@ -254,6 +254,7 @@ pub async fn list_monitors(
                 (SELECT SUM(CASE WHEN t.direction = 'out' THEN t.amount ELSE 0 END)
                  FROM monitor_transactions t
                  WHERE t.monitor_id = m.monitor_id
+                   AND t.tenant_id = m.tenant_id
                    AND t.tx_timestamp >= extract(epoch from now() - interval '20 days') * 1000),
                 0
             ) AS outflow_20_calc
@@ -286,7 +287,7 @@ pub async fn create_monitor(
     Json(body): Json<CreateMonitorRequest>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     if body.address.trim().is_empty() {
         return Err(ApiError::BadRequest("address is required".into()));
@@ -329,7 +330,7 @@ pub async fn delete_monitor(
     Path(monitor_id): Path<i64>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     // Soft delete - set is_active = false
     let result = sqlx::query(
@@ -376,7 +377,7 @@ pub async fn update_monitor_remark(
     Json(body): Json<UpdateMonitorRemarkRequest>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     let row = sqlx::query(
         "UPDATE address_monitors SET remark = $1, updated_at = now() WHERE monitor_id = $2 AND tenant_id = $3 RETURNING *",
@@ -398,7 +399,7 @@ pub async fn pnl_summary(
     Query(q): Query<PnlSummaryQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     let period = q.period.as_deref().unwrap_or("week");
     let days = q.days.unwrap_or(7);
@@ -449,7 +450,7 @@ pub async fn update_tx_meta(
     Json(body): Json<BatchTxMetaRequest>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     let mut updated = 0;
     for item in body.transactions {
@@ -593,7 +594,7 @@ pub async fn export_transactions(
     Query(q): Query<ListTransactionsQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     let parsed_start = q
         .start_ms
@@ -634,7 +635,9 @@ pub async fn export_transactions(
                      AND related.network = t.network
                ), 0) AS counterparty_tx_count
         FROM monitor_transactions t
-        JOIN address_monitors m ON m.monitor_id = t.monitor_id
+        JOIN address_monitors m
+          ON m.monitor_id = t.monitor_id
+         AND m.tenant_id = t.tenant_id
         LEFT JOIN monitor_counterparty_labels labels
           ON labels.tenant_id = t.tenant_id
          AND labels.counterparty = t.counterparty
@@ -689,7 +692,7 @@ pub async fn year_summary(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, merchant_id) = scope.require_merchant()?;
+    let (tenant_id, _merchant_id) = scope.require_merchant()?;
 
     let now = chrono::Utc::now();
     let year_start = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
@@ -755,14 +758,16 @@ pub async fn claim_monitor(
     headers: HeaderMap,
     Path(monitor_id): Path<i64>,
 ) -> ApiResult<Json<Value>> {
-    let _scope = resolve_scope(&state, &headers).await?;
+    let scope = resolve_scope(&state, &headers).await?;
+    let (tenant_id, _) = scope.require_merchant()?;
 
     let result = sqlx::query(
         "UPDATE address_monitors SET is_active = true, updated_at = now() \
-         WHERE monitor_id = $1 AND is_active = false \
+         WHERE monitor_id = $1 AND tenant_id = $2 AND is_active = false \
          RETURNING monitor_id",
     )
     .bind(monitor_id)
+    .bind(&tenant_id)
     .fetch_optional(state.db()?)
     .await?;
 

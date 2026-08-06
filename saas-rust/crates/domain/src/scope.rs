@@ -7,6 +7,7 @@ use crate::models::Role;
 pub struct Scope {
     pub authenticated: bool,
     pub user_id: Option<Uuid>,
+    pub actor_key: Option<String>,
     pub role: Role,
     pub actor_role: Role,
     pub tenant_id: Option<String>,

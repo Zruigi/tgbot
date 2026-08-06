@@ -6,6 +6,8 @@ pub mod feature_gate;
 pub mod group_policy;
 pub mod telegram_auto_replies;
 pub mod telegram_commands;
+pub mod telegram_preferences;
+pub mod telegram_wallet;
 
 // Empty/legacy modules are not part of the formal app release graph. Keep
 // them behind an opt-in feature so an accidental import cannot expose a

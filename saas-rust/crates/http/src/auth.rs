@@ -34,9 +34,12 @@ async fn resolve_session_token_scope(
     let Some(token) = bearer_token(headers) else {
         return Ok(None);
     };
-    let Some(payload) = crate::routes::auth::verify_session_token(&token) else {
+    let Some(payload) =
+        crate::routes::auth::verify_session_token(&token, &state.config.session_secret)
+    else {
         return Ok(None);
     };
+    let actor_key = Some(crate::routes::auth::session_actor_key(&token));
     let role = match payload.get("role").and_then(|value| value.as_str()) {
         Some("platform_admin") => Role::PlatformAdmin,
         Some("merchant_owner") => Role::MerchantOwner,
@@ -58,6 +61,7 @@ async fn resolve_session_token_scope(
         return Ok(Some(Scope {
             authenticated: true,
             user_id: None,
+            actor_key: actor_key.clone(),
             role: Role::PlatformAdmin,
             actor_role: Role::PlatformAdmin,
             tenant_id: None,
@@ -105,6 +109,7 @@ async fn resolve_session_token_scope(
     Ok(Some(Scope {
         authenticated: true,
         user_id: None,
+        actor_key: actor_key.clone(),
         role: role.clone(),
         actor_role: role,
         tenant_id: Some(tenant_id),
@@ -138,20 +143,27 @@ async fn resolve_internal_scope(state: &AppState, headers: &HeaderMap) -> ApiRes
     // 1. x-merchant-id as UUID (e.g. "550e8400-...")
     // 2. x-merchant-id as legacy integer (e.g. "42") — Python proxy sends this
     // 3. x-legacy-merchant-id as integer (e.g. "42") — explicit fallback header
-    let merchant_id = if let Some(mid) =
-        header_str(headers, "x-merchant-id").and_then(|v| Uuid::parse_str(&v).ok())
+    let merchant_hint = header_str(headers, "x-merchant-id");
+    let merchant_id = if let Some(mid) = merchant_hint
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok())
     {
-        // Format 1: UUID
-        Some(mid)
-    } else if let Some(legacy_id_str) = header_str(headers, "x-merchant-id")
+        sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM merchants WHERE id = $1 AND ($2::text IS NULL OR tenant_id = $2)",
+        )
+        .bind(mid)
+        .bind(tenant_id.as_deref())
+        .fetch_optional(state.db()?)
+        .await?
+    } else if let Some(legacy_id_str) = merchant_hint
         .or_else(|| header_str(headers, "x-legacy-merchant-id"))
         .and_then(|v| v.parse::<i64>().ok())
     {
-        // Format 2/3: legacy integer → look up UUID via DB
         sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT id FROM merchants WHERE legacy_merchant_id = $1",
+            "SELECT id FROM merchants WHERE legacy_merchant_id = $1 AND ($2::text IS NULL OR tenant_id = $2)",
         )
         .bind(legacy_id_str)
+        .bind(tenant_id.as_deref())
         .fetch_optional(state.db()?)
         .await?
     } else {
@@ -165,6 +177,7 @@ async fn resolve_internal_scope(state: &AppState, headers: &HeaderMap) -> ApiRes
     Ok(Some(Scope {
         authenticated: true,
         user_id,
+        actor_key: user_id.map(|id| format!("uuid:{id}")),
         role: role.clone(),
         actor_role: role,
         tenant_id,
@@ -197,6 +210,7 @@ async fn resolve_supabase_scope(state: &AppState, headers: &HeaderMap) -> ApiRes
         return Ok(Scope {
             authenticated: true,
             user_id: Some(user_id),
+            actor_key: Some(format!("uuid:{user_id}")),
             role: Role::PlatformAdmin,
             actor_role: Role::PlatformAdmin,
             tenant_id: None,
@@ -222,6 +236,7 @@ async fn resolve_supabase_scope(state: &AppState, headers: &HeaderMap) -> ApiRes
     Ok(Scope {
         authenticated: true,
         user_id: Some(user_id),
+        actor_key: Some(format!("uuid:{user_id}")),
         role: role.clone(),
         actor_role: role,
         tenant_id: Some(row.try_get("tenant_id")?),

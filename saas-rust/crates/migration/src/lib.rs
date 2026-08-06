@@ -4,5 +4,6 @@ pub mod migrate_merchants;
 pub mod migrate_messages;
 pub mod migrate_small_tables;
 pub mod migrate_users;
+pub mod migration_audit;
 pub mod sqlite_reader;
 pub mod verify_counts;

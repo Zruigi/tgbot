@@ -5,8 +5,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::PgPool;
-use uuid::Uuid;
 
+use crate::migration_audit::MigrationFailure;
 use crate::sqlite_reader::{SqliteConfig, SqliteMessage, SqliteReader};
 
 /// Migration statistics for messages
@@ -17,6 +17,7 @@ pub struct MessageMigrationStats {
     pub skipped: i64,
     pub errors: i64,
     pub batch_size: usize,
+    pub failures: Vec<MigrationFailure>,
 }
 
 /// Migrate messages from SQLite to PostgreSQL with batching
@@ -42,6 +43,7 @@ pub async fn migrate_messages(
         skipped: 0,
         errors: 0,
         batch_size,
+        failures: Vec::new(),
     };
 
     let mut offset = 0;
@@ -58,8 +60,10 @@ pub async fn migrate_messages(
         let batch_result = migrate_message_batch(&messages, pg_pool).await;
 
         match batch_result {
-            Ok(batch_migrated) => {
+            Ok((batch_migrated, batch_failures)) => {
                 stats.migrated += batch_migrated;
+                stats.errors += batch_failures.len() as i64;
+                stats.failures.extend(batch_failures);
                 tracing::debug!(
                     "Migrated batch: {} messages (offset={})",
                     batch_migrated,
@@ -69,22 +73,14 @@ pub async fn migrate_messages(
             Err(e) => {
                 tracing::error!("Failed to migrate batch at offset {}: {}", offset, e);
                 stats.errors += messages.len() as i64;
+                let error = e.to_string();
+                stats.failures.extend(messages.iter().map(|message| {
+                    MigrationFailure::new("messages", message_source_key(message), error.clone())
+                }));
             }
         }
 
         offset += batch_size;
-    }
-
-    // Get skipped count (already migrated)
-    let target_count: i64 =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM chat.messages")
-            .fetch_one(pg_pool)
-            .await
-            .context("Failed to count messages in PostgreSQL")?;
-
-    // If target count is close to source, consider the rest as skipped (already migrated)
-    if target_count < stats.total_source {
-        stats.skipped = stats.total_source - stats.migrated - stats.errors;
     }
 
     tracing::info!(
@@ -98,29 +94,42 @@ pub async fn migrate_messages(
 }
 
 /// Migrate a batch of messages
-async fn migrate_message_batch(messages: &[SqliteMessage], pg_pool: &PgPool) -> Result<i64> {
+async fn migrate_message_batch(
+    messages: &[SqliteMessage],
+    pg_pool: &PgPool,
+) -> Result<(i64, Vec<MigrationFailure>)> {
     let mut migrated = 0;
+    let mut failures = Vec::new();
 
     for msg in messages {
         match migrate_single_message(msg, pg_pool).await {
             Ok(_) => migrated += 1,
             Err(e) => {
-                // Log but continue with other messages
                 tracing::warn!("Failed to migrate message {}: {}", msg.msg_id, e);
+                failures.push(MigrationFailure::new(
+                    "messages",
+                    message_source_key(msg),
+                    e.to_string(),
+                ));
             }
         }
     }
 
-    Ok(migrated)
+    Ok((migrated, failures))
+}
+
+fn message_source_key(message: &SqliteMessage) -> String {
+    format!("tenant_id={}::msg_id={}", message.tenant_id, message.msg_id)
 }
 
 /// Migrate a single message from SQLite to PostgreSQL
 async fn migrate_single_message(sqlite_msg: &SqliteMessage, pg_pool: &PgPool) -> Result<()> {
     // Generate trace_id if not present
-    let trace_id = sqlite_msg
-        .trace_id
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let trace_id = normalized_trace_id(
+        sqlite_msg.trace_id.as_deref(),
+        &sqlite_msg.tenant_id,
+        sqlite_msg.msg_id,
+    );
 
     // Parse timestamp
     let timestamp = parse_timestamp(&sqlite_msg.timestamp)?;
@@ -226,6 +235,13 @@ fn parse_timestamp(s: &str) -> Result<DateTime<Utc>> {
     Err(anyhow::anyhow!("Failed to parse timestamp: {}", s))
 }
 
+fn normalized_trace_id(trace_id: Option<&str>, tenant_id: &str, message_id: i64) -> String {
+    trace_id
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("legacy-message:{tenant_id}:{message_id}"))
+}
+
 /// Verify message migration by comparing counts
 pub async fn verify_message_migration(
     sqlite_config: &SqliteConfig,
@@ -272,5 +288,25 @@ mod tests {
     fn test_parse_timestamp() {
         let result = parse_timestamp("2026-01-15 10:30:00");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_normalized_trace_id_preserves_existing_value() {
+        assert_eq!(
+            normalized_trace_id(Some("trace-1"), "tenant-a", 42),
+            "trace-1"
+        );
+    }
+
+    #[test]
+    fn test_normalized_trace_id_is_stable_for_missing_value() {
+        assert_eq!(
+            normalized_trace_id(None, "tenant-a", 42),
+            "legacy-message:tenant-a:42"
+        );
+        assert_eq!(
+            normalized_trace_id(Some("  "), "tenant-a", 42),
+            "legacy-message:tenant-a:42"
+        );
     }
 }

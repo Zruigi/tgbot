@@ -293,6 +293,25 @@ impl SqliteReader {
         Ok(count)
     }
 
+    pub fn count_plans(&self) -> Result<i64> {
+        self.count_table("plans", "plans")
+    }
+
+    pub fn count_address_monitors(&self) -> Result<i64> {
+        self.count_table("address_monitors", "address monitors")
+    }
+
+    pub fn count_monitor_transactions(&self) -> Result<i64> {
+        self.count_table("monitor_transactions", "monitor transactions")
+    }
+
+    fn count_table(&self, table: &str, label: &str) -> Result<i64> {
+        let query = format!("SELECT COUNT(*) FROM {table}");
+        self.conn
+            .query_row(&query, [], |row| row.get(0))
+            .with_context(|| format!("Failed to count {label}"))
+    }
+
     // ========================================================================
     // Group Message Data Reading
     // ========================================================================

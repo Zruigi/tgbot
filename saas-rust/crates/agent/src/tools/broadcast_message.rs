@@ -6,11 +6,15 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::sync::Arc;
-use tgbot_integrations::telegram::{SendMessageParams, TelegramClient};
+use tgbot_integrations::{
+    litellm::LiteLLMClient,
+    telegram::{SendMessageParams, SendPhotoParams, TelegramClient},
+};
 use tracing::{error, info, warn};
 
 const MAX_BROADCAST_TARGETS: usize = 500;
 const MAX_BROADCAST_TEXT_CHARS: usize = 4096;
+const MAX_IMAGE_SOURCE_CHARS: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // BroadcastMessageTool
@@ -25,6 +29,7 @@ const MAX_BROADCAST_TEXT_CHARS: usize = 4096;
 pub struct BroadcastMessageTool {
     pool: Option<Arc<PgPool>>,
     telegram_client: Option<Arc<TelegramClient>>,
+    llm: Option<Arc<LiteLLMClient>>,
 }
 
 impl BroadcastMessageTool {
@@ -33,6 +38,7 @@ impl BroadcastMessageTool {
         Self {
             pool: None,
             telegram_client: None,
+            llm: None,
         }
     }
 
@@ -41,6 +47,7 @@ impl BroadcastMessageTool {
         Self {
             pool: None,
             telegram_client: Some(client),
+            llm: None,
         }
     }
 
@@ -48,6 +55,27 @@ impl BroadcastMessageTool {
         Self {
             pool: Some(pool),
             telegram_client: Some(client),
+            llm: None,
+        }
+    }
+
+    pub fn with_telegram_and_llm(client: Arc<TelegramClient>, llm: Arc<LiteLLMClient>) -> Self {
+        Self {
+            pool: None,
+            telegram_client: Some(client),
+            llm: Some(llm),
+        }
+    }
+
+    pub fn with_pool_telegram_and_llm(
+        pool: Arc<PgPool>,
+        client: Arc<TelegramClient>,
+        llm: Arc<LiteLLMClient>,
+    ) -> Self {
+        Self {
+            pool: Some(pool),
+            telegram_client: Some(client),
+            llm: Some(llm),
         }
     }
 }
@@ -92,7 +120,19 @@ impl Tool for BroadcastMessageTool {
                 },
                 "include_image": {
                     "type": "boolean",
-                    "description": "是否包含图片（如有上传的话）"
+                    "description": "是否包含图片；需要同时提供 image_file_id、image_url 或 image"
+                },
+                "image_file_id": {
+                    "type": "string",
+                    "description": "Telegram 图片 file_id"
+                },
+                "image_url": {
+                    "type": "string",
+                    "description": "Telegram 可访问的图片 URL"
+                },
+                "image": {
+                    "type": "string",
+                    "description": "图片 file_id 或 URL（image_file_id/image_url 的兼容别名）"
                 },
                 "do_translate": {
                     "type": "boolean",
@@ -111,19 +151,24 @@ impl Tool for BroadcastMessageTool {
                     "description": "自定义跳转按钮列表"
                 }
             },
-            "required": ["content"]
+            "required": []
         })
     }
 
     async fn execute(&self, params: &Value, context: &AgentContext) -> ToolExecuteResult {
-        let content = params
+        let mut content = params
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .trim();
+            .trim()
+            .to_string();
+        let image_source = match parse_image_source(params) {
+            Ok(source) => source,
+            Err(error) => return ToolExecuteResult::fail(&error),
+        };
 
-        if content.is_empty() {
-            return ToolExecuteResult::fail("消息内容不能为空");
+        if content.is_empty() && image_source.is_none() {
+            return ToolExecuteResult::fail("消息内容或图片不能为空");
         }
         if content.chars().count() > MAX_BROADCAST_TEXT_CHARS {
             return ToolExecuteResult::fail("消息内容不能超过 4096 个字符");
@@ -133,20 +178,30 @@ impl Tool for BroadcastMessageTool {
             return ToolExecuteResult::fail("Telegram 客户端未配置，广播未执行");
         }
 
-        if params
-            .get("include_image")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return ToolExecuteResult::fail("广播图片发送尚未接通，广播未执行");
-        }
-
-        if params
+        let do_translate = params
             .get("do_translate")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return ToolExecuteResult::fail("广播自动翻译尚未接通，广播未执行");
+            .unwrap_or(false);
+        if do_translate {
+            if content.is_empty() {
+                return ToolExecuteResult::fail("图片广播没有可翻译的正文");
+            }
+            let Some(llm) = self.llm.as_ref() else {
+                return ToolExecuteResult::fail("翻译服务未配置，广播未执行");
+            };
+            content = match llm
+                .simple_chat(
+                    "Translate the message into English when it is not English, otherwise into Simplified Chinese. Preserve Telegram HTML tags and return only the translation.",
+                    &content,
+                )
+                .await
+            {
+                Ok(translated) => translated.trim().to_string(),
+                Err(error) => return ToolExecuteResult::fail(&format!("广播翻译失败: {error}")),
+            };
+            if content.is_empty() || content.chars().count() > MAX_BROADCAST_TEXT_CHARS {
+                return ToolExecuteResult::fail("翻译后的消息长度无效，广播未执行");
+            }
         }
 
         info!(
@@ -179,7 +234,14 @@ impl Tool for BroadcastMessageTool {
 
         // 执行广播
         match self
-            .execute_broadcast(target_type, &target_ids, content, &buttons, context)
+            .execute_broadcast(
+                target_type,
+                &target_ids,
+                &content,
+                &buttons,
+                image_source.as_deref(),
+                context,
+            )
             .await
         {
             Ok(result) => {
@@ -215,6 +277,7 @@ impl BroadcastMessageTool {
         target_ids: &[i64],
         content: &str,
         buttons: &[Value],
+        image_source: Option<&str>,
         context: &AgentContext,
     ) -> Result<serde_json::Value, String> {
         let (user_ids, chat_ids) = self
@@ -237,14 +300,15 @@ impl BroadcastMessageTool {
             if let Some(ref client) = self.telegram_client {
                 info!("BroadcastMessageTool: 向 {} 个用户发送消息", user_ids.len());
                 for uid in &user_ids {
-                    let params = SendMessageParams {
-                        chat_id: *uid,
-                        text: content.to_string(),
-                        parse_mode: Some("HTML".to_string()),
-                        reply_markup: reply_markup.clone(),
-                        reply_to_message_id: None,
-                    };
-                    match client.send_message(params).await {
+                    match send_broadcast_message(
+                        client,
+                        *uid,
+                        content,
+                        image_source,
+                        reply_markup.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(_) => success += 1,
                         Err(e) => {
                             warn!("Failed to send to user {}: {}", uid, e);
@@ -264,14 +328,15 @@ impl BroadcastMessageTool {
             if let Some(ref client) = self.telegram_client {
                 info!("BroadcastMessageTool: 向 {} 个群组发送消息", chat_ids.len());
                 for gid in &chat_ids {
-                    let params = SendMessageParams {
-                        chat_id: *gid,
-                        text: content.to_string(),
-                        parse_mode: Some("HTML".to_string()),
-                        reply_markup: reply_markup.clone(),
-                        reply_to_message_id: None,
-                    };
-                    match client.send_message(params).await {
+                    match send_broadcast_message(
+                        client,
+                        *gid,
+                        content,
+                        image_source,
+                        reply_markup.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(_) => success += 1,
                         Err(e) => {
                             warn!("Failed to send to group {}: {}", gid, e);
@@ -296,6 +361,7 @@ impl BroadcastMessageTool {
             "failed": failed_items.len(),
             "failed_items": failed_items,
             "buttons": buttons,
+            "has_image": image_source.is_some(),
         }))
     }
 
@@ -405,6 +471,66 @@ impl BroadcastMessageTool {
     }
 }
 
+async fn send_broadcast_message(
+    client: &TelegramClient,
+    chat_id: i64,
+    content: &str,
+    image_source: Option<&str>,
+    reply_markup: Option<&Value>,
+) -> anyhow::Result<tgbot_integrations::telegram::Message> {
+    match image_source {
+        Some(photo) => {
+            client
+                .send_photo(SendPhotoParams {
+                    chat_id,
+                    photo: photo.to_string(),
+                    caption: (!content.is_empty()).then(|| content.to_string()),
+                    parse_mode: Some("HTML".to_string()),
+                    reply_to_message_id: None,
+                    reply_markup: reply_markup.cloned(),
+                })
+                .await
+        }
+        None => {
+            client
+                .send_message(SendMessageParams {
+                    chat_id,
+                    text: content.to_string(),
+                    parse_mode: Some("HTML".to_string()),
+                    reply_markup: reply_markup.cloned(),
+                    reply_to_message_id: None,
+                })
+                .await
+        }
+    }
+}
+
+fn parse_image_source(params: &Value) -> Result<Option<String>, String> {
+    let source = ["image_file_id", "image_url", "image"]
+        .iter()
+        .find_map(|key| {
+            params
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+    let include_image = params
+        .get("include_image")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if include_image && source.is_none() {
+        return Err("include_image=true 时必须提供图片 file_id 或 URL".into());
+    }
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    if source.chars().count() > MAX_IMAGE_SOURCE_CHARS {
+        return Err("图片 file_id 或 URL 过长".into());
+    }
+    Ok(Some(source.to_string()))
+}
+
 fn build_reply_markup(buttons: &[Value]) -> Result<Option<Value>, String> {
     if buttons.is_empty() {
         return Ok(None);
@@ -476,6 +602,8 @@ mod tests {
         let props = schema.get("properties").unwrap();
         assert!(props.get("content").is_some());
         assert!(props.get("target_type").is_some());
+        assert!(props.get("image_file_id").is_some());
+        assert!(props.get("image_url").is_some());
     }
 
     #[tokio::test]
@@ -486,6 +614,48 @@ mod tests {
         let result = tool.execute(&params, &ctx).await;
         assert!(!result.success);
         assert!(result.message.unwrap().contains("不能为空"));
+    }
+
+    #[tokio::test]
+    async fn test_image_flag_requires_a_source() {
+        let tool = BroadcastMessageTool::new();
+        let ctx = AgentContext::new(1);
+        let result = tool
+            .execute(
+                &serde_json::json!({
+                    "content": "图片广播",
+                    "include_image": true,
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.message.unwrap().contains("必须提供图片"));
+    }
+
+    #[tokio::test]
+    async fn test_translation_requires_an_llm_client() {
+        let telegram = Arc::new(
+            TelegramClient::new(tgbot_integrations::telegram::TelegramConfig {
+                bot_token: "beta-test".into(),
+                api_base_url: "http://127.0.0.1:1".into(),
+                timeout_secs: 1,
+            })
+            .unwrap(),
+        );
+        let tool = BroadcastMessageTool::with_telegram(telegram);
+        let ctx = AgentContext::new(1);
+        let result = tool
+            .execute(
+                &serde_json::json!({
+                    "content": "translate me",
+                    "do_translate": true,
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.message.unwrap().contains("翻译服务未配置"));
     }
 
     #[tokio::test]

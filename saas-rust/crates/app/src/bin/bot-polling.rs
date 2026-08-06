@@ -39,10 +39,16 @@ fn is_polling_enabled(value: Option<&str>) -> bool {
 
 fn classify_message(text: &str, bot_username: &str) -> MessageAction {
     if let Some(command) = parse_telegram_command(text, bot_username) {
+        if matches!(
+            command,
+            TelegramCommand::Wallets | TelegramCommand::WalletMonitor(_)
+        ) {
+            return MessageAction::UnknownCommand;
+        }
         return MessageAction::Command(command);
     }
 
-    let token = text.trim().split_whitespace().next().unwrap_or_default();
+    let token = text.split_whitespace().next().unwrap_or_default();
     if !token.starts_with('/') {
         return MessageAction::Ignore;
     }
@@ -181,6 +187,14 @@ mod tests {
         assert_eq!(
             classify_message("/start ref_abc", "MyTestBot"),
             MessageAction::Command(TelegramCommand::Start(Some("ref_abc".into())))
+        );
+    }
+
+    #[test]
+    fn test_polling_rejects_tenant_wallet_menu() {
+        assert_eq!(
+            classify_message("/wallets", "MyTestBot"),
+            MessageAction::UnknownCommand
         );
     }
 

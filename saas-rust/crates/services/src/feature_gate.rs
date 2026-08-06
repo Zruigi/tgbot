@@ -49,8 +49,6 @@ async fn check_session_setting(pool: &PgPool, setting: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Unit-level tests for the session-setting parser.
     // The actual PG session variable is tested in integration tests.
 
