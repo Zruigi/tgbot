@@ -101,6 +101,11 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Telegram bot account has no username"))?;
     tracing::info!(bot_username = %bot_username, "Polling bot identity resolved");
 
+    // Align the command menu and Mini App console button with the source
+    // project (Python `post_init`): global `/menu`, admin-only commands, and
+    // the MenuButtonWebApp console entry when FRONTEND_URL is a public URL.
+    configure_bot_menu(&token).await;
+
     let handler = Update::filter_message().endpoint(message_handler);
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
@@ -112,6 +117,104 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Polling started — press Ctrl+C to stop");
     dispatcher.dispatch().await;
     Ok(())
+}
+
+/// Align the bot's command menu and Mini App console button with the source
+/// project (Python `post_init`):
+///
+/// - global command menu: `/menu` (Open interactive menu / 打开交互菜单)
+/// - admin-only command menu (scope `chat` = `ADMIN_ID`): `/menu`, `/admin`,
+///   `/status`, `/sync_potential`, `/clear`
+/// - menu button: `MenuButtonWebApp` "控制台" pointing at
+///   `{FRONTEND_URL}/miniapp?entry=admin_console` (only when `FRONTEND_URL`
+///   is a public URL, mirroring the source project's guard)
+///
+/// Menu configuration is best-effort: failures are logged but never prevent
+/// the polling bot from starting.
+async fn configure_bot_menu(token: &str) {
+    use serde_json::json;
+    use tgbot_integrations::telegram::{BotCommandItem, TelegramClient, TelegramConfig};
+
+    let Ok(client) = TelegramClient::new(TelegramConfig {
+        bot_token: token.to_string(),
+        api_base_url: std::env::var("TELEGRAM_API_BASE_URL")
+            .unwrap_or_else(|_| "https://api.telegram.org".into()),
+        timeout_secs: 30,
+    }) else {
+        tracing::warn!("Failed to build Telegram client for menu setup");
+        return;
+    };
+
+    // 1. Global command menu.
+    let global_commands = vec![BotCommandItem {
+        command: "menu".into(),
+        description: "Open interactive menu / 打开交互菜单".into(),
+    }];
+    match client.set_my_commands(global_commands, None).await {
+        Ok(()) => tracing::info!("Global command menu configured"),
+        Err(error) => tracing::warn!(%error, "Failed to set global command menu"),
+    }
+
+    // 2. Admin-only command menu.
+    let admin_id = std::env::var("ADMIN_ID")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    if let Some(admin_id) = admin_id {
+        let admin_commands = vec![
+            BotCommandItem {
+                command: "menu".into(),
+                description: "🧭 打开交互菜单".into(),
+            },
+            BotCommandItem {
+                command: "admin".into(),
+                description: "⚙️ 启动机器人控制面板".into(),
+            },
+            BotCommandItem {
+                command: "status".into(),
+                description: "📊 查看监听与监控运行状态".into(),
+            },
+            BotCommandItem {
+                command: "sync_potential".into(),
+                description: "🔄 同步群组潜在用户".into(),
+            },
+            BotCommandItem {
+                command: "clear".into(),
+                description: "🧹 清理当前对话缓存".into(),
+            },
+        ];
+        let scope = json!({ "type": "chat", "chat_id": admin_id });
+        match client.set_my_commands(admin_commands, Some(scope)).await {
+            Ok(()) => tracing::info!(admin_id, "Admin command menu configured"),
+            Err(error) => tracing::warn!(%error, "Failed to set admin command menu"),
+        }
+    }
+
+    // 3. Mini App console menu button (mirror source guard: public URL only).
+    let frontend_url = std::env::var("FRONTEND_URL").unwrap_or_default();
+    let frontend_url = frontend_url.trim_end_matches('/').to_string();
+    if frontend_url.is_empty()
+        || frontend_url.contains("127.0.0.1")
+        || frontend_url.contains("localhost")
+    {
+        tracing::warn!("FRONTEND_URL 未配置或为本地地址，跳过 Menu Button 设置");
+        return;
+    }
+    let miniapp_url = format!("{frontend_url}/miniapp?entry=admin_console");
+    let menu_button = json!({
+        "type": "web_app",
+        "text": "控制台",
+        "web_app": { "url": miniapp_url }
+    });
+    match client.set_chat_menu_button(None, menu_button.clone()).await {
+        Ok(()) => tracing::info!(%miniapp_url, "Mini App menu button configured"),
+        Err(error) => tracing::warn!(%error, "Failed to set menu button"),
+    }
+    if let Some(admin_id) = admin_id {
+        match client.set_chat_menu_button(Some(admin_id), menu_button).await {
+            Ok(()) => tracing::info!(admin_id, "Admin Mini App menu button configured"),
+            Err(error) => tracing::warn!(%error, "Failed to set admin menu button"),
+        }
+    }
 }
 
 async fn message_handler(

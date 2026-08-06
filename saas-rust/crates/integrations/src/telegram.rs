@@ -245,6 +245,13 @@ pub struct SetWebhookParams {
     pub allowed_updates: Option<Vec<String>>,
 }
 
+/// One entry of `setMyCommands` (BotCommand).
+#[derive(Clone, Debug, Serialize)]
+pub struct BotCommandItem {
+    pub command: String,
+    pub description: String,
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -624,6 +631,51 @@ impl TelegramClient {
             Ok(())
         } else {
             Err(anyhow!("deleteWebhook failed"))
+        }
+    }
+
+    /// Set the bot command menu (`setMyCommands`).
+    ///
+    /// `commands` is a list of `{ command, description }` objects; `scope`
+    /// is the optional `BotCommandScope` JSON object (e.g. `{"type":"chat",
+    /// "chat_id": 123}`). When `scope` is `None` the default (all chats)
+    /// scope is used.
+    pub async fn set_my_commands(
+        &self,
+        commands: Vec<BotCommandItem>,
+        scope: Option<Value>,
+    ) -> Result<()> {
+        let mut params = json!({ "commands": commands });
+        if let Some(scope) = scope {
+            params["scope"] = scope;
+        }
+        let result: bool = self.request("setMyCommands", params).await?;
+        if result {
+            Ok(())
+        } else {
+            Err(anyhow!("setMyCommands returned false"))
+        }
+    }
+
+    /// Set the menu button (`setChatMenuButton`).
+    ///
+    /// `chat_id` scopes the button to one chat when provided; `menu_button`
+    /// is the `MenuButton` JSON object (e.g. `{"type":"web_app",
+    /// "text":"控制台","web_app":{"url": "https://…/miniapp?entry=admin_console"}}`).
+    pub async fn set_chat_menu_button(
+        &self,
+        chat_id: Option<i64>,
+        menu_button: Value,
+    ) -> Result<()> {
+        let mut params = json!({ "menu_button": menu_button });
+        if let Some(chat_id) = chat_id {
+            params["chat_id"] = chat_id.into();
+        }
+        let result: bool = self.request("setChatMenuButton", params).await?;
+        if result {
+            Ok(())
+        } else {
+            Err(anyhow!("setChatMenuButton returned false"))
         }
     }
 

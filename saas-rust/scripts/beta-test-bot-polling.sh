@@ -25,4 +25,6 @@ exec env -i \
   BOT_TOKEN="$BOT_TOKEN" \
   TELEGRAM_POLLING_ENABLED=true \
   RUST_LOG="${RUST_LOG:-info}" \
+  FRONTEND_URL="${FRONTEND_URL:-}" \
+  ADMIN_ID="${ADMIN_ID:-}" \
   "$binary_path"
