@@ -183,3 +183,13 @@
 **租户功能对齐结论：完整对齐且更强（Rust 增加数据库级 RLS + 三级 scope 解析 + 按租户派生密钥加密）。**
 
 **git 哈希**：本行动仅审计+记录，无代码改动（基于 d1709b4）。
+
+### 行动 11：Mini App 真机验收环境准备（本行动）
+- **问题**：bootstrap 返回 unregistered——本地 DB merchants 表为空（测试 Bot 未绑定租户），导致 Mini App 无法登录。
+- **修复**：
+  1. 用 `beta-seed-test-bot` seed 测试 Bot：tenant=`beta-real-test-bot`、merchant=`77777777-7777-4777-8777-777777777777`、bot=ZruiPPT_bot、status=active、onboarding_completed=true、tenant_secret_refs 写入加密 token 引用 ✅
+  2. **关键**：app 必须用与 seed 相同的 `TGBOT_SECRET_ENCRYPTION_KEY` 启动才能解密 token；session_secret 需 ≥32 字节；手动 setsid 启动（beta-local-app.sh 的 nohup 嵌套在 wslrun 下不可靠）。
+- **环境状态（全部验证）**：health/ready 200 ✅ ｜ /miniapp 静态 200 ✅ ｜ tunnel 公网 200 ✅ ｜ bootstrap 接口响应正常（引导走 /api/login/tma）✅
+- **TMA 认证确认**：`/api/login/tma` 完整实现 HMAC-SHA256 initData 校验（auth.rs:337-347，从 DB 取 bot_token 验证），与 Python 原版一致；bootstrap init_data 路径为兼容占位（引导回 Telegram 走 login_tma）。
+- **验收方式（供用户）**：Telegram 打开 @ZruiPPT_bot → 控制台按钮 → Mini App 自动带 initData → 前端调 /api/login/tma（HMAC 通过）→ 进入控制台；或浏览器打开 tunnel URL + WEB_ADMIN_TOKEN 兜底登录。
+- **git 哈希**：本行动无代码改动（基于 ed58366；seed/启动为本地环境操作）。
