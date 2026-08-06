@@ -130,3 +130,56 @@
 - API-MIGRATION-AUDIT.md（本次新增，API 迁移对照）
 
 **git 哈希**：本行动仅审计+记录，无代码改动（基于 8b0295d）。
+
+### 行动 10：Agent 功能 + 租户功能对齐审计（用户追问）
+
+**Agent 工具对照**（Python `services/ai_agent/tools.py` 13 个工具类 vs Rust `crates/agent/src/tools/`）：
+
+| Python 工具类 | Rust 实现 | 状态 |
+|--------------|----------|------|
+| FinanceTool | `tools/finance_query.rs`（20KB）| ✅ |
+| BroadcastTool | `tools/broadcast_message.rs`（24KB，含 LLM 翻译）| ✅ |
+| ContentGeneratorTool | `tools/generate_content.rs` | ✅ |
+| AdDetectorTool | `tools/detect_advertising.rs`（+ `agent/src/ad_detection.rs`）| ✅ |
+| QueryRecentAdMessagesTool | `tools/query_recent_ad_messages.rs`（+ services/ad_detection.rs）| ✅ |
+| DeleteRecentAdMessagesTool | `tools/delete_recent_ad_messages.rs`（+ deletion_guard.rs）| ✅ |
+| DeleteAdMessageTool | `agent_tools.rs::tool_delete_ad_cluster`（安全闸 409/服务端重查）| ✅ |
+| QueryAdClustersTool | `tools/query_ad_clusters.rs` + `agent_tools.rs::tool_query_ad_clusters` | ✅ |
+| DeleteAdClusterTool | `agent_tools.rs::tool_delete_ad_cluster`（238 行，含 safety gates 测试）| ✅ |
+| SystemQueryTool | `tools/system_query.rs`（bound_chats/active_groups）| ✅ |
+| TelegramSdkQueryTool | `agent_tools.rs::tool_telegram_sdk_query`（99 行）| ✅ |
+| SkillManageTool | `tools/skill_manage.rs`（+ skills 路由 /api/ai/skills/*）| ✅ |
+| （Python 无对应） | `tools/ocr.rs`、`tools/n8n_workflow.rs`（Rust 新增）| ➕ 扩展 |
+
+**Agent 核心管线**（Python `core.py` vs Rust `core.rs`）：
+- `process_message` → Rust 等价管线 ✅
+- `confirm_and_execute` → `core.rs:490` ✅
+- `_match_tool_from_text`（白名单路由）→ `core.rs:730` ✅
+- `_build_fallback_args` → `core.rs:923` ✅
+- `_resolve_contextual_command` → `contextual_command.rs` ✅
+- `_is_recent_ad_delete_request` → `deletion_guard.rs` ✅
+- `available_tools`（manifest）→ tools/mod.rs 注册；**HTTP 端点 /api/agent/tools/manifest 未注册**（见行动 9 备注）
+- 安全：`safety.rs` DANGEROUS_ACTIONS 硬拦截 ✅（对应 Python `safety.py`）
+
+**Agent 功能对齐结论：核心工具 12/12 全部迁移，且新增 OCR/n8n 两个工具；唯一缺口 = manifest HTTP 端点（前端不调用）。**
+
+---
+
+**租户功能对照**：
+
+| 维度 | Python | Rust | 状态 |
+|------|--------|------|------|
+| 会话租户解析 | `web_admin.py:_request_scope_context`（session 读 tenant_id/is_merchant）| `http/src/auth.rs:resolve_scope` 三级解析（内部密钥 → session token → Supabase）| ✅ 更强 |
+| 角色模型 | platform_admin / merchant_owner / merchant_admin / merchant_viewer | `auth.rs:42-47` 同一套角色映射 | ✅ |
+| 商户表 | merchants（tenant_id + legacy_merchant_id）| `0001_saas_core.sql` + `auth.rs:80-84` legacy id 反查 | ✅ |
+| 租户隔离查询 | database.py `_normalize_tenant_id` / `_resolve_tenant_id_from_group` | group.rs:62-127 merchant-scoped WHERE tenant_id | ✅ |
+| 数据库层 | 单库共享表 + 应用层过滤 | 迁移 0006/0007/0008 显式 tenant 隔离 + RLS（0024/0026）| ✅ 更强 |
+| 群组/聊天隔离 | tracked_groups 按 tenant | 0008_group_telegram_tenant + group.rs 强制 scope | ✅ |
+| 广播隔离 | — | 0007_broadcast_tenant_isolation | ✅ |
+| 监控隔离 | — | 0004_monitor_finance + monitor.rs tenant | ✅ |
+| 密钥加密 | secret_manager.py / field_crypto.py | `http/src/secret_crypto.rs`（SecretCipher 按 tenant 派生）| ✅ |
+| MiniApp 会话 | miniapp/context | miniapp.rs + auth.rs resolve_scope | ✅ |
+
+**租户功能对齐结论：完整对齐且更强（Rust 增加数据库级 RLS + 三级 scope 解析 + 按租户派生密钥加密）。**
+
+**git 哈希**：本行动仅审计+记录，无代码改动（基于 d1709b4）。
