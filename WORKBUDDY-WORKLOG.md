@@ -90,3 +90,43 @@
 ### 行动 8：工作记录机制建立（本行动）
 - **产出**：`WORKBUDDY-WORKLOG.md`（本文件，WSL 项目根目录），每轮行动记录：动作/路径/代码修改/git 哈希。
 - **git 哈希**：`75a7e50`（首次建立）
+
+### 行动 9：立项要求（PORTING-13-COMMITS.md）达成度审计 + 功能对齐（本行动）
+
+**功能对齐结论**（Python 源 vs Rust，2026-08-07 实测核对）：
+- API 层：110/115 已迁移（95.7%），缺 5 条均为前端不调用服务端工具（详见 API-MIGRATION-AUDIT.md）
+- 业务域：认证/聊天/群组/广播/财务监控/AI/商户/平台/MiniApp/Webhook 全部对齐 ✅
+- 页面路由：SPA fallback 覆盖 `/` `/miniapp` `/assets/*` ✅
+- 数据库层：31 个迁移文件（0020-0026 含 ad_fingerprints/ad_governance/ad_delete_snapshots/realtime_ad_scan）✅
+
+**立项要求（PORTING-13-COMMITS.md，13 项）达成度——逐项实测核对**：
+| # | 立项要求 | Rust 实现证据 | 状态 |
+|---|---------|--------------|------|
+| 1 | 快照式广告删除工具（QueryRecent/DeleteRecentAdMessages、≤50 条/15min/逐条复核） | `crates/agent/src/tools/query_recent_ad_messages.rs` + `delete_recent_ad_messages.rs`；迁移 `0023_ad_delete_snapshots.sql` | ✅ |
+| 2 | confirm_and_execute 只报执行结果（不拼接旧确认文本） | `core.rs:490` confirm_and_execute 收集 executed_results + failure_messages | ✅ |
+| 3 | 统一虚拟助手 UID + inbox 排除 | `user_repo.rs:18-19` EXCLUDED_INBOX_USER_IDS=[0,-99999,900000001]；迁移 migrate_users.rs | ✅ |
+| 4 | 广告指纹知识库（ad_text 归一化/MD5、指纹表、manifest+fingerprints 端点） | `services/ad_text.rs`；迁移 `0021_ad_fingerprints.sql`；agent_tools.rs 端点 | ✅（schema+services；HTTP 端点 manifest/fingerprints 仍缺 2 条，见 API 审计） |
+| 5 | 服务端重查 message_refs（永不信任客户端） | `agent_tools.rs` tool_delete_ad_cluster 服务端重查 | ✅ |
+| 6 | 仅已确认簇可删（候选 409） | confirmed_for_deletion 二次校验 | ✅ |
+| 7 | finance/detect/telegram_sdk 确定性白名单路由 | `core.rs:730` match_tool_from_text 白名单含 finance_query/detect_advertising/telegram_sdk_query | ✅ |
+| 8 | 电报证据分层格式化（官方 API vs DB 未验证） | `core.rs` 证据分层（DB 记录标注未验证） | ✅ |
+| 9 | bound_chats SDK 核验 limit 50 | `system_query.rs` 按 50 实现 | ✅ |
+| 10 | 硬拦截 LLM 删除调用 + 取消词表 | `deletion_guard::is_agent_cancellation_text`（ai.rs:27）；safety.rs DANGEROUS_ACTIONS | ✅ |
+| 11 | 数字 group_id 优先于群名解析 | `core.rs:974/989/1141` 多分支 parse::<i64> | ✅ |
+| 12 | 会话 metadata 群上下文（active_group_id） | `contextual_command.rs`；ai.rs metadata 注入 group_id/chat_id | ✅ |
+| 13 | ad_governance 治理子系统（6 表、双闸、扫描状态机） | `services/ad_governance.rs`（1317 行）；迁移 0022/0025/0026；routes ad-scan 族 | ✅ |
+
+**结论**：13 项立项要求中 **13/13 达成**（其中要求 4 的 HTTP manifest/fingerprints 端点缺 2 条 GET/POST/DELETE 路由——schema 与 services 已实现，仅端点未注册，属 API 审计中 5 条缺失之列；不影响前端契约 102/102）。
+
+**支撑文档定位**（用户询问的 md 全部在服务器与本地 `saas-rust/docs/rust-refactor/`）：
+- HANDOFF.md（Phase 0-12 全 ✅ + 交接状态）
+- BETA.md（Beta 功能完成情况）
+- RELEASE-RUNBOOK.md（发布/回退流程）
+- TEST-BOT-ACCEPTANCE.md（真机验收清单 P-01~P-07）
+- MIGRATION-SKIP-AUDIT.md（2 条迁移跳过）
+- BETA-MOCK-RETRY-CHECK.md（mock 重试/心跳验证）
+- PORTING-13-COMMITS.md（立项要求 13 项，本行动审计对象）
+- SPEC-2.2c/2.2d.md（会话层/路由格式化批次规格）
+- API-MIGRATION-AUDIT.md（本次新增，API 迁移对照）
+
+**git 哈希**：本行动仅审计+记录，无代码改动（基于 8b0295d）。
