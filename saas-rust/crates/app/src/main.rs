@@ -241,8 +241,24 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Middleware chain: outermost runs first
+    // Static frontend (vite dist) is served from FRONTEND_DIST_DIR when set;
+    // otherwise the backend is API-only (deployed behind nginx).
+    let static_router = match std::env::var("FRONTEND_DIST_DIR").ok() {
+        Some(dist_dir) if !dist_dir.is_empty() => {
+            tracing::info!(%dist_dir, "Serving frontend static files");
+            let serve = tower_http::services::ServeDir::new(&dist_dir)
+                .append_index_html_on_directories(true);
+            let fallback = serve.not_found_service(tower_http::services::ServeFile::new(
+                format!("{dist_dir}/index.html"),
+            ));
+            Router::new().fallback_service(fallback)
+        }
+        _ => Router::new(),
+    };
+
     let app = Router::new()
         .merge(routes::router())
+        .merge(static_router)
         .layer(axum::middleware::from_fn(middleware::rate_limit_middleware))
         .layer(axum::middleware::from_fn(
             middleware::security_headers_middleware,
