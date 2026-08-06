@@ -55,3 +55,38 @@
 1. 每个 git 哈希对应一轮明确行动，可在 `git show <hash> --stat` 核对改动文件。
 2. 服务器（代码主仓）与本地 WSL 已同步到 `dcfb354`；后续行动产生的提交需双向 bundle 同步。
 3. 待办阻塞项：①P-01~P-07 人工验收 ②2 条迁移跳过记录处置（需 release owner 拍板）③灰度上线 ④地址监听真实链上验收。
+### 行动 6b：磁盘清理（已完成）
+- **动作**：删除 （14G）；target 15G → 1.7G； 16G → 3.2G；WSL 虚拟磁盘 20G → 5.9G。
+- **保留**：release 1.6G + beta-postgres 67M 数据。
+- **git 哈希**：无代码改动。
+
+### 行动 7：浏览器兜底登录本地化验证（本行动）
+- **问题**：本地  未注入 WEB_ADMIN_TOKEN/BOT_TOKEN，浏览器兜底登录（/api/login）与 TMA 验证在本地不可用。
+- **代码修改**： 增加 / 透传（env -i 白名单）。
+- **验证**（本地 18090）：
+  -  正确 token → ；错误 token → 401 ✅
+  -  消费 OTP → JWT session（platform_admin）；重复使用 → 401（一次性）✅
+  - 与 Python 原版（generate_otp：12 位 + 300s TTL + 消费即删）逻辑一致 ✅
+- **git 哈希**：
+
+### 行动 8：工作记录机制建立（本行动）
+- **产出**：（本文件，WSL 项目根目录），每轮行动记录：动作/路径/代码修改/git 哈希。
+- **git 哈希**：（首次建立）
+
+### 行动 6b：磁盘清理（已完成）
+- **动作**：删除 `saas-rust/target/debug`（14G）；target 15G → 1.7G；`/home/dev` 16G → 3.2G；WSL 虚拟磁盘 20G → 5.9G。
+- **保留**：release 1.6G + beta-postgres 67M 数据。
+- **git 哈希**：无代码改动。
+
+### 行动 7：浏览器兜底登录本地化验证（本行动）
+- **问题**：本地 `beta-local-app.sh` 未注入 WEB_ADMIN_TOKEN/BOT_TOKEN，浏览器兜底登录（/api/login）与 TMA 验证在本地不可用。
+- **代码修改**：`saas-rust/scripts/beta-local-app.sh` 增加 `WEB_ADMIN_TOKEN`/`BOT_TOKEN` 透传（env -i 白名单）。
+- **验证**（本地 18090）：
+  - `/api/login` 正确 token → `{status:ok, otp, csrf_token}`；错误 token → 401 ✅
+  - `/api/login/otp` 消费 OTP → JWT session（platform_admin）；重复使用 → 401（一次性）✅
+  - 与 Python 原版（generate_otp：12 位 + 300s TTL + 消费即删）逻辑一致 ✅
+- **git 哈希**：`730c368`
+
+### 行动 8：工作记录机制建立（本行动）
+- **产出**：`WORKBUDDY-WORKLOG.md`（本文件，WSL 项目根目录），每轮行动记录：动作/路径/代码修改/git 哈希。
+- **git 哈希**：`75a7e50`（首次建立）
