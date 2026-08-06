@@ -190,6 +190,7 @@ run_app() {
     TELEGRAM_WALLET_MONITORS_ENABLED="false" \
     CORS_ALLOWED_ORIGIN="*" \
     RUST_LOG="info" \
+    FRONTEND_DIST_DIR="${FRONTEND_DIST_DIR:-}" \
     "$binary_path"
 }
 

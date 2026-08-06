@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
+use axum::response::IntoResponse;
 use axum::Router;
 use std::{sync::Arc, time::Duration};
 use tgbot_domain::config::Config;
@@ -243,22 +244,8 @@ async fn main() -> anyhow::Result<()> {
     // Middleware chain: outermost runs first
     // Static frontend (vite dist) is served from FRONTEND_DIST_DIR when set;
     // otherwise the backend is API-only (deployed behind nginx).
-    let static_router = match std::env::var("FRONTEND_DIST_DIR").ok() {
-        Some(dist_dir) if !dist_dir.is_empty() => {
-            tracing::info!(%dist_dir, "Serving frontend static files");
-            let serve = tower_http::services::ServeDir::new(&dist_dir)
-                .append_index_html_on_directories(true);
-            let fallback = serve.not_found_service(tower_http::services::ServeFile::new(
-                format!("{dist_dir}/index.html"),
-            ));
-            Router::new().fallback_service(fallback)
-        }
-        _ => Router::new(),
-    };
-
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(routes::router())
-        .merge(static_router)
         .layer(axum::middleware::from_fn(middleware::rate_limit_middleware))
         .layer(axum::middleware::from_fn(
             middleware::security_headers_middleware,
@@ -267,6 +254,38 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
+
+    if let Ok(dist_dir) = std::env::var("FRONTEND_DIST_DIR") {
+        if !dist_dir.is_empty() {
+            tracing::info!(%dist_dir, "Serving frontend static files");
+            // Static assets are served directly; SPA routes fall back to
+            // index.html with a 200 status (tower-http's not_found_service
+            // would force a 404 status, which breaks SPA navigation).
+            let assets_dir = format!("{dist_dir}/assets");
+            app = app
+                .nest_service(
+                    "/assets",
+                    tower_http::services::ServeDir::new(&assets_dir),
+                )
+                .fallback({
+                    let index_path = format!("{dist_dir}/index.html");
+                    axum::routing::get(move || {
+                        let index_path = index_path.clone();
+                        async move {
+                            match tokio::fs::read(&index_path).await {
+                                Ok(bytes) => (
+                                    axum::http::StatusCode::OK,
+                                    [(axum::http::header::CONTENT_TYPE, "text/html")],
+                                    bytes,
+                                )
+                                    .into_response(),
+                                Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
+                            }
+                        }
+                    })
+                });
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!("tgbot Rust backend listening on {}", config.bind_addr);
