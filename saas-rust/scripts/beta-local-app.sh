@@ -191,6 +191,8 @@ run_app() {
     CORS_ALLOWED_ORIGIN="*" \
     RUST_LOG="info" \
     FRONTEND_DIST_DIR="${FRONTEND_DIST_DIR:-}" \
+    WEB_ADMIN_TOKEN="${WEB_ADMIN_TOKEN:-}" \
+    BOT_TOKEN="${BOT_TOKEN:-}" \
     "$binary_path"
 }
 
