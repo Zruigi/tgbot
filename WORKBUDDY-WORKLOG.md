@@ -387,3 +387,28 @@
 - ✅ 设置页路由 /settings?focus=ai 200
 
 **git 哈希**：待提交。
+
+### 行动 21：MVP 上线（本行动，灰度上线完成）
+
+**用户指令**：今天就要上线。
+
+**完成的门禁（3.x）**：
+- 3.3 契约回归：**beta-runtime-check 102/102 全绿**（static-only=0）
+- 3.4 门禁：API parity 102 契约注册 ✅、无 legacy feature ✅、迁移清单 29 文件对齐 ✅、350 测试通过
+- 3.5 真机 Bot 冒烟：bot-polling 启动，ZruiPPT_bot 连上 Telegram（P-01~P-07 就绪）
+- 修复：join_endpoint `/v1/v1` 双写 bug（门禁抓出）；vite.config.ts.orig 残留清理；0032 入迁移清单
+
+**服务器灰度（4.x）**：
+- 编译：服务器 cargo 1.96 release 3m19s（28MB）
+- 数据迁移：生产 SQLite 17MB → 服务器 PG tgbot_rust_beta（2 商户/1297 消息/15 群/20751 群消息/28 监控）
+- schema：32 个迁移全绿（tgbot_migrator BYPASSRLS 角色 + owner 改 ubuntu）
+- .env.production：27 行（生产 BOT_TOKEN/TRON/BSC + LITELLM gpt-5.6-luna + 随机 secrets）
+- systemd：tgbot-rust-beta.service active running（pid 3877371）
+- 切流：Python tgbot.service 重启，SAAS_BACKEND_URL=http://127.0.0.1:18090 生效
+- 验证：Rust /api/ready ok（workers=true）、Rust 处理生产群消息（group_message_policy_worker 真实消息）、内部 secret 转发链路通、tunnel 前端 200
+
+**双服务状态**：tgbot.service（Python 8080 回退）+ tgbot-rust-beta（18090）均 active running。
+
+**遗留**：4.3 灰度观察 ≥3 天；4.4 beta 转正；5.x 清理。迁移进度表 3.3/3.4/3.5/4.1/4.2 标记完成。
+
+**git 哈希**：523e0ddb（服务器）+ 本地最新。
