@@ -317,3 +317,21 @@
 **待办**：BSC 监控需付费 BscScan V2 key；balance_snapshot worker 未实现（仅端点）；finance_ledgers 真实链路（当前从 monitor_transactions 派生）。
 
 **git 哈希**：待提交。
+
+### 行动 18：Supabase 端点连接检查（本行动）
+
+**用户要求**：检查 Supabase 端点连接情况。
+
+**检查结论**：
+1. **Python 生产不用 Supabase**：web_admin.py:1570 只做"forward SaaS API traffic to Rust/Supabase backend when SAAS_BACKEND_URL configured"。
+2. **Rust 端 Supabase 集成完整**：`supabase_rest.rs`（361 行：select/insert/update/delete/rpc/count）+ `resolve_supabase_scope`（auth.rs:188，JWT HS256 验证 → 查本地 saas_user_roles/tenant_memberships）+ main.rs:51 启动构建 + state.supabase 注入。
+3. **唯一真实 ref**：`xttdylrgdldzmvnbeqoc.supabase.co`（supabase_rest.rs:15 注释）——**NXDOMAIN，项目已不存在/删除/过期**。
+4. **连通性**：本机/WSL/服务器（43.135.141.154）全部无法解析该域名（Could not resolve host / NXDOMAIN）——不是网络问题，是端点不存在。
+5. **本地环境**：SUPABASE_URL=127.0.0.1:18092 + placeholder key（mock 未运行）→ platform.rs/rest_db.rs 的 Supabase REST 调用在本地会失败。
+6. **不影响主链路**：核心租户隔离（RLS 用 app.tenant_id GUC）+ resolve_scope 前两级（内部密钥/session token）不依赖 Supabase；Supabase JWT 是第三级可选路径。
+
+**影响评估**：
+- platform.rs merchants 列表/管理、rest_db.rs 通用 CRUD 依赖 Supabase REST —— 本地验收这些接口会报错（但前端主流程不用）。
+- 如需启用：用户需提供**有效 Supabase 项目 URL + service_role_key + JWT secret**（当前 ref 已死）。
+
+**git 哈希**：本行动仅检查，无代码改动（基于 a7ecd9e）。
