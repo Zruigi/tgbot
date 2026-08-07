@@ -36,7 +36,7 @@ const MAX_TOOL_CALL_ROUNDS: usize = 5;
 const MAX_HISTORY: usize = 40;
 
 /// 默认 LLM 模型
-const DEFAULT_MODEL: &str = "gemini-2.5-flash-lite";
+const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
 // ---------------------------------------------------------------------------
 // LlmCaller trait — 抽象 LLM 调用

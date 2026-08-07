@@ -144,7 +144,7 @@ pub async fn get_config(
             .unwrap_or(false);
     let llm_model = setting("llm_model", String::new());
     let llm_model_lock_enabled = is_truthy(&setting("llm_model_lock_enabled", "false".into()));
-    let llm_model_lock_target = setting("llm_model_lock_target", "gemini-3.1-pro-preview".into());
+    let llm_model_lock_target = setting("llm_model_lock_target", "gpt-5.6-luna".into());
     let global_auto_translate = is_truthy(&setting("global_auto_translate", "false".into()));
     let translation_engine = setting("translation_engine", "llm".into());
 

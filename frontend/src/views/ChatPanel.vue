@@ -1151,6 +1151,18 @@ async function sendMessageAsync(
           // ★ 区分后端返回的错误类型，显示准确提示
           const errMsg = (res as any).message || (res as any)?.error?.message || 'AI 助手回复失败'
           console.error('[发送消息] AI 返回错误:', errMsg)
+          // ★ LLM 未配置 / 配置缺失时，弹窗引导去设置页
+          const rawReply = String((res as any).reply ?? '')
+          const llmUnconfigured =
+            errMsg.includes('LLM') || errMsg.includes('llm') || rawReply.includes('[LLM 错误]')
+          if (llmUnconfigured) {
+            const goSettings = window.confirm('AI 助手需要使用大模型 API。当前 LLM 配置不可用，是否前往「设置 - AI 设置」完成配置？')
+            if (goSettings && (window as any).router) {
+              ;(window as any).router.push('/settings?focus=ai')
+            } else if (goSettings) {
+              window.location.hash = '#/settings?focus=ai'
+            }
+          }
           // 不再用alert()，改用状态提示
           chatStore.messages = [...chatStore.messages, {
             msg_id: Date.now() + 2,

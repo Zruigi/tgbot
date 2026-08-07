@@ -129,14 +129,14 @@
 
             <div class="sub-panel lock-panel">
               <h4 class="sub-title">模型锁定</h4>
-              <p class="helper-text">开启后，后端将强制使用 `gemini-3.1-pro-preview`，忽略请求里传入的其它模型。</p>
+              <p class="helper-text">开启后，后端将强制使用 `gpt-5.6-luna`，忽略请求里传入的其它模型。</p>
               <div class="model-lock-row">
                 <div>
                   <div class="toggle-title">当前状态：{{ config.llm_model_lock_enabled ? '已锁定' : '未锁定' }}</div>
                   <div class="helper-text">锁定模型：{{ config.llm_model_lock_target || MODEL_LOCK_TARGET }}</div>
                 </div>
                 <button class="uc-btn" :class="config.llm_model_lock_enabled ? 'uc-btn-danger' : 'uc-btn-primary'" @click="toggleModelLock" :disabled="modelLockSaving">
-                  {{ modelLockSaving ? '处理中...' : (config.llm_model_lock_enabled ? '解除锁定' : '锁定为 gemini-3.1-pro-preview') }}
+                  {{ modelLockSaving ? '处理中...' : (config.llm_model_lock_enabled ? '解除锁定' : '锁定为 gpt-5.6-luna') }}
                 </button>
               </div>
             </div>
@@ -483,7 +483,7 @@ const config = reactive({
   llm_api_key: '',
   llm_model: '',
   llm_model_lock_enabled: false,
-  llm_model_lock_target: 'gemini-3.1-pro-preview',
+  llm_model_lock_target: 'gpt-5.6-luna',
   global_auto_translate: false,
 })
 
@@ -514,7 +514,7 @@ const skillForm = reactive<AiSkill>({
 
 const activeSkillRows = computed(() => (skillDrawerTab.value === 'custom' ? aiSkills.value : builtinSkills.value))
 
-const MODEL_LOCK_TARGET = 'gemini-3.1-pro-preview'
+const MODEL_LOCK_TARGET = 'gpt-5.6-luna'
 const vertexQuickForm = reactive({
   vertex_api_key: '',
   oneapi_base_url: '',
@@ -523,7 +523,7 @@ const vertexQuickForm = reactive({
 })
 
 const quickGeminiModels = ref<string[]>([
-  'gemini-3.1-pro-preview',
+  'gpt-5.6-luna',
   'gemini-2.5-pro',
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',

@@ -127,6 +127,50 @@ pub struct AdPipelineQuery {
 // Preserves the frontend response shape while routing general chat through AIAgent.
 // ---------------------------------------------------------------------------
 
+/// Tenant-scoped LLM endpoint settings resolved from `tenant_configs`.
+#[derive(Clone, Debug, Default)]
+pub struct TenantLlmConfig {
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub lock_enabled: bool,
+    pub lock_target: Option<String>,
+}
+
+/// Read a tenant's LLM configuration (`llm_base_url`, `llm_api_key`,
+/// `llm_model`, `llm_model_lock_enabled`, `llm_model_lock_target`) from
+/// `tenant_saas.tenant_configs`.
+pub async fn tenant_llm_config(
+    pool: &sqlx::PgPool,
+    tenant_id: &str,
+) -> Result<TenantLlmConfig, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT config_key, config_value FROM tenant_saas.tenant_configs \
+         WHERE tenant_id = $1 AND config_key IN \
+           ('llm_base_url','llm_api_key','llm_model','llm_model_lock_enabled','llm_model_lock_target')",
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut cfg = TenantLlmConfig::default();
+    for row in rows {
+        let key: String = row.try_get("config_key")?;
+        let value: String = row.try_get("config_value")?;
+        match key.as_str() {
+            "llm_base_url" => cfg.base_url = Some(value),
+            "llm_api_key" => cfg.api_key = Some(value),
+            "llm_model" => cfg.model = Some(value),
+            "llm_model_lock_enabled" => {
+                cfg.lock_enabled = matches!(value.as_str(), "true" | "1" | "yes")
+            }
+            "llm_model_lock_target" => cfg.lock_target = Some(value),
+            _ => {}
+        }
+    }
+    Ok(cfg)
+}
+
 #[derive(Default)]
 struct AgentUsage {
     model: Option<String>,
@@ -139,6 +183,58 @@ struct AgentUsage {
 struct LiteLlmAgentCaller {
     client: LiteLLMClient,
     usage: Arc<Mutex<AgentUsage>>,
+    pool: Option<sqlx::PgPool>,
+    tenant_id: Option<String>,
+}
+
+impl LiteLlmAgentCaller {
+    /// Resolve tenant LLM endpoint overrides for a request.
+    async fn endpoint_overrides(&self) -> (Option<String>, Option<String>) {
+        let (Some(pool), Some(tenant_id)) = (&self.pool, &self.tenant_id) else {
+            return (None, None);
+        };
+        if tenant_id.is_empty() || tenant_id == "platform" {
+            return (None, None);
+        }
+        match tenant_llm_config(pool, tenant_id).await {
+            Ok(cfg) => {
+                let has_own_creds = cfg
+                    .base_url
+                    .as_deref()
+                    .is_some_and(|url| !url.trim().is_empty())
+                    && cfg
+                        .api_key
+                        .as_deref()
+                        .is_some_and(|key| !key.trim().is_empty());
+                if has_own_creds {
+                    (cfg.base_url, cfg.api_key)
+                } else {
+                    (None, None)
+                }
+            }
+            Err(error) => {
+                warn!(tenant_id, %error, "failed to load tenant LLM config; using platform default");
+                (None, None)
+            }
+        }
+    }
+
+    /// Resolve the model to use, applying the tenant model lock when enabled.
+    async fn resolve_model(&self, requested: &str) -> String {
+        let (Some(pool), Some(tenant_id)) = (&self.pool, &self.tenant_id) else {
+            return requested.to_string();
+        };
+        if tenant_id.is_empty() || tenant_id == "platform" {
+            return requested.to_string();
+        }
+        match tenant_llm_config(pool, tenant_id).await {
+            Ok(cfg) if cfg.lock_enabled => cfg
+                .lock_target
+                .filter(|target| !target.trim().is_empty())
+                .unwrap_or_else(|| requested.to_string()),
+            _ => requested.to_string(),
+        }
+    }
 }
 
 #[async_trait]
@@ -149,8 +245,10 @@ impl LlmCaller for LiteLlmAgentCaller {
         model: &str,
         tools: &[Value],
     ) -> Result<LlmCallResult, anyhow::Error> {
+        let (override_base_url, override_api_key) = self.endpoint_overrides().await;
+        let model = self.resolve_model(model).await;
         let request = ChatCompletionRequest {
-            model: model.to_string(),
+            model: model.clone(),
             messages: messages
                 .iter()
                 .map(|message| ChatMessage {
@@ -166,6 +264,8 @@ impl LlmCaller for LiteLlmAgentCaller {
             } else {
                 json!({"tools": tools, "tool_choice": "auto"})
             },
+            override_base_url,
+            override_api_key,
         };
         let response = self.client.chat_completion(&request).await?;
         if let Ok(mut usage) = self.usage.lock() {
@@ -251,7 +351,7 @@ async fn build_agent(
         None => None,
     };
     let mut tools = default_tool_registry_with_pool_telegram_and_llm(
-        Some(pool),
+        Some(pool.clone()),
         telegram_client,
         Some(Arc::new(state.llm.clone())),
     );
@@ -292,6 +392,8 @@ async fn build_agent(
     let caller = LiteLlmAgentCaller {
         client: state.llm.clone(),
         usage: Arc::clone(&usage),
+        pool: Some((*pool).clone()),
+        tenant_id: tenant_id.map(str::to_string),
     };
     Ok((AIAgent::new(Arc::new(caller), Arc::new(tools)), usage))
 }
@@ -1039,7 +1141,23 @@ pub async fn ai_chat(
     // Save session with any metadata updates
     session_store.update(&session_key, session.clone());
 
-    let model = body.model.as_deref().unwrap_or("gemini-2.5-flash-lite");
+    // Resolve model: request body > tenant config (incl. model lock) > env default
+    let mut model = body
+        .model
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            std::env::var("LITELLM_DEFAULT_MODEL").unwrap_or_else(|_| "gemini-2.5-flash-lite".into())
+        });
+    if let Ok(tenant_cfg) = tenant_llm_config(&state.db()?.clone(), tenant_id).await {
+        if tenant_cfg.lock_enabled {
+            if let Some(target) = tenant_cfg.lock_target.filter(|t| !t.trim().is_empty()) {
+                model = target;
+            }
+        } else if let Some(tenant_model) = tenant_cfg.model.filter(|m| !m.trim().is_empty()) {
+            model = tenant_model;
+        }
+    }
     let (agent, usage) = match build_agent(&state, &scope.role, Some(tenant_id)).await {
         Ok(agent) => agent,
         Err(_) => {
@@ -1056,7 +1174,7 @@ pub async fn ai_chat(
         }
     };
     let response = agent
-        .process_message(&routed_input, &mut session.ctx, model)
+        .process_message(&routed_input, &mut session.ctx, &model)
         .await;
     if response.requires_confirmation {
         session.set_pending(response.clone());
@@ -1069,7 +1187,7 @@ pub async fn ai_chat(
         user_id,
         tenant_id,
         body.feature_key.as_deref().unwrap_or("general"),
-        model,
+        &model,
         usage,
     )
     .await;

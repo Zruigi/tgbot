@@ -366,3 +366,24 @@
 5. **AI 设置精简**：设置页 AI 板块作为主入口（全局翻译等归拢），避免与系统设置 UI 冲撞
 
 **git 哈希**：本行动为检查评估，无代码改动（基于 c299bf6）。
+
+### 行动 20：Agent 功能实施完成（本行动，核心代码改动）
+
+**基于行动 19 检查结论实施 5 步方案**：
+1. **租户 LLM 注入** ✅：litellm.rs ChatCompletionRequest 增加 override_base_url/override_api_key（serde skip 不序列化）；chat_completion 用覆盖值；ai.rs 新增 tenant_llm_config() 读 tenant_configs + LiteLlmAgentCaller.endpoint_overrides()/resolve_model() 按请求注入租户 base_url/api_key/model（含模型锁定）
+2. **三格式适配** ✅：litellm.rs 新增 claude_messages()（/v1/messages + anthropic-version header + claude_text() 提取）+ responses()（/v1/responses + responses_text() 提取），join_endpoint() 统一处理 base_url 带/不带 /v1 后缀（修复 /v1/v1 双写 bug）
+3. **模型锁定** ✅：前后端默认模型 gemini-3.1-pro-preview → gpt-5.6-luna（config.rs:147 + SettingsView.vue 5 处 + core.rs DEFAULT_MODEL + litellm.rs from_env）
+4. **前端弹窗** ✅：ChatPanel.vue AI 请求失败含 LLM 关键词时 confirm 弹窗引导 → /settings?focus=ai
+5. **AI 设置精简** ✅：isAiFocusMode 已默认 true（设置页默认 AI 视图，无需改动）
+
+**额外修复**：
+- join_endpoint() 处理 base_url 带 /v1（OneAPI 网关风格）导致 /v1/v1 404
+- ai_chat model 解析：body.model > tenant config(锁定) > LITELLM_DEFAULT_MODEL env > gemini 兜底
+
+**验证（本地 + 真实 API）**：
+- ✅ /api/ai/chat 普通问答：gpt-5.6-luna 返回"我是 TGBot AI 助手..."
+- ✅ /api/ai/chat 工具调用：finance_query 工具真实执行返回"未核销 0 条"（tool_calls_made=["finance_query"]）
+- ✅ 前端 dist 重建（Node 22 需 nvm 安装：nvm install 22，WSL 原 Node 18 太旧）
+- ✅ 设置页路由 /settings?focus=ai 200
+
+**git 哈希**：待提交。
