@@ -304,7 +304,7 @@ impl AdGovernanceWorker {
         Ok(())
     }
 
-    /// LLM classification: 15s timeout, returns empty on failure
+    /// LLM classification: 60s timeout, returns empty on failure
     async fn classify_with_llm(
         &self,
         candidates: &[HashMap<String, Value>],
@@ -334,7 +334,7 @@ impl AdGovernanceWorker {
             &prompt,
         );
 
-        match timeout(Duration::from_secs(15), future).await {
+        match timeout(Duration::from_secs(60), future).await {
             Ok(Ok(response)) => {
                 if let Ok(parsed) = serde_json::from_str::<Vec<Value>>(&response) {
                     let mut results = HashMap::new();
@@ -368,7 +368,7 @@ impl AdGovernanceWorker {
                 Ok(HashMap::new())
             }
             Err(_) => {
-                warn!("LLM timeout (15s), keeping clusters pending");
+                warn!("LLM timeout (60s), keeping clusters pending");
                 Ok(HashMap::new())
             }
         }
