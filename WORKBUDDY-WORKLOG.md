@@ -231,3 +231,27 @@
 - 无效 hash → 拒绝 ✅
 
 **git 哈希**：待提交。
+
+### 行动 14：链上财务功能调查与方案设计（本行动）
+
+**用户需求**：完善链上财务功能；开发进度以本地为主（本地已领先服务器）。
+
+**现状调查结论**：
+1. **后端 API 层（Rust）**：monitors 路由 15+ 个全部对齐 Python（list/create/delete/remark/pnl/export/transactions/year_summary/claim/tx_meta/batch/counterparty_aliases/user_queries）；finance 路由 9 个（summary/reconcile/categories/calculate_pnl/report/unreconciled/tokens/audit_logs/download_report）+ v1 兼容族（monitors/transactions/meta/labels/unreconciled/reconcile/account_categories/audit_logs/reports/generate）。
+2. **链上扫描 Worker（Rust）**：`address_monitor_worker.rs`（508 行）TRC20/BSC 扫描→解析→事务性入库（ON CONFLICT 去重）→ job_queue 入队 monitor_alert → 更新 last_tx_timestamp 游标，完整对齐 Python chain_monitor.py；`monitor_worker.rs`（404 行）余额监控 + 价格告警；`AddressMonitorAlertWorker` 已注册（main.rs:164/168）。
+3. **集成层**：trongrid.rs（409 行）+ bscscan.rs（92 行）+ binance.rs（价格）。
+4. **数据库**：migrations 0004_monitor_finance + 0030_monitor_transaction_tenant_key + 0031_monitor_alert_outbox。
+5. **前端**：生产 Python 有 OnChainFinancePanel.vue（1333 行）+ onChainFinance.ts store（API_BASE=/api/v1/monitors/finance）；本地 frontend 与 origin/master 一致。
+
+**真实差距（需完善点）**：
+- A. `finance_service.rs`/`monitor_service.rs` 是 stub（1 行）——业务逻辑散落在 routes 层直连 DB，未下沉 service 层（架构债务，非功能缺失）。
+- B. 链上财务的**数据可视化/报表导出**完整度未验证（report 生成逻辑、download_report 是否真实可下载）。
+- C. **测试覆盖**：链上扫描/解析/对账的 Rust 单元测试与 Python 行为一致性未全面验证。
+- D. 本地验收环境未跑过真实链上数据（需真实 TronGrid/BscScan key + 真实监控地址）。
+
+**完善方案（分 3 阶段）**：
+- **阶段 1（对齐验证）**：跑本地链上财务回归——用 mock 数据验证 monitors/finance/v1 全链路；确认 report 导出；补 finance_service/monitor_service 层（把 routes 里重复 SQL 下沉）。
+- **阶段 2（增强）**：链上财务报表导出增强（PDF/CSV）、对账建议引擎（按 counterparty 聚合）、PnL 计算增强（持仓成本/实现盈亏）。
+- **阶段 3（真机验收）**：配置真实 TronGrid/BscScan key，用测试监控地址跑真实链上数据，验证扫描→入库→告警→对账全链路。
+
+**git 哈希**：本行动仅调查+记录，无代码改动（基于 c668503）。
