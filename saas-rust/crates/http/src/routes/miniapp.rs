@@ -158,23 +158,189 @@ pub async fn bootstrap(
     let mut session: Option<Value> = None;
 
     if !init_data.is_empty() {
-        // This compatibility bootstrap endpoint has no verified Telegram bot
-        // identity in its request context.  Never turn arbitrary init_data into
-        // a platform token; callers must use /api/login/tma, which performs the
-        // HMAC check against a configured bot secret, or use a one-time grant.
-        let landing = build_landing_payload("unregistered", &entry_intent, &business_window);
-        return Ok(Json(json!({
-            "status": "reopen_in_telegram_required",
-            "message": "无法在 bootstrap 中验证 Telegram 身份，请重新通过已配置 Bot 登录",
-            "reason": "tma_verification_required",
-            "landing": landing,
-            "renewal": {"rotated": false, "source": "init_data", "grant_expires_at": Value::Null},
-            "ui_context": {
-                "business_window": business_window,
-                "entry_intent": entry_intent,
-                "identity_label": "需要返回 Telegram"
+        // Authenticate via Telegram Mini App init_data (HMAC-verified).
+        // This is the same protocol as /api/login/tma, but with the relaxed
+        // bootstrap semantics from the Python source: an unknown Telegram user
+        // resolves to role "unregistered" (guide to onboarding) instead of an
+        // immediate 401.
+        use crate::routes::auth::{
+            build_data_check_string, compute_telegram_hash, get_bot_token_for_tma,
+            parse_telegram_init_data,
+        };
+        let parsed = parse_telegram_init_data(&init_data);
+        let received_hash = parsed.get("hash").cloned().unwrap_or_default();
+        if !received_hash.is_empty() {
+            // Resolve the signing bot token: tenant_hint/merchant_id_hint when
+            // present (merchant-scoped), otherwise the configured bot token.
+            let tenant_hint = body.tenant_hint.clone().unwrap_or_default();
+            let merchant_id_hint = body.merchant_id_hint;
+            match get_bot_token_for_tma(&state, &tenant_hint, merchant_id_hint).await {
+                Ok(bot_token) => {
+                    let data_check_string = build_data_check_string(&parsed);
+                    let expected_hash = compute_telegram_hash(&data_check_string, &bot_token);
+                    if expected_hash == received_hash {
+                        // Extract Telegram user id from init_data.user
+                        let user_json = parsed.get("user").cloned().unwrap_or_default();
+                        let telegram_user_id = serde_json::from_str::<Value>(&user_json)
+                            .ok()
+                            .and_then(|u| u.get("id").and_then(Value::as_i64));
+                        if let Some(tg_user_id) = telegram_user_id {
+                            // auth_date expiry check (24h window, same as login_tma)
+                            let auth_date = parsed
+                                .get("auth_date")
+                                .and_then(|v| v.parse::<i64>().ok());
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            let expired = auth_date.is_some_and(|ts| {
+                                now.saturating_sub(ts) > 86400 || ts > now.saturating_add(300)
+                            });
+                            if !expired {
+                                // Resolve role: platform_admin if in auth.users
+                                // with platform_admin role; merchant_owner/admin/
+                                // viewer if owner/member of the hinted tenant;
+                                // otherwise unregistered.
+                                let is_platform_admin: bool = sqlx::query_scalar(
+                                    "SELECT EXISTS(
+                                         SELECT 1
+                                         FROM auth.users u
+                                         JOIN auth.saas_user_roles r ON r.user_id = u.id
+                                         WHERE u.tg_user_id = $1 AND r.role = 'platform_admin'
+                                     )",
+                                )
+                                .bind(tg_user_id)
+                                .fetch_one(state.db()?)
+                                .await
+                                .unwrap_or(false);
+
+                                let (role, tenant_id, merchant_id) =
+                                    if is_platform_admin {
+                                        ("platform_admin".to_string(), String::new(), None)
+                                    } else if !tenant_hint.trim().is_empty() {
+                                        // Merchant-scoped lookup
+                                        let member_role: Option<String> = sqlx::query_scalar(
+                                            "SELECT CASE
+                                                 WHEN m.owner_tg_user_id = $1 THEN 'merchant_owner'
+                                                 ELSE tm.role
+                                             END
+                                             FROM merchants m
+                                             LEFT JOIN auth.users u ON u.tg_user_id = $1
+                                             LEFT JOIN tenant_memberships tm
+                                               ON tm.user_id = u.id AND tm.tenant_id = m.tenant_id
+                                             WHERE m.tenant_id = $2
+                                               AND m.status IN ('active', 'active_free')
+                                               AND (m.owner_tg_user_id = $1 OR tm.user_id IS NOT NULL)
+                                             ORDER BY CASE WHEN m.owner_tg_user_id = $1 THEN 0 ELSE 1 END
+                                             LIMIT 1",
+                                        )
+                                        .bind(tg_user_id)
+                                        .bind(tenant_hint.trim())
+                                        .fetch_optional(state.db()?)
+                                        .await
+                                        .ok()
+                                        .flatten();
+
+                                        match member_role.as_deref() {
+                                            Some(r @ ("merchant_owner" | "merchant_admin"
+                                            | "merchant_viewer")) => (
+                                                r.to_string(),
+                                                tenant_hint.trim().to_string(),
+                                                merchant_id_hint,
+                                            ),
+                                            _ => (
+                                                "unregistered".to_string(),
+                                                String::new(),
+                                                None,
+                                            ),
+                                        }
+                                    } else {
+                                        // No tenant hint and not platform admin:
+                                        // look up any merchant owned by this user.
+                                        let owned: Option<String> = sqlx::query_scalar(
+                                            "SELECT tenant_id FROM merchants
+                                             WHERE owner_tg_user_id = $1
+                                               AND status IN ('active', 'active_free')
+                                             LIMIT 1",
+                                        )
+                                        .bind(tg_user_id)
+                                        .fetch_optional(state.db()?)
+                                        .await
+                                        .ok()
+                                        .flatten();
+
+                                        match owned {
+                                            Some(owned_tenant) => (
+                                                "merchant_owner".to_string(),
+                                                owned_tenant,
+                                                merchant_id_hint,
+                                            ),
+                                            None => (
+                                                "unregistered".to_string(),
+                                                String::new(),
+                                                None,
+                                            ),
+                                        }
+                                    };
+
+                                if role != "unregistered" {
+                                    let session_token = crate::routes::auth::issue_session_token(
+                                        &state.config.session_secret,
+                                        &role,
+                                        &tenant_id,
+                                        merchant_id,
+                                        Some(&user_json),
+                                    )
+                                    .ok_or_else(|| {
+                                        ApiError::ServiceUnavailable(
+                                            "session signing unavailable".into(),
+                                        )
+                                    })?;
+                                    token = Some(session_token.clone());
+                                    session = Some(json!({
+                                        "role": role,
+                                        "tenant_id": tenant_id,
+                                        "merchant_id": merchant_id,
+                                        "actor_role": role
+                                    }));
+                                } else {
+                                    // Unregistered: signal onboarding with
+                                    // status ok + session.role=unregistered
+                                    // (Python bootstrap semantics).
+                                    let landing = build_landing_payload(
+                                        "unregistered",
+                                        &entry_intent,
+                                        &business_window,
+                                    );
+                                    return Ok(Json(json!({
+                                        "status": "ok",
+                                        "token": Value::Null,
+                                        "session": {
+                                            "role": "unregistered",
+                                            "tenant_id": "",
+                                            "merchant_id": Value::Null,
+                                            "actor_role": "unregistered",
+                                        },
+                                        "landing": landing,
+                                        "renewal": {"rotated": false, "source": "init_data", "grant_expires_at": Value::Null},
+                                        "ui_context": {
+                                            "business_window": business_window,
+                                            "entry_intent": entry_intent,
+                                            "identity_label": "未注册"
+                                        }
+                                    })));
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::warn!("MiniApp bootstrap TMA HMAC verification failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "MiniApp bootstrap bot token resolution failed");
+                }
             }
-        })));
+        }
     } else if !otp.is_empty() {
         // Authenticate via OTP
         let otp_store = state.otp_store.clone();

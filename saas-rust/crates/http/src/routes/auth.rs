@@ -484,7 +484,9 @@ pub async fn login_tma(
 }
 
 // 解析 Telegram init_data 为 key-value 对
-fn parse_telegram_init_data(init_data: &str) -> std::collections::HashMap<String, String> {
+pub(crate) fn parse_telegram_init_data(
+    init_data: &str,
+) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     for pair in init_data.split('&') {
         let parts: Vec<&str> = pair.splitn(2, '=').collect();
@@ -515,7 +517,9 @@ fn urlencoding_decode(s: &str) -> String {
 }
 
 // 构建 data_check_string (用于计算 hash)
-fn build_data_check_string(data: &std::collections::HashMap<String, String>) -> String {
+pub(crate) fn build_data_check_string(
+    data: &std::collections::HashMap<String, String>,
+) -> String {
     let mut pairs: Vec<String> = data
         .iter()
         .filter(|(k, _)| *k != "hash")
@@ -526,7 +530,7 @@ fn build_data_check_string(data: &std::collections::HashMap<String, String>) -> 
 }
 
 // 计算 Telegram HMAC-SHA256 hash
-fn compute_telegram_hash(data_check_string: &str, bot_token: &str) -> String {
+pub(crate) fn compute_telegram_hash(data_check_string: &str, bot_token: &str) -> String {
     // Telegram Web Apps derive a per-bot secret first, then sign the sorted
     // data-check string with that secret. Using the raw bot token here would
     // reject valid Mini App payloads and is not the Telegram protocol.
@@ -542,7 +546,7 @@ fn compute_telegram_hash(data_check_string: &str, bot_token: &str) -> String {
 }
 
 // 从数据库获取 TMA 登录用的 bot_token
-async fn get_bot_token_for_tma(
+pub(crate) async fn get_bot_token_for_tma(
     state: &AppState,
     tenant_hint: &str,
     merchant_id_hint: Option<i64>,

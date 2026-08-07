@@ -193,3 +193,22 @@
 - **TMA 认证确认**：`/api/login/tma` 完整实现 HMAC-SHA256 initData 校验（auth.rs:337-347，从 DB 取 bot_token 验证），与 Python 原版一致；bootstrap init_data 路径为兼容占位（引导回 Telegram 走 login_tma）。
 - **验收方式（供用户）**：Telegram 打开 @ZruiPPT_bot → 控制台按钮 → Mini App 自动带 initData → 前端调 /api/login/tma（HMAC 通过）→ 进入控制台；或浏览器打开 tunnel URL + WEB_ADMIN_TOKEN 兜底登录。
 - **git 哈希**：本行动无代码改动（基于 ed58366；seed/启动为本地环境操作）。
+
+### 行动 12：Mini App「无法验证身份」根因修复（本行动，重要代码改动）
+
+**用户反馈**：Mini App 打开报「无法验证身份」/「登录状态已失效」。
+
+**根因（审计确认）**：Rust `/api/miniapp/bootstrap` 的 init_data 分支是**兼容占位**（不校验 HMAC，直接返回 `tma_verification_required`），而前端 MiniApp 入口**只调 bootstrap**（App.vue onMounted → bootstrapMiniAppEntry → /api/miniapp/bootstrap，从不 fallback 到 /api/login/tma）。生产 Python bootstrap 是完整实现（_authenticate_tma_init_data：HMAC 校验 → merchant 解析 → 发 token）。这是**真实迁移缺口**（之前 API 审计只对比了路径存在，未发现占位实现）。
+
+**代码修改**：
+- `crates/http/src/routes/auth.rs`：`parse_telegram_init_data`/`build_data_check_string`/`compute_telegram_hash`/`get_bot_token_for_tma` 改为 `pub(crate)`（供 miniapp 复用）
+- `crates/http/src/routes/miniapp.rs`：bootstrap init_data 分支从占位改为**宽松 TMA 认证**（HMAC-SHA256 校验 + auth_date 24h 过期检查 + platform_admin 查库 + merchant owner/member 解析 + unregistered 语义返回 status:ok 引导注册，与 Python 一致）
+
+**验证（本地 18090，模拟真实 initData）**：
+- 有效 initData（用户 6889612019，HMAC 正确）→ `status:ok` + `role:platform_admin` + JWT token + landing /saas ✅
+- 无效 hash → `bootstrap_auth_failed` 拒绝 ✅
+- 未注册用户 → `status:ok` + `role:unregistered` + 引导 /onboarding（Python 语义）✅
+
+**验收数据准备（本地 DB，非代码）**：auth.users 插 6889612019（DaisyBallesteros）+ saas_user_roles platform_admin + merchants owner_tg_user_id=6889612019（tenant=beta-real-test-bot）。
+
+**git 哈希**：待提交（本行动后提交）。
