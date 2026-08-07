@@ -1018,22 +1018,31 @@ async function handleAgentUiAction(action: any, silent = false) {
 
 function startAgentJobPolling(jobId: string, targetMsg: any) {
   if (!jobId || agentJobPollers.has(jobId)) return
+  let lastStatus = ''
   const timer = setInterval(async () => {
     try {
       const response = await fetch(`/api/agent/ad-scans/${encodeURIComponent(jobId)}`, { headers: authH() })
       const data = await response.json()
       if (!response.ok || data?.status !== 'ok') return
-      targetMsg.job = data.job
-      chatStore.messages = chatStore.messages.map((msg: any) => msg.msg_id === targetMsg.msg_id ? { ...msg, job: data.job } : msg)
-      if (['completed', 'partial', 'failed', 'cancelled'].includes(String(data.job?.status || ''))) {
+      const job = data.job
+      // Only touch the store when the job status actually changed; avoid
+      // rebuilding the whole message array on every tick (was causing the
+      // chat view to visibly re-render every 2s even with no change).
+      const newStatus = String(job?.status || '')
+      if (newStatus !== lastStatus || !targetMsg.job) {
+        lastStatus = newStatus
+        targetMsg.job = job
+        chatStore.messages = chatStore.messages.map((msg: any) => msg.msg_id === targetMsg.msg_id ? { ...msg, job } : msg)
+      }
+      if (['completed', 'partial', 'failed', 'cancelled'].includes(newStatus)) {
         clearInterval(timer)
         agentJobPollers.delete(jobId)
-        if (['completed', 'partial'].includes(String(data.job?.status || ''))) {
+        if (['completed', 'partial'].includes(newStatus)) {
           await handleAgentUiAction({ id: 'get_ad_scan_result', payload: { job_id: jobId }, label: '查看扫描结果' }, true)
         }
       }
     } catch {}
-  }, 2000)
+  }, 5000)
   agentJobPollers.set(jobId, timer)
 }
 
