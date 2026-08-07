@@ -406,6 +406,18 @@ pub fn router() -> Router<AppState> {
             "/api/v1/monitors/finance/reports/generate",
             get(finance::download_report),
         )
+        .route(
+            "/api/v1/monitors/finance/portfolio_pnl",
+            get(finance::portfolio_pnl),
+        )
+        .route(
+            "/api/v1/monitors/finance/reconcile_suggestions",
+            get(finance::reconcile_suggestions),
+        )
+        .route(
+            "/api/v1/monitors/finance/balance_history",
+            get(finance::balance_history),
+        )
         // AI / Agent routes
         .route("/api/ai/chat", post(ai::ai_chat))
         .route("/api/ai/detect_ad", post(ai::detect_ad))

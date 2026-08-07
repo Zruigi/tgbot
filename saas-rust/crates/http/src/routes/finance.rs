@@ -97,6 +97,25 @@ pub struct TransactionPnlItem {
     pub quantity: f64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BalanceHistoryQuery {
+    pub monitor_id: Option<i64>,
+    pub network: Option<String>,
+    pub token_symbol: Option<String>,
+    pub days: Option<i32>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PortfolioPnlQuery {
+    pub period: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub monitor_id: Option<i64>,
+    pub network: Option<String>,
+    pub token_symbol: Option<String>,
+}
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -469,6 +488,468 @@ pub async fn calculate_pnl(
             "fee": fee,
             "pnl": pnl,
             "pnl_rate": pnl_rate
+        }
+    })))
+}
+
+// GET /api/v1/monitors/finance/portfolio_pnl - Portfolio PnL breakdown
+//
+// Computes per-(token, network, monitor) position summary using FIFO lot
+// matching on finance_ledgers rows: realized_pnl is the locked-in profit from
+// matched outflows vs prior inflows (after fee), unrealized_pnl is the marked
+// pnl of remaining open lots against a notional current price (the average
+// cost basis when no live price is provided).
+pub async fn portfolio_pnl(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PortfolioPnlQuery>,
+) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    let tenant_id = scope.require_tenant_view()?;
+    let (start_ms, end_ms) =
+        resolve_time_bounds(query.period.as_deref(), query.start.as_deref(),
+                          query.end.as_deref(), Some(30));
+    let token_symbol = clean_filter(query.token_symbol.as_deref());
+    let network = clean_filter(query.network.as_deref());
+
+    // Fetch every ledger row in window that belongs to a known monitor
+    // (so counterparty attribution stays per-monitor).
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            l.token_symbol,
+            COALESCE(l.network, 'unknown') AS network,
+            l.monitor_id,
+            COALESCE(m.address, '') AS monitor_address,
+            l.direction,
+            l.amount::double precision AS amount,
+            l.exchange_rate::double precision AS exchange_rate,
+            l.tx_timestamp
+        FROM finance_ledgers l
+        LEFT JOIN address_monitors m
+          ON m.monitor_id = l.monitor_id AND m.tenant_id = l.tenant_id
+        WHERE ($1::text = '' OR l.tenant_id = $1)
+          AND l.tx_timestamp >= $2
+          AND l.tx_timestamp < $3
+          AND ($4::bigint IS NULL OR l.monitor_id = $4)
+          AND ($5::text IS NULL OR UPPER(l.token_symbol) = UPPER($5))
+          AND ($6::text IS NULL OR UPPER(l.network) = UPPER($6))
+        ORDER BY l.tx_timestamp ASC
+        "#,
+    )
+    .bind(&tenant_id)
+    .bind(start_ms)
+    .bind(end_ms)
+    .bind(query.monitor_id)
+    .bind(&token_symbol)
+    .bind(&network)
+    .fetch_all(state.db()?)
+    .await?;
+
+    // Group by (token_symbol, network, monitor_id)
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<(String, String, Option<i64>), PositionState> = BTreeMap::new();
+    for row in rows {
+        let key_token: String = row.try_get("token_symbol").unwrap_or_default();
+        let key_network: String = row.try_get("network").unwrap_or_default();
+        let monitor_id: Option<i64> = row.try_get("monitor_id").ok();
+        let monitor_address: Option<String> = row.try_get("monitor_address").ok();
+        let direction: String = row.try_get("direction").unwrap_or_default();
+        let amount: f64 = row.try_get("amount").unwrap_or(0.0);
+        let exchange_rate: f64 = row.try_get("exchange_rate").unwrap_or(0.0);
+
+        let entry = groups.entry((key_token, key_network, monitor_id)).or_insert_with(
+            || PositionState::new(monitor_address),
+        );
+        if direction == "in" {
+            entry.lots.push_back(FifoLot { amount, cost: exchange_rate });
+            entry.quantity += amount;
+            entry.cost_inflows += amount * exchange_rate;
+            entry.in_count += 1;
+        } else if direction == "out" {
+            let mut remaining_out = amount;
+            let mut realized = 0.0;
+            while remaining_out > 0.0 && !entry.lots.is_empty() {
+                let mut lot = entry.lots.pop_front().unwrap();
+                if lot.amount <= remaining_out + 1e-9 {
+                    realized += lot.amount * (exchange_rate - lot.cost);
+                    remaining_out -= lot.amount;
+                } else {
+                    realized += remaining_out * (exchange_rate - lot.cost);
+                    lot.amount -= remaining_out;
+                    remaining_out = 0.0;
+                    entry.lots.push_front(lot);
+                }
+            }
+            entry.realized_pnl += realized;
+            entry.realized_count += 1;
+            entry.quantity -= amount;
+        }
+    }
+
+    let positions: Vec<Value> = groups
+        .into_iter()
+        .map(|((token_symbol, network, monitor_id), state)| {
+            let avg_cost = if state.quantity.abs() > 1e-9 {
+                // Remaining open lot weighted average cost
+                let open_cost: f64 = state.lots.iter().map(|l| l.amount * l.cost).sum();
+                let open_qty: f64 = state.lots.iter().map(|l| l.amount).sum();
+                if open_qty > 0.0 {
+                    open_cost / open_qty
+                } else {
+                    0.0
+                }
+            } else if state.in_count > 0 {
+                state.cost_inflows / state.quantity.max(1.0)
+            } else {
+                0.0
+            };
+            // Marked-to-market: last known exchange_rate from inflows; if no open
+            // lots the unrealized PnL is 0.
+            let mark_price = state.lots.back().map(|l| l.cost).unwrap_or(avg_cost);
+            let current_value = state.quantity * mark_price;
+            let unrealized_pnl = state.quantity * (mark_price - avg_cost);
+            let total_pnl = state.realized_pnl + unrealized_pnl;
+
+            json!({
+                "token_symbol": token_symbol,
+                "network": network,
+                "monitor_id": monitor_id,
+                "monitor_address": state.monitor_address,
+                "quantity": state.quantity,
+                "avg_cost": avg_cost,
+                "mark_price": mark_price,
+                "current_value": current_value,
+                "realized_pnl": state.realized_pnl,
+                "unrealized_pnl": unrealized_pnl,
+                "total_pnl": total_pnl,
+                "realized_count": state.realized_count,
+                "unrealized_count": if state.quantity.abs() > 1e-9 { 1 } else { 0 },
+                "tx_count": state.in_count + state.realized_count,
+            })
+        })
+        .collect();
+
+    let total_realized: f64 = positions
+        .iter()
+        .filter_map(|v| v.get("realized_pnl").and_then(|x| x.as_f64()))
+        .sum();
+    let total_unrealized: f64 = positions
+        .iter()
+        .filter_map(|v| v.get("unrealized_pnl").and_then(|x| x.as_f64()))
+        .sum();
+    let total_pnl = total_realized + total_unrealized;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "data": {
+            "period_start_ms": start_ms,
+            "period_end_ms": end_ms,
+            "total_realized_pnl": total_realized,
+            "total_unrealized_pnl": total_unrealized,
+            "total_pnl": total_pnl,
+            "position_count": positions.len(),
+            "positions": positions
+        }
+    })))
+}
+
+struct PositionState {
+    monitor_address: Option<String>,
+    lots: std::collections::VecDeque<FifoLot>,
+    quantity: f64,
+    cost_inflows: f64,
+    realized_pnl: f64,
+    realized_count: i64,
+    in_count: i64,
+}
+
+impl PositionState {
+    fn new(monitor_address: Option<String>) -> Self {
+        Self {
+            monitor_address,
+            lots: std::collections::VecDeque::new(),
+            quantity: 0.0,
+            cost_inflows: 0.0,
+            realized_pnl: 0.0,
+            realized_count: 0,
+            in_count: 0,
+        }
+    }
+}
+
+struct FifoLot {
+    amount: f64,
+    cost: f64,
+}
+
+// GET /api/v1/monitors/finance/reconcile_suggestions - Suggest account labels
+//
+// For each UNRECONCILED ledger row, surface the strongest available hint:
+//   1. an existing counterparty label wins outright (confidence 1.0)
+//   2. otherwise, the counterparty's historical tx-count for this tenant+network
+//      plus an amount bucket ("common small", "common large", "rare") drives a
+//      confidence score (0..1) and a default suggestion.
+//   3. unlabelled counterparties produce a "needs_review" suggestion with
+//      confidence 0 and a noop suggestion.
+pub async fn reconcile_suggestions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FinanceSummaryQuery>,
+) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    let tenant_id = scope.require_tenant_view()?;
+    let (start_ms, end_ms) = resolve_time_bounds(
+        query.period.as_deref(),
+        query.start.as_deref(),
+        query.end.as_deref(),
+        Some(30),
+    );
+    let token_symbol = clean_filter(query.token_symbol.as_deref());
+    let network = clean_filter(query.network.as_deref());
+
+    // All UNRECONCILED rows in window
+    let rows = sqlx::query(
+        r#"
+        SELECT l.ledger_id::text AS ledger_id,
+               l.counterparty,
+               COALESCE(l.network, 'unknown') AS network,
+               l.amount::double precision AS amount,
+               l.token_symbol,
+               l.monitor_id,
+               l.tx_timestamp
+        FROM finance_ledgers l
+        WHERE ($1::text = '' OR l.tenant_id = $1)
+          AND l.reconciled_status = 'UNRECONCILED'
+          AND l.tx_timestamp >= $2 AND l.tx_timestamp < $3
+          AND ($4::bigint IS NULL OR l.monitor_id = $4)
+          AND ($5::text IS NULL OR UPPER(l.token_symbol) = UPPER($5))
+          AND ($6::text IS NULL OR UPPER(l.network) = UPPER($6))
+        ORDER BY l.tx_timestamp DESC
+        LIMIT 500
+        "#,
+    )
+    .bind(&tenant_id)
+    .bind(start_ms)
+    .bind(end_ms)
+    .bind(query.monitor_id)
+    .bind(&token_symbol)
+    .bind(&network)
+    .fetch_all(state.db()?)
+    .await?;
+
+    // Counterparty frequency across the tenant (recent 90 days, all status)
+    let freq_rows = sqlx::query(
+        r#"
+        SELECT counterparty, COALESCE(network, 'unknown') AS network,
+               COUNT(*) AS tx_count, SUM(amount)::double precision AS total_amount,
+               AVG(amount)::double precision AS avg_amount,
+               MAX(amount)::double precision AS max_amount
+        FROM finance_ledgers
+        WHERE ($1::text = '' OR tenant_id = $1)
+          AND tx_timestamp >= $2
+        GROUP BY counterparty, network
+        "#,
+    )
+    .bind(&tenant_id)
+    .bind(now_minus_90_days())
+    .fetch_all(state.db()?)
+    .await?;
+    use std::collections::HashMap;
+    let mut freq: HashMap<(String, String), (i64, f64, f64, f64)> = HashMap::new();
+    for row in freq_rows {
+        let cp: String = row.try_get("counterparty").unwrap_or_default();
+        let nt: String = row.try_get("network").unwrap_or_default();
+        let cnt: i64 = row.try_get("tx_count").unwrap_or(0);
+        let total: f64 = row.try_get("total_amount").unwrap_or(0.0);
+        let avg: f64 = row.try_get("avg_amount").unwrap_or(0.0);
+        let mx: f64 = row.try_get("max_amount").unwrap_or(0.0);
+        freq.insert((cp, nt), (cnt, total, avg, mx));
+    }
+
+    // Existing counterparty labels (authoritative)
+    let label_rows = sqlx::query(
+        "SELECT counterparty, network, label
+         FROM monitor_counterparty_labels
+         WHERE ($1::text = '' OR tenant_id = $1)",
+    )
+    .bind(&tenant_id)
+    .fetch_all(state.db()?)
+    .await?;
+    let mut labels: HashMap<(String, String), String> = HashMap::new();
+    for row in label_rows {
+        let cp: String = row.try_get("counterparty").unwrap_or_default();
+        let nt: String = row.try_get("network").unwrap_or_default();
+        let lbl: String = row.try_get("label").unwrap_or_default();
+        labels.insert((cp, nt), lbl);
+    }
+
+    let mut suggestions: Vec<Value> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let ledger_id: String = row.try_get("ledger_id").unwrap_or_default();
+        let counterparty: String = row.try_get("counterparty").unwrap_or_default();
+        let nt: String = row.try_get("network").unwrap_or_default();
+        let amount: f64 = row.try_get("amount").unwrap_or(0.0);
+        let token: String = row.try_get("token_symbol").unwrap_or_default();
+        let monitor_id: Option<i64> = row.try_get("monitor_id").ok();
+        let ts: i64 = row.try_get("tx_timestamp").unwrap_or(0);
+
+        if counterparty.is_empty() {
+            suggestions.push(json!({
+                "ledger_id": ledger_id,
+                "counterparty": "",
+                "network": nt,
+                "token_symbol": token,
+                "amount": amount,
+                "tx_timestamp": ts,
+                "suggested_label": "(no counterparty)",
+                "confidence": 0.0,
+                "reason": "missing_counterparty",
+                "needs_review": true
+            }));
+            continue;
+        }
+
+        // Authoritative label
+        if let Some(label) = labels.get(&(counterparty.clone(), nt.clone())) {
+            suggestions.push(json!({
+                "ledger_id": ledger_id,
+                "counterparty": counterparty,
+                "network": nt,
+                "token_symbol": token,
+                "amount": amount,
+                "tx_timestamp": ts,
+                "suggested_label": label,
+                "confidence": 1.0,
+                "reason": "user_label",
+                "needs_review": false
+            }));
+            continue;
+        }
+
+        // Frequency-based heuristic
+        let (cnt, _total, avg, mx) = freq
+            .get(&(counterparty.clone(), nt.clone()))
+            .copied()
+            .unwrap_or((0, 0.0, 0.0, 0.0));
+        let confidence = if cnt >= 5 {
+            0.85
+        } else if cnt >= 2 {
+            0.7
+        } else if cnt == 1 {
+            0.4
+        } else {
+            0.0
+        };
+        // Bucketize amount into a default label hint
+        let amount_bucket = if mx > 0.0 && amount >= mx * 0.5 {
+            "common-large"
+        } else if avg > 0.0 && amount >= avg * 0.5 && amount <= avg * 2.0 {
+            "common-typical"
+        } else {
+            "anomalous"
+        };
+        let needs_review = confidence < 0.7;
+        let suggested_label = format!("unlabeled:{amount_bucket}:{counterparty}");
+        suggestions.push(json!({
+            "ledger_id": ledger_id,
+            "counterparty": counterparty,
+            "network": nt,
+            "token_symbol": token,
+            "amount": amount,
+            "tx_timestamp": ts,
+            "monitor_id": monitor_id,
+            "suggested_label": suggested_label,
+            "confidence": confidence,
+            "reason": format!("frequency={cnt}, amount_bucket={amount_bucket}"),
+            "needs_review": needs_review
+        }));
+    }
+
+    let needs_review_count = suggestions
+        .iter()
+        .filter(|v| v.get("needs_review").and_then(|x| x.as_bool()).unwrap_or(false))
+        .count();
+
+    Ok(Json(json!({
+        "status": "ok",
+        "data": {
+            "period_start_ms": start_ms,
+            "period_end_ms": end_ms,
+            "total_suggestions": suggestions.len(),
+            "needs_review_count": needs_review_count,
+            "suggestions": suggestions
+        }
+    })))
+}
+
+fn now_minus_90_days() -> i64 {
+    let now = chrono::Utc::now().timestamp_millis();
+    now - 90 * 86_400_000
+}
+
+// GET /api/v1/monitors/finance/balance_history - Recent balance snapshots
+pub async fn balance_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BalanceHistoryQuery>,
+) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    let tenant_id = scope.require_tenant_view()?;
+    let days = query.days.unwrap_or(30).clamp(1, 365);
+    let limit = query.limit.unwrap_or(500).clamp(1, 5000);
+    let token_symbol = clean_filter(query.token_symbol.as_deref());
+    let network = clean_filter(query.network.as_deref());
+
+    let rows = sqlx::query(
+        r#"
+        SELECT snapshot_id, monitor_id, address, network, token_symbol,
+               snapshot_at, balance::double precision AS balance,
+               usdt_value::double precision AS usdt_value, source
+        FROM balance_monitor_balance_snapshots
+        WHERE ($1::text = '' OR tenant_id = $1)
+          AND snapshot_at >= now() - make_interval(days => $2)
+          AND ($3::bigint IS NULL OR monitor_id = $3)
+          AND ($4::text IS NULL OR UPPER(network) = UPPER($4))
+          AND ($5::text IS NULL OR UPPER(token_symbol) = UPPER($5))
+        ORDER BY monitor_id ASC, snapshot_at DESC
+        LIMIT $6
+        "#,
+    )
+    .bind(&tenant_id)
+    .bind(days)
+    .bind(query.monitor_id)
+    .bind(&network)
+    .bind(&token_symbol)
+    .bind(limit)
+    .fetch_all(state.db()?)
+    .await?;
+
+    let data: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "snapshot_id": row.try_get::<i64, _>("snapshot_id").unwrap_or(0),
+                "monitor_id": row.try_get::<i64, _>("monitor_id").unwrap_or(0),
+                "address": row.try_get::<String, _>("address").unwrap_or_default(),
+                "network": row.try_get::<String, _>("network").unwrap_or_default(),
+                "token_symbol": row.try_get::<String, _>("token_symbol").unwrap_or_default(),
+                "snapshot_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("snapshot_at")
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_default(),
+                "balance": row.try_get::<f64, _>("balance").unwrap_or(0.0),
+                "usdt_value": row.try_get::<f64, _>("usdt_value").unwrap_or(0.0),
+                "source": row.try_get::<String, _>("source").unwrap_or_default()
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "status": "ok",
+        "data": {
+            "window_days": days,
+            "snapshot_count": data.len(),
+            "snapshots": data
         }
     })))
 }

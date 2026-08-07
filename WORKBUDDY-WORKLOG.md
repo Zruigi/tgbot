@@ -273,3 +273,25 @@
 **结论**：链上财务阶段 1（对齐验证）+ 阶段 2 核心（报表导出验证）完成；阶段 2 增强项（对账建议/PnL 拆分/余额快照）按方案保留待用户确认；阶段 3 真实链上 key 待用户提供。
 
 **git 哈希**：待提交。
+
+### 行动 16：阶段 2 增强项实施（本行动，三个新端点）
+
+**用户要求**：澄清 Python 脚本 vs Rust 二进制误解；继续做阶段 2 + 提供真实 key 跑真机验收。
+
+**澄清**：start_app_scope.py 是 Python 调度工具（subprocess 调 wsl.exe），Rust 二进制 target/release/tgbot-app（29MB）才是真实服务。
+
+**阶段 2 三个增强项**：
+- A2a: PnL 拆分：`GET /api/v1/monitors/finance/portfolio_pnl` —— 按 (token, network, monitor) 聚合，FIFO 批次匹配，输出 realized_pnl / unrealized_pnl / avg_cost / current_value / quantity
+- A2b: 对账建议引擎：`GET /api/v1/monitors/finance/reconcile_suggestions` —— 用户 label 权威 (confidence=1.0) + 频次启发 (0/1/2/5+ → 0/0.4/0.7/0.85) + amount_bucket (common-typical/common-large/anomalous) + needs_review 标记
+- A2c: 余额快照：migration 0032_balance_snapshots.sql（balance_monitor_balance_snapshots 表 + 2 索引）+ `GET /api/v1/monitors/finance/balance_history`（window_days/monitor/network/token 过滤）
+
+**代码修改**：
+- `crates/http/src/routes/finance.rs`：`PortfolioPnlQuery`/`BalanceHistoryQuery` 请求类型、`portfolio_pnl`/`reconcile_suggestions`/`balance_history` 三个 handler（含 PositionState/FifoLot 结构 + FIFO 匹配算法 + confidence 算法 + now_minus_90_days 辅助）
+- `crates/http/src/routes/mod.rs`：3 个新路由注册
+- `migrations/0032_balance_snapshots.sql`：表 + 索引
+
+**验证（本地 + mock 数据）**：3 个端点全 200，输出结构正确（PnL 数据因 mock exchange_rate=0 显示 0 是预期的；balance_history 趋势 100.5→350.5→270.5 正确）。
+
+**git 哈希**：待提交。
+
+**阶段 3 真机验收** 待用户给 TronGrid/BscScan API key。
