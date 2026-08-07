@@ -212,3 +212,22 @@
 **验收数据准备（本地 DB，非代码）**：auth.users 插 6889612019（DaisyBallesteros）+ saas_user_roles platform_admin + merchants owner_tg_user_id=6889612019（tenant=beta-real-test-bot）。
 
 **git 哈希**：待提交（本行动后提交）。
+
+### 行动 13：Mini App「登录状态已失效」真正根因——UTF-8 URL 解码 bug（本行动，重要）
+
+**用户反馈**：仍显示「登录状态已失效」，怀疑缺 Python 的 grant 刷新机制。
+
+**排查过程**：
+1. 日志发现 `MiniApp bootstrap TMA HMAC verification failed`（08:13:39/08:13:45 = 用户真实打开时间）——HMAC 校验失败，非 grant 缺失。
+2. **对比测试定位 bug**：构造 ASCII first_name（Daisy）initData → 登录成功；中文 first_name（张三）→ HMAC 失败。100% 复现。
+3. **根因**：Rust 手写 `urlencoding_decode` 把 `%XX` 解码为单字节后直接 `push(byte as char)`，UTF-8 多字节字符（中文名）被拆成 3 个乱码 char → data_check_string 与 Telegram 原始值不一致 → HMAC 不匹配。Python 用标准 parse_qsl（字节级正确）。
+4. **grant 刷新机制调查**：Python `generate_entry_grant` 定义了 DB 持久化 grant + proof cookie 轮换 + touch 刷新，但**生产代码无调用方（未启用）**——核心登录仍靠 initData HMAC。Rust 内存 grant_store 缺失不构成实际功能缺口。
+
+**代码修改**：`crates/http/src/routes/auth.rs` `urlencoding_decode` 改为**字节级 UTF-8 percent-decode**（先收集 Vec<u8> 再 from_utf8_lossy），正确处理 %E5%BC%A0 → "张"。
+
+**验证（本地 18090）**：
+- 中文 first_name（张三）→ `status:ok` + platform_admin + JWT ✅（修复前失败）
+- ASCII first_name（Daisy）→ 依然成功 ✅
+- 无效 hash → 拒绝 ✅
+
+**git 哈希**：待提交。

@@ -497,23 +497,29 @@ pub(crate) fn parse_telegram_init_data(
     map
 }
 
-// URL 解码
+// URL 解码（字节级，正确处理 UTF-8 多字节：%E5%BC%A0 → "张"）
 fn urlencoding_decode(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                result.push(byte as char);
+    let bytes = s.as_bytes();
+    let mut result: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                result.push(byte);
+                i += 3;
+                continue;
             }
-        } else if c == '+' {
-            result.push(' ');
-        } else {
-            result.push(c);
+        } else if c == b'+' {
+            result.push(b' ');
+            i += 1;
+            continue;
         }
+        result.push(c);
+        i += 1;
     }
-    result
+    String::from_utf8_lossy(&result).into_owned()
 }
 
 // 构建 data_check_string (用于计算 hash)
