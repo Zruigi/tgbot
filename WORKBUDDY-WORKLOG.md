@@ -335,3 +335,34 @@
 - 如需启用：用户需提供**有效 Supabase 项目 URL + service_role_key + JWT secret**（当前 ref 已死）。
 
 **git 哈希**：本行动仅检查，无代码改动（基于 a7ecd9e）。
+
+### 行动 19：Agent 功能检查 + LLM API 适配评估（本行动）
+
+**用户任务**：检查 agent 功能可用性；AI 设置精简（弹窗提示需要 LLM API）；适配新 LLM 站点三种格式。
+**测试站点**：http://38.76.215.180:8333/v1（OneAPI 网关），key sk-YZ5hcbDhmE...，模型 gpt-5.6-luna。
+
+**API 测试结论（三种格式全通）**：
+- ✅ OpenAI Chat：/v1/chat/completions 200（chat.completion + reasoning_content 字段）
+- ✅ OpenAI Chat 流式：SSE chat.completion.chunk 标准
+- ✅ OpenAI Responses：/v1/responses 200（resp_xxx + output[].content[] 标准）
+- ✅ Responses 流式：event: response.created + output_text.delta
+- ✅ Claude Messages：/v1/messages 200（anthropic-version header，type: message）
+- ✅ /v1/models：gpt-5.6-luna 可用，还有 gpt-5.4/5.5/5.6-terra 等
+- 站点特征：OneAPI 网关（prompt_cache_key/retention 24h、billing_usage 等）
+
+**Agent 功能现状（代码检查）**：
+- litellm.rs（366 行）：只支持 OpenAI Chat Completions 格式（/v1/chat/completions），**无 Claude/Responses 实现**
+- agent crate：完整（core/session/tools 12 个/safety/schema），LLM 走 LiteLLMClient
+- state.llm 是 LiteLLMClient 值类型（进程级单例，from_env 读 LITELLM_BASE_URL/API_KEY，默认 127.0.0.1:4000）
+- 前端 SettingsView.vue（1311 行）AI 设置完整：llm_api_mode（rented/own）+ 模型锁定 + 翻译策略 + AI Skills + 调试面板
+- **核心缺陷**：前端配置存 tenant_configs（llm_base_url/api_key），但后端实际调用走进程级 from_env —— **租户配置从未被 agent/翻译使用**（用户在前端填的 key 不生效）
+- 模型锁定目标硬编码 gemini-3.1-pro-preview（前端 517 行 + 后端 config.rs 147 行默认）
+
+**适配方案（待用户确认）**：
+1. **租户 LLM 注入**：LitellmClient 支持按请求覆盖 base_url/api_key/model（从 tenant_configs 读），agent/翻译/openai 路由注入租户配置
+2. **三种格式支持**：litellm.rs 新增 Claude Messages + Responses 格式调用（站点全支持）
+3. **模型锁定**：默认锁定 gpt-5.6-luna（租用模式），own 模式用户自填
+4. **前端弹窗**：agent 助手无 LLM 配置时弹窗提示"需要配置 LLM API 才能使用"
+5. **AI 设置精简**：设置页 AI 板块作为主入口（全局翻译等归拢），避免与系统设置 UI 冲撞
+
+**git 哈希**：本行动为检查评估，无代码改动（基于 c299bf6）。
