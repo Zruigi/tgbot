@@ -151,7 +151,7 @@ pub async fn get_summary(
     Query(q): Query<FinanceSummaryQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _merchant_id) = scope.require_merchant()?;
+    let tenant_id = scope.require_tenant_view()?;
 
     let days = q.days.unwrap_or(30);
     let (start_ms, end_ms) = resolve_time_bounds(
@@ -177,7 +177,7 @@ pub async fn get_summary(
             SUM(CASE WHEN l.reconciled_status = 'UNRECONCILED' THEN 1 ELSE 0 END) AS unreconciled_count,
             SUM(CASE WHEN l.reconciled_status = 'UNRECONCILED' THEN l.base_fiat_value ELSE 0 END)::double precision AS unreconciled_value
         FROM finance_ledgers l
-        WHERE l.tenant_id = $1
+        WHERE ($1::text = '' OR l.tenant_id = $1)
           AND l.tx_timestamp >= $2
           AND l.tx_timestamp < $3
           AND ($4::bigint IS NULL OR l.monitor_id = $4)
@@ -250,7 +250,7 @@ pub async fn get_summary(
             COALESCE(SUM(CASE WHEN direction = 'in' THEN amount ELSE 0 END), 0)::double precision AS daily_in,
             COALESCE(SUM(CASE WHEN direction = 'out' THEN amount ELSE 0 END), 0)::double precision AS daily_out
         FROM finance_ledgers
-        WHERE tenant_id = $1
+        WHERE ($1::text = '' OR tenant_id = $1)
           AND tx_timestamp >= $2
           AND tx_timestamp < $3
         "#,
@@ -538,7 +538,7 @@ pub async fn get_unreconciled(
     Query(query): Query<FinanceSummaryQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _merchant_id) = scope.require_merchant()?;
+    let tenant_id = scope.require_tenant_view()?;
     let (start_ms, end_ms) =
         if query.period.is_some() || query.start.is_some() || query.end.is_some() {
             resolve_time_bounds(
@@ -564,7 +564,7 @@ pub async fn get_unreconciled(
         FROM finance_ledgers l
         LEFT JOIN address_monitors m ON m.monitor_id = l.monitor_id AND m.tenant_id = l.tenant_id
         LEFT JOIN chart_of_accounts a ON a.account_id = l.account_id
-        WHERE l.tenant_id = $1
+        WHERE ($1::text = '' OR l.tenant_id = $1)
           AND l.reconciled_status = 'UNRECONCILED'
           AND l.tx_timestamp >= $2
           AND l.tx_timestamp < $3
@@ -598,14 +598,14 @@ pub async fn get_tokens(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _merchant_id) = scope.require_merchant()?;
+    let tenant_id = scope.require_tenant_view()?;
     let rows = sqlx::query(
         r#"
         SELECT token_symbol
         FROM (
-            SELECT DISTINCT token_symbol FROM finance_ledgers WHERE tenant_id = $1
+            SELECT DISTINCT token_symbol FROM finance_ledgers WHERE ($1::text = '' OR tenant_id = $1)
             UNION
-            SELECT DISTINCT token_symbol FROM monitor_transactions WHERE tenant_id = $1
+            SELECT DISTINCT token_symbol FROM monitor_transactions WHERE ($1::text = '' OR tenant_id = $1)
         ) tokens
         WHERE token_symbol IS NOT NULL AND token_symbol <> ''
         ORDER BY token_symbol
@@ -628,7 +628,7 @@ pub async fn get_audit_logs(
     Query(query): Query<AuditLogQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _merchant_id) = scope.require_merchant()?;
+    let tenant_id = scope.require_tenant_view()?;
     let days = query.days.unwrap_or(30).clamp(1, 365);
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     let action = clean_filter(query.action.as_deref());
@@ -639,7 +639,7 @@ pub async fn get_audit_logs(
         SELECT audit_id, timestamp, admin_userid, action, target_table, target_id,
                reason, ip_address, before_state, after_state
         FROM finance_audit_logs
-        WHERE tenant_id = $1
+        WHERE ($1::text = '' OR tenant_id = $1)
           AND timestamp >= now() - make_interval(days => $2)
           AND ($3::text IS NULL OR action = $3)
           AND ($4::text IS NULL OR target_table = $4)
@@ -846,7 +846,7 @@ pub async fn download_report(
     Query(query): Query<ReportDownloadQuery>,
 ) -> ApiResult<Response> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _merchant_id) = scope.require_merchant()?;
+    let tenant_id = scope.require_tenant_view()?;
     let month = query
         .month
         .clone()
@@ -867,7 +867,7 @@ pub async fn download_report(
                l.tx_timestamp, l.direction, l.amount::double precision AS amount, l.token_symbol, l.network,
                COALESCE(l.counterparty, '') AS counterparty, l.reconciled_status
         FROM finance_ledgers l
-        WHERE l.tenant_id = $1
+        WHERE ($1::text = '' OR l.tenant_id = $1)
           AND l.tx_timestamp >= $2
           AND l.tx_timestamp < $3
           AND ($4::bigint IS NULL OR l.monitor_id = $4)

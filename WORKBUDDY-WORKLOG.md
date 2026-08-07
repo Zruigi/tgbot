@@ -255,3 +255,21 @@
 - **阶段 3（真机验收）**：配置真实 TronGrid/BscScan key，用测试监控地址跑真实链上数据，验证扫描→入库→告警→对账全链路。
 
 **git 哈希**：本行动仅调查+记录，无代码改动（基于 c668503）。
+
+### 行动 15：链上财务完善——阶段 1+2 实施（本行动，重要代码改动）
+
+**目标**：链上财务全链路验证 + 修复权限缺陷 + 报表导出验证（"一起搞定"）。
+
+**发现并修复的真实缺陷（platform_admin 无法访问链上财务）**：
+- `Scope::require_merchant()` 只允许商户角色 → platform_admin（Mini App admin_console 入口的用户）访问 finance API 全部 forbidden。
+- **修复**：`crates/domain/src/scope.rs` 新增 `require_tenant_view()`（platform_admin 返回空 tenant=全平台；商户返回自己 tenant）；`finance.rs` 只读接口（get_summary/get_unreconciled/get_tokens/get_audit_logs/download_report）改用；`monitor.rs` 只读接口（list_monitors/export_transactions）改用；SQL 改为 `WHERE ($1::text='' OR tenant_id=$1)` 条件过滤。
+- **保留写接口的商户限制**：reconcile/update_tx_meta/create_monitor 等仍 require_merchant（安全）。
+
+**全链路验证（本地 18090 + mock 链上数据）**：
+- 注入 mock：2 监控地址（TRC20+BSC）、7 条 finance_ledgers、3 条 monitor_transactions。
+- 全部 8 个 v1 finance 接口 platform_admin 访问 ✅：monitors/transactions/unreconciled/tokens/summary（profit 725.75 精确）/audit_logs/reports/account_categories。
+- **报表导出真实可用**：PDF 200 + %PDF-1.4（1299B）；Excel 200 + PK zip（1962B）。
+
+**结论**：链上财务阶段 1（对齐验证）+ 阶段 2 核心（报表导出验证）完成；阶段 2 增强项（对账建议/PnL 拆分/余额快照）按方案保留待用户确认；阶段 3 真实链上 key 待用户提供。
+
+**git 哈希**：待提交。

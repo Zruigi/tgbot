@@ -36,4 +36,27 @@ impl Scope {
             _ => Err(crate::error::ApiError::Forbidden),
         }
     }
+
+    /// Resolve the tenant scope for read-only finance views.
+    ///
+    /// Platform admins may view aggregate finance data across the platform
+    /// (tenant_id is empty, so queries must not filter by tenant).
+    /// Merchant roles are restricted to their own tenant.
+    /// Returns the tenant_id to filter by (empty string = platform-wide).
+    pub fn require_tenant_view(&self) -> Result<String, crate::error::ApiError> {
+        if self.role == Role::PlatformAdmin {
+            return Ok(String::new());
+        }
+        if matches!(
+            self.role,
+            Role::MerchantOwner | Role::MerchantAdmin | Role::MerchantViewer
+        ) {
+            if let Some(tenant_id) = self.tenant_id.as_deref() {
+                if !tenant_id.is_empty() {
+                    return Ok(tenant_id.to_string());
+                }
+            }
+        }
+        Err(crate::error::ApiError::Forbidden)
+    }
 }

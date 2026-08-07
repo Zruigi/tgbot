@@ -221,7 +221,7 @@ pub async fn list_monitors(
     Query(q): Query<ListMonitorsQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _merchant_id) = scope.require_merchant()?;
+    let tenant_id = scope.require_tenant_view()?;
 
     let active_only = q.active_only.unwrap_or(true);
     let limit = q.limit.unwrap_or(100).clamp(1, 200);
@@ -259,7 +259,7 @@ pub async fn list_monitors(
                 0
             ) AS outflow_20_calc
         FROM address_monitors m
-        WHERE m.tenant_id = $1
+        WHERE ($1::text = '' OR m.tenant_id = $1)
           AND ($2::bool IS NULL OR m.is_active = $2)
           AND ($3::text IS NULL OR m.network = $3)
         ORDER BY m.created_at DESC
@@ -594,7 +594,7 @@ pub async fn export_transactions(
     Query(q): Query<ListTransactionsQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _merchant_id) = scope.require_merchant()?;
+    let tenant_id = scope.require_tenant_view()?;
 
     let parsed_start = q
         .start_ms
@@ -642,7 +642,7 @@ pub async fn export_transactions(
           ON labels.tenant_id = t.tenant_id
          AND labels.counterparty = t.counterparty
          AND labels.network = t.network
-        WHERE t.tenant_id = $1
+        WHERE ($1::text = '' OR t.tenant_id = $1)
           AND t.tx_timestamp >= $2
           AND t.tx_timestamp < $3
           AND ($4::bigint IS NULL OR t.monitor_id = $4)
