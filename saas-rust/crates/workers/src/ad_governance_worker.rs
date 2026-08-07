@@ -309,69 +309,74 @@ impl AdGovernanceWorker {
         &self,
         candidates: &[HashMap<String, Value>],
     ) -> Result<HashMap<String, Value>> {
-        let items: Vec<Value> = candidates
-            .iter()
-            .take(20)
-            .map(|cluster| {
-                json!({
-                    "family_hash": cluster.get("template_hash").and_then(|v| v.as_str()).unwrap_or(""),
-                    "text": cluster.get("representative_text").and_then(|v| v.as_str()).unwrap_or(""),
+        let mut results: HashMap<String, Value> = HashMap::new();
+
+        // Classify in batches of 20 (the LLM prompt grows with input length;
+        // oversized single calls caused timeouts on slow models). Every batch
+        // is aggregated into one decisions map, so all candidates eventually
+        // get classified instead of only the first 20.
+        const BATCH_SIZE: usize = 20;
+        for batch in candidates.chunks(BATCH_SIZE) {
+            let items: Vec<Value> = batch
+                .iter()
+                .map(|cluster| {
+                    json!({
+                        "family_hash": cluster.get("template_hash").and_then(|v| v.as_str()).unwrap_or(""),
+                        "text": cluster.get("representative_text").and_then(|v| v.as_str()).unwrap_or(""),
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        if items.is_empty() {
-            return Ok(HashMap::new());
-        }
+            if items.is_empty() {
+                continue;
+            }
 
-        let prompt = format!(
-            "Classify these text clusters as advertising (yes/no) with confidence 0.0-1.0:\n{}",
-            serde_json::to_string(&items)?
-        );
+            let prompt = format!(
+                "Classify these text clusters as advertising (yes/no) with confidence 0.0-1.0:\n{}",
+                serde_json::to_string(&items)?
+            );
 
-        let future = self.litellm.simple_chat(
-            "You are an ad classifier. Reply ONLY with JSON array of {family_hash, is_ad, confidence, reason}. No markdown.",
-            &prompt,
-        );
+            let future = self.litellm.simple_chat(
+                "You are an ad classifier. Reply ONLY with JSON array of {family_hash, is_ad, confidence, reason}. No markdown.",
+                &prompt,
+            );
 
-        match timeout(Duration::from_secs(60), future).await {
-            Ok(Ok(response)) => {
-                if let Ok(parsed) = serde_json::from_str::<Vec<Value>>(&response) {
-                    let mut results = HashMap::new();
-                    for item in parsed {
-                        if let (Some(hash), Some(is_ad), Some(conf_val)) = (
-                            item.get("family_hash").and_then(|v| v.as_str()),
-                            item.get("is_ad").and_then(|v| v.as_bool()),
-                            item.get("confidence").and_then(|v| v.as_f64()),
-                        ) {
-                            if conf_val >= 0.65 {
-                                results.insert(
-                                    hash.to_string(),
-                                    json!({
-                                        "is_ad": is_ad,
-                                        "source": "llm",
-                                        "confidence": conf_val,
-                                        "reason": item.get("reason").and_then(|v| v.as_str()).unwrap_or("")
-                                    }),
-                                );
+            match timeout(Duration::from_secs(60), future).await {
+                Ok(Ok(response)) => {
+                    if let Ok(parsed) = serde_json::from_str::<Vec<Value>>(&response) {
+                        for item in parsed {
+                            if let (Some(hash), Some(is_ad), Some(conf_val)) = (
+                                item.get("family_hash").and_then(|v| v.as_str()),
+                                item.get("is_ad").and_then(|v| v.as_bool()),
+                                item.get("confidence").and_then(|v| v.as_f64()),
+                            ) {
+                                if conf_val >= 0.65 {
+                                    results.insert(
+                                        hash.to_string(),
+                                        json!({
+                                            "is_ad": is_ad,
+                                            "source": "llm",
+                                            "confidence": conf_val,
+                                            "reason": item.get("reason").and_then(|v| v.as_str()).unwrap_or("")
+                                        }),
+                                    );
+                                }
                             }
                         }
+                    } else {
+                        warn!("LLM response parse error, keeping clusters pending");
                     }
-                    Ok(results)
-                } else {
-                    warn!("LLM response parse error, keeping clusters pending");
-                    Ok(HashMap::new())
+                }
+                Ok(Err(e)) => {
+                    warn!("LLM call failed: {}, keeping clusters pending", e);
+                }
+                Err(_) => {
+                    warn!("LLM timeout (60s), keeping clusters pending");
                 }
             }
-            Ok(Err(e)) => {
-                warn!("LLM call failed: {}, keeping clusters pending", e);
-                Ok(HashMap::new())
-            }
-            Err(_) => {
-                warn!("LLM timeout (60s), keeping clusters pending");
-                Ok(HashMap::new())
-            }
         }
+
+        Ok(results)
     }
 
     /// Execute tiered actions (delete/warn/mute) based on cluster classification and action tier
