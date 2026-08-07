@@ -376,8 +376,23 @@ fn value_as_string(value: &Value) -> Option<String> {
         .as_str()
         .map(str::to_string)
         .or_else(|| value.as_i64().map(|number| number.to_string()))?;
-    (!result.is_empty() && result.chars().all(|character| character.is_ascii_digit()))
-        .then_some(result)
+    // Guard against pathological UINT256-max / garbage values that would
+    // overflow numeric(30,8) on insert.  A TRC20/BEP20 raw amount larger than
+    // 30 digits is never a real transfer amount (real USDT amounts are <= 1e24
+    // for 1e18 tokens, well within numeric(30,8)); clamp anything absurd.
+    let cleaned = result.trim().trim_start_matches('0');
+    if cleaned.is_empty() {
+        return Some("0".to_string());
+    }
+    if !cleaned.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    if cleaned.len() > 30 {
+        // Clamp to a large-but-safe sentinel that will not overflow and is
+        // effectively dust-invisible after the /1e6..1e18 division.
+        return Some("999999999999999999".to_string());
+    }
+    Some(cleaned.to_string())
 }
 
 fn value_as_i64(value: &Value) -> Option<i64> {

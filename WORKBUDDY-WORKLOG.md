@@ -295,3 +295,25 @@
 **git 哈希**：待提交。
 
 **阶段 3 真机验收** 待用户给 TronGrid/BscScan API key。
+
+### 行动 17：链上财务阶段 3 真机验收（本行动，真实链上全链路打通）
+
+**用户提供**：TronGrid `7b00b51f-94f4-4c54-a320-1db54e3360f8`；BscScan 从生产 .env 扒出 `KS68QT4DHCESTRTJJDA8VYJ2GUC9A31U7E`（用户忘密码）。
+
+**验证结论**：
+1. **TronGrid key 有效**：真实地址（币安热钱包 TN3W4H6...）返回 100 笔真实 USDT 交易。
+2. **BscScan 已废弃**：V1 报 deprecated，V2 免费 plan 不支持 BSC（chainid=56）→ **生产 Python 的 BSC 监控实际也是坏的**（chain_monitor.py:113 同用 V1）。BSC 公共 RPC eth_getLogs 被 limit exceeded 拒绝。BSC 侧需付费 BscScan V2 key（待用户）。
+3. **发现 2 个 Rust bug 并修复**：
+   - **UINT256 溢出**：TronGrid 返回 value=2^256-1（78 位）→ numeric(30,8) overflow。修复 `value_as_string`：>30 位截断为哨兵值，非数字过滤。
+   - **连接池死锁**：`SAAS_DB_MAX_CONNECTIONS=2` 时 worker 事务占满连接 → cron 无法 enqueue。本地启动用 10。
+
+**真机验收结果（本地 + 真实链上）**：
+- ✅ monitor_transactions 入库 8 笔真实 USDT 交易（7.37/18.5/19.5/500/14.5/16.5/3.5/5），金额换算精确（raw/1e6）
+- ✅ counterparty=真实对端地址，direction=in
+- ✅ monitor 游标 last_tx_timestamp 更新
+- ✅ monitor_alert 入队 8 个并成功投递（"wallet monitor alert delivered"）
+- ✅ 与 Python 对齐：只写 monitor_transactions，不写 finance_ledgers（finance 是 Rust 增强）
+
+**待办**：BSC 监控需付费 BscScan V2 key；balance_snapshot worker 未实现（仅端点）；finance_ledgers 真实链路（当前从 monitor_transactions 派生）。
+
+**git 哈希**：待提交。
