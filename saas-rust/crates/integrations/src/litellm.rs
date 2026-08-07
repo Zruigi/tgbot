@@ -52,10 +52,11 @@ impl LiteLLMConfig {
 /// a trailing `/v1` (gateway style) as well as bare hosts.
 fn join_endpoint(base_url: &str, path: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/v1") && !path.starts_with("/v1") {
-        format!("{}{}", trimmed, path)
+    let cleaned_path = path.trim_start_matches('/');
+    if trimmed.ends_with("/v1") {
+        format!("{}/{}", trimmed, cleaned_path)
     } else {
-        format!("{}/v1{}", trimmed, path.trim_start_matches("/v1").trim_start_matches('/'))
+        format!("{}/v1/{}", trimmed, cleaned_path)
     }
 }
 
