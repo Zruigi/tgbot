@@ -707,17 +707,25 @@ pub async fn list_group_messages(
     // include_deleted=true to see everything.
     let include_deleted = q.include_deleted.unwrap_or(false);
 
+    // Chat-room ordering (mirrors Python): inner query takes the LATEST page
+    // (message_ts DESC), outer query flips it back to ASC so the newest message
+    // lands at the bottom of the array. The frontend renders the array top-down
+    // then scrolls to bottom — with plain DESC the newest would render at the
+    // top and the scroll would land on old messages ("no chat history").
     let rows = sqlx::query(
         r#"
-        SELECT * FROM groups.group_messages
-        WHERE group_id = $1
-          AND ($2::text IS NULL OR tenant_id = $2)
-          AND ($3::bigint IS NULL OR user_id = $3)
-          AND ($4::text IS NULL OR msg_type = $4)
-          AND ($5::boolean IS NULL OR is_advertising = $5)
-          AND ($6::boolean OR NOT is_deleted)
-        ORDER BY timestamp DESC
-        LIMIT $7 OFFSET $8
+        SELECT t.* FROM (
+            SELECT * FROM groups.group_messages
+            WHERE group_id = $1
+              AND ($2::text IS NULL OR tenant_id = $2)
+              AND ($3::bigint IS NULL OR user_id = $3)
+              AND ($4::text IS NULL OR msg_type = $4)
+              AND ($5::boolean IS NULL OR is_advertising = $5)
+              AND ($6::boolean OR NOT is_deleted)
+            ORDER BY message_ts DESC, tg_msg_id DESC, id DESC
+            LIMIT $7 OFFSET $8
+        ) t
+        ORDER BY t.message_ts ASC, t.tg_msg_id ASC, t.id ASC
         "#,
     )
     .bind(q.group_id)
