@@ -311,11 +311,11 @@ impl AdGovernanceWorker {
     ) -> Result<HashMap<String, Value>> {
         let mut results: HashMap<String, Value> = HashMap::new();
 
-        // Classify in batches of 20 (the LLM prompt grows with input length;
+        // Classify in batches of 10 (the LLM prompt grows with input length;
         // oversized single calls caused timeouts on slow models). Every batch
         // is aggregated into one decisions map, so all candidates eventually
-        // get classified instead of only the first 20.
-        const BATCH_SIZE: usize = 20;
+        // get classified instead of only the first batch.
+        const BATCH_SIZE: usize = 10;
         for batch in candidates.chunks(BATCH_SIZE) {
             let items: Vec<Value> = batch
                 .iter()
@@ -341,7 +341,7 @@ impl AdGovernanceWorker {
                 &prompt,
             );
 
-            match timeout(Duration::from_secs(60), future).await {
+            match timeout(Duration::from_secs(120), future).await {
                 Ok(Ok(response)) => {
                     if let Ok(parsed) = serde_json::from_str::<Vec<Value>>(&response) {
                         for item in parsed {
@@ -371,7 +371,7 @@ impl AdGovernanceWorker {
                     warn!("LLM call failed: {}, keeping clusters pending", e);
                 }
                 Err(_) => {
-                    warn!("LLM timeout (60s), keeping clusters pending");
+                    warn!("LLM timeout (120s), keeping clusters pending");
                 }
             }
         }
