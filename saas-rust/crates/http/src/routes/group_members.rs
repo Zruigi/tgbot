@@ -97,6 +97,7 @@ pub struct GroupMessagesQuery {
     pub offset: Option<i64>,
     pub msg_type: Option<String>,
     pub is_advertising: Option<bool>,
+    pub include_deleted: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -701,6 +702,11 @@ pub async fn list_group_messages(
 
     let tenant_id = resolve_tenant_id(&scope)?;
 
+    // Group room chat: show only live (non-deleted) messages by default so the
+    // room is not flooded with already-removed ad spam. Callers can pass
+    // include_deleted=true to see everything.
+    let include_deleted = q.include_deleted.unwrap_or(false);
+
     let rows = sqlx::query(
         r#"
         SELECT * FROM groups.group_messages
@@ -709,8 +715,9 @@ pub async fn list_group_messages(
           AND ($3::bigint IS NULL OR user_id = $3)
           AND ($4::text IS NULL OR msg_type = $4)
           AND ($5::boolean IS NULL OR is_advertising = $5)
+          AND ($6::boolean OR NOT is_deleted)
         ORDER BY timestamp DESC
-        LIMIT $6 OFFSET $7
+        LIMIT $7 OFFSET $8
         "#,
     )
     .bind(q.group_id)
@@ -718,6 +725,7 @@ pub async fn list_group_messages(
     .bind(q.user_id)
     .bind(q.msg_type)
     .bind(q.is_advertising)
+    .bind(include_deleted)
     .bind(limit)
     .bind(offset)
     .fetch_all(state.db()?)
