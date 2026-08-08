@@ -29,6 +29,14 @@ use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        // SPA static assets (Mini App frontend). Served from ../static/dist relative
+        // to the working directory (saas-rust/) with fallback to index.html so deep
+        // links and router paths work. Only matches non-/api paths implicitly via
+        // fallback_service (API routes are registered above and take precedence).
+        .fallback_service(
+            tower_http::services::ServeDir::new("../static/dist")
+                .not_found_service(tower_http::services::ServeFile::new("../static/dist/index.html")),
+        )
         // Health
         .route("/healthz", get(session::health))
         .route("/api/health", get(session::health))
