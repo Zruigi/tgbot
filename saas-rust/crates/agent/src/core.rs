@@ -1198,7 +1198,7 @@ impl AIAgent {
             });
         };
         let exec_result = tool.execute(&params, ctx).await;
-        let result_value = exec_result.to_json_value();
+        let mut result_value = exec_result.to_json_value();
         let message = exec_result
             .message
             .clone()
@@ -1211,10 +1211,39 @@ impl AIAgent {
             format!("广告查询失败：{}", message)
         };
         let mut tool_results = HashMap::new();
+        // 查询本身没有副作用：标记为无需确认，避免确认时被通用机制重放（查询不会删除）
+        if let Some(obj) = result_value.as_object_mut() {
+            obj.insert("needs_confirmation".into(), Value::Bool(false));
+        }
         tool_results.insert("query_recent_ad_messages".into(), result_value);
+
+        // 将"删除已锁定快照"注入待确认队列：用户确认后 confirm_and_execute 重放
+        // delete_recent_ad_messages（携带 snapshot_id）执行真实删除
+        let snapshot_id = exec_result
+            .data
+            .as_ref()
+            .and_then(|data| data.get("snapshot_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut pending_tools: Vec<String> = vec!["query_recent_ad_messages".to_string()];
+        let mut requires_confirmation = false;
+        if exec_result.success && !snapshot_id.is_empty() {
+            requires_confirmation = true;
+            tool_results.insert(
+                "delete_recent_ad_messages".into(),
+                serde_json::json!({
+                    "needs_confirmation": true,
+                    "_params": {"snapshot_id": snapshot_id, "confirm": true},
+                    "message": "删除已锁定广告（待确认）",
+                    "success": true,
+                    "action_taken": false,
+                }),
+            );
+            pending_tools.push("delete_recent_ad_messages".to_string());
+        }
         Some(AgentResponse {
             text,
-            tool_calls_made: vec!["query_recent_ad_messages".into()],
+            tool_calls_made: pending_tools,
             tool_results,
             is_action_taken: false,
             action_summary: format!(
@@ -1225,7 +1254,7 @@ impl AIAgent {
                 group_match.unwrap_or(0),
                 message
             ),
-            requires_confirmation: exec_result.success && exec_result.needs_confirmation,
+            requires_confirmation,
             confidence: if exec_result.success { 1.0 } else { 0.0 },
             raw_response: None,
         })
