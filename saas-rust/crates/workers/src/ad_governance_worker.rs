@@ -501,6 +501,34 @@ impl AdGovernanceWorker {
 
                 for tg_msg_id in telegram_message_ids {
                     if let Err(error) = telegram.delete_message(group_id, tg_msg_id).await {
+                        // Idempotent deletion: a 400 "message to delete not found" means the
+                        // message is already gone (e.g. another pipeline deleted it). Treat
+                        // it as already-satisfied and keep going; only non-idempotent errors
+                        // abort the action.
+                        let error_text = error.to_string();
+                        let already_gone = error_text.contains("message to delete not found")
+                            || error_text.contains("MESSAGE_ID_INVALID")
+                            || error_text.contains("message can't be deleted");
+                        if already_gone {
+                            warn!(
+                                tg_msg_id,
+                                "ad delete idempotent skip: message already gone"
+                            );
+                            let result = sqlx::query(
+                                "UPDATE groups.group_messages \
+                                 SET is_deleted = true, deleted_at = now(), ad_action_status = 'deleted' \
+                                 WHERE tenant_id = $1 AND group_id = $2 AND tg_msg_id = $3",
+                            )
+                            .bind(tenant_id)
+                            .bind(group_id)
+                            .bind(tg_msg_id)
+                            .execute(pool)
+                            .await;
+                            if let Err(db_error) = result {
+                                warn!(tg_msg_id, %db_error, "idempotent delete row update failed");
+                            }
+                            continue;
+                        }
                         let message =
                             format!("failed to delete Telegram message {tg_msg_id}: {error}");
                         mark_action_failed_preserving_error(
