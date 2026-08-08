@@ -1010,7 +1010,7 @@ const fileStore = useFileStore()
 const themeStore = useThemeStore()
 const fileUrls = computed(() => fileStore.fileUrls)
 
-const token = () => localStorage.getItem('admin_token') || ''
+const token = () => { const raw = sessionStorage.getItem('adm_s'); if (raw) { try { return decodeURIComponent(atob(raw)) } catch { return '' } } return localStorage.getItem('admin_token') || '' }
 const authH = () => ({ 'Authorization': `Bearer ${token()}`, 'Content-Type': 'application/json' })
 
 const mobilePanelView = ref<'list'|'detail'>('list')
