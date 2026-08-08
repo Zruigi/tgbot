@@ -412,3 +412,32 @@
 **遗留**：4.3 灰度观察 ≥3 天；4.4 beta 转正；5.x 清理。迁移进度表 3.3/3.4/3.5/4.1/4.2 标记完成。
 
 **git 哈希**：523e0ddb（服务器）+ 本地最新。
+
+### 行动 22：Agent 广告链路评测 + 前端修复 + 上线切换（本行动）
+
+**用户指令**：掐 Python token，让 Rust 参与工作（agent 广告删除评测 + 前端刷新修复）。
+
+**Agent 广告链路消息注入测试（完成）**：
+- 1) "检查群聊多少个" → system_query stats_overview → 15 群/181 用户（需带 x-tenant-id，空 tenant 返回 0）
+- 2) "找到大鹅群" → active_groups → -1001991086404 排第一
+- 3) "检查广告" → is_ad_scan_intent → list_ad_scan_groups → 选群(select, requires_confirmation+UI) → confirm → worker 扫描 → **completed dry-run，465 簇**
+- **权限验证**：Zrui_bot 大鹅群 administrator + can_delete_messages=true
+- **设计核对**：哈希去重（ad_text_hash 与 Python 位级一致）/管理员跳过/fail-closed 匿名/sender_id=0 —— 无跑偏
+
+**发现并修复的缺陷**：
+1. **前端 agentJobPolling 2s 全量重建** → 5s + 仅状态变化更新（commit 3c2ed2e）
+2. **服务器前端 dist 缺失**（.gitignore 排除）→ npm install+build（Rust 18090 之前 404 现已 200）
+3. **LLM 分类超时 15s→60s**（gpt-5.6-luna 慢，15s 必超时）commit 42bc7a5
+4. **classify 只 take(20)** 388 簇 pending → **分批 chunks(20) 循环全量分类**（commit cc6c90a 含）
+5. **default 租户无 merchant bot 绑定** → 插入 merchant（6464245290/Zrui_bot）+ register_bot 注册成功
+
+**真实删除评测（进行中）**：
+- activate_ad_policy 触发多次：早期失败（LLM 超时→tenant no bot→修复后分批）
+- 最新任务 scan_064b95f0（436 簇）scanning 35% 中——全量聚类 9940 条 + 22 批 LLM 分类耗时>10min
+- 暴露：无并发控制（多 activate 任务同时 running）+ 全量扫描慢（性能问题待优化）
+
+**上线切换（Python→Rust）**：
+- register_bot 注册成功但**未实际 setWebhook**（url 仍空，Python 轮询未断）
+- 待办：改 cloudflared 指向 18090 + 显式 setWebhook + 停 Python 轮询（用户已批准方向）
+
+**git 哈希**：cc6c90a（本地+服务器同步）

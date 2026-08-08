@@ -53,6 +53,7 @@ pub struct CreateAdScanRequest {
     pub dry_run: Option<bool>,
     pub activate_policy: Option<bool>,
     pub source: Option<String>,
+    pub recent_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,6 +116,7 @@ pub async fn create_ad_scan(
     let source = payload.source.unwrap_or_else(|| "agent".to_string());
 
     let service = AdGovernanceService::new(Arc::new(state.db()?.clone()));
+    let recent_only = payload.recent_only.unwrap_or(true);
     let job = service
         .create_job(
             &tenant_id,
@@ -124,6 +126,7 @@ pub async fn create_ad_scan(
             dry_run,
             activate_policy,
             &source,
+            recent_only,
         )
         .await
         .map_err(map_ad_scan_error)?;

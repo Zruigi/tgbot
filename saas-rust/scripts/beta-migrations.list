@@ -27,3 +27,4 @@
 0030_monitor_transaction_tenant_key.sql
 0031_monitor_alert_outbox.sql
 0032_balance_snapshots.sql
+0033_ad_scan_recent_only.sql

@@ -214,6 +214,7 @@ impl AdGovernanceService {
         _dry_run: bool, // Ignored: first scan always dry_run=true
         activate_policy: bool,
         source: &str,
+        recent_only: bool,
     ) -> Result<AdScanJob> {
         // SAFETY INVARIANT: First scan FORCED dry_run=true
         // Only explicit confirm via configure_job + start_job can lift this for enforcement runs
@@ -251,8 +252,8 @@ impl AdGovernanceService {
             r#"
             INSERT INTO groups.ad_scan_jobs
                 (job_id, tenant_id, group_id, group_title, requested_by,
-                 dry_run, activate_policy, source, status, total_messages)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'prepared', $9)
+                 dry_run, activate_policy, source, status, total_messages, recent_only)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'prepared', $9, $10)
             "#,
         )
         .bind(&job_id)
@@ -264,6 +265,7 @@ impl AdGovernanceService {
         .bind(activate_policy)
         .bind(source)
         .bind(message_count)
+        .bind(recent_only)
         .execute(self.pool.as_ref())
         .await?;
 
@@ -512,7 +514,7 @@ impl AdGovernanceService {
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
-            SELECT status, group_id, source
+            SELECT status, group_id, source, recent_only
             FROM groups.ad_scan_jobs
             WHERE job_id = $1 AND tenant_id = $2
             FOR UPDATE
@@ -526,6 +528,7 @@ impl AdGovernanceService {
         let status: String = row.get("status");
         let group_id: i64 = row.get("group_id");
         let source: String = row.get("source");
+        let recent_only: bool = row.get("recent_only");
 
         if !matches!(status.as_str(), "prepared" | "queued") {
             transaction.rollback().await?;
@@ -556,7 +559,7 @@ impl AdGovernanceService {
                        'tenant_id', $1::text,
                        'group_id', $3::bigint,
                        'source', $4::text,
-                       'recent_only', false
+                       'recent_only', $5::bool
                    ),
                    5, 3, now(), 'pending'
             WHERE NOT EXISTS (
@@ -572,6 +575,7 @@ impl AdGovernanceService {
         .bind(job_id)
         .bind(group_id)
         .bind(source)
+        .bind(recent_only)
         .execute(&mut *transaction)
         .await?;
 

@@ -743,6 +743,7 @@ async fn handle_ad_scan_agent_action(
                     true,
                     false,
                     "agent",
+                    true, // recent_only: incremental scan (fast)
                 )
                 .await?;
             let title = job
@@ -864,6 +865,7 @@ async fn handle_ad_scan_agent_action(
                     true,
                     true,
                     "agent_activation",
+                    true, // recent_only: incremental scan (fast)
                 )
                 .await?;
             let configured = service

@@ -853,7 +853,7 @@ async fn load_group_messages(
           AND (NULLIF(btrim(COALESCE(content, '')), '') IS NOT NULL
                OR NULLIF(btrim(COALESCE(media_unique_id, '')), '') IS NOT NULL)
           AND NOT is_deleted
-          AND (NOT $3 OR message_ts >= EXTRACT(EPOCH FROM now() - interval '24 hours')::bigint)
+          AND (NOT $3 OR message_ts >= EXTRACT(EPOCH FROM now() - interval '7 days')::bigint)
         ORDER BY message_ts ASC, id ASC
         LIMIT 10000
         "#,
