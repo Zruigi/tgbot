@@ -1132,22 +1132,31 @@ impl AIAgent {
             return None;
         }
 
-        // Parse hours from text (default 24, clamp to 1-24)
-        let hours = if let Some(caps) = regex::Regex::new(r"(\d{1,3})\s*(?:小时|h)")
+        // Parse hours from text (default 168h=7d, clamp to 1-720h=30d)
+        // Supports both "X小时/Xh" and "X天/X日/Xd" units.
+        let hours = if let Some(caps) = regex::Regex::new(r"(\d{1,3})\s*(?:小时|h|天|日|d)")
             .ok()
             .and_then(|re| re.captures(user_text))
         {
-            caps.get(1)
+            let raw = caps
+                .get(1)
                 .and_then(|m| m.as_str().parse::<i64>().ok())
-                .unwrap_or(24)
-                .max(1)
-                .min(24)
+                .unwrap_or(168);
+            let unit = caps
+                .get(0)
+                .and_then(|m| m.as_str().chars().next_back())
+                .unwrap_or('h');
+            let hours = match unit {
+                '天' | '日' | 'd' | 'D' => raw * 24,
+                _ => raw,
+            };
+            hours.max(1).min(720)
         } else {
-            24
+            168
         };
 
-        // Parse requested limit from text (default 50, clamp to 1-50)
-        let requested_limit = if let Some(caps) = regex::Regex::new(r"(?:最近\s*)?(\d{1,2})\s*条")
+        // Parse requested limit from text (default 50, clamp to 1-200)
+        let requested_limit = if let Some(caps) = regex::Regex::new(r"(?:最近\s*)?(\d{1,3})\s*条")
             .ok()
             .and_then(|re| re.captures(user_text))
         {
@@ -1155,7 +1164,7 @@ impl AIAgent {
                 .and_then(|m| m.as_str().parse::<i64>().ok())
                 .unwrap_or(50)
                 .max(1)
-                .min(50)
+                .min(200)
         } else {
             50
         };

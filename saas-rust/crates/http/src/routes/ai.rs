@@ -865,7 +865,7 @@ async fn handle_ad_scan_agent_action(
                     true,
                     true,
                     "agent_activation",
-                    true, // recent_only: incremental scan (fast)
+                    false, // full history: activation cleans ALL ads, incl. old ones
                 )
                 .await?;
             let configured = service

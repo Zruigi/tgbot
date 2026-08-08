@@ -24,7 +24,7 @@ impl Tool for QueryRecentAdMessagesTool {
     }
 
     fn description(&self) -> &str {
-        "Query recent 24-hour ad messages and create a snapshot for deletion confirmation."
+        "Query recent ad messages (window up to 30 days, default 7 days) and create a snapshot for deletion confirmation."
     }
 
     fn category(&self) -> &str {
@@ -42,7 +42,7 @@ impl Tool for QueryRecentAdMessagesTool {
                     "properties": {
                         "hours": {
                             "type": "integer",
-                            "description": "Query window in hours (1-24, default 24)"
+                            "description": "Query window in hours (1-720, default 168, i.e. up to 30 days)"
                         },
                         "group_id": {
                             "type": "integer",
@@ -50,7 +50,7 @@ impl Tool for QueryRecentAdMessagesTool {
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Candidate limit, default 20, max 50"
+                            "description": "Candidate limit, default 50, max 200"
                         }
                     },
                     "required": []
@@ -63,15 +63,15 @@ impl Tool for QueryRecentAdMessagesTool {
         let hours = params
             .get("hours")
             .and_then(|v| v.as_i64())
-            .unwrap_or(24)
+            .unwrap_or(168)
             .max(1)
-            .min(24);
+            .min(720);
         let limit = params
             .get("limit")
             .and_then(|v| v.as_i64())
-            .unwrap_or(20)
+            .unwrap_or(50)
             .max(1)
-            .min(50);
+            .min(200);
         let group_id = params.get("group_id").and_then(|v| v.as_i64());
 
         let tenant_id = context
@@ -170,8 +170,8 @@ impl Tool for QueryRecentAdMessagesTool {
         if let Err(e) = sqlx::query(
             r#"
             INSERT INTO groups.ad_delete_snapshots
-            (snapshot_id, tenant_id, group_id, refs, excluded_groups_count, created_at, created_by)
-            VALUES ($1, $2, $3, $4, $5, now(), 'agent')
+            (snapshot_id, tenant_id, group_id, refs, excluded_groups_count, cutoff_ts, created_at, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, now(), 'agent')
             ON CONFLICT (snapshot_id) DO NOTHING
             "#,
         )
@@ -180,6 +180,7 @@ impl Tool for QueryRecentAdMessagesTool {
         .bind(group_id)
         .bind(serde_json::to_value(&refs).unwrap_or(Value::Null))
         .bind(0i32)
+        .bind(cutoff_ts)
         .execute(self.pool.as_ref())
         .await
         {

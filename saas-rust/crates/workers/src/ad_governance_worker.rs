@@ -163,7 +163,11 @@ impl AdGovernanceWorker {
         let exact_clusters = service.exact_clusters(messages.clone());
         let known_hashes = get_known_hashes(pool, tenant_id).await?;
 
-        // Filter to candidates (3+ occurrence or known hash or stored_ad)
+        // Filter to candidates (3+ occurrence or known hash or stored_ad).
+        // Realtime (rt_) jobs targeting a single fresh message relax this to
+        // row_count>=1 so brand-new ad variants are judged (and deleted) on
+        // first sight instead of waiting for 3+ repeats.
+        let is_realtime = job_id.starts_with("rt_");
         let candidates: Vec<_> = exact_clusters
             .into_iter()
             .filter(|cluster| {
@@ -171,6 +175,20 @@ impl AdGovernanceWorker {
                     .get("rows")
                     .and_then(|v| v.as_array())
                     .map(|a| a.len())
+                    .unwrap_or(0);
+                let recent_row_count = cluster
+                    .get("rows")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        let cutoff = Utc::now().timestamp() - 86400;
+                        a.iter()
+                            .filter(|row| {
+                                row.get("message_ts")
+                                    .and_then(Value::as_i64)
+                                    .is_some_and(|ts| ts >= cutoff)
+                            })
+                            .count()
+                    })
                     .unwrap_or(0);
                 row_count >= 3
                     || cluster
@@ -182,6 +200,8 @@ impl AdGovernanceWorker {
                         .get("stored_ad")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
+                    || (is_realtime && row_count >= 1)
+                    || recent_row_count >= 1
             })
             .collect();
 
@@ -211,7 +231,7 @@ impl AdGovernanceWorker {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
 
-            if known_hashes.contains(fingerprint_hash) {
+            if known_hashes.contains(fingerprint_hash) || known_hashes.contains(template_hash) {
                 decisions.insert(
                     template_hash.to_string(),
                     json!({
@@ -224,9 +244,22 @@ impl AdGovernanceWorker {
             }
         }
 
-        // LLM classification for unknowns
-        if !candidates.is_empty() && decisions.len() < candidates.len() {
-            if let Ok(llm_results) = self.classify_with_llm(&candidates).await {
+        // LLM classification for unknowns only: skip clusters already resolved
+        // via known fingerprints (prevents re-judging confirmed ads and shrinks
+        // the number of LLM batches on full-history activations).
+        let unresolved: Vec<HashMap<String, Value>> = candidates
+            .iter()
+            .filter(|cluster| {
+                let template_hash = cluster
+                    .get("template_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                !decisions.contains_key(template_hash)
+            })
+            .cloned()
+            .collect();
+        if !unresolved.is_empty() {
+            if let Ok(llm_results) = self.classify_with_llm(&unresolved).await {
                 decisions.extend(llm_results);
             }
         }
@@ -474,10 +507,29 @@ impl AdGovernanceWorker {
                     return Err(anyhow!(permission_error));
                 }
 
-                let telegram_message_ids = recent_messages
-                    .iter()
-                    .filter_map(|message| message.get("tg_msg_id").and_then(Value::as_i64))
-                    .collect::<Vec<_>>();
+                // exact_delete_* tiers delete the FULL cluster (rows_arr), not just
+                // recent_messages. This is what makes a full-history activation
+                // actually clear old ads; previously the 24h cutoff meant only
+                // recent rows were deleted and the rest were silently skipped.
+                let full_delete = matches!(
+                    action_tier,
+                    "exact_delete" | "similar_delete" | "exact_delete_mute"
+                );
+                let telegram_message_ids = if full_delete {
+                    rows_arr
+                        .iter()
+                        .filter_map(|message| {
+                            message.get("tg_msg_id").and_then(Value::as_i64)
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    recent_messages
+                        .iter()
+                        .filter_map(|message| {
+                            message.get("tg_msg_id").and_then(Value::as_i64)
+                        })
+                        .collect::<Vec<_>>()
+                };
                 if telegram_message_ids.is_empty() {
                     return Ok(());
                 }
@@ -792,7 +844,7 @@ fn enforcement_allowed(dry_run: bool, auto_enforce_enabled: bool) -> bool {
 fn validate_policy_activation(
     dry_run: bool,
     activate_policy: bool,
-    pending_clusters: usize,
+    _pending_clusters: usize,
 ) -> Result<()> {
     if !activate_policy {
         return Ok(());
@@ -802,11 +854,11 @@ fn validate_policy_activation(
             "activate_policy cannot be applied by a dry-run scan"
         ));
     }
-    if pending_clusters > 0 {
-        return Err(anyhow!(
-            "activate_policy cannot be applied with pending classifications"
-        ));
-    }
+    // Activation no longer requires zero pending clusters. Known ads (fingerprint
+    // / previously confirmed template hashes) are enforced immediately; clusters
+    // the LLM could not classify are left pending for the next scan instead of
+    // aborting the whole activation. This keeps deletion working even when the
+    // upstream LLM gateway is flaky.
     Ok(())
 }
 
@@ -853,12 +905,20 @@ fn cluster_action_tier(cluster: &HashMap<String, Value>) -> &'static str {
 
     if rows.len() >= 6 && sender_count >= 3 {
         "exact_delete_mute"
-    } else if rows.len() >= 6 {
+    } else if rows.len() >= 2 && sender_count >= 2 {
+        // Aggressive tier: same template posted by 2+ different accounts in cluster
+        // crosses the deletion threshold. Catches duplicates like "卡卡台/VCC" spammers
+        // who rotate throw-away accounts.
         "exact_delete"
-    } else if rows.len() > 1 && recent_rows.len() >= 5 {
-        "similar_delete"
-    } else if recent_rows.len() >= 3 {
-        "warn"
+    } else if rows.len() >= 2 {
+        // Second occurrence of the same ad template (even from one sender).
+        // Already classified as ad; delete immediately.
+        "exact_delete"
+    } else if recent_rows.len() >= 1 {
+        // Aggressive default: any freshly-posted ad (even the first occurrence of a
+        // new variant) is deleted immediately. The cluster was already classified as
+        // ad (fingerprint reuse or LLM), so deleting normal messages is unlikely.
+        "exact_delete"
     } else {
         "none"
     }
@@ -914,8 +974,15 @@ async fn load_group_messages(
 
 /// Get known ad fingerprints for tenant
 async fn get_known_hashes(pool: &PgPool, tenant_id: &str) -> Result<HashSet<String>> {
+    // 1) Explicit fingerprints recorded from confirmed deletions.
+    // 2) template_hash of any previously confirmed ad cluster (same tenant).
+    //    Reusing them lets a full-history activation skip LLM classification
+    //    for ads already judged in earlier dry-runs/activations.
     let rows = sqlx::query_scalar::<_, String>(
-        "SELECT text_hash FROM groups.ad_text_fingerprints WHERE tenant_id = $1",
+        "SELECT text_hash FROM groups.ad_text_fingerprints WHERE tenant_id = $1 \
+         UNION \
+         SELECT template_hash FROM groups.ad_governance_clusters \
+         WHERE tenant_id = $1 AND classification = 'ad' AND template_hash <> ''",
     )
     .bind(tenant_id)
     .fetch_all(pool)

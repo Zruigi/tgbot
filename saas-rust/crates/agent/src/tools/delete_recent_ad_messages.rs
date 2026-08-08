@@ -105,7 +105,7 @@ impl Tool for DeleteRecentAdMessagesTool {
 
         // Load snapshot with TENANT SCOPING (fix #3)
         let snapshot_row = match sqlx::query(
-            "SELECT snapshot_id, tenant_id, refs, created_at, consumed_at FROM groups.ad_delete_snapshots WHERE snapshot_id = $1 AND tenant_id = $2"
+            "SELECT snapshot_id, tenant_id, refs, cutoff_ts, created_at, consumed_at FROM groups.ad_delete_snapshots WHERE snapshot_id = $1 AND tenant_id = $2"
         )
         .bind(snapshot_id)
         .bind(tenant_id)
@@ -140,6 +140,8 @@ impl Tool for DeleteRecentAdMessagesTool {
         let created_at: chrono::DateTime<Utc> = snapshot_row.get("created_at");
         let consumed_at: Option<chrono::DateTime<Utc>> = snapshot_row.get("consumed_at");
         let refs_json: Value = snapshot_row.get("refs");
+        // Query window lower bound stored at snapshot creation (may be NULL on legacy rows)
+        let cutoff_ts: Option<i64> = snapshot_row.get("cutoff_ts");
 
         // Check if already consumed
         if consumed_at.is_some() {
@@ -210,7 +212,8 @@ impl Tool for DeleteRecentAdMessagesTool {
         let mut deleted = 0i64;
         let mut skipped = 0i64;
         let mut error_details: Vec<Value> = Vec::new();
-        let cutoff_ts = created_at.timestamp();
+        // Upper bound: snapshot creation time (tolerate +60s clock skew)
+        let snapshot_upper_ts = created_at.timestamp() + 60;
 
         for ref_item in refs_array {
             let msg_id = match ref_item.get("msg_id").and_then(|v| v.as_i64()) {
@@ -239,7 +242,10 @@ impl Tool for DeleteRecentAdMessagesTool {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
 
-            // Re-verify row exists and matches criteria
+            // Re-verify row exists and matches criteria.
+            // Time window semantics (mirrors Python): message_ts must fall inside
+            // [snapshot cutoff, snapshot created_at]. NULL cutoff (legacy rows)
+            // disables the lower bound; upper bound always enforced.
             let row_exists = match sqlx::query(
                 r#"
                 SELECT 1 FROM groups.group_messages
@@ -249,7 +255,8 @@ impl Tool for DeleteRecentAdMessagesTool {
                   AND user_id = $4
                   AND (is_advertising = true OR ad_score >= 40)
                   AND NOT COALESCE(is_deleted, false)
-                  AND COALESCE(message_ts::bigint, EXTRACT(EPOCH FROM timestamp)::bigint) >= $5
+                  AND ($5::bigint IS NULL OR COALESCE(message_ts::bigint, EXTRACT(EPOCH FROM timestamp)::bigint) >= $5)
+                  AND COALESCE(message_ts::bigint, EXTRACT(EPOCH FROM timestamp)::bigint) <= $6
                 LIMIT 1
                 "#,
             )
@@ -258,6 +265,7 @@ impl Tool for DeleteRecentAdMessagesTool {
             .bind(tg_msg_id)
             .bind(user_id)
             .bind(cutoff_ts)
+            .bind(snapshot_upper_ts)
             .fetch_optional(self.pool.as_ref())
             .await
             {

@@ -28,3 +28,4 @@
 0031_monitor_alert_outbox.sql
 0032_balance_snapshots.sql
 0033_ad_scan_recent_only.sql
+0034_ad_delete_snapshots_cutoff.sql
