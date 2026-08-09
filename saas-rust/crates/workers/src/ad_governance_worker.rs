@@ -23,6 +23,7 @@ use crate::scheduler::Worker;
 use tgbot_integrations::litellm::LiteLLMClient;
 use tgbot_integrations::telegram::SendMessageParams;
 use tgbot_services::ad_governance::AdGovernanceService;
+use tgbot_services::ad_text::{ad_text_hash, normalize_ad_text};
 
 // ============================================================================
 // Ad Governance Worker
@@ -639,6 +640,44 @@ impl AdGovernanceWorker {
                         }
                     }
                 }
+
+                // Learning loop: a confirmed ad cluster that we actually deleted is
+                // the strongest signal we have. Persist the fingerprint so identical
+                // future text bypasses the LLM (mirrors Python persist_ad_fingerprint).
+                // Uses the cluster representative text (normalized-hash stable).
+                {
+                    let representative = cluster
+                        .get("representative_text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let first_source = rows_arr
+                        .iter()
+                        .find_map(|row| row.get("tg_msg_id").and_then(Value::as_i64));
+                    let first_sender = rows_arr
+                        .iter()
+                        .find_map(|row| row.get("user_id").and_then(Value::as_i64));
+                    if !representative.is_empty() {
+                        if let Err(error) = persist_ad_fingerprint(
+                            pool,
+                            tenant_id,
+                            representative,
+                            first_source,
+                            first_sender,
+                            "worker",
+                        )
+                        .await
+                        {
+                            warn!(%error, "failed to persist ad fingerprint after delete");
+                        } else {
+                            info!(
+                                %tenant_id, %group_id,
+                                template_hash,
+                                "persisted ad fingerprint after confirmed deletion"
+                            );
+                        }
+                    }
+                }
+
                 service
                     .mark_action_executed(tenant_id, job_id, group_id, &delete_action_key)
                     .await?;
@@ -989,6 +1028,73 @@ async fn get_known_hashes(pool: &PgPool, tenant_id: &str) -> Result<HashSet<Stri
     .await?;
 
     Ok(rows.into_iter().collect())
+}
+
+/// Persist one confirmed ad fingerprint so identical future text bypasses the LLM.
+/// Mirrors Python `persist_ad_fingerprint` (database.py): UPSERT into
+/// ad_text_fingerprints keyed by (tenant_id, text_hash), bumping confirmed_count.
+/// Also updates the sender profile when a sender_id is available.
+async fn persist_ad_fingerprint(
+    pool: &PgPool,
+    tenant_id: &str,
+    content: &str,
+    source_msg_id: Option<i64>,
+    sender_id: Option<i64>,
+    confirmed_by: &str,
+) -> Result<String> {
+    let effective_tenant = if tenant_id.trim().is_empty() {
+        "default"
+    } else {
+        tenant_id
+    };
+    let text_hash = ad_text_hash(content);
+    let normalized = normalize_ad_text(content);
+
+    sqlx::query(
+        r#"
+        INSERT INTO groups.ad_text_fingerprints (
+            tenant_id, text_hash, normalized_text, representative_text,
+            source_msg_id, confirmed_by, confirmed_count,
+            first_confirmed_at, last_confirmed_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, 1, now(), now())
+        ON CONFLICT (tenant_id, text_hash) DO UPDATE SET
+            representative_text = EXCLUDED.representative_text,
+            source_msg_id = EXCLUDED.source_msg_id,
+            confirmed_by = EXCLUDED.confirmed_by,
+            confirmed_count = groups.ad_text_fingerprints.confirmed_count + 1,
+            last_confirmed_at = now()
+        "#,
+    )
+    .bind(effective_tenant)
+    .bind(&text_hash)
+    .bind(&normalized)
+    .bind(content)
+    .bind(source_msg_id)
+    .bind(confirmed_by)
+    .execute(pool)
+    .await?;
+
+    if let Some(sender) = sender_id {
+        sqlx::query(
+            r#"
+            INSERT INTO groups.ad_sender_profiles (
+                tenant_id, sender_id, confirmed_ad_count, last_text_hash,
+                first_confirmed_at, last_confirmed_at
+            ) VALUES ($1, $2, 1, $3, now(), now())
+            ON CONFLICT (tenant_id, sender_id) DO UPDATE SET
+                confirmed_ad_count = groups.ad_sender_profiles.confirmed_ad_count + 1,
+                last_text_hash = EXCLUDED.last_text_hash,
+                last_confirmed_at = now()
+            "#,
+        )
+        .bind(effective_tenant)
+        .bind(sender)
+        .bind(&text_hash)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(text_hash)
 }
 
 /// Check if bot has permission to delete messages in group
