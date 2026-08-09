@@ -612,8 +612,11 @@ pub async fn get_group_photo(
     axum::extract::Query(query): axum::extract::Query<GroupIdQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
-    ensure_group_owned(&state, tenant_id, query.group_id).await?;
+    // 平台管理员会话无 tenant_id：回退到默认租户（生产主 bot），并跳过归属校验
+    let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
+    if !matches!(scope.role, Role::PlatformAdmin) {
+        ensure_group_owned(&state, tenant_id, query.group_id).await?;
+    }
     let (_, telegram) = state.tenant_telegram(tenant_id).await?;
     let chat = telegram
         .get_chat(query.group_id)
@@ -639,8 +642,11 @@ pub async fn get_group_member_count(
     axum::extract::Query(query): axum::extract::Query<GroupIdQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
-    ensure_group_owned(&state, tenant_id, query.group_id).await?;
+    // 平台管理员会话无 tenant_id：回退到默认租户（生产主 bot），并跳过归属校验
+    let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
+    if !matches!(scope.role, Role::PlatformAdmin) {
+        ensure_group_owned(&state, tenant_id, query.group_id).await?;
+    }
     let (_, telegram) = state.tenant_telegram(tenant_id).await?;
     let count = telegram
         .get_chat_member_count(query.group_id)

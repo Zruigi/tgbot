@@ -481,7 +481,8 @@ pub async fn get_file(
     if file_id.is_empty() || file_id.len() > 512 {
         return Err(ApiError::BadRequest("invalid file_id".into()));
     }
-    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
+    // 平台管理员会话无 tenant_id：回退到默认租户（生产主 bot）
+    let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
     let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("merchant has no bot configured".into()))?;
