@@ -3381,6 +3381,7 @@ dependencies = [
  "hex",
  "hmac",
  "jsonwebtoken",
+ "regex",
  "rust_decimal",
  "serde",
  "serde_json",

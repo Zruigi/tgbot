@@ -357,7 +357,7 @@ async def init_db():
                 "（以下为可选补充，会附加在系统固定规则之后；留空亦可）\n"
                 "例如：优先保留用户语气；遇到合约/风控词务必译准确。"
             ),
-            "global_auto_translate": "false",
+            "global_auto_translate": "true",
             "llm_api_mode": "rented"
         }
         for key, val in default_settings.items():

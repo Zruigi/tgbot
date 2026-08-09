@@ -73,60 +73,6 @@
               </label>
             </div>
 
-            <div class="sub-panel accent-panel">
-              <h4 class="sub-title">Vertex 一键自动配置（推荐）</h4>
-              <p class="helper-text">输入 Vertex Key 与 OneAPI 地址后，自动生成可直接使用的中转配置。</p>
-
-              <div class="uc-grid uc-grid-cols-3">
-                <label class="uc-field">
-                  <span class="uc-label">Vertex API Key</span>
-                  <input v-model="vertexQuickForm.vertex_api_key" type="password" class="uc-input" placeholder="AIza..." />
-                </label>
-
-                <label class="uc-field">
-                  <span class="uc-label">OneAPI Base URL</span>
-                  <input v-model="vertexQuickForm.oneapi_base_url" class="uc-input" placeholder="https://oneapi.example.com" />
-                </label>
-
-                <label class="uc-field">
-                  <span class="uc-label">Gemini 模型</span>
-                  <select v-model="vertexQuickForm.model" class="uc-input">
-                    <option v-for="m in quickGeminiModels" :key="m" :value="m">{{ m }}</option>
-                  </select>
-                </label>
-              </div>
-
-              <label class="uc-field">
-                <span class="uc-label">中转 SK（可选）</span>
-                <input v-model="vertexQuickForm.relay_api_key" class="uc-input" placeholder="sk-your-own-relay-key" />
-              </label>
-
-              <div class="uc-actions">
-                <button class="uc-btn uc-btn-primary" @click="oneClickVertexSetup" :disabled="quickSetting">
-                  {{ quickSetting ? '配置中...' : '一键自动配置' }}
-                </button>
-              </div>
-
-              <div v-if="quickResult" class="quick-result-grid">
-                <label class="uc-field">
-                  <span class="uc-label">中转 URL</span>
-                  <pre class="debug-block">{{ quickResult.oneapi_base_url }}</pre>
-                </label>
-                <label class="uc-field">
-                  <span class="uc-label">模型 ID</span>
-                  <pre class="debug-block">{{ quickResult.model }}</pre>
-                </label>
-                <label class="uc-field">
-                  <span class="uc-label">调用地址</span>
-                  <pre class="debug-block">{{ quickResult.model_infer_url }}</pre>
-                </label>
-                <label class="uc-field">
-                  <span class="uc-label">中转 SK</span>
-                  <pre class="debug-block">{{ quickResult.relay_api_key }}</pre>
-                </label>
-              </div>
-            </div>
-
             <div class="sub-panel lock-panel">
               <h4 class="sub-title">模型锁定</h4>
               <p class="helper-text">开启后，后端将强制使用 `gpt-5.6-luna`，忽略请求里传入的其它模型。</p>
@@ -167,6 +113,7 @@
           <p class="uc-card-subtitle">仅管理项目隔离后的 Skills，避免读取服务器全局目录</p>
 
           <div class="settings-stack">
+            <div v-if="skillsError" class="debug-error">{{ skillsError }}</div>
             <div class="uc-actions">
               <button class="uc-btn uc-btn-ghost" @click="loadAiSkills" :disabled="skillsLoading || skillsSaving || skillsImporting">
                 {{ skillsLoading ? '刷新中...' : '刷新列表' }}
@@ -484,7 +431,7 @@ const config = reactive({
   llm_model: '',
   llm_model_lock_enabled: false,
   llm_model_lock_target: 'gpt-5.6-luna',
-  global_auto_translate: false,
+  global_auto_translate: true,
 })
 
 type AiSkill = {
@@ -502,6 +449,7 @@ const builtinSkills = ref<AiSkill[]>([])
 const skillsLoading = ref(false)
 const skillsSaving = ref(false)
 const skillsImporting = ref(false)
+const skillsError = ref('')
 const showSkillsDrawer = ref(false)
 const skillDrawerTab = ref<'custom' | 'builtin'>('custom')
 const skillForm = reactive<AiSkill>({
@@ -515,32 +463,6 @@ const skillForm = reactive<AiSkill>({
 const activeSkillRows = computed(() => (skillDrawerTab.value === 'custom' ? aiSkills.value : builtinSkills.value))
 
 const MODEL_LOCK_TARGET = 'gpt-5.6-luna'
-const vertexQuickForm = reactive({
-  vertex_api_key: '',
-  oneapi_base_url: '',
-  relay_api_key: '',
-  model: 'gemini-2.5-flash-lite',
-})
-
-const quickGeminiModels = ref<string[]>([
-  'gpt-5.6-luna',
-  'gemini-2.5-pro',
-  'gemini-2.5-flash',
-  'gemini-2.5-flash-lite',
-  'gemini-2.0-flash',
-  'gemini-2.0-flash-lite',
-  'gemini-1.5-pro',
-  'gemini-1.5-flash',
-])
-const quickSetting = ref(false)
-const quickResult = ref<null | {
-  oneapi_base_url: string
-  model_infer_url: string
-  model_list_url: string
-  relay_api_key: string
-  relay_api_key_masked: string
-  model: string
-}>(null)
 const modelLockSaving = ref(false)
 
 const debugLoadingModels = ref(false)
@@ -571,10 +493,6 @@ onMounted(async () => {
     config.llm_model_lock_target = String(res.data.llm_model_lock_target || MODEL_LOCK_TARGET).trim() || MODEL_LOCK_TARGET
     if (typeof res.data.llm_model === 'string' && res.data.llm_model.trim()) {
       debugForm.model = res.data.llm_model.trim()
-      vertexQuickForm.model = res.data.llm_model.trim()
-    }
-    if (Array.isArray(res.data.gemini_model_options) && res.data.gemini_model_options.length) {
-      quickGeminiModels.value = res.data.gemini_model_options.map((x: any) => String(x)).filter(Boolean)
     }
     if (config.llm_model_lock_enabled) {
       applyModelLockToForms()
@@ -683,16 +601,20 @@ function fillSkillForm(s: AiSkill) {
 
 async function loadAiSkills() {
   skillsLoading.value = true
+  skillsError.value = ''
   try {
     const res = await sharedApi.getAiSkills(false)
     if (res?.status === 'ok') {
       const rows = Array.isArray(res.data) ? res.data : []
       aiSkills.value = rows.filter((x: AiSkill) => String(x.source || '').toLowerCase() !== 'builtin_fs')
+      skillsError.value = ''
     } else {
-      alert('加载 Skill 列表失败: ' + String(res?.message || '未知错误'))
+      skillsError.value = 'Skill 列表加载失败: ' + String(res?.message || '未知错误')
+      console.error('[Settings] loadAiSkills failed:', res)
     }
   } catch (e) {
-    alert('加载 Skill 列表失败，请检查网络或后端日志')
+    skillsError.value = 'Skill 列表加载失败，请检查网络或后端日志'
+    console.error('[Settings] loadAiSkills failed:', e)
   } finally {
     skillsLoading.value = false
   }
@@ -814,64 +736,11 @@ async function saveSettings() {
   }
 }
 
-async function oneClickVertexSetup() {
-  quickSetting.value = true
-  quickResult.value = null
-
-  try {
-    const payload = {
-      vertex_api_key: vertexQuickForm.vertex_api_key.trim(),
-      oneapi_base_url: vertexQuickForm.oneapi_base_url.trim(),
-      relay_api_key: vertexQuickForm.relay_api_key.trim(),
-      model: vertexQuickForm.model.trim(),
-    }
-
-    const res = await configApi.setupVertexOneClick(payload)
-    if (res?.status !== 'ok') {
-      alert('一键配置失败: ' + String(res?.message || '未知错误'))
-      return
-    }
-
-    const result = res.data || {}
-    quickResult.value = {
-      oneapi_base_url: String(result.oneapi_base_url || ''),
-      model_infer_url: String(result.model_infer_url || ''),
-      model_list_url: String(result.model_list_url || ''),
-      relay_api_key: String(result.relay_api_key || ''),
-      relay_api_key_masked: String(result.relay_api_key_masked || ''),
-      model: String(result.model || ''),
-    }
-
-    config.llm_api_mode = 'own'
-    config.llm_model_type = 'openai'
-    config.llm_base_url = quickResult.value.oneapi_base_url
-    config.llm_model = quickResult.value.model
-    debugForm.model = quickResult.value.model
-    if (config.llm_model_lock_enabled) {
-      applyModelLockToForms()
-    }
-
-    const successText = [
-      '✅ Vertex 一键配置完成',
-      `中转 URL: ${quickResult.value.oneapi_base_url}`,
-      `模型: ${quickResult.value.model}`,
-      `中转 SK: ${quickResult.value.relay_api_key}`,
-      `调用地址: ${quickResult.value.model_infer_url}`,
-    ].join('\n')
-    alert(successText)
-  } catch (e) {
-    alert('一键配置请求失败，请检查后端日志')
-  } finally {
-    quickSetting.value = false
-  }
-}
-
 function applyModelLockToForms() {
   const lockTarget = String(config.llm_model_lock_target || MODEL_LOCK_TARGET).trim() || MODEL_LOCK_TARGET
   config.llm_model_lock_target = lockTarget
   config.llm_model = lockTarget
   debugForm.model = lockTarget
-  vertexQuickForm.model = lockTarget
 }
 
 async function toggleModelLock() {

@@ -7,6 +7,9 @@ pub enum TelegramCommand {
     Help,
     Wallets,
     WalletMonitor(Option<String>),
+    Menu,
+    Status,
+    Clear,
 }
 
 /// 命令回复，包含纯文本消息。
@@ -96,6 +99,9 @@ pub fn parse_telegram_command(text: &str, bot_username: &str) -> Option<Telegram
         "wallet_monitor" | "add_wallet" => Some(TelegramCommand::WalletMonitor(
             (!payload.is_empty()).then(|| payload.to_string()),
         )),
+        "menu" => Some(TelegramCommand::Menu),
+        "status" => Some(TelegramCommand::Status),
+        "clear" => Some(TelegramCommand::Clear),
         _ => None,
     }
 }
@@ -153,6 +159,15 @@ pub fn build_command_reply(command: &TelegramCommand, first_name: &str) -> Comma
         }
         TelegramCommand::WalletMonitor(None) => {
             "请发送 `/wallet_monitor <TRC20或BSC地址>` 添加地址监听。".to_string()
+        }
+        TelegramCommand::Menu => {
+            "交互菜单：\n/start - 打开交互菜单\n/wallets - 查看地址监听\n/wallet_monitor <地址> - 添加地址监听\n/status - 查看监听与监控运行状态\n/clear - 清理当前对话缓存".to_string()
+        }
+        TelegramCommand::Status => {
+            "正在检查监听与机器人运行状态...".to_string()
+        }
+        TelegramCommand::Clear => {
+            "当前对话缓存已清理 ✅".to_string()
         }
     };
     CommandReply { text }

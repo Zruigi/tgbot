@@ -45,7 +45,8 @@ export const request = async (method: string, url: string, body?: any) => {
 
   const isExecCall = url.includes('/exec') || url.includes('/chat/completions')
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), isExecCall ? 35000 : 15000)
+  // LLM 后端超时 120s（litellm.rs），前端 exec 给 90s 缓冲，避免 35s 错配导致正常慢响应被误杀
+  const timer = setTimeout(() => controller.abort(), isExecCall ? 90000 : 15000)
 
   try {
     const res = await fetch(url, {
@@ -65,7 +66,7 @@ export const request = async (method: string, url: string, body?: any) => {
         headers,
         body: body ? JSON.stringify(body) : undefined,
         keepalive: true,
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(isExecCall ? 90000 : 15000),
       })
       return retryRes.json()
     }
@@ -73,7 +74,7 @@ export const request = async (method: string, url: string, body?: any) => {
     return res.json()
   } catch (e: any) {
     if (e.name === 'AbortError') {
-      throw new Error(isExecCall ? 'LLM 调用超时 (>35s)，可能是 API Key 无效或模型不可达' : '请求超时请检查网络连接')
+      throw new Error(isExecCall ? 'LLM 调用超时 (>90s)，可能是 API Key 无效或模型不可达' : '请求超时请检查网络连接')
     }
     throw e
   }

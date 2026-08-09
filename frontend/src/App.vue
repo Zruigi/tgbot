@@ -26,7 +26,6 @@
 
       <AppContentHost
         :active-tab="activeTab"
-        :show-after-hours-banner="showAfterHoursBanner"
         :nav-gate-notice="navGateNotice"
         @navigate="navigateTo"
         @reopen-telegram="handleReopenTelegram"
@@ -60,7 +59,6 @@ useTheme()
 useViewportHeight()
 useRealtimeConnection()
 
-const showAfterHoursBanner = computed(() => auth.isAuthenticated && auth.landingMode === 'after_hours')
 const isMiniAppEntry = computed(() => location.pathname === '/miniapp')
 
 const backgroundStyle = computed(() => {

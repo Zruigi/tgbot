@@ -52,11 +52,6 @@ pub fn router() -> Router<AppState> {
             "/api/config",
             get(config::get_config).post(config::save_config),
         )
-        .route("/api/config/vertex", post(config::vertex_oneclick_config))
-        .route(
-            "/api/config/vertex/oneclick",
-            post(config::vertex_oneclick_config),
-        ) // alias for frontend
         .route("/api/config/gemini_models", get(config::get_gemini_models))
         .route("/api/config/gemini-models", get(config::get_gemini_models)) // alias for frontend
         // Session context

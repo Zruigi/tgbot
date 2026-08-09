@@ -25,8 +25,6 @@ export const authApi = {
 export const configApi = {
   getConfig: () => request('GET', '/api/config'),
   saveConfig: (data: any) => request('POST', '/api/config', data),
-  setupVertexOneClick: (data: { vertex_api_key: string; oneapi_base_url?: string; relay_api_key?: string; model?: string }) =>
-    request('POST', '/api/config/vertex/oneclick', data),
 }
 
 // 导出 request 供其他模块使用

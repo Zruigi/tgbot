@@ -28,6 +28,16 @@ fn uuid_to_i64(uuid: &Uuid) -> i64 {
     result
 }
 
+/// 平台 admin（tenant_id 为空）对账时回退到默认租户 `default`（生产主 bot 所在租户），
+/// 与 group_photo / file 等端点的回退策略一致；merchant 角色保持原租户隔离。
+fn resolve_write_tenant(scope: &tgbot_domain::scope::Scope) -> Result<String, ApiError> {
+    match scope.tenant_id.as_deref() {
+        Some(tenant_id) if !tenant_id.is_empty() => Ok(tenant_id.to_string()),
+        _ if scope.role == tgbot_domain::models::Role::PlatformAdmin => Ok("default".to_string()),
+        _ => Err(ApiError::Forbidden),
+    }
+}
+
 // ============================================================================
 // Request/Response Types
 // ============================================================================
@@ -318,7 +328,7 @@ pub async fn reconcile(
     Json(body): Json<ReconcileRequest>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _merchant_id) = scope.require_merchant()?;
+    let tenant_id = resolve_write_tenant(&scope)?;
 
     // Validate ledger_id
     let ledger_uuid = Uuid::parse_str(&body.ledger_id)
@@ -961,7 +971,7 @@ pub async fn generate_report(
     Json(body): Json<GenerateReportRequest>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (_tenant_id, _merchant_id) = scope.require_merchant()?;
+    let _tenant_id = resolve_write_tenant(&scope)?;
 
     let transactions = body.transactions.unwrap_or_default();
 

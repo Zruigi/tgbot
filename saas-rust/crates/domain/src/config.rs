@@ -49,7 +49,7 @@ impl Config {
             database_max_connections: std::env::var("SAAS_DB_MAX_CONNECTIONS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(8),
+                .unwrap_or(20),
             allow_rest_only: parse_rest_only_enabled(
                 std::env::var("SAAS_ALLOW_REST_ONLY").ok().as_deref(),
             ),

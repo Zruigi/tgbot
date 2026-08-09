@@ -5,3 +5,4 @@ pub mod rest_db;
 pub mod routes;
 pub mod secret_crypto;
 pub mod state;
+pub mod translate;

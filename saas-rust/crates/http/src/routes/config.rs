@@ -28,14 +28,6 @@ pub struct SaveConfigRequest {
     pub translation_engine: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct VertexOneClickRequest {
-    pub vertex_api_key: String,
-    pub oneapi_base_url: Option<String>,
-    pub relay_api_key: Option<String>,
-    pub model: Option<String>,
-}
-
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -145,7 +137,7 @@ pub async fn get_config(
     let llm_model = setting("llm_model", String::new());
     let llm_model_lock_enabled = is_truthy(&setting("llm_model_lock_enabled", "false".into()));
     let llm_model_lock_target = setting("llm_model_lock_target", "gpt-5.6-luna".into());
-    let global_auto_translate = is_truthy(&setting("global_auto_translate", "false".into()));
+    let global_auto_translate = is_truthy(&setting("global_auto_translate", "true".into()));
     let translation_engine = setting("translation_engine", "llm".into());
 
     // Get bot token masked
@@ -299,137 +291,6 @@ pub async fn save_config(
     Ok(Json(
         json!({ "status": "ok", "data": {"updated": settings.len()} }),
     ))
-}
-
-// POST /api/config/vertex - Vertex AI one-click configuration
-pub async fn vertex_oneclick_config(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<VertexOneClickRequest>,
-) -> ApiResult<Json<Value>> {
-    let scope = resolve_scope(&state, &headers).await?;
-    scope.require_platform()?;
-
-    let vertex_api_key = validate_setting("vertex_api_key", &body.vertex_api_key, 8_192)?;
-    if vertex_api_key.is_empty() {
-        return Err(ApiError::BadRequest("vertex_api_key required".into()));
-    }
-    let oneapi_base_url = body
-        .oneapi_base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("https://generativelanguage.googleapis.com/v1beta")
-        .trim_end_matches('/')
-        .to_string();
-    validate_http_url("oneapi_base_url", &oneapi_base_url)?;
-    let requested_model = body
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("gemini-2.5-flash-lite")
-        .to_string();
-    validate_setting("model", &requested_model, 200)?;
-    let lock_enabled = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM platform.admin_settings WHERE key = 'llm_model_lock_enabled'",
-    )
-    .fetch_optional(state.db()?)
-    .await?
-    .map(|value| is_truthy(&value))
-    .unwrap_or(false);
-    let model = if lock_enabled {
-        sqlx::query_scalar::<_, String>(
-            "SELECT value FROM platform.admin_settings WHERE key = 'llm_model_lock_target'",
-        )
-        .fetch_optional(state.db()?)
-        .await?
-        .unwrap_or_else(|| "gemini-3.1-pro-preview".into())
-    } else {
-        requested_model
-    };
-    let relay_api_key = body
-        .relay_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            format!(
-                "sk-{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            )
-        });
-    validate_setting("relay_api_key", &relay_api_key, 8_192)?;
-
-    // Build URLs
-    let model_infer_url = format!("{oneapi_base_url}/models/{model}:generateContent");
-    let model_list_url = format!("{oneapi_base_url}/models");
-    let openai_chat_url = format!("{oneapi_base_url}/chat/completions");
-
-    // Save all configs
-    sqlx::query(
-        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('vertex_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-    )
-    .bind(vertex_api_key)
-    .execute(state.db()?)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('oneapi_base_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-    )
-    .bind(&oneapi_base_url)
-    .execute(state.db()?)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('relay_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-    )
-    .bind(&relay_api_key)
-    .execute(state.db()?)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('llm_model', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-    )
-    .bind(&model)
-    .execute(state.db()?)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('llm_base_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-    )
-    .bind(&openai_chat_url)
-    .execute(state.db()?)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO platform.admin_settings (key, value, updated_at) VALUES ('llm_api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-    )
-    .bind(&relay_api_key)
-    .execute(state.db()?)
-    .await?;
-
-    // Mask keys for response
-    let relay_masked = mask_secret(&relay_api_key, 8, 4);
-    let vertex_masked = mask_secret(vertex_api_key, 4, 4);
-
-    Ok(Json(json!({
-        "status": "ok",
-        "data": {
-            "oneapi_base_url": oneapi_base_url,
-            "model_infer_url": model_infer_url,
-            "model_list_url": model_list_url,
-            "openai_chat_url": openai_chat_url,
-            "relay_api_key": "",
-            "relay_api_key_configured": true,
-            "relay_api_key_masked": relay_masked,
-            "model": model,
-            "vertex_api_key_masked": vertex_masked,
-        },
-        "message": "Vertex AI configuration generated and saved"
-    })))
 }
 
 // GET /api/config/gemini_models - Get available Gemini models

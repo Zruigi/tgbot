@@ -180,6 +180,9 @@ impl Worker for TelegramCommandWorker {
                     TelegramCommand::Wallets => "wallets",
                     TelegramCommand::Start(_) => "start",
                     TelegramCommand::WalletMonitor(_) => "wallet_monitor",
+                    TelegramCommand::Menu => "menu",
+                    TelegramCommand::Status => "status",
+                    TelegramCommand::Clear => "clear",
                 };
                 (
                     localized_command_reply(

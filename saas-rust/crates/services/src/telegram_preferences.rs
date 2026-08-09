@@ -79,6 +79,9 @@ pub fn localized_command_reply(command: &str, first_name: &str, locale: &str) ->
                 "Available commands:\n/start - Start using the bot\n/help - Show help\n/wallets - View address monitors\n/wallet_monitor <address> - Add an address monitor".to_string()
             }
             "wallets" => "Reading the address monitors for this tenant. Please wait.".to_string(),
+            "menu" => "Interactive menu:\n/start - Open interactive menu\n/wallets - View address monitors\n/wallet_monitor <address> - Add an address monitor\n/status - View monitoring status\n/clear - Clear current conversation cache".to_string(),
+            "status" => "Checking monitoring and bot status...".to_string(),
+            "clear" => "Current conversation cache cleared ✅".to_string(),
             _ => anyhow!("unsupported Telegram command").to_string(),
         };
     }
@@ -88,6 +91,9 @@ pub fn localized_command_reply(command: &str, first_name: &str, locale: &str) ->
         ),
         "help" => "已实现的命令：\n/start - 开始使用机器人\n/help - 显示帮助信息\n/wallets - 查看地址监听\n/wallet_monitor <地址> - 添加地址监听".to_string(),
         "wallets" => "正在读取当前租户的地址监听列表，请稍候。".to_string(),
+        "menu" => "交互菜单：\n/start - 打开交互菜单\n/wallets - 查看地址监听\n/wallet_monitor <地址> - 添加地址监听\n/status - 查看监听与监控运行状态\n/clear - 清理当前对话缓存".to_string(),
+        "status" => "正在检查监听与机器人运行状态...".to_string(),
+        "clear" => "当前对话缓存已清理 ✅".to_string(),
         _ => anyhow!("unsupported Telegram command").to_string(),
     }
 }

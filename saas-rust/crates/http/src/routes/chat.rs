@@ -205,14 +205,41 @@ pub async fn send_message(
     let headers = request.headers().clone();
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
-    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
-    let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
+    // 平台 admin（scope.tenant_id 为空）时：优先用请求参数 ?tenant_id，
+    // 否则从目标用户最近消息反查租户（对齐 Python api_send_message 平台管理员可全局发送）。
+    let tenant_id = match scope.tenant_id.as_deref() {
+        Some(tenant) => tenant.to_string(),
+        None => {
+            let uri = request.uri();
+            let query_tenant = uri
+                .query()
+                .and_then(|q| {
+                    q.split('&').find_map(|pair| {
+                        let mut parts = pair.splitn(2, '=');
+                        if parts.next() == Some("tenant_id") {
+                            parts.next().map(|v| v.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                });
+            match query_tenant {
+                Some(tenant) => tenant,
+                None => resolve_user_tenant(state.db()?, user_id)
+                    .await?
+                    .ok_or(ApiError::Forbidden)?,
+            }
+        }
+    };
+    let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, &tenant_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("merchant has no bot configured".into()))?;
-    ensure_tenant_user(&state, user_id, tenant_id, bot_id).await?;
-    let telegram = telegram_for_tenant_bot(&state, tenant_id, bot_id).await?;
+    ensure_tenant_user(&state, user_id, &tenant_id, bot_id).await?;
+    let telegram = telegram_for_tenant_bot(&state, &tenant_id, bot_id).await?;
     let outgoing = parse_outgoing_message(request, &state).await?;
 
+    // 双向翻译结果（管理员回复 → 用户语言），在 match 外写回数据库
+    let mut translated_text: Option<String> = None;
     let (sent, content, msg_type, file_id, reply_to_msg_id) = match outgoing {
         OutgoingMessage::Json(body) => {
             let content = body.content.unwrap_or_default().trim().to_string();
@@ -229,11 +256,31 @@ pub async fn send_message(
                     "message exceeds {content_limit} characters"
                 )));
             }
+            // 双向翻译：管理员回复 → 用户语言（取用户最近一条消息检测语言）。
+            // 译文发给用户，数据库保留原文 + 译文（对齐 Python translate_to_customer）。
+            let mut send_text = content.clone();
+            if file_id.is_empty() && !content.is_empty() {
+                if let Ok(Some(customer_msg)) = last_user_message(state.db()?, user_id, &tenant_id)
+                    .await
+                {
+                    if let Some(translated) = crate::translate::translate_to_customer(
+                        &state.llm,
+                        state.db()?,
+                        &content,
+                        &customer_msg,
+                    )
+                    .await
+                    {
+                        send_text = translated.clone();
+                        translated_text = Some(translated);
+                    }
+                }
+            }
             let sent = if file_id.is_empty() {
                 telegram
                     .send_message(SendMessageParams {
                         chat_id: user_id,
-                        text: content.clone(),
+                        text: send_text.clone(),
                         parse_mode: None,
                         reply_markup: None,
                         reply_to_message_id: body.reply_to_msg_id,
@@ -315,10 +362,27 @@ pub async fn send_message(
         None,
         true,
         Some(sent.message_id),
-        tenant_id,
+        &tenant_id,
         reply_to_msg_id,
     )
     .await?;
+
+    // 双向翻译：译文写回 translated_text（对齐 Python 管理端「原文 + 译文」展示）
+    if let Some(translated) = translated_text {
+        if !content.is_empty() && translated != content {
+            sqlx::query(
+                "UPDATE chat.messages SET translated_text = $2, original_text = $3 \
+                 WHERE id = $1 AND tenant_id = $4",
+            )
+            .bind(saved_msg_id)
+            .bind(&translated)
+            .bind(&content)
+            .bind(tenant_id)
+            .execute(state.db()?)
+            .await
+            .map_err(|_| ApiError::Anyhow(anyhow::anyhow!("failed to persist translation")))?;
+        }
+    }
 
     tracing::info!("send_message: saved msg_id={saved_msg_id} to user {user_id}");
 
@@ -554,11 +618,28 @@ async fn resolve_bot_id_for_scope(
 }
 
 fn require_write_access(scope: &tgbot_domain::scope::Scope) -> ApiResult<()> {
-    if matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin) {
+    // 对齐 Python：平台管理员也可通过 Web 端向任意租户用户发送消息
+    if matches!(
+        scope.role,
+        Role::MerchantOwner | Role::MerchantAdmin | Role::PlatformAdmin
+    ) {
         Ok(())
     } else {
         Err(ApiError::Forbidden)
     }
+}
+
+/// 平台管理员发送时反查目标用户所属租户（最近一条消息的 tenant_id）。
+async fn resolve_user_tenant(pool: &sqlx::PgPool, user_id: i64) -> Result<Option<String>, sqlx::Error> {
+    let tenant: Option<String> = sqlx::query_scalar(
+        "SELECT tenant_id FROM chat.messages \
+         WHERE (from_userid = $1 OR to_userid = $1) AND tenant_id IS NOT NULL \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(tenant)
 }
 
 async fn ensure_tenant_user(
@@ -572,6 +653,25 @@ async fn ensure_tenant_user(
     } else {
         Err(ApiError::Forbidden)
     }
+}
+
+/// 取用户最近一条文本消息（用于双向翻译的语言检测参考）。
+async fn last_user_message(
+    pool: &sqlx::PgPool,
+    user_id: i64,
+    tenant_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let content: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM chat.messages \
+         WHERE from_userid = $1 AND tenant_id = $2 AND is_deleted = false \
+           AND NULLIF(btrim(content), '') IS NOT NULL \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(content)
 }
 
 async fn telegram_for_tenant_bot(
