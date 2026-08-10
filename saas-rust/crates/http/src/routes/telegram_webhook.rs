@@ -716,6 +716,11 @@ pub async fn install_default_handlers(
                 {
                     return Ok(());
                 }
+                if handle_verify_quiz_callback(&update, &entry, Some(pool), &telegram_api_base_url)
+                    .await?
+                {
+                    return Ok(());
+                }
                 if let Some(cq) = &update.callback_query {
                     let data = cq.get("data").and_then(|d| d.as_str()).unwrap_or("");
                     let callback_chat_id = cq
@@ -901,6 +906,8 @@ async fn deliver_admin_reply(
     target_user: i64,
     text: &str,
     reply_to_tg_msg_id: Option<i64>,
+    admin_id: i64,
+    admin_name: &str,
 ) -> Result<(), String> {
     // 双向翻译：管理员中文回复 → 用户语言
     let mut send_text = text.to_string();
@@ -913,12 +920,18 @@ async fn deliver_admin_reply(
             translated_text = Some(translated);
         }
     }
+    // 身份标签（对齐 Python format_admin_tag）：客服 <a>名字</a>：
+    let esc_name = html_escape(admin_name);
+    let esc_body = html_escape(&send_text);
+    let final_text = format!(
+        "客服 <a href=\"tg://user?id={admin_id}\">{esc_name}</a>：\n{esc_body}"
+    );
     let telegram = telegram_for_bot(entry, telegram_api_base_url);
     let sent = telegram
         .send_message(tgbot_integrations::telegram::SendMessageParams {
             chat_id: target_user,
-            text: send_text,
-            parse_mode: None,
+            text: final_text,
+            parse_mode: Some("HTML".to_string()),
             reply_markup: None,
             reply_to_message_id: reply_to_tg_msg_id,
         })
@@ -968,16 +981,28 @@ async fn deliver_admin_reply(
 }
 
 // ---------------------------------------------------------------------------
-// P3 入群验证（math 算术题 + 静音 + 回调解禁）
+// P3 入群验证（math 算术题 / captcha 数字验证码 / quiz 答题 + 静音 + 回调解禁）
 // ---------------------------------------------------------------------------
 
-/// 内存验证状态：(group_id, user_id) -> (正确答案, 验证消息 id)
+/// 内存验证状态：(group_id, user_id) -> (正确答案, 验证消息 id, 验证类型)
+/// 三种验证类型共用：
+///   - math：answer = a + b（i64 算式结果）
+///   - captcha：answer = 6 位数字验证码解析为 i64（Python _make_captcha 取
+///     randint(100000,999999)，天然无前导零，可无损存入 i64）
+///   - quiz：answer = 正确答案下标 correct_idx（i64）
 /// 重启后丢失，验证中断的用户重新触发即可（Python 同样依赖内存 _verifying_users）。
-static VERIFY_STATE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(i64, i64), (i64, i64)>>> =
+static VERIFY_STATE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(i64, i64), (i64, i64, String)>>> =
     std::sync::OnceLock::new();
 
-fn verify_state() -> &'static std::sync::Mutex<std::collections::HashMap<(i64, i64), (i64, i64)>> {
+fn verify_state() -> &'static std::sync::Mutex<std::collections::HashMap<(i64, i64), (i64, i64, String)>> {
     VERIFY_STATE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 清理指定用户的验证状态（用户离开/被踢/验证超时后调用，防止重加入时被 has_pending 拦截）。
+fn clear_verify_state(group_id: i64, user_id: i64) {
+    if let Ok(mut state) = verify_state().lock() {
+        state.remove(&(group_id, user_id));
+    }
 }
 
 /// 简单确定性伪随机（避免引入 rand 依赖）：按时间种子生成 1..=9 的数字。
@@ -985,7 +1010,7 @@ fn pseudo_int(seed: u64, max: i64) -> i64 {
     (seed % max as u64) as i64 + 1
 }
 
-/// 新成员入群触发验证：查群配置 → 静音 → 发算术题（带选项按钮）。
+/// 新成员入群触发验证：查群配置 → 静音 → 按 verify_type 派发（math/captcha/quiz）。
 async fn start_group_verify(
     pool: &sqlx::PgPool,
     entry: &BotEntry,
@@ -995,7 +1020,8 @@ async fn start_group_verify(
     first_name: &str,
 ) -> Result<(), String> {
     let row = sqlx::query(
-        "SELECT verify_enabled, verify_type FROM groups.tracked_groups \
+        "SELECT verify_enabled, verify_type, verify_timeout, verify_questions \
+         FROM groups.tracked_groups \
          WHERE group_id = $1 AND tenant_id = $2",
     )
     .bind(group_id)
@@ -1008,13 +1034,16 @@ async fn start_group_verify(
     };
     let enabled: bool = row.try_get("verify_enabled").unwrap_or(false);
     let vtype: String = row.try_get("verify_type").ok().unwrap_or_default();
+    // 超时秒数（P2-6：对齐 Python get_group_verify_config，默认 120）
+    let timeout_secs: i64 = row.try_get("verify_timeout").unwrap_or(120).max(10);
+    let questions: Option<String> = row.try_get("verify_questions").ok().flatten();
     if !enabled || !matches!(vtype.as_str(), "math" | "captcha" | "quiz") {
         return Ok(());
     }
 
-    // 已验证用户跳过
-    let verified: bool = sqlx::query_scalar(
-        "SELECT is_verified FROM groups.group_members \
+    // 已验证用户跳过；同时读取 status/pending_verify_msg_id 用于兜底清理过期会话
+    let member = sqlx::query(
+        "SELECT is_verified, status, pending_verify_msg_id FROM groups.group_members \
          WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3",
     )
     .bind(group_id)
@@ -1022,12 +1051,267 @@ async fn start_group_verify(
     .bind(&entry.tenant_id)
     .fetch_optional(pool)
     .await
-    .map_err(|_| "failed to check member verified".to_string())?
-    .unwrap_or(false);
-    if verified {
+    .map_err(|_| "failed to check member verify state".to_string())?;
+    if member
+        .as_ref()
+        .map(|row| row.try_get::<bool, _>("is_verified").unwrap_or(false))
+        .unwrap_or(false)
+    {
         return Ok(());
     }
 
+    // 已存在未完成的验证会话则跳过（对齐 Python _verifying_users 去重）。
+    // P1-5 兜底：超时踢（verify_timeout_worker）只清 DB、不清 webhook 内存状态；
+    // 若用户已被踢（status=left/banned）或 DB pending 已清空而内存仍残留，则清除
+    // 过期状态后继续重新发题，避免用户重进群时被 has_pending 拦截绕过验证。
+    let has_pending = verify_state()
+        .lock()
+        .map(|state| state.contains_key(&(group_id, user_id)))
+        .unwrap_or(false);
+    if has_pending {
+        let stale = member.as_ref().map(|row| {
+            let status: String = row.try_get("status").unwrap_or_default();
+            let pending_msg: Option<i64> = row.try_get("pending_verify_msg_id").ok().flatten();
+            matches!(status.as_str(), "left" | "banned") || pending_msg.is_none()
+        }).unwrap_or(false);
+        if stale {
+            clear_verify_state(group_id, user_id);
+        } else {
+            return Ok(());
+        }
+    }
+
+    // 静音
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
+    let _ = telegram
+        .restrict_chat_member(
+            group_id,
+            user_id,
+            serde_json::json!({
+                "can_send_messages": false,
+                "can_send_polls": false,
+                "can_send_other_messages": false,
+                "can_add_web_page_previews": false
+            }),
+            None,
+        )
+        .await;
+
+    match vtype.as_str() {
+        "captcha" => {
+            start_captcha_verify(pool, entry, telegram_api_base_url, group_id, user_id, first_name, timeout_secs)
+                .await
+        }
+        "quiz" => {
+            start_quiz_verify(
+                pool,
+                entry,
+                telegram_api_base_url,
+                group_id,
+                user_id,
+                first_name,
+                questions.as_deref(),
+                timeout_secs,
+            )
+            .await
+        }
+        _ => {
+            start_math_verify(pool, entry, telegram_api_base_url, group_id, user_id, first_name, timeout_secs)
+                .await
+        }
+    }
+}
+
+/// 记录验证挑战：写内存状态 + 持久化 pending_verify_msg_id + 入队超时踢
+/// （超时秒数读 tracked_groups.verify_timeout，对齐 Python join_verify.py）。
+async fn record_verify_challenge(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    group_id: i64,
+    user_id: i64,
+    answer: i64,
+    verify_type: &str,
+    msg_id: i64,
+    timeout_secs: i64,
+) {
+    if let Ok(mut state) = verify_state().lock() {
+        state.insert((group_id, user_id), (answer, msg_id, verify_type.to_string()));
+    }
+    let _ = sqlx::query(
+        "UPDATE groups.group_members SET pending_verify_msg_id = $3 \
+         WHERE group_id = $1 AND user_id = $2 AND tenant_id = $4",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .bind(msg_id)
+    .bind(&entry.tenant_id)
+    .execute(pool)
+    .await;
+    // 超时踢：发题时入队延迟 job（对齐 Python join_verify.py，时长来自群配置）
+    let _ = sqlx::query(
+        "INSERT INTO job_queue (tenant_id, job_type, payload, priority, max_attempts, run_at) \
+         VALUES ($1, 'verify_timeout_kick', jsonb_build_object('group_id', $2, 'user_id', $3, 'msg_id', $4), 50, 3, now() + make_interval(secs => $5))",
+    )
+    .bind(&entry.tenant_id)
+    .bind(group_id)
+    .bind(user_id)
+    .bind(msg_id)
+    .bind(timeout_secs)
+    .execute(pool)
+    .await;
+}
+
+/// 生成 6 位数字验证码（对齐 Python _make_captcha：randint(100000, 999999)）。
+fn make_captcha(seed: u64) -> i64 {
+    // 确定性伪随机，结果落在 [100000, 999999]
+    100000 + ((seed.wrapping_mul(2654435761) ^ (seed >> 16)) % 900000) as i64
+}
+
+/// captcha 验证：静音后发文字消息（无按钮），用户回复验证码作答。
+async fn start_captcha_verify(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    telegram_api_base_url: &str,
+    group_id: i64,
+    user_id: i64,
+    first_name: &str,
+    timeout_secs: i64,
+) -> Result<(), String> {
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        .wrapping_add(user_id as u64);
+    let code = make_captcha(now_nanos);
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
+    let text = format!(
+        "👋 欢迎 {first_name} 加入！\n\n请回复下方验证码完成入群验证：\n🔐 <code>{code}</code>\n\n验证通过后自动解除禁言，{timeout_secs} 秒内未验证将被移出群组。"
+    );
+    match telegram
+        .send_message(tgbot_integrations::telegram::SendMessageParams {
+            chat_id: group_id,
+            text,
+            parse_mode: Some("HTML".to_string()),
+            reply_markup: None,
+            reply_to_message_id: None,
+        })
+        .await
+    {
+        Ok(sent) => {
+            record_verify_challenge(pool, entry, group_id, user_id, code, "captcha", sent.message_id, timeout_secs)
+                .await;
+            info!(group_id, user_id, code, "Captcha verify challenge sent");
+        }
+        Err(error) => warn!(%error, group_id, user_id, "Failed to send captcha verify challenge"),
+    }
+    Ok(())
+}
+
+/// quiz 验证：从 verify_questions 随机选题 → 带选项按钮（verify_quiz 回调）。
+async fn start_quiz_verify(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    telegram_api_base_url: &str,
+    group_id: i64,
+    user_id: i64,
+    first_name: &str,
+    questions_json: Option<&str>,
+    timeout_secs: i64,
+) -> Result<(), String> {
+    // 题库为空时回退到 captcha（对齐 Python _start_quiz_verify: if not questions）
+    let questions: Vec<serde_json::Value> = questions_json
+        .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
+        .unwrap_or_default();
+    if questions.is_empty() {
+        return start_captcha_verify(pool, entry, telegram_api_base_url, group_id, user_id, first_name, timeout_secs)
+            .await;
+    }
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        .wrapping_add(user_id as u64);
+    let q = &questions[(now_nanos as usize) % questions.len()];
+    let question_text = q
+        .get("question")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("请回答问题")
+        .to_string();
+    let options: Vec<String> = q
+        .get("options")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    if options.is_empty() {
+        return start_captcha_verify(
+            pool,
+            entry,
+            telegram_api_base_url,
+            group_id,
+            user_id,
+            first_name,
+            timeout_secs,
+        )
+        .await;
+    }
+    let correct_idx: i64 = q
+        .get("correct")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        .clamp(0, options.len() as i64 - 1);
+
+    let buttons: Vec<serde_json::Value> = options
+        .iter()
+        .enumerate()
+        .map(|(idx, opt)| {
+            serde_json::json!({
+                "text": opt,
+                "callback_data": format!("verify_quiz:{group_id}:{user_id}:{idx}:{correct_idx}")
+            })
+        })
+        .collect();
+    let keyboard = serde_json::json!({
+        "inline_keyboard": buttons.iter().map(|b| vec![b.clone()]).collect::<Vec<_>>()
+    });
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
+    let text = format!(
+        "👋 欢迎 {first_name} 加入！\n\n请回答以下问题完成入群验证：\n❓ {question_text}\n\n点击正确选项，验证后自动解除禁言。"
+    );
+    match telegram
+        .send_message(tgbot_integrations::telegram::SendMessageParams {
+            chat_id: group_id,
+            text,
+            parse_mode: None,
+            reply_markup: Some(keyboard),
+            reply_to_message_id: None,
+        })
+        .await
+    {
+        Ok(sent) => {
+            record_verify_challenge(pool, entry, group_id, user_id, correct_idx, "quiz", sent.message_id, timeout_secs)
+                .await;
+            info!(group_id, user_id, correct_idx, "Quiz verify challenge sent");
+        }
+        Err(error) => warn!(%error, group_id, user_id, "Failed to send quiz verify challenge"),
+    }
+    Ok(())
+}
+
+/// math 验证（原有逻辑，抽成独立函数）：算术题 + 4 选项按钮。
+async fn start_math_verify(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    telegram_api_base_url: &str,
+    group_id: i64,
+    user_id: i64,
+    first_name: &str,
+    timeout_secs: i64,
+) -> Result<(), String> {
     // 生成算术题（a + b = ?）
     let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1053,22 +1337,6 @@ async fn start_group_verify(
         seed % 1000
     });
 
-    // 静音
-    let telegram = telegram_for_bot(entry, telegram_api_base_url);
-    let _ = telegram
-        .restrict_chat_member(
-            group_id,
-            user_id,
-            serde_json::json!({
-                "can_send_messages": false,
-                "can_send_media_messages": false,
-                "can_send_other_messages": false,
-                "can_add_web_page_previews": false
-            }),
-            None,
-        )
-        .await;
-
     // 发送算术验证消息（4 个选项按钮）
     let buttons: Vec<serde_json::Value> = options
         .iter()
@@ -1088,6 +1356,7 @@ async fn start_group_verify(
     let text = format!(
         "⚠️ 欢迎 {first_name}！请完成入群验证：**{a} + {b} = ?**（点击正确选项，验证后自动解除禁言）"
     );
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
     match telegram
         .send_message(tgbot_integrations::telegram::SendMessageParams {
             chat_id: group_id,
@@ -1099,25 +1368,106 @@ async fn start_group_verify(
         .await
     {
         Ok(sent) => {
-            // 记录状态 + 持久化 pending_verify_msg_id
-            if let Ok(mut state) = verify_state().lock() {
-                state.insert((group_id, user_id), (correct, sent.message_id));
-            }
-            let _ = sqlx::query(
-                "UPDATE groups.group_members SET pending_verify_msg_id = $3 \
-                 WHERE group_id = $1 AND user_id = $2 AND tenant_id = $4",
-            )
-            .bind(group_id)
-            .bind(user_id)
-            .bind(sent.message_id)
-            .bind(&entry.tenant_id)
-            .execute(pool)
-            .await;
+            record_verify_challenge(pool, entry, group_id, user_id, correct, "math", sent.message_id, timeout_secs)
+                .await;
             info!(group_id, user_id, correct, "Group verify challenge sent");
         }
         Err(error) => warn!(%error, group_id, user_id, "Failed to send group verify challenge"),
     }
     Ok(())
+}
+
+/// 三种验证类型共用的通过处理：解除静音 + 标记 is_verified + 删验证消息 + 清内存状态。
+/// math / quiz 回调与 captcha 文字回复均调用此函数。
+async fn pass_group_verify(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    telegram_api_base_url: &str,
+    group_id: i64,
+    user_id: i64,
+) -> Result<(), String> {
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
+    let _ = telegram
+        .restrict_chat_member(
+            group_id,
+            user_id,
+            serde_json::json!({
+                "can_send_messages": true,
+                "can_send_polls": true,
+                "can_send_other_messages": true,
+                "can_add_web_page_previews": true
+            }),
+            None,
+        )
+        .await;
+    // 先从状态中取出验证消息 id（drop guard），再删除消息
+    let verify_msg_id = verify_state()
+        .lock()
+        .ok()
+        .and_then(|mut state| state.remove(&(group_id, user_id)).map(|(_, msg_id, _)| msg_id));
+    if let Some(msg_id) = verify_msg_id {
+        let _ = telegram.delete_message(group_id, msg_id).await;
+    }
+    let _ = sqlx::query(
+        "UPDATE groups.group_members SET is_verified = true, pending_verify_msg_id = NULL, updated_at = now() \
+         WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .bind(&entry.tenant_id)
+    .execute(pool)
+    .await;
+    info!(group_id, user_id, "Group verify passed");
+    Ok(())
+}
+
+/// captcha 文字回复验证（对齐 Python handle_verify_message）：
+/// 群内文本消息匹配该 (group,user) 的 captcha 答案 → 通过；否则删除作答消息保留挑战。
+/// 返回 Ok(true) 表示这是一条验证作答消息（已消费，不应再落库）。
+async fn handle_captcha_reply(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    telegram_api_base_url: &str,
+    group_id: i64,
+    user_id: i64,
+    text: &str,
+    answer_message_id: i64,
+) -> Result<bool, String> {
+    let pending = verify_state()
+        .lock()
+        .ok()
+        .and_then(|state| state.get(&(group_id, user_id)).cloned());
+    let Some((answer, _msg_id, vtype)) = pending else {
+        return Ok(false);
+    };
+    if vtype != "captcha" {
+        return Ok(false);
+    }
+    // P2-7：以 / 开头的命令不当作验证作答（不消费、不删除）
+    if text.trim_start().starts_with('/') {
+        return Ok(false);
+    }
+    // 先比较后删除作答消息（对齐 Python handle_verify_message：比对成功后删）
+    let matched = text.trim() == answer.to_string();
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
+    let _ = telegram.delete_message(group_id, answer_message_id).await;
+    if matched {
+        pass_group_verify(pool, entry, telegram_api_base_url, group_id, user_id).await?;
+        let _ = telegram
+            .send_message(tgbot_integrations::telegram::SendMessageParams {
+                chat_id: group_id,
+                text: "✅ 验证通过，欢迎加入！".to_string(),
+                parse_mode: None,
+                reply_markup: None,
+                reply_to_message_id: None,
+            })
+            .await;
+        info!(group_id, user_id, "Captcha verify passed by reply");
+    } else {
+        // 答案错误：删除作答消息，保留验证挑战（对齐 Python）
+        info!(group_id, user_id, "Captcha verify wrong answer");
+    }
+    Ok(true)
 }
 
 /// 入群验证回调：verify_math:{group_id}:{user_id}:{value}
@@ -1172,7 +1522,7 @@ async fn handle_verify_math_callback(
 
     let correct = verify_state()
         .lock()
-        .map(|state| state.get(&(group_id, user_id)).map(|(answer, _)| *answer))
+        .map(|state| state.get(&(group_id, user_id)).map(|(answer, _, _)| *answer))
         .ok()
         .flatten();
     let telegram = telegram_for_bot(entry, telegram_api_base_url);
@@ -1198,37 +1548,8 @@ async fn handle_verify_math_callback(
         return Ok(true);
     }
 
-    // 验证通过：解除静音 + 标记已验 + 删除验证消息
-    let _ = telegram
-        .restrict_chat_member(
-            group_id,
-            user_id,
-            serde_json::json!({
-                "can_send_messages": true,
-                "can_send_media_messages": true,
-                "can_send_other_messages": true,
-                "can_add_web_page_previews": true
-            }),
-            None,
-        )
-        .await;
-    // 先从状态中取出验证消息 id（drop guard），再删除消息
-    let verify_msg_id = verify_state()
-        .lock()
-        .ok()
-        .and_then(|mut state| state.remove(&(group_id, user_id)).map(|(_, msg_id)| msg_id));
-    if let Some(msg_id) = verify_msg_id {
-        let _ = telegram.delete_message(group_id, msg_id).await;
-    }
-    let _ = sqlx::query(
-        "UPDATE groups.group_members SET is_verified = true, pending_verify_msg_id = NULL, updated_at = now() \
-         WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3",
-    )
-    .bind(group_id)
-    .bind(user_id)
-    .bind(&entry.tenant_id)
-    .execute(pool)
-    .await;
+    // 验证通过：共用解禁 + 标记 + 删题 + 清状态
+    pass_group_verify(pool, entry, telegram_api_base_url, group_id, user_id).await?;
     let _ = telegram
         .answer_callback_query(AnswerCallbackQueryParams {
             callback_query_id: callback_id.to_string(),
@@ -1236,7 +1557,116 @@ async fn handle_verify_math_callback(
             show_alert: Some(false),
         })
         .await;
-    info!(group_id, user_id, "Group verify passed");
+    Ok(true)
+}
+
+/// 入群验证回调：verify_quiz:{group_id}:{user_id}:{choice_idx}:{correct_idx}
+async fn handle_verify_quiz_callback(
+    update: &TelegramUpdate,
+    entry: &BotEntry,
+    pool: Option<&sqlx::PgPool>,
+    telegram_api_base_url: &str,
+) -> Result<bool, String> {
+    let Some(callback) = update.callback_query.as_ref() else {
+        return Ok(false);
+    };
+    let Some(data) = callback.get("data").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(rest) = data.strip_prefix("verify_quiz:") else {
+        return Ok(false);
+    };
+    let Some(pool) = pool else {
+        return Ok(false);
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() != 4 {
+        return Ok(false);
+    }
+    let (Ok(group_id), Ok(user_id), Ok(chosen), Ok(correct)) = (
+        parts[0].parse::<i64>(),
+        parts[1].parse::<i64>(),
+        parts[2].parse::<i64>(),
+        parts[3].parse::<i64>(),
+    ) else {
+        return Ok(false);
+    };
+    let Some(callback_id) = callback.get("id").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    // 仅允许被验证用户本人点击
+    let actor = callback
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(Value::as_i64);
+    if actor != Some(user_id) {
+        let telegram = telegram_for_bot(entry, telegram_api_base_url);
+        let _ = telegram
+            .answer_callback_query(AnswerCallbackQueryParams {
+                callback_query_id: callback_id.to_string(),
+                text: Some("请本人完成验证".to_string()),
+                show_alert: Some(true),
+            })
+            .await;
+        return Ok(true);
+    }
+
+    // 必须存在未完成的验证会话
+    let has_pending = verify_state()
+        .lock()
+        .map(|state| state.contains_key(&(group_id, user_id)))
+        .unwrap_or(false);
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
+    if !has_pending {
+        let _ = telegram
+            .answer_callback_query(AnswerCallbackQueryParams {
+                callback_query_id: callback_id.to_string(),
+                text: Some("验证已过期，请重新进群验证".to_string()),
+                show_alert: Some(true),
+            })
+            .await;
+        return Ok(true);
+    }
+
+    if chosen != correct {
+        // P1-3：答错即踢出（对齐 Python join_verify.py:566-586：ban+unban、清状态、删验证消息）
+        let _ = telegram.ban_chat_member(group_id, user_id).await;
+        let _ = telegram.unban_chat_member(group_id, user_id).await;
+        let challenge_msg_id = verify_state()
+            .lock()
+            .ok()
+            .and_then(|mut state| state.remove(&(group_id, user_id)).map(|(_, msg_id, _)| msg_id));
+        if let Some(msg_id) = challenge_msg_id {
+            let _ = telegram.delete_message(group_id, msg_id).await;
+        }
+        let _ = sqlx::query(
+            "UPDATE groups.group_members SET pending_verify_msg_id = NULL, status = 'left', updated_at = now() \
+             WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3",
+        )
+        .bind(group_id)
+        .bind(user_id)
+        .bind(&entry.tenant_id)
+        .execute(pool)
+        .await;
+        let _ = telegram
+            .answer_callback_query(AnswerCallbackQueryParams {
+                callback_query_id: callback_id.to_string(),
+                text: Some("❌ 答案错误，已移出群组".to_string()),
+                show_alert: Some(true),
+            })
+            .await;
+        return Ok(true);
+    }
+
+    // 验证通过：共用解禁 + 标记 + 删题 + 清状态
+    pass_group_verify(pool, entry, telegram_api_base_url, group_id, user_id).await?;
+    let _ = telegram
+        .answer_callback_query(AnswerCallbackQueryParams {
+            callback_query_id: callback_id.to_string(),
+            text: Some("✅ 验证通过，欢迎加入！".to_string()),
+            show_alert: Some(false),
+        })
+        .await;
     Ok(true)
 }
 
@@ -1289,17 +1719,21 @@ async fn handle_incoming_message(
     match chat_type {
         "private" => {
             // P2 客服闭环：管理员回复转发的消息 → 直接发回用户（带双向翻译）。
-            // 对齐 Python：管理员回复推送消息（reply_to）或直接发消息（非回复，路由最近活跃用户）。
+            // 对齐 Python：管理员回复推送消息（reply_to）保持直接发送；
+            // 非回复消息改为写入 pending_admin_messages（不直接发），给管理员确认按钮。
             if let Some(admin_id) = merchant_owner_tg_id(pool, &entry.tenant_id).await? {
                 if user_id == admin_id {
                     let Some(inbound_ref) = inbound.as_ref() else {
                         return Ok(());
                     };
-                    let Some(text) = inbound_ref.content.as_deref() else {
-                        return Ok(());
-                    };
-                    let text = text.trim();
-                    if !text.is_empty() && !text.starts_with('/') {
+                    let text = inbound_ref
+                        .content
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty());
+                    let is_command = text.is_some_and(|text| text.starts_with('/'));
+                    let has_media = inbound_ref.file_id.is_some();
+                    if (text.is_some() && !is_command) || has_media {
                         // 1) 回复推送消息 → 反查目标用户
                         let mut target_user: Option<i64> = None;
                         let mut reply_to_tg_msg_id: Option<i64> = None;
@@ -1334,39 +1768,72 @@ async fn handle_incoming_message(
                                 reply_to_tg_msg_id = Some(orig_tg_msg_id);
                             }
                         }
-                        // 2) 非回复消息 → 路由最近活跃用户（对齐 Python handle_admin_non_reply 的 latest_user）
-                        if target_user.is_none() {
-                            let latest: Option<i64> = sqlx::query_scalar(
-                                "SELECT from_userid FROM chat.messages \
-                                 WHERE to_userid = $1 AND tenant_id = $2 \
-                                   AND from_userid <> $1 AND from_userid > 0 \
-                                   AND is_deleted = false AND msg_type = 'text' \
-                                   AND NULLIF(btrim(content), '') IS NOT NULL \
-                                   AND left(btrim(content), 1) <> '/' \
-                                 ORDER BY id DESC LIMIT 1",
-                            )
-                            .bind(entry.bot_id)
-                            .bind(&entry.tenant_id)
-                            .fetch_optional(pool)
-                            .await
-                            .map_err(|_| "failed to resolve latest active user".to_string())?;
-                            target_user = latest;
-                        }
+                        // 2) 回复分支：保持直接发送（对齐 Python 回复消息即时回复）
                         if let Some(target_user) = target_user {
-                            deliver_admin_reply(
-                                pool,
-                                llm,
-                                entry,
-                                telegram_api_base_url,
-                                target_user,
-                                text,
-                                reply_to_tg_msg_id,
-                            )
-                            .await?;
-                            info!(admin_id, target_user, "Admin reply delivered to user");
+                            if let Some(text) = text {
+                                deliver_admin_reply(
+                                    pool,
+                                    llm,
+                                    entry,
+                                    telegram_api_base_url,
+                                    target_user,
+                                    text,
+                                    reply_to_tg_msg_id,
+                                    user_id,
+                                    first_name.as_deref().unwrap_or("客服"),
+                                )
+                                .await?;
+                                info!(admin_id, target_user, "Admin reply delivered to user");
+                            }
                             return Ok(());
                         }
-                        // 3) 无目标用户：提示管理员（对齐 Python "无法直接发送"）
+                        // 3) 非回复分支：路由最近活跃用户 → 写入 pending_admin_messages，
+                        //    给管理员确认按钮（对齐 Python quick_send/select_other_user/cancel_send）
+                        let latest: Option<i64> = sqlx::query_scalar(
+                            "SELECT from_userid FROM chat.messages \
+                             WHERE to_userid = $1 AND tenant_id = $2 \
+                               AND from_userid <> $1 AND from_userid > 0 \
+                               AND is_deleted = false AND msg_type = 'text' \
+                               AND NULLIF(btrim(content), '') IS NOT NULL \
+                               AND left(btrim(content), 1) <> '/' \
+                             ORDER BY id DESC LIMIT 1",
+                        )
+                        .bind(entry.bot_id)
+                        .bind(&entry.tenant_id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|_| "failed to resolve latest active user".to_string())?;
+                        if let Some(latest_user) = latest {
+                            let msg_uuid = insert_pending_admin_message(
+                                pool,
+                                admin_id,
+                                text.unwrap_or(""),
+                                &inbound_ref.msg_type,
+                                inbound_ref.file_id.as_deref(),
+                                Some(latest_user),
+                            )
+                            .await?;
+                            let telegram = telegram_for_bot(entry, telegram_api_base_url);
+                            let markup = serde_json::json!({
+                                "inline_keyboard": [
+                                    [{"text": "✅ 确认发送", "callback_data": format!("quick_send:{latest_user}:{msg_uuid}")}],
+                                    [{"text": "👥 选择其他用户", "callback_data": format!("select_other_user:{msg_uuid}")}],
+                                    [{"text": "❌ 取消", "callback_data": format!("cancel_send:{msg_uuid}")}]
+                                ]
+                            });
+                            let _ = telegram
+                                .send_message(tgbot_integrations::telegram::SendMessageParams {
+                                    chat_id: admin_id,
+                                    text: "📤 消息已暂存，请确认发送对象：".to_string(),
+                                    parse_mode: None,
+                                    reply_markup: Some(markup),
+                                    reply_to_message_id: Some(message_id),
+                                })
+                                .await;
+                            info!(admin_id, latest_user, msg_uuid, "Admin message staged for confirmation");
+                            return Ok(());
+                        }
+                        // 4) 无目标用户：提示管理员（对齐 Python "无法直接发送"）
                         let telegram = telegram_for_bot(entry, telegram_api_base_url);
                         let _ = telegram
                             .send_message(tgbot_integrations::telegram::SendMessageParams {
@@ -1456,9 +1923,13 @@ async fn handle_incoming_message(
                 .map_err(|_| "failed to persist private message timestamp".to_string())?;
             }
             // 客服自动翻译（用户 → 管理员，译为中文）：
-            // 文本消息且启发式命中时调用 LLM，译文写回 translated_text/original_text。
+            // 文本/媒体 caption 且启发式命中时调用 LLM，译文写回 translated_text/original_text。
             // 与 Python translator.py 行为一致：翻译失败/无需翻译时静默跳过，不影响消息落库。
-            if inbound.msg_type == "text" {
+            if inbound
+                .content
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+            {
                 if let Some(text) = inbound.content.as_deref() {
                     if let Some(translated) =
                         translate::translate_to_admin(llm, pool, text).await
@@ -1511,20 +1982,26 @@ async fn handle_incoming_message(
                     .flatten();
                     let esc_display = html_escape(&display_text);
                     let esc_name = html_escape(first_name.as_deref().unwrap_or("用户"));
+                    let esc_username = html_escape(username.as_deref().unwrap_or(""));
+                    let identity_line = if esc_username.is_empty() {
+                        format!("<a href=\"tg://user?id={user_id}\">{esc_name}</a>")
+                    } else {
+                        format!("<a href=\"tg://user?id={user_id}\">{esc_name}</a> (@{esc_username})")
+                    };
                     let push_text = if let Some(translated) = card_translated {
                         if !translated.trim().is_empty() && translated.trim() != display_text {
                             let esc_translated = html_escape(&translated);
                             format!(
-                                "💬 新私聊消息 · <a href=\"tg://user?id={user_id}\">{esc_name}</a>\n\n原文: {esc_display}\n译文: {esc_translated}\n\n💡 点击下方按钮快速处理，或直接回复此消息。",
+                                "💬 新私聊消息 · {identity_line}\n\n原文: {esc_display}\n译文: {esc_translated}\n\n💡 点击下方按钮快速处理，或直接回复此消息。",
                             )
                         } else {
                             format!(
-                                "💬 新私聊消息 · <a href=\"tg://user?id={user_id}\">{esc_name}</a>\n\n内容: {esc_display}\n\n💡 点击下方按钮快速处理，或直接回复此消息。",
+                                "💬 新私聊消息 · {identity_line}\n\n内容: {esc_display}\n\n💡 点击下方按钮快速处理，或直接回复此消息。",
                             )
                         }
                     } else {
                         format!(
-                            "💬 新私聊消息 · <a href=\"tg://user?id={user_id}\">{esc_name}</a>\n\n内容: {esc_display}\n\n💡 点击下方按钮快速处理，或直接回复此消息。",
+                            "💬 新私聊消息 · {identity_line}\n\n内容: {esc_display}\n\n💡 点击下方按钮快速处理，或直接回复此消息。",
                         )
                     };
                     let telegram = telegram_for_bot(entry, telegram_api_base_url);
@@ -1593,6 +2070,23 @@ async fn handle_incoming_message(
             )
             .await?;
             apply_message_membership_events(pool, entry, message, chat_id, &group_title, telegram_api_base_url).await?;
+            // P3 captcha 文字回复验证（对齐 Python handle_verify_message）：
+            // 命中验证作答消息即消费（删除作答消息），不再作为普通群消息落库。
+            if let Some(text) = message.get("text").and_then(Value::as_str) {
+                if handle_captcha_reply(
+                    pool,
+                    entry,
+                    telegram_api_base_url,
+                    chat_id,
+                    user_id,
+                    text,
+                    message_id,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
             if !group_policy.is_monitored {
                 return Ok(());
             }
@@ -1808,6 +2302,7 @@ async fn apply_message_membership_events(
             .and_then(Value::as_i64)
             .filter(|value| *value > 0)
         {
+            clear_verify_state(group_id, user_id);
             sqlx::query(
                 "UPDATE groups.group_members SET status = 'left', updated_at = now() \
                  WHERE group_id = $1 AND user_id = $2 AND tenant_id = $3",
@@ -1920,6 +2415,9 @@ async fn handle_chat_member_update(
         .filter(|value| *value > 0)
         .ok_or_else(|| "member update has invalid user".to_string())?;
     let status = persisted_member_status(member);
+    if matches!(status, "left" | "banned") {
+        clear_verify_state(group_id, user_id);
+    }
     upsert_group_member(
         pool,
         &entry.tenant_id,
@@ -2069,7 +2567,8 @@ fn parse_wallet_callback(data: &str) -> Option<WalletCallback> {
 }
 
 /// 客服系统回调：cs_mark_read / cs_quick_reply / cs_close_session
-/// （Python cs_callback_handler 的 Rust 版本，覆盖已读/快速回复/结束会话）。
+/// + 批量补发（quick_send / select_other_user / cancel_send / user_page / confirm_send_to）。
+/// （Python cs_callback_handler 的 Rust 版本）。
 async fn handle_customer_callback(
     update: &TelegramUpdate,
     entry: &BotEntry,
@@ -2082,6 +2581,15 @@ async fn handle_customer_callback(
     let Some(data) = callback.get("data").and_then(Value::as_str) else {
         return Ok(false);
     };
+    let Some(pool) = pool else {
+        return Ok(false);
+    };
+
+    // 批量补发回调（管理员操作，内部校验权限；前缀不匹配时返回 Ok(false)）
+    if handle_pending_send_callback(update, entry, pool, telegram_api_base_url).await? {
+        return Ok(true);
+    }
+
     let (action, user_id_str) = if let Some(rest) = data.strip_prefix("cs_mark_read:") {
         ("mark_read", rest)
     } else if let Some(rest) = data.strip_prefix("cs_quick_reply:") {
@@ -2091,15 +2599,34 @@ async fn handle_customer_callback(
     } else {
         return Ok(false);
     };
-    let Some(pool) = pool else {
-        return Ok(false);
-    };
     let Ok(user_id) = user_id_str.parse::<i64>() else {
         return Ok(false);
     };
     let Some(callback_id) = callback.get("id").and_then(Value::as_str) else {
         return Ok(false);
     };
+
+    // P1-2：cs_* 均为管理员操作，统一校验租户 owner/admin（对齐 Python cs_callback_handler 入口 ADMIN_TG_IDS 检查）
+    let Some(actor) = callback
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+    else {
+        return Ok(false);
+    };
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
+    let is_admin = is_tenant_admin(pool, &entry.tenant_id, actor).await?;
+    if !is_admin {
+        let _ = telegram
+            .answer_callback_query(AnswerCallbackQueryParams {
+                callback_query_id: callback_id.to_string(),
+                text: Some("权限不足".to_string()),
+                show_alert: Some(true),
+            })
+            .await;
+        return Ok(true);
+    }
 
     let (ok_text, err_text) = match action {
         "mark_read" => {
@@ -2139,7 +2666,6 @@ async fn handle_customer_callback(
         _ => return Ok(false),
     };
 
-    let telegram = telegram_for_bot(entry, telegram_api_base_url);
     telegram
         .answer_callback_query(AnswerCallbackQueryParams {
             callback_query_id: callback_id.to_string(),
@@ -2150,6 +2676,743 @@ async fn handle_customer_callback(
         .map_err(|_| err_text.to_string())?;
     info!(bot_id = entry.bot_id, action, user_id, "Customer service callback handled");
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// 批量补发（pending_admin_messages）辅助函数
+// ---------------------------------------------------------------------------
+
+/// 待确认管理员消息行（对齐 Python pending_admin_messages 表结构）。
+struct PendingAdminMessage {
+    msg_uuid: String,
+    admin_id: i64,
+    content: Option<String>,
+    msg_type: String,
+    file_id: Option<String>,
+    target_user_id: Option<i64>,
+    status: String,
+    /// 入队时间（quick_send 批次路由按 timestamp 取 <= 当前的消息）
+    timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// 校验 callback 发起者是否为租户 owner/admin（对齐 Python ADMIN_TG_IDS 权限校验）。
+async fn is_tenant_admin(
+    pool: &sqlx::PgPool,
+    tenant_id: &str,
+    user_id: i64,
+) -> Result<bool, String> {
+    let is_admin: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM merchants
+             WHERE tenant_id = $1 AND owner_tg_user_id = $2
+         ) OR EXISTS (
+             SELECT 1
+             FROM tenant_memberships membership
+             JOIN auth.users user_record ON user_record.id = membership.user_id
+             WHERE membership.tenant_id = $1
+               AND user_record.tg_user_id = $2
+               AND membership.role IN ('merchant_owner', 'merchant_admin')
+         )",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| "failed to verify admin permission".to_string())?;
+    Ok(is_admin)
+}
+
+/// 写入一条待确认管理员消息，返回 msg_uuid（30 分钟过期，对齐 Python）。
+/// P2-8：msg_uuid 截断为 8 位（对齐 Python `str(uuid.uuid4())[:8]`），
+/// 避免 confirm_send_to/quick_send 等 callback_data 超过 Telegram 64 字节上限。
+async fn insert_pending_admin_message(
+    pool: &sqlx::PgPool,
+    admin_id: i64,
+    content: &str,
+    msg_type: &str,
+    file_id: Option<&str>,
+    target_user_id: Option<i64>,
+) -> Result<String, String> {
+    let msg_uuid = uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    sqlx::query(
+        "INSERT INTO platform.pending_admin_messages \
+         (msg_uuid, admin_id, content, msg_type, file_id, target_user_id, status, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', now() + interval '30 minutes')",
+    )
+    .bind(&msg_uuid)
+    .bind(admin_id)
+    .bind(content)
+    .bind(msg_type)
+    .bind(file_id)
+    .bind(target_user_id)
+    .execute(pool)
+    .await
+    .map_err(|_| "failed to persist pending admin message".to_string())?;
+    Ok(msg_uuid)
+}
+
+/// 待确认消息是否过期（30 分钟，对齐 Python is_pending_message_expired）。
+async fn pending_message_expired(pool: &sqlx::PgPool, msg_uuid: &str) -> Result<bool, String> {
+    let expired: bool = sqlx::query_scalar(
+        "SELECT COALESCE(expires_at <= now(), false) FROM platform.pending_admin_messages \
+         WHERE msg_uuid = $1",
+    )
+    .bind(msg_uuid)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| "failed to check pending message expiry".to_string())?;
+    Ok(expired)
+}
+
+/// 查询待确认管理员消息。
+async fn fetch_pending_admin_message(
+    pool: &sqlx::PgPool,
+    msg_uuid: &str,
+) -> Result<Option<PendingAdminMessage>, String> {
+    let row = sqlx::query(
+        "SELECT msg_uuid, admin_id, content, msg_type, file_id, target_user_id, status, timestamp \
+         FROM platform.pending_admin_messages WHERE msg_uuid = $1",
+    )
+    .bind(msg_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| "failed to load pending admin message".to_string())?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(PendingAdminMessage {
+        msg_uuid: row.try_get("msg_uuid").map_err(|_| "invalid pending msg_uuid".to_string())?,
+        admin_id: row.try_get("admin_id").unwrap_or(0),
+        content: row.try_get("content").ok().flatten(),
+        msg_type: row.try_get("msg_type").unwrap_or_else(|_| "text".to_string()),
+        file_id: row.try_get("file_id").ok().flatten(),
+        target_user_id: row.try_get("target_user_id").ok().flatten(),
+        status: row.try_get("status").unwrap_or_else(|_| "pending".to_string()),
+        timestamp: row.try_get("timestamp").unwrap_or_else(|_| chrono::Utc::now()),
+    }))
+}
+
+/// 查询某管理员名下全部待确认消息（quick_send 批次，timestamp <= 当前，对齐 Python）。
+async fn fetch_pending_admin_batch(
+    pool: &sqlx::PgPool,
+    admin_id: i64,
+    up_to: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<PendingAdminMessage>, String> {
+    let rows = sqlx::query(
+        "SELECT msg_uuid, admin_id, content, msg_type, file_id, target_user_id, status, timestamp \
+         FROM platform.pending_admin_messages \
+         WHERE admin_id = $1 AND status = 'pending' AND timestamp <= $2 \
+         ORDER BY timestamp ASC",
+    )
+    .bind(admin_id)
+    .bind(up_to)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| "failed to load pending admin batch".to_string())?;
+    let mut batch = Vec::new();
+    for row in rows {
+        batch.push(PendingAdminMessage {
+            msg_uuid: row.try_get("msg_uuid").map_err(|_| "invalid pending msg_uuid".to_string())?,
+            admin_id: row.try_get("admin_id").unwrap_or(0),
+            content: row.try_get("content").ok().flatten(),
+            msg_type: row.try_get("msg_type").unwrap_or_else(|_| "text".to_string()),
+            file_id: row.try_get("file_id").ok().flatten(),
+            target_user_id: row.try_get("target_user_id").ok().flatten(),
+            status: row.try_get("status").unwrap_or_else(|_| "pending".to_string()),
+            timestamp: row.try_get("timestamp").unwrap_or_else(|_| chrono::Utc::now()),
+        });
+    }
+    Ok(batch)
+}
+
+/// 发送待确认消息给目标用户（带客服身份标签 + 入库 + 标记 sent）。
+async fn send_pending_message_to_user(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    telegram_api_base_url: &str,
+    admin_id: i64,
+    admin_name: &str,
+    target_user: i64,
+    pending: &PendingAdminMessage,
+) -> Result<(), String> {
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
+    let esc_name = html_escape(admin_name);
+    let body = pending.content.as_deref().unwrap_or("");
+    let esc_body = html_escape(body);
+    let text = format!("客服 <a href=\"tg://user?id={admin_id}\">{esc_name}</a>：\n{esc_body}");
+
+    let sent = if pending.msg_type == "photo" && pending.file_id.is_some() {
+        telegram
+            .send_photo(tgbot_integrations::telegram::SendPhotoParams {
+                chat_id: target_user,
+                photo: pending.file_id.clone().unwrap_or_default(),
+                caption: Some(text),
+                parse_mode: Some("HTML".to_string()),
+                reply_to_message_id: None,
+                reply_markup: None,
+            })
+            .await
+            .map_err(|_| "failed to send pending photo".to_string())?
+    } else if pending.msg_type == "document" && pending.file_id.is_some() {
+        telegram
+            .send_document(tgbot_integrations::telegram::SendDocumentParams {
+                chat_id: target_user,
+                document: pending.file_id.clone().unwrap_or_default(),
+                caption: Some(text),
+                parse_mode: Some("HTML".to_string()),
+            })
+            .await
+            .map_err(|_| "failed to send pending document".to_string())?
+    } else {
+        telegram
+            .send_message(tgbot_integrations::telegram::SendMessageParams {
+                chat_id: target_user,
+                text,
+                parse_mode: Some("HTML".to_string()),
+                reply_markup: None,
+                reply_to_message_id: None,
+            })
+            .await
+            .map_err(|_| "failed to send pending admin message".to_string())?
+    };
+
+    message_repo::save_message(
+        pool,
+        entry.bot_id,
+        target_user,
+        Some(body),
+        &pending.msg_type,
+        pending.file_id.as_deref(),
+        None,
+        true,
+        Some(sent.message_id),
+        &entry.tenant_id,
+        None,
+    )
+    .await
+    .map_err(|_| "failed to persist pending admin message".to_string())?;
+
+    sqlx::query(
+        "UPDATE platform.pending_admin_messages \
+         SET status = 'sent', target_user_id = $2, expires_at = NULL, timestamp = now() \
+         WHERE msg_uuid = $1",
+    )
+    .bind(&pending.msg_uuid)
+    .bind(target_user)
+    .execute(pool)
+    .await
+    .map_err(|_| "failed to mark pending message sent".to_string())?;
+    Ok(())
+}
+
+/// 租户活跃用户列表（对齐 Python get_inbox_list，按最近活跃排序）。
+/// P2-9：仅取 7 天内有活跃的用户（对齐 Python get_inbox_list 的 7 天窗口）。
+async fn active_inbox_users(
+    pool: &sqlx::PgPool,
+    tenant_id: &str,
+) -> Result<Vec<(i64, Option<String>)>, String> {
+    let rows = sqlx::query(
+        "SELECT user_id, username FROM chat.admin_inbox \
+         WHERE tenant_id = $1 AND last_active >= now() - interval '7 days' \
+         ORDER BY last_active DESC",
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| "failed to load active users".to_string())?;
+    let mut users = Vec::new();
+    for row in rows {
+        let user_id: i64 = row.try_get("user_id").unwrap_or(0);
+        let username: Option<String> = row.try_get("username").ok().flatten();
+        if user_id > 0 {
+            users.push((user_id, username));
+        }
+    }
+    Ok(users)
+}
+
+/// 管理员最近一次「选择其他用户」对应的 msg_uuid（user_page 分页需要，前缀不含 uuid）。
+static PENDING_SEND_CONTEXT: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<i64, String>>,
+> = std::sync::OnceLock::new();
+
+fn pending_send_context() -> &'static std::sync::Mutex<std::collections::HashMap<i64, String>> {
+    PENDING_SEND_CONTEXT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 批量补发回调：quick_send / select_other_user / cancel_send / user_page / confirm_send_to。
+/// 前缀不匹配返回 Ok(false)；命中后校验管理员权限并返回 Ok(true)。
+async fn handle_pending_send_callback(
+    update: &TelegramUpdate,
+    entry: &BotEntry,
+    pool: &sqlx::PgPool,
+    telegram_api_base_url: &str,
+) -> Result<bool, String> {
+    let Some(callback) = update.callback_query.as_ref() else {
+        return Ok(false);
+    };
+    let Some(data) = callback.get("data").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    if !(data.starts_with("quick_send:")
+        || data.starts_with("select_other_user:")
+        || data.starts_with("cancel_send:")
+        || data.starts_with("user_page:")
+        || data.starts_with("confirm_send_to:"))
+    {
+        return Ok(false);
+    }
+    let Some(callback_id) = callback.get("id").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(actor) = callback
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+    else {
+        return Ok(false);
+    };
+    let admin_name = callback
+        .get("from")
+        .and_then(|from| from.get("first_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("客服");
+    let message_id = callback
+        .get("message")
+        .and_then(|message| message.get("message_id"))
+        .and_then(Value::as_i64);
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
+
+    // 管理员操作权限校验（对齐 Python ADMIN_TG_IDS 检查）
+    let is_admin = is_tenant_admin(pool, &entry.tenant_id, actor).await?;
+    if !is_admin {
+        let _ = telegram
+            .answer_callback_query(AnswerCallbackQueryParams {
+                callback_query_id: callback_id.to_string(),
+                text: Some("权限不足".to_string()),
+                show_alert: Some(true),
+            })
+            .await;
+        return Ok(true);
+    }
+
+    // quick_send:{target_id}:{msg_uuid}：把该管理员名下所有 pending（timestamp <= 当前）
+    // 的消息按批次发给 target，逐条 status → sent（对齐 Python customer_service.py:358-468）。
+    if let Some(rest) = data.strip_prefix("quick_send:") {
+        let mut parts = rest.splitn(2, ':');
+        let (Some(target_str), Some(msg_uuid)) = (parts.next(), parts.next()) else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 消息索引丢失".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        let Ok(target) = target_str.parse::<i64>() else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 目标用户无效".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        if target <= 0 || msg_uuid.is_empty() {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 参数无效".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        }
+        let Some(pending) = fetch_pending_admin_message(pool, msg_uuid).await? else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("⚠️ 消息已处理或不存在".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        if pending.status != "pending" {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("⚠️ 消息已处理或不存在".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        }
+        // 过期检查（对齐 Python is_pending_message_expired）
+        if pending_message_expired(pool, msg_uuid).await? {
+            let _ = sqlx::query(
+                "UPDATE platform.pending_admin_messages SET status = 'expired' \
+                 WHERE msg_uuid = $1",
+            )
+            .bind(msg_uuid)
+            .execute(pool)
+            .await;
+            if let Some(message_id) = message_id {
+                let _ = telegram
+                    .edit_message_text(EditMessageTextParams {
+                        chat_id: actor,
+                        message_id,
+                        text: "⏰ 这条待发送消息已超过30分钟，默认失效。".to_string(),
+                        parse_mode: None,
+                        reply_markup: None,
+                    })
+                    .await;
+            }
+            return Ok(true);
+        }
+        // 批次：该管理员名下所有早于等于当前消息的 pending（对齐 Python pending_batch）
+        let batch = fetch_pending_admin_batch(pool, actor, pending.timestamp).await?;
+        if batch.is_empty() {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("⚠️ 批次已完成或已失效".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            if let Some(message_id) = message_id {
+                let _ = telegram
+                    .edit_message_text(EditMessageTextParams {
+                        chat_id: actor,
+                        message_id,
+                        text: "✅ 所有待处理消息已发送完毕。".to_string(),
+                        parse_mode: None,
+                        reply_markup: None,
+                    })
+                    .await;
+            }
+            return Ok(true);
+        }
+        let mut sent_count = 0_usize;
+        let mut first_error: Option<String> = None;
+        for item in &batch {
+            match send_pending_message_to_user(
+                pool,
+                entry,
+                telegram_api_base_url,
+                actor,
+                admin_name,
+                target,
+                item,
+            )
+            .await
+            {
+                Ok(()) => sent_count += 1,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if sent_count > 0 {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some(format!("✅ 成功补发 {sent_count} 条消息")),
+                    show_alert: Some(false),
+                })
+                .await;
+            if let Some(message_id) = message_id {
+                let _ = telegram
+                    .edit_message_text(EditMessageTextParams {
+                        chat_id: actor,
+                        message_id,
+                        text: format!("✅ <b>成功补发 {sent_count} 条消息</b>\n目标用户：<code>{target}</code>"),
+                        parse_mode: Some("HTML".to_string()),
+                        reply_markup: None,
+                    })
+                    .await;
+            }
+        } else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some(format!("❌ 发送失败: {}", first_error.unwrap_or_else(|| "未知错误".into()))),
+                    show_alert: Some(true),
+                })
+                .await;
+        }
+        return Ok(true);
+    }
+
+    // select_other_user:{msg_uuid}：列出活跃用户（分页 user_page）
+    if let Some(msg_uuid) = data.strip_prefix("select_other_user:") {
+        if msg_uuid.is_empty() {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 索引丢失".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        }
+        let users = active_inbox_users(pool, &entry.tenant_id).await?;
+        if users.is_empty() {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("暂无活跃用户".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        }
+        // 记录该管理员当前操作的 msg_uuid（user_page 分页时使用）
+        if let Ok(mut context) = pending_send_context().lock() {
+            context.insert(actor, msg_uuid.to_string());
+        }
+        let keyboard = build_user_page_keyboard(&users, 0, msg_uuid);
+        let _ = telegram
+            .edit_message_text(EditMessageTextParams {
+                chat_id: actor,
+                message_id: message_id.unwrap_or(0),
+                text: "请选择要补发的目标用户：".to_string(),
+                parse_mode: None,
+                reply_markup: Some(keyboard),
+            })
+            .await;
+        return Ok(true);
+    }
+
+    // cancel_send:{msg_uuid}：取消
+    if let Some(msg_uuid) = data.strip_prefix("cancel_send:") {
+        if !msg_uuid.is_empty() {
+            // P2-9：对齐 Python update_pending_admin_msg_status(msg_uuid, 'expired')，
+            // 统一用 'expired' 表示已失效，避免后续 quick_send 再次命中
+            let _ = sqlx::query(
+                "UPDATE platform.pending_admin_messages SET status = 'expired' \
+                 WHERE msg_uuid = $1 AND status = 'pending'",
+            )
+            .bind(msg_uuid)
+            .execute(pool)
+            .await;
+        }
+        if let Some(message_id) = message_id {
+            let _ = telegram
+                .edit_message_text(EditMessageTextParams {
+                    chat_id: actor,
+                    message_id,
+                    text: "🚫 已取消发送。提示：回复用户请尽量使用“左滑引用”。".to_string(),
+                    parse_mode: None,
+                    reply_markup: None,
+                })
+                .await;
+        }
+        return Ok(true);
+    }
+
+    // user_page:{page}：分页用户列表（msg_uuid 取该管理员最近一次 select_other_user）
+    if let Some(page_str) = data.strip_prefix("user_page:") {
+        let Ok(page) = page_str.parse::<i64>().map(|value| value.max(0)) else {
+            return Ok(false);
+        };
+        let msg_uuid = pending_send_context()
+            .lock()
+            .map(|context| context.get(&actor).cloned())
+            .ok()
+            .flatten();
+        let Some(msg_uuid) = msg_uuid else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 索引丢失，请重新选择".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        let users = active_inbox_users(pool, &entry.tenant_id).await?;
+        if users.is_empty() {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("暂无活跃用户".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        }
+        let keyboard = build_user_page_keyboard(&users, page, &msg_uuid);
+        let _ = telegram
+            .edit_message_text(EditMessageTextParams {
+                chat_id: actor,
+                message_id: message_id.unwrap_or(0),
+                text: format!("请选择要补发的目标用户（第 {} 页）：", page + 1),
+                parse_mode: None,
+                reply_markup: Some(keyboard),
+            })
+            .await;
+        return Ok(true);
+    }
+
+    // confirm_send_to:{user_id}:{msg_uuid}：确认发给指定用户
+    if let Some(rest) = data.strip_prefix("confirm_send_to:") {
+        let mut parts = rest.splitn(2, ':');
+        let (Some(target_str), Some(msg_uuid)) = (parts.next(), parts.next()) else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 消息索引丢失".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        let Ok(target) = target_str.parse::<i64>() else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 目标用户无效".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        let Some(pending) = fetch_pending_admin_message(pool, msg_uuid).await? else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("⚠️ 消息已处理或不存在".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        if pending.status != "pending" {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("⚠️ 消息已处理或不存在".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        }
+        // P1-4：confirm_send_to 补 30 分钟过期检查（对齐 Python py:1424-1428）
+        if pending_message_expired(pool, msg_uuid).await? {
+            let _ = sqlx::query(
+                "UPDATE platform.pending_admin_messages SET status = 'expired' \
+                 WHERE msg_uuid = $1",
+            )
+            .bind(msg_uuid)
+            .execute(pool)
+            .await;
+            if let Some(message_id) = message_id {
+                let _ = telegram
+                    .edit_message_text(EditMessageTextParams {
+                        chat_id: actor,
+                        message_id,
+                        text: "⏰ 这条待发送消息已超过30分钟，默认失效。".to_string(),
+                        parse_mode: None,
+                        reply_markup: None,
+                    })
+                    .await;
+            }
+            return Ok(true);
+        }
+        match send_pending_message_to_user(
+            pool,
+            entry,
+            telegram_api_base_url,
+            actor,
+            admin_name,
+            target,
+            &pending,
+        )
+        .await
+        {
+            Ok(()) => {
+                let _ = telegram
+                    .answer_callback_query(AnswerCallbackQueryParams {
+                        callback_query_id: callback_id.to_string(),
+                        text: Some("✅ 已发送".to_string()),
+                        show_alert: Some(false),
+                    })
+                    .await;
+                if let Some(message_id) = message_id {
+                    let _ = telegram
+                        .edit_message_text(EditMessageTextParams {
+                            chat_id: actor,
+                            message_id,
+                            text: format!("✅ 已发送给用户 <code>{target}</code>", target = target),
+                            parse_mode: Some("HTML".to_string()),
+                            reply_markup: None,
+                        })
+                        .await;
+                }
+            }
+            Err(error) => {
+                let _ = telegram
+                    .answer_callback_query(AnswerCallbackQueryParams {
+                        callback_query_id: callback_id.to_string(),
+                        text: Some(format!("❌ 发送失败: {error}")),
+                        show_alert: Some(true),
+                    })
+                    .await;
+            }
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// 构建用户选择键盘（每页最多 10 人；含分页与取消按钮）。
+fn build_user_page_keyboard(users: &[(i64, Option<String>)], page: i64, msg_uuid: &str) -> Value {
+    const PAGE_SIZE: usize = 10;
+    let total_pages = ((users.len() + PAGE_SIZE - 1) / PAGE_SIZE).max(1) as i64;
+    let page = page.clamp(0, total_pages - 1);
+    let start = (page as usize) * PAGE_SIZE;
+    let slice = users.iter().skip(start).take(PAGE_SIZE);
+
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for (user_id, username) in slice {
+        let label = username
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("👤 @{name} (ID: {user_id})"))
+            .unwrap_or_else(|| format!("👤 用户 (ID: {user_id})"));
+        rows.push(vec![serde_json::json!({
+            "text": label,
+            "callback_data": format!("confirm_send_to:{user_id}:{msg_uuid}")
+        })]);
+    }
+    let mut nav_row: Vec<Value> = Vec::new();
+    if page > 0 {
+        nav_row.push(serde_json::json!({
+            "text": "⬅️ 上一页",
+            "callback_data": format!("user_page:{}", page - 1)
+        }));
+    }
+    if page + 1 < total_pages {
+        nav_row.push(serde_json::json!({
+            "text": "下一页 ➡️",
+            "callback_data": format!("user_page:{}", page + 1)
+        }));
+    }
+    if !nav_row.is_empty() {
+        rows.push(nav_row);
+    }
+    rows.push(vec![serde_json::json!({
+        "text": "❌ 取消",
+        "callback_data": format!("cancel_send:{msg_uuid}")
+    })]);
+    serde_json::json!({ "inline_keyboard": rows })
 }
 
 async fn handle_wallet_callback(

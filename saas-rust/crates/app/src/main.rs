@@ -23,7 +23,7 @@ use tgbot_workers::{
     AdGovernanceWorker, AddressMonitorAlertWorker, AddressMonitorWorker,
     Dispatcher as WorkerDispatcher, GroupMessagePolicyWorker, PushTaskWorker, Scheduler,
     SchedulerConfig, TelegramAutoReplyWorker, TelegramClientResolver, TelegramCommandWorker,
-    Worker, WorkerHandle,
+    VerifyTimeoutWorker, Worker, WorkerHandle,
 };
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -178,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
                 resolver.clone(),
                 config.telegram_wallet_monitors_enabled,
             )) as Arc<dyn Worker>);
+            workers.push(Arc::new(VerifyTimeoutWorker::new(resolver.clone())) as Arc<dyn Worker>);
         }
         if config.telegram_auto_replies_enabled {
             workers
@@ -217,6 +218,21 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let worker_enabled = worker_handle.is_some();
+
+    // Spawn revoke-sync reconciliation loop (30s round, aligned with Python revoke_sync_loop).
+    // Detached tokio task; it dies with the process on shutdown. Requires REVOKE_PROBE_CHAT_ID
+    // to be configured (the worker skips rounds when absent).
+    if let Some(pg) = pool.as_ref() {
+        let resolver = Arc::new(RegistryTelegramResolver {
+            bot_registry: bot_registry.clone(),
+        });
+        tokio::spawn(tgbot_workers::run_revoke_sync_loop(
+            pg.clone(),
+            resolver,
+            env_duration("REVOKE_SYNC_INTERVAL_SECS", 30),
+        ));
+    }
+
     let state = AppState {
         config: config.clone(),
         pool,

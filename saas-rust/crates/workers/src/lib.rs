@@ -53,9 +53,11 @@ pub mod ocr_worker;
 #[cfg(feature = "legacy-workers")]
 pub mod payment_worker;
 pub mod push_task_worker;
+pub mod revoke_sync_worker;
 pub mod scheduler;
 pub mod telegram_auto_reply_worker;
 pub mod telegram_command_worker;
+pub mod verify_timeout_worker;
 
 // Re-export commonly used types
 pub use ad_governance_worker::AdGovernanceWorker;
@@ -81,6 +83,7 @@ pub use ocr_worker::{OcrTaskType, OcrWorker};
 #[cfg(feature = "legacy-workers")]
 pub use payment_worker::{PaymentTaskType, PaymentWorker};
 pub use push_task_worker::{PushTaskWorker, TelegramClientResolver};
+pub use revoke_sync_worker::{run_revoke_sync_loop, run_revoke_sync_round};
 #[cfg(feature = "legacy-workers")]
 pub use scheduler::{run_cron_checks, schedule_monitor_checks};
 pub use scheduler::{
@@ -89,6 +92,7 @@ pub use scheduler::{
 };
 pub use telegram_auto_reply_worker::TelegramAutoReplyWorker;
 pub use telegram_command_worker::TelegramCommandWorker;
+pub use verify_timeout_worker::VerifyTimeoutWorker;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;

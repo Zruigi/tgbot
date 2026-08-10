@@ -10,6 +10,15 @@ pub enum TelegramCommand {
     Menu,
     Status,
     Clear,
+    Ping,
+    Email,
+    Price(Option<String>),
+    Reply,
+    RestartBot,
+    /// /register_merchant <商户名>：自助创建商户档案（对齐 Python merchant_onboarding.py）。
+    RegisterMerchant(Option<String>),
+    /// /sync_potential：管理员立即同步群组潜在用户（对齐 Python admin_panel.py）。
+    SyncPotential,
 }
 
 /// 命令回复，包含纯文本消息。
@@ -100,6 +109,17 @@ pub fn parse_telegram_command(text: &str, bot_username: &str) -> Option<Telegram
             (!payload.is_empty()).then(|| payload.to_string()),
         )),
         "menu" => Some(TelegramCommand::Menu),
+        "ping" => Some(TelegramCommand::Ping),
+        "email" => Some(TelegramCommand::Email),
+        "price" => Some(TelegramCommand::Price(
+            (!payload.is_empty()).then(|| payload.to_string()),
+        )),
+        "reply" => Some(TelegramCommand::Reply),
+        "restart_bot" => Some(TelegramCommand::RestartBot),
+        "register_merchant" => Some(TelegramCommand::RegisterMerchant(
+            (!payload.is_empty()).then(|| payload.to_string()),
+        )),
+        "sync_potential" => Some(TelegramCommand::SyncPotential),
         "status" => Some(TelegramCommand::Status),
         "clear" => Some(TelegramCommand::Clear),
         _ => None,
@@ -168,6 +188,30 @@ pub fn build_command_reply(command: &TelegramCommand, first_name: &str) -> Comma
         }
         TelegramCommand::Clear => {
             "当前对话缓存已清理 ✅".to_string()
+        }
+        TelegramCommand::Ping => {
+            "pong 🏓".to_string()
+        }
+        TelegramCommand::Email => {
+            "请输入要绑定的邮箱（发送 /email <邮箱>）。".to_string()
+        }
+        TelegramCommand::Price(_) => {
+            "正在查询行情，请稍候...".to_string()
+        }
+        TelegramCommand::Reply => {
+            "管理员回复：发送 /reply <用户ID> <内容>".to_string()
+        }
+        TelegramCommand::RestartBot => {
+            "正在重启机器人...".to_string()
+        }
+        TelegramCommand::RegisterMerchant(None) => {
+            "商户入驻：发送 /register_merchant <商户名> 创建你的商户档案。".to_string()
+        }
+        TelegramCommand::RegisterMerchant(Some(_)) => {
+            "正在创建商户档案，请稍候...".to_string()
+        }
+        TelegramCommand::SyncPotential => {
+            "正在同步群组潜在用户，请稍候...".to_string()
         }
     };
     CommandReply { text }
@@ -326,6 +370,32 @@ mod tests {
     }
 
     // ---- build_command_reply ----
+
+    #[test]
+    fn parses_register_merchant_and_sync_potential() {
+        assert_eq!(
+            parse_telegram_command("/register_merchant 星海社区助手", BOT),
+            Some(TelegramCommand::RegisterMerchant(Some("星海社区助手".into())))
+        );
+        assert_eq!(
+            parse_telegram_command("/register_merchant", BOT),
+            Some(TelegramCommand::RegisterMerchant(None))
+        );
+        assert_eq!(
+            parse_telegram_command("/sync_potential", BOT),
+            Some(TelegramCommand::SyncPotential)
+        );
+        assert_eq!(
+            parse_telegram_command("/sync_potential@MyTestBot", BOT),
+            Some(TelegramCommand::SyncPotential)
+        );
+    }
+
+    #[test]
+    fn test_register_merchant_reply_fails_closed_for_missing_name() {
+        let reply = build_command_reply(&TelegramCommand::RegisterMerchant(None), "Alice");
+        assert!(reply.text.contains("/register_merchant"));
+    }
 
     #[test]
     fn test_start_reply_includes_greeting() {

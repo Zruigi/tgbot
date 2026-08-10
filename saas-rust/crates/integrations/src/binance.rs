@@ -40,7 +40,7 @@ impl BinanceConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             base_url: std::env::var("BINANCE_BASE_URL")
-                .unwrap_or_else(|_| "https://api.binance.com".into()),
+                .unwrap_or_else(|_| "https://data-api.binance.vision".into()),
             api_key: std::env::var("BINANCE_API_KEY").ok(),
             secret_key: std::env::var("BINANCE_SECRET_KEY").ok(),
             timeout_secs: std::env::var("BINANCE_TIMEOUT_SECS")

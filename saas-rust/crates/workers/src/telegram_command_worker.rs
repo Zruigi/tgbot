@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
-use tgbot_integrations::telegram::SendMessageParams;
+use tgbot_integrations::binance::BinanceClient;
+use tgbot_integrations::telegram::{SendMessageParams, TelegramClient};
 use tgbot_repos::message_repo;
 use tgbot_services::telegram_commands::{
     build_command_reply, parse_channel_start_payload, parse_telegram_command,
@@ -174,6 +175,96 @@ impl Worker for TelegramCommandWorker {
                     (wallet_monitor_prompt(&locale), None)
                 }
             }
+            TelegramCommand::Status => {
+                system_status_reply(pool, &key.tenant_id, &locale).await?
+            }
+            TelegramCommand::Ping => (if locale == "en" { "pong 🏓".to_string() } else { "pong 🏓".to_string() }, None),
+            TelegramCommand::Email => {
+                // 对齐 Python /email：绑定或查看邮箱（存 auth.users.email）
+                let email_arg: Option<String> = row
+                    .try_get::<String, _>("content")
+                    .ok()
+                    .and_then(|text| {
+                        let mut parts = text.split_whitespace();
+                        parts.next();
+                        parts.next().map(|arg| arg.trim().to_string())
+                    });
+                let email_opt: Option<String> = sqlx::query_scalar(
+                    "SELECT email FROM auth.users WHERE tg_user_id = $1",
+                )
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?;
+                match email_arg {
+                    Some(email) => {
+                        let valid = email.contains('@')
+                            && email.split('@').nth(1).is_some_and(|d| d.contains('.'));
+                        if !valid {
+                            (if locale == "en" { "Invalid email address".into() } else { "邮箱格式无效".into() }, None)
+                        } else {
+                            sqlx::query(
+                                "UPDATE auth.users SET email = $1, updated_at = now() WHERE tg_user_id = $2",
+                            )
+                            .bind(&email)
+                            .bind(user_id)
+                            .execute(pool)
+                            .await?;
+                            (if locale == "en" { format!("Email bound: {email}") } else { format!("邮箱已绑定: {email}") }, None)
+                        }
+                    }
+                    None => match email_opt {
+                        Some(email) if !email.trim().is_empty() => {
+                            (if locale == "en" { format!("Current email: {email}") } else { format!("当前绑定邮箱: {email}") }, None)
+                        }
+                        _ => (if locale == "en" { "No email bound. Send /email <address> to bind.".into() } else { "尚未绑定邮箱。发送 /email <邮箱> 进行绑定。".into() }, None),
+                    },
+                }
+            }
+            TelegramCommand::Price(symbol) => {
+                price_reply(pool, symbol.as_deref(), &locale).await?
+            }
+            TelegramCommand::Reply => {
+                // 管理员指定用户回复：/reply <user_id> <text>
+                let content = row.try_get::<String, _>("content").unwrap_or_default();
+                let parts: Vec<&str> = content.splitn(3, char::is_whitespace).collect();
+                if parts.len() >= 3 && parts[0] == "/reply" {
+                    match parts[1].parse::<i64>() {
+                        Ok(target) if target > 0 => {
+                            let text = parts[2].trim().to_string();
+                            if text.is_empty() {
+                                (if locale == "en" { "Empty reply content".into() } else { "回复内容为空".into() }, None)
+                            } else {
+                                match admin_reply_to_user(pool, &telegram, &key.tenant_id, target, &text).await {
+                                    Ok(()) => (if locale == "en" { "Reply sent".into() } else { "回复已发送".into() }, None),
+                                    Err(e) => (format!("Reply failed: {e}"), None),
+                                }
+                            }
+                        }
+                        _ => (if locale == "en" { "Invalid user id. Usage: /reply <user_id> <text>".into() } else { "用户 ID 无效。用法：/reply <用户ID> <内容>".into() }, None),
+                    }
+                } else {
+                    (if locale == "en" { "Usage: /reply <user_id> <text>".into() } else { "用法：/reply <用户ID> <内容>".into() }, None)
+                }
+            }
+            TelegramCommand::RestartBot => {
+                // 管理员重启：触发进程退出，由 systemd Restart=always 拉起
+                let is_owner = is_tenant_owner(pool, &key.tenant_id, user_id).await.unwrap_or(false);
+                if is_owner {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        std::process::exit(0);
+                    });
+                    (if locale == "en" { "Restarting bot...".into() } else { "正在重启机器人...".into() }, None)
+                } else {
+                    (if locale == "en" { "Permission denied".into() } else { "无权限执行此命令".into() }, None)
+                }
+            }
+            TelegramCommand::RegisterMerchant(name) => {
+                register_merchant_reply(pool, user_id, name.as_deref(), &locale).await?
+            }
+            TelegramCommand::SyncPotential => {
+                sync_potential_reply(pool, &key.tenant_id, user_id, &locale).await?
+            }
             _ => {
                 let command_name = match command {
                     TelegramCommand::Help => "help",
@@ -183,6 +274,13 @@ impl Worker for TelegramCommandWorker {
                     TelegramCommand::Menu => "menu",
                     TelegramCommand::Status => "status",
                     TelegramCommand::Clear => "clear",
+                    TelegramCommand::Ping => "ping",
+                    TelegramCommand::Email => "email",
+                    TelegramCommand::Price(_) => "price",
+                    TelegramCommand::Reply => "reply",
+                    TelegramCommand::RestartBot => "restart_bot",
+                    TelegramCommand::RegisterMerchant(_) => "register_merchant",
+                    TelegramCommand::SyncPotential => "sync_potential",
                 };
                 (
                     localized_command_reply(
@@ -449,6 +547,334 @@ fn telegram_member_is_subscribed(member: &Value) -> bool {
             .unwrap_or(false),
         _ => false,
     }
+}
+
+
+
+
+/// 校验用户是否为租户 owner（管理员命令权限）。
+async fn is_tenant_owner(
+    pool: &PgPool,
+    tenant_id: &str,
+    user_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM merchants WHERE tenant_id = $1 AND owner_tg_user_id = $2)",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
+/// /register_merchant <商户名>：自助创建商户档案（对齐 Python merchant_onboarding.py 简化版）。
+/// - 校验商户名 2-40 字符
+/// - 已存在则提示
+/// - 创建 merchants 记录（tenant_id = m-{user_id}-merchant，status = active_free）
+/// - 付费套餐流程跳过（记录为简化版）
+async fn register_merchant_reply(
+    pool: &PgPool,
+    user_id: i64,
+    name: Option<&str>,
+    locale: &str,
+) -> Result<(String, Option<Value>), anyhow::Error> {
+    let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok((
+            if locale == "en" {
+                "Usage: /register_merchant <merchant name>".into()
+            } else {
+                "用法：/register_merchant <商户名>".into()
+            },
+            None,
+        ));
+    };
+    let char_count = name.chars().count();
+    if char_count < 2 {
+        return Ok((
+            if locale == "en" {
+                "Name too short, at least 2 characters.".into()
+            } else {
+                "❌ 名称太短了，请至少输入 2 个字。".into()
+            },
+            None,
+        ));
+    }
+    if char_count > 40 {
+        return Ok((
+            if locale == "en" {
+                "Name too long, at most 40 characters.".into()
+            } else {
+                "❌ 名称太长了，请控制在 40 个字以内。".into()
+            },
+            None,
+        ));
+    }
+
+    // 已存在则提示（对齐 Python get_merchant_by_owner）
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM merchants WHERE owner_tg_user_id = $1)",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    if exists {
+        return Ok((
+            if locale == "en" {
+                "You already have a merchant profile.".into()
+            } else {
+                "🏪 你已经有商户档案了".into()
+            },
+            None,
+        ));
+    }
+
+    let tenant_id_new = format!("m-{}-merchant", user_id);
+    let result = sqlx::query(
+        "INSERT INTO merchants \
+         (tenant_id, merchant_name, owner_tg_user_id, status, plan_type, subscription_status, onboarding_completed) \
+         VALUES ($1, $2, $3, 'active_free', 'free', 'active', true) \
+         ON CONFLICT (tenant_id) DO NOTHING",
+    )
+    .bind(&tenant_id_new)
+    .bind(name)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Ok((
+            if locale == "en" {
+                "Merchant profile creation failed (may already exist).".into()
+            } else {
+                "⚠️ 商户档案创建失败（可能已存在）。".into()
+            },
+            None,
+        ));
+    }
+
+    let text = if locale == "en" {
+        format!(
+            "✅ Merchant profile created\nName: {name}\nTenant: {tenant_id_new}\nPlan: Free\n\nNext: create a bot via @BotFather and bind its token in the console."
+        )
+    } else {
+        format!(
+            "✅ 商户档案已创建\n\n商户名称：{name}\n租户标识：{tenant_id_new}\n当前套餐：免费套餐\n\n接下来：1. 点击 @BotFather 创建机器人；2. 复制 Bot Token；3. 在商户控制台提交 Token 完成接入。"
+        )
+    };
+    info!(user_id, tenant_id_new, merchant_name = name, "merchant registered via /register_merchant");
+    Ok((text, None))
+}
+
+/// /sync_potential：管理员立即同步群组潜在用户（对齐 Python admin_panel.py 简化版）。
+/// 仅租户 owner 可触发；直接执行一次潜客 upsert（ad_score >= 40 的群消息）。
+async fn sync_potential_reply(
+    pool: &PgPool,
+    tenant_id: &str,
+    user_id: i64,
+    locale: &str,
+) -> Result<(String, Option<Value>), anyhow::Error> {
+    let is_owner = is_tenant_owner(pool, tenant_id, user_id).await.unwrap_or(false);
+    if !is_owner {
+        return Ok((
+            if locale == "en" {
+                "Permission denied".into()
+            } else {
+                "无权限执行此命令".into()
+            },
+            None,
+        ));
+    }
+    // 简化版潜客同步：将 monitored 群内 ad_score >= 40 的未捕获消息 upsert 到 potential_users
+    let result = sqlx::query(
+        "INSERT INTO tenant_saas.potential_users \
+         (user_id, username, first_name, last_name, message_text, keywords, profile_tags, \
+          group_id, group_title, tenant_id, captured_at) \
+         SELECT DISTINCT ON (gm.tenant_id, gm.user_id) \
+                gm.user_id, gm.username, member.first_name, member.last_name, \
+                left(gm.content, 2000), '', '', \
+                gm.group_id, tracked.group_title, gm.tenant_id, gm.timestamp \
+         FROM groups.group_messages gm \
+         JOIN groups.tracked_groups tracked \
+           ON tracked.group_id = gm.group_id AND tracked.tenant_id = gm.tenant_id \
+         LEFT JOIN groups.group_members member \
+           ON member.group_id = gm.group_id AND member.user_id = gm.user_id \
+          AND member.tenant_id = gm.tenant_id \
+         WHERE gm.tenant_id = $1 \
+           AND tracked.is_monitored = true \
+           AND gm.sender_type = 'user' \
+           AND gm.ad_score >= 40 \
+           AND gm.tg_msg_id IS NOT NULL \
+           AND NULLIF(btrim(gm.content), '') IS NOT NULL \
+         ORDER BY gm.tenant_id, gm.user_id, gm.timestamp DESC \
+         ON CONFLICT (tenant_id, user_id) DO UPDATE \
+           SET username = EXCLUDED.username, first_name = EXCLUDED.first_name, \
+               last_name = EXCLUDED.last_name, message_text = EXCLUDED.message_text, \
+               group_id = EXCLUDED.group_id, group_title = EXCLUDED.group_title, \
+               updated_at = now()",
+    )
+    .bind(tenant_id)
+    .execute(pool)
+    .await?;
+    let affected = result.rows_affected();
+    let text = if locale == "en" {
+        format!(
+            "✅ Potential user sync triggered (Beta simplified). Captured/updated {affected} users."
+        )
+    } else {
+        format!("✅ 已触发潜客同步（Beta 简化版），本次捕获/更新 {affected} 位潜客。")
+    };
+    info!(tenant_id, affected, "potential user sync triggered via /sync_potential");
+    Ok((text, None))
+}
+
+/// /price 行情查询（Binance 公共 API，对齐 Python crypto_price.py）。
+async fn price_reply(
+    pool: &PgPool,
+    symbol: Option<&str>,
+    locale: &str,
+) -> Result<(String, Option<Value>), anyhow::Error> {
+    let symbol = symbol.map(str::trim).filter(|s| !s.is_empty());
+    let Some(symbol) = symbol else {
+        return Ok((
+            if locale == "en" {
+                "Usage: /price <SYMBOL>  e.g. /price BTC".into()
+            } else {
+                "用法：/price <币种>  例如 /price BTC".into()
+            },
+            None,
+        ));
+    };
+    let sym = if symbol.contains('/') {
+        symbol.replace('/', "")
+    } else if symbol.to_uppercase().ends_with("USDT") {
+        symbol.to_string()
+    } else {
+        format!("{symbol}USDT")
+    };
+    let client = BinanceClient::from_env().context("failed to init binance client")?;
+    match client.get_24hr_ticker(&sym).await {
+        Ok(t) => {
+            let text = if locale == "en" {
+                format!(
+                    "💰 {}\nPrice: {}\n24h: {}%\nRange: {} ~ {}",
+                    t.symbol, t.last_price, t.price_change_percent, t.low_price, t.high_price
+                )
+            } else {
+                format!(
+                    "💰 {}\n最新价: {}\n24h: {}%\n区间: {} ~ {}",
+                    t.symbol, t.last_price, t.price_change_percent, t.low_price, t.high_price
+                )
+            };
+            Ok((text, None))
+        }
+        Err(error) => Ok((
+            format!(
+                "{} {}",
+                if locale == "en" { "Query failed:" } else { "查询失败:" },
+                error
+            ),
+            None,
+        )),
+    }
+}
+
+/// 管理员回复指定用户（/reply）：发送 + 入库。
+async fn admin_reply_to_user(
+    pool: &PgPool,
+    telegram: &TelegramClient,
+    tenant_id: &str,
+    target: i64,
+    text: &str,
+) -> Result<(), String> {
+    let bot_id: Option<i64> = sqlx::query_scalar("SELECT bot_id FROM merchants WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let bot_id = bot_id.unwrap_or(0);
+    let sent = telegram
+        .send_message(SendMessageParams {
+            chat_id: target,
+            text: text.to_string(),
+            parse_mode: None,
+            reply_markup: None,
+            reply_to_message_id: None,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO chat.messages          (trace_id, from_userid, to_userid, content, msg_type, is_read, tg_msg_id, status, tenant_id)          VALUES (gen_random_uuid()::text, $1, $2, $3, 'text', true, $4, 'sent', $5)",
+    )
+    .bind(bot_id)
+    .bind(target)
+    .bind(text)
+    .bind(sent.message_id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// /status 真实运行报告（对齐 Python status.py 的健康报告，简化版）。
+/// 返回：消息总数、24h 消息、未读用户数、监听群数、地址监听数。
+async fn system_status_reply(
+    pool: &PgPool,
+    tenant_id: &str,
+    locale: &str,
+) -> Result<(String, Option<Value>), anyhow::Error> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.messages WHERE tenant_id = $1 AND is_deleted = false",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+    let today: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.messages WHERE tenant_id = $1 AND is_deleted = false          AND timestamp >= now() - interval '24 hours'",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+    let unread_users: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.admin_inbox WHERE tenant_id = $1 AND unread_count > 0",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+    let groups: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM groups.tracked_groups WHERE tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+    let monitors: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM address_monitors WHERE tenant_id = $1 AND is_active = true",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+    let text = if locale == "en" {
+        format!(
+            "📊 System Status
+
+Messages (total): {total}
+Messages (24h): {today}
+Unread users: {unread_users}
+Tracked groups: {groups}
+Active monitors: {monitors}"
+        )
+    } else {
+        format!(
+            "📊 系统运行状态
+
+消息总数: {total}
+24 小时消息: {today}
+未读会话: {unread_users}
+监听群数: {groups}
+地址监听: {monitors}"
+        )
+    };
+    Ok((text, None))
 }
 
 fn parse_job_key(payload: &Value) -> Result<TelegramCommandJobKey> {
