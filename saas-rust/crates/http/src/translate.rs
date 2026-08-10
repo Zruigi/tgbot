@@ -7,8 +7,9 @@
 //! 开关默认开启（get_config 默认 true），关闭后本模块直接跳过。
 
 use regex::Regex;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::sync::OnceLock;
+use tracing::warn;
 use tgbot_integrations::litellm::LiteLLMClient;
 
 // ---------------------------------------------------------------------------
@@ -265,7 +266,13 @@ pub async fn translate_to_admin(
     let system_prompt = build_system_prompt_for_user_to_admin();
     let user_prompt = format!("请翻译以下用户消息：\n{shielded}");
 
-    let raw = llm.simple_chat(&system_prompt, &user_prompt).await.ok()?;
+    let raw = match llm.simple_chat(&system_prompt, &user_prompt).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            warn!(%error, "translate_to_admin: LLM call failed, skip translation");
+            return None;
+        }
+    };
 
     let mut translated = parse_llm_translation_output(&raw);
 
@@ -357,11 +364,51 @@ pub fn detect_language(text: &str) -> &'static str {
 /// 管理员 → 用户翻译（双向翻译的回复方向）。
 /// 用户消息语言非中文、且管理员回复含中文时，译为用户语言；
 /// 否则返回 None（不翻译）。带地址脱敏/回填/一致性校验。
+
+/// 取用户最近的对话上下文（管理员/用户交替，最多 limit 条），供翻译理解语境。
+async fn recent_dialog_context(
+    pool: &PgPool,
+    user_id: i64,
+    tenant_id: &str,
+    limit: i64,
+) -> String {
+    let Ok(rows) = sqlx::query(
+        "SELECT from_userid, content FROM chat.messages          WHERE (from_userid = $1 OR to_userid = $1) AND tenant_id = $2            AND is_deleted = false AND msg_type = 'text'            AND NULLIF(btrim(content), '') IS NOT NULL          ORDER BY id DESC LIMIT $3",
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    else {
+        return String::new();
+    };
+    rows.iter()
+        .rev()
+        .filter_map(|row| {
+            let from: Option<i64> = row.try_get("from_userid").ok();
+            let content: Option<String> = row.try_get("content").ok();
+            match (from, content) {
+                (Some(from), Some(content)) if from == user_id => {
+                    Some(format!("用户: {}", content.chars().take(120).collect::<String>()))
+                }
+                (Some(_), Some(content)) => {
+                    Some(format!("客服: {}", content.chars().take(120).collect::<String>()))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub async fn translate_to_customer(
     llm: &LiteLLMClient,
     pool: &PgPool,
     content: &str,
     customer_msg: &str,
+    user_id: i64,
+    tenant_id: &str,
 ) -> Option<String> {
     if !global_translate_enabled(pool).await {
         return None;
@@ -379,14 +426,28 @@ pub async fn translate_to_customer(
     let system_prompt = format!(
         "你是专业翻译。将管理员回复译为目标语言：{target_lang}。\n\
          只输出译文，不要解释。保留占位符 [[ADDR_N]] 不变。\n\
-         若原文已是目标语言，保持原文。\n"
+         若原文已是目标语言，保持原文。\n\
+         结合下方最近的对话上下文理解语境，保持术语与语气一致。"
     );
 
     let (shielded, mapping) = shield_text(content);
     if shielded.trim().is_empty() {
         return None;
     }
-    let raw = llm.simple_chat(&system_prompt, &shielded).await.ok()?;
+    // 最近对话上下文（最多 6 条）：让翻译理解上下文关联（对齐用户诉求）
+    let context = recent_dialog_context(pool, user_id, tenant_id, 6).await;
+    let user_prompt = if context.is_empty() {
+        shielded.clone()
+    } else {
+        format!("最近的对话上下文（仅供理解语境）：\n{context}\n\n请翻译这条管理员回复：\n{shielded}")
+    };
+    let raw = match llm.simple_chat(&system_prompt, &user_prompt).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            warn!(%error, "translate_to_customer: LLM call failed, skip translation");
+            return None;
+        }
+    };
     let translated = raw.trim_matches(&['"', '\''][..]).trim().to_string();
     let final_text = unshield_text(&translated, &mapping);
     if !verify_address_consistency(content, &final_text) {

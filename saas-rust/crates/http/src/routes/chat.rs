@@ -148,22 +148,32 @@ pub async fn get_messages(
         }
     }
 
-    // Resolve bot_id for the query. Platform administrators must explicitly
-    // select a tenant; the old bot_id=0 sentinel silently returned an empty
-    // success response and could hide a missing tenant context.
+    // Resolve bot_id for the query. Platform administrators may pass ?tenant_id;
+    // when absent, fall back to the user's most recent tenant (align Python,
+    // which queries unconditionally for platform admins).
     let (bot_id, history_tenant_id) = if scope.role == Role::PlatformAdmin {
-        let tenant_id = q
+        match q
             .tenant_id
             .as_deref()
             .map(str::trim)
             .filter(|tenant_id| !tenant_id.is_empty())
-            .ok_or_else(|| {
-                ApiError::BadRequest("tenant_id is required for platform chat history".into())
-            })?;
-        let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
-            .await?
-            .ok_or_else(|| ApiError::BadRequest("tenant has no bot configured".into()))?;
-        (Some(bot_id), Some(tenant_id.to_owned()))
+        {
+            Some(tenant_id) => {
+                let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, tenant_id)
+                    .await?
+                    .ok_or_else(|| ApiError::BadRequest("tenant has no bot configured".into()))?;
+                (Some(bot_id), Some(tenant_id.to_owned()))
+            }
+            None => {
+                let tenant = resolve_user_tenant(state.db()?, user_id).await?.ok_or_else(|| {
+                    ApiError::BadRequest("unable to resolve tenant for chat history".into())
+                })?;
+                let bot_id = user_repo::get_bot_id_for_tenant(state.db()?, &tenant)
+                    .await?
+                    .ok_or_else(|| ApiError::BadRequest("tenant has no bot configured".into()))?;
+                (Some(bot_id), Some(tenant))
+            }
+        }
     } else {
         (
             resolve_bot_id_for_scope(&state, &scope).await?,
@@ -205,6 +215,12 @@ pub async fn send_message(
     let headers = request.headers().clone();
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
+    // 对齐 Python：负 user_id（虚拟助手会话）拒绝
+    if user_id < 0 {
+        return Err(ApiError::BadRequest(
+            "虚拟助手会话请使用 /api/ai/chat".into(),
+        ));
+    }
     // 平台 admin（scope.tenant_id 为空）时：优先用请求参数 ?tenant_id，
     // 否则从目标用户最近消息反查租户（对齐 Python api_send_message 平台管理员可全局发送）。
     let tenant_id = match scope.tenant_id.as_deref() {
@@ -268,6 +284,8 @@ pub async fn send_message(
                         state.db()?,
                         &content,
                         &customer_msg,
+                        user_id,
+                        &tenant_id,
                     )
                     .await
                     {
@@ -456,11 +474,26 @@ pub async fn mark_read(
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
 
-    let bot_id = resolve_bot_id_for_scope(&state, &scope).await?;
-    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
-    let bid = bot_id.ok_or(ApiError::Forbidden)?;
-    ensure_tenant_user(&state, user_id, tenant_id, bid).await?;
-    user_repo::mark_messages_as_read(state.db()?, user_id, bid, tenant_id).await?;
+    // 平台 admin（tenant 为空）时反查用户租户 + 租户 bot（对齐 send_message fallback）
+    let (tenant_id, bid) = match scope.tenant_id.as_deref() {
+        Some(tenant) => {
+            let bid = resolve_bot_id_for_scope(&state, &scope)
+                .await?
+                .ok_or(ApiError::Forbidden)?;
+            (tenant.to_string(), bid)
+        }
+        None => {
+            let tenant = resolve_user_tenant(state.db()?, user_id)
+                .await?
+                .ok_or(ApiError::Forbidden)?;
+            let bid = user_repo::get_bot_id_for_tenant(state.db()?, &tenant)
+                .await?
+                .ok_or(ApiError::Forbidden)?;
+            (tenant, bid)
+        }
+    };
+    ensure_tenant_user(&state, user_id, &tenant_id, bid).await?;
+    user_repo::mark_messages_as_read(state.db()?, user_id, bid, &tenant_id).await?;
 
     Ok(Json(json!({"status": "ok"})))
 }

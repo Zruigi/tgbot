@@ -914,7 +914,7 @@ async fn deliver_admin_reply(
     let mut translated_text: Option<String> = None;
     if let Ok(Some(customer_msg)) = user_last_text(pool, target_user, &entry.tenant_id).await {
         if let Some(translated) =
-            translate::translate_to_customer(llm, pool, text, &customer_msg).await
+            translate::translate_to_customer(llm, pool, text, &customer_msg, target_user, &entry.tenant_id).await
         {
             send_text = translated.clone();
             translated_text = Some(translated);
