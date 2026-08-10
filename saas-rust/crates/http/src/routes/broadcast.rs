@@ -51,7 +51,13 @@ pub async fn list_broadcast_targets(
     Query(query): Query<BroadcastTargetsQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _) = scope.require_merchant()?;
+    // 平台 admin 允许：回退到默认租户（对齐 Web 端其他端点的 tenant 回退策略）
+    let tenant_id = if scope.role == Role::PlatformAdmin {
+        scope.tenant_id.clone().unwrap_or_else(|| "default".into())
+    } else {
+        let (tid, _) = scope.require_merchant()?;
+        tid
+    };
     let chat_types = query.chat_types.as_ref().map(|value| {
         value
             .split(',')
@@ -80,7 +86,12 @@ pub async fn sync_broadcast_targets(
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
-    let (tenant_id, _) = scope.require_merchant()?;
+    let tenant_id = if scope.role == Role::PlatformAdmin {
+        scope.tenant_id.clone().unwrap_or_else(|| "default".into())
+    } else {
+        let (tid, _) = scope.require_merchant()?;
+        tid
+    };
     let result = sqlx::query(
         r#"
         INSERT INTO broadcast.broadcast_targets
@@ -770,7 +781,7 @@ fn parse_truthy(value: &str) -> bool {
 }
 
 fn require_write_access(scope: &tgbot_domain::scope::Scope) -> ApiResult<()> {
-    if matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin) {
+    if matches!(scope.role, Role::MerchantOwner | Role::MerchantAdmin | Role::PlatformAdmin) {
         Ok(())
     } else {
         Err(ApiError::Forbidden)
