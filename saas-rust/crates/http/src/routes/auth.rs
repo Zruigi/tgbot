@@ -126,6 +126,7 @@ fn build_session_token_payload(
     tenant_id: &str,
     merchant_id: Option<i64>,
     issued_for: Option<&str>,
+    ttl_secs: i64,
 ) -> Value {
     let issued_at = chrono::Utc::now().timestamp();
     json!({
@@ -135,7 +136,7 @@ fn build_session_token_payload(
         "merchant_id": merchant_id,
         "issued_for": issued_for.unwrap_or(""),
         "iat": issued_at,
-        "exp": issued_at + 24 * 60 * 60
+        "exp": issued_at + ttl_secs
     })
 }
 
@@ -152,11 +153,12 @@ pub(crate) fn issue_session_token(
     tenant_id: &str,
     merchant_id: Option<i64>,
     issued_for: Option<&str>,
+    ttl_secs: i64,
 ) -> Option<String> {
     if session_secret.as_bytes().len() < 32 {
         return None;
     }
-    let payload = build_session_token_payload(role, tenant_id, merchant_id, issued_for);
+    let payload = build_session_token_payload(role, tenant_id, merchant_id, issued_for, ttl_secs);
     let payload_json = serde_json::to_string(&payload).ok()?;
 
     // 使用标准 base64 编码
@@ -225,6 +227,9 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub token: Option<String>,
+    /// 生成长效 OTP（默认 5 分钟；true = 7 天，用于一次性公网面板链接）
+    #[serde(default)]
+    pub long_lived: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,15 +268,23 @@ pub async fn login(
     // Generate OTP (for compatibility, we issue session token directly)
     let otp = generate_secure_token(12);
     let now = chrono::Utc::now().timestamp() as f64;
-    let expire_at = now + 300.0; // 5 minutes TTL
+    // 默认 5 分钟 TTL；long_lived=true 时为 7 天（公网一次性链接）
+    let ttl = if body.long_lived {
+        7.0 * 24.0 * 3600.0
+    } else {
+        300.0
+    };
+    let expire_at = now + ttl;
 
     // Store OTP with session token
+    let session_ttl = if body.long_lived { 7 * 24 * 3600 } else { 24 * 3600 };
     let session_token = issue_session_token(
         &state.config.session_secret,
         "platform_admin",
         "",
         None,
         Some("admin"),
+        session_ttl,
     )
     .ok_or_else(|| ApiError::ServiceUnavailable("session signing unavailable".into()))?;
     let otp_data = OtpData {
@@ -463,6 +476,7 @@ pub async fn login_tma(
         &tenant_id,
         merchant_id_hint,
         user_json_ref,
+        24 * 3600,
     )
     .ok_or_else(|| ApiError::ServiceUnavailable("session signing unavailable".into()))?;
 
@@ -632,6 +646,7 @@ pub async fn generate_otp_internal(
         &tenant_id,
         merchant_id,
         issued_for.as_deref(),
+        24 * 3600,
     )
     .ok_or_else(|| ApiError::ServiceUnavailable("session signing unavailable".into()))?;
 
@@ -657,14 +672,26 @@ mod tests {
     #[test]
     fn session_tokens_require_the_deployment_secret_and_round_trip() {
         let secret = "beta-session-secret-012345678901234567";
-        let token = issue_session_token(secret, "merchant_owner", "tenant-a", None, Some("actor"))
+        let token = issue_session_token(
+        secret,
+        "merchant_owner",
+        "tenant-a",
+        None,
+        Some("actor"),
+        24 * 3600,)
             .expect("valid secret should sign a session");
 
         let payload = verify_session_token(&token, secret).expect("signed token should verify");
         assert_eq!(payload["role"], "merchant_owner");
         assert!(verify_session_token(&token, "wrong-secret-012345678901234567890").is_none());
         assert!(
-            issue_session_token("too-short", "merchant_owner", "tenant-a", None, None).is_none()
+            issue_session_token(
+        "too-short",
+        "merchant_owner",
+        "tenant-a",
+        None,
+        None,
+        24 * 3600,).is_none()
         );
     }
 

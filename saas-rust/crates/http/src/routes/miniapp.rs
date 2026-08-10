@@ -290,6 +290,7 @@ pub async fn bootstrap(
                                         &tenant_id,
                                         merchant_id,
                                         Some(&user_json),
+                                        24 * 3600,
                                     )
                                     .ok_or_else(|| {
                                         ApiError::ServiceUnavailable(
@@ -355,6 +356,7 @@ pub async fn bootstrap(
                     &otp_data.tenant_id,
                     otp_data.merchant_id,
                     otp_data.issued_for.as_deref(),
+                    24 * 3600,
                 )
                 .ok_or_else(|| {
                     ApiError::ServiceUnavailable("session signing unavailable".into())
@@ -378,6 +380,7 @@ pub async fn bootstrap(
                 &grant_data.tenant_id,
                 grant_data.merchant_id,
                 Some(&grant_data.issued_for),
+                24 * 3600,
             )
             .ok_or_else(|| ApiError::ServiceUnavailable("session signing unavailable".into()))?;
             token = Some(session_token.clone());
