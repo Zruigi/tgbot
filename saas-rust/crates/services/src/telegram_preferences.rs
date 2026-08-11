@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 pub const DEFAULT_TELEGRAM_LOCALE: &str = "zh-CN";
 pub const SUPPORTED_TELEGRAM_LOCALES: [&str; 2] = ["en", "zh-CN"];
@@ -155,6 +155,203 @@ pub async fn set_telegram_locale(
     .execute(pool)
     .await?;
     Ok(locale.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// 主菜单 / 控制台入口（对齐 Python handlers/start.py 的卡片菜单）
+// ---------------------------------------------------------------------------
+
+/// 查询 Telegram 用户在控制台场景下的角色：是否平台管理员、是否商户 owner
+pub async fn user_console_roles(pool: &PgPool, tg_user_id: i64) -> Result<(bool, bool)> {
+    let is_platform_admin = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+             SELECT 1 FROM auth.users u \
+             JOIN auth.saas_user_roles r ON r.user_id = u.id \
+             WHERE u.tg_user_id = $1 AND r.role = 'platform_admin' \
+         )",
+    )
+    .bind(tg_user_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+    let has_merchant = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+             SELECT 1 FROM merchants \
+             WHERE owner_tg_user_id = $1 AND status IN ('active', 'active_free') \
+         )",
+    )
+    .bind(tg_user_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+    Ok((is_platform_admin, has_merchant))
+}
+
+/// 查询该 Telegram 用户拥有的商户：(tenant_id, legacy_merchant_id)
+pub async fn merchant_console_by_owner(
+    pool: &PgPool,
+    tg_user_id: i64,
+) -> Result<Option<(String, Option<i64>)>> {
+    let row = sqlx::query(
+        "SELECT tenant_id, legacy_merchant_id FROM merchants \
+         WHERE owner_tg_user_id = $1 AND status IN ('active', 'active_free') \
+         ORDER BY created_at LIMIT 1",
+    )
+    .bind(tg_user_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.try_get::<String, _>("tenant_id")?,
+        row.try_get::<Option<i64>, _>("legacy_merchant_id")?,
+    )))
+}
+
+/// 构建 /start 主菜单（对齐 Python _admin_keyboard/_user_keyboard）
+///
+/// 管理员额外显示 Web 管理后台；普通用户显示联系人工客服；
+/// 商户 owner 显示商户控制台，否则显示注册机器人入口（点击后提示未绑定）。
+pub fn build_full_start_menu(
+    is_platform_admin: bool,
+    has_merchant_console: bool,
+    first_name: &str,
+    user_id: i64,
+    locale: &str,
+) -> (String, Option<Value>) {
+    let locale = normalize_telegram_locale(locale).unwrap_or(DEFAULT_TELEGRAM_LOCALE);
+    let role_tag = if is_platform_admin {
+        "👑 管理员"
+    } else if has_merchant_console {
+        "🏪 商户"
+    } else {
+        "👤 用户"
+    };
+    let text = if locale == "en" {
+        format!(
+            "Hello, {first_name} {role_tag}\nUserID: <code>{user_id}</code>\n\nPlease select a function:"
+        )
+    } else {
+        format!(
+            "你好，{first_name} {role_tag}\nUserID: <code>{user_id}</code>\n\n请选择功能："
+        )
+    };
+
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    if is_platform_admin {
+        rows.push(vec![json!({
+            "text": "🌐 Web 管理后台",
+            "callback_data": "admin_web_otp",
+        })]);
+    }
+    rows.push(vec![json!({
+        "text": "🎧 联系人工客服",
+        "callback_data": "contact_admin",
+    })]);
+    rows.push(vec![json!({
+        "text": if has_merchant_console { "🏪 商户控制台" } else { "🤖 注册机器人" },
+        "callback_data": "merchant_web_otp",
+    })]);
+    rows.push(vec![
+        json!({
+            "text": "👛 监听钱包",
+            "callback_data": "wallet_monitor",
+        }),
+        json!({
+            "text": "📋 我的列表",
+            "callback_data": "wallet_my_list",
+        }),
+    ]);
+    rows.push(vec![json!({
+        "text": "🌐 语言选择",
+        "callback_data": "lang_menu",
+    })]);
+
+    (text, Some(json!({ "inline_keyboard": rows })))
+}
+
+/// 构建控制台入口卡片（web_app 打开 Mini App + 浏览器兜底 OTP + 返回主菜单）
+pub fn build_console_entry_card(
+    locale: &str,
+    miniapp_url: &str,
+    browser_url: &str,
+    is_merchant: bool,
+) -> (String, Option<Value>) {
+    let _ = locale;
+    let text = if is_merchant {
+        "🏪 商户控制台\n\nMini App 主入口会优先使用 Telegram 身份自动登录。\n浏览器兜底入口仍保留 OTP，并在同设备内支持无感续签。"
+    } else {
+        "🚀 Web 管理后台\n\nMini App 主入口会优先使用 Telegram 身份自动登录。\n浏览器兜底入口仍保留 OTP，并在同设备内支持无感续签。"
+    };
+    let open_label = if is_merchant {
+        "🏪 打开商户控制台"
+    } else {
+        "🚀 打开管理后台"
+    };
+    let keyboard = json!({
+        "inline_keyboard": [
+            [{ "text": open_label, "web_app": { "url": miniapp_url } }],
+            [{ "text": "🌐 浏览器打开", "url": browser_url }],
+            [{ "text": "⬅️ 返回主菜单", "callback_data": "back_to_start" }],
+        ]
+    });
+    (text.to_string(), Some(keyboard))
+}
+
+/// 构建控制台入口 URL：(miniapp_url, browser_url)。
+/// browser_url 额外带 otp，浏览器打开后 LoginView 自动登录（无需手工输 token）。
+pub fn console_entry_urls(
+    frontend_url: &str,
+    entry_intent: &str,
+    grant: &str,
+    otp: Option<&str>,
+    tenant_id: Option<&str>,
+    merchant_id: Option<i64>,
+) -> (String, String) {
+    let base = frontend_url.trim().trim_end_matches('/');
+    let mut params = Vec::new();
+    params.push(("entry".to_string(), entry_intent.to_string()));
+    params.push(("grant".to_string(), grant.to_string()));
+    if let Some(tenant_id) = tenant_id.filter(|value| !value.trim().is_empty()) {
+        params.push(("tenant".to_string(), tenant_id.trim().to_string()));
+    }
+    if let Some(merchant_id) = merchant_id.filter(|value| *value > 0) {
+        params.push(("merchant_id".to_string(), merchant_id.to_string()));
+    }
+    let miniapp_url = build_miniapp_url(base, &params);
+    let mut browser_params = params.clone();
+    if let Some(otp) = otp.filter(|value| !value.trim().is_empty()) {
+        browser_params.push(("otp".to_string(), otp.trim().to_string()));
+    }
+    let browser_url = build_miniapp_url(base, &browser_params);
+    (miniapp_url, browser_url)
+}
+
+fn build_miniapp_url(base: &str, params: &[(String, String)]) -> String {
+    if base.is_empty() {
+        return String::new();
+    }
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", urlencode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}/miniapp?{query}")
+}
+
+/// 极简 urlencode（对齐 Python urllib.parse.quote 的主要场景）
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

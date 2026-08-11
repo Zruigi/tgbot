@@ -129,6 +129,8 @@ async fn main() -> anyhow::Result<()> {
     configure_bot_menus(&bot_registry).await;
 
     // Initialize update dispatcher with default handlers
+    let otp_store = OtpStore::new();
+    let grant_store = GrantStore::new();
     let dispatcher = Arc::new(UpdateDispatcher::new());
     install_default_handlers(
         &dispatcher,
@@ -136,6 +138,10 @@ async fn main() -> anyhow::Result<()> {
         llm.clone(),
         std::env::var("TELEGRAM_API_BASE_URL")
             .unwrap_or_else(|_| "https://api.telegram.org".into()),
+        grant_store.clone(),
+        otp_store.clone(),
+        config.session_secret.clone(),
+        config.frontend_url.clone(),
     )
     .await;
 
@@ -238,9 +244,9 @@ async fn main() -> anyhow::Result<()> {
         pool,
         supabase,
         llm,
-        otp_store: OtpStore::new(),
+        otp_store,
         csrf_store: CsrfStore::new(),
-        grant_store: GrantStore::new(),
+        grant_store,
         bot_registry,
         worker_enabled,
         worker_telemetry,

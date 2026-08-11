@@ -18,6 +18,8 @@ pub struct Config {
     pub telegram_commands_enabled: bool,
     pub telegram_wallet_monitors_enabled: bool,
     pub cors_allowed_origin: String,
+    /// 前端门户域名（拼 Mini App / 浏览器兜底 OTP 链接），来自 FRONTEND_URL 或 WEB_BASE_URL
+    pub frontend_url: String,
 }
 
 impl Config {
@@ -78,6 +80,9 @@ impl Config {
             ),
             cors_allowed_origin: std::env::var("CORS_ALLOWED_ORIGIN")
                 .unwrap_or_else(|_| "*".to_string()),
+            frontend_url: std::env::var("FRONTEND_URL")
+                .or_else(|_| std::env::var("WEB_BASE_URL"))
+                .unwrap_or_default(),
         })
     }
 }

@@ -16,19 +16,23 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::resolve_scope;
+use crate::routes::auth::{issue_session_token, OtpData, OtpStore};
+use crate::routes::miniapp::{GrantData, GrantStore};
 use crate::secret_crypto::SecretCipher;
 use crate::state::AppState;
 use crate::translate;
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_integrations::litellm::LiteLLMClient;
 use tgbot_integrations::telegram::{
-    AnswerCallbackQueryParams, EditMessageTextParams, TelegramClient, TelegramConfig,
+    AnswerCallbackQueryParams, EditMessageTextParams, SendMessageParams, TelegramClient,
+    TelegramConfig,
 };
 use tgbot_repos::{audit_repo, message_repo};
 use tgbot_services::ad_text::ad_text_hash;
 use tgbot_services::telegram_preferences::{
-    language_menu_reply, localized_start_menu_reply, parse_language_callback, set_telegram_locale,
-    telegram_locale, LanguageCallback,
+    build_console_entry_card, build_full_start_menu, console_entry_urls, language_menu_reply,
+    merchant_console_by_owner, parse_language_callback, set_telegram_locale, telegram_locale,
+    user_console_roles, LanguageCallback,
 };
 use tgbot_services::telegram_wallet::{
     wallet_admin_list_reply_for_locale, wallet_list_reply_for_locale, wallet_monitor_prompt,
@@ -626,6 +630,10 @@ pub async fn install_default_handlers(
     pool: Option<sqlx::PgPool>,
     llm: LiteLLMClient,
     telegram_api_base_url: String,
+    grant_store: GrantStore,
+    otp_store: OtpStore,
+    session_secret: String,
+    frontend_url: String,
 ) {
     let message_pool = pool.clone();
     let message_llm = llm.clone();
@@ -680,12 +688,35 @@ pub async fn install_default_handlers(
 
     // Callback query handler
     let callback_pool = pool.clone();
+    let callback_grant_store = grant_store.clone();
+    let callback_otp_store = otp_store.clone();
+    let callback_session_secret = session_secret.clone();
+    let callback_frontend_url = frontend_url.clone();
     dispatcher
         .on(UpdateKind::CallbackQuery, move |update, entry| {
             let pool = callback_pool.clone();
             let telegram_api_base_url = telegram_api_base_url.clone();
+            let grant_store = callback_grant_store.clone();
+            let otp_store = callback_otp_store.clone();
+            let session_secret = callback_session_secret.clone();
+            let frontend_url = callback_frontend_url.clone();
             async move {
                 let pool = require_webhook_pool(pool.as_ref())?;
+                // 控制台菜单回调（主菜单 / 管理后台入口 / 商户控制台入口 / 客服）
+                if handle_console_callback(
+                    &update,
+                    &entry,
+                    Some(pool),
+                    &telegram_api_base_url,
+                    &grant_store,
+                    &otp_store,
+                    &session_secret,
+                    &frontend_url,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
                 if handle_channel_subscription_callback(
                     &update,
                     &entry,
@@ -2566,6 +2597,286 @@ fn parse_wallet_callback(data: &str) -> Option<WalletCallback> {
         })
 }
 
+/// 控制台菜单回调：主菜单 / Web 管理后台入口 / 商户控制台入口 / 联系客服
+///
+/// 对齐 Python handlers/start.py 的卡片菜单迁移：
+/// - back_to_start     → 重建完整主菜单（管理员/商户/用户角色区分）
+/// - admin_web_otp     → 生成 Web 管理后台入口（web_app + 浏览器兜底 OTP）
+/// - merchant_web_otp  → 生成商户控制台入口（无商户则提示未绑定）
+/// - contact_admin     → 客服说明
+async fn handle_console_callback(
+    update: &TelegramUpdate,
+    entry: &BotEntry,
+    pool: Option<&sqlx::PgPool>,
+    telegram_api_base_url: &str,
+    grant_store: &GrantStore,
+    otp_store: &OtpStore,
+    session_secret: &str,
+    frontend_url: &str,
+) -> Result<bool, String> {
+    let Some(callback) = update.callback_query.as_ref() else {
+        return Ok(false);
+    };
+    let Some(data) = callback.get("data").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let action = match data {
+        "back_to_start" | "admin_web_otp" | "merchant_web_otp" | "contact_admin" => data,
+        _ => return Ok(false),
+    };
+    let Some(pool) = pool else {
+        return Ok(false);
+    };
+    let Some(callback_id) = callback.get("id").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(user_id) = callback
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+    else {
+        return Ok(false);
+    };
+    let message = callback.get("message");
+    let callback_chat_id = message
+        .and_then(|message| message.get("chat"))
+        .and_then(|chat| chat.get("id"))
+        .and_then(Value::as_i64);
+    let message_id = message
+        .and_then(|message| message.get("message_id"))
+        .and_then(Value::as_i64);
+    if callback_chat_id != Some(user_id) {
+        answer_console_callback(
+            telegram_api_base_url,
+            entry,
+            callback_id,
+            "请在私聊中操作",
+            true,
+        )
+        .await?;
+        return Ok(true);
+    }
+    let Some(message_id) = message_id else {
+        answer_console_callback(telegram_api_base_url, entry, callback_id, "请求无效", true)
+            .await?;
+        return Ok(true);
+    };
+    let telegram = TelegramClient::new(TelegramConfig {
+        bot_token: entry.bot_token.clone(),
+        api_base_url: telegram_api_base_url.to_string(),
+        timeout_secs: 30,
+    })
+    .map_err(|_| "failed to initialize Telegram client".to_string())?;
+    let first_name = callback
+        .get("from")
+        .and_then(|from| from.get("first_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("朋友");
+    let locale = telegram_locale(pool, &entry.tenant_id, user_id)
+        .await
+        .unwrap_or_else(|_| "zh-CN".to_string());
+
+    let (text, reply_markup) = match action {
+        "back_to_start" => {
+            let (is_platform_admin, has_merchant) = user_console_roles(pool, user_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            build_full_start_menu(is_platform_admin, has_merchant, first_name, user_id, &locale)
+        }
+        "admin_web_otp" => {
+            let grant = uuid::Uuid::new_v4().simple().to_string();
+            grant_store
+                .insert(
+                    grant.clone(),
+                    GrantData {
+                        grant_hash: String::new(),
+                        issued_for: user_id.to_string(),
+                        role_hint: "platform_admin".to_string(),
+                        tenant_id: String::new(),
+                        merchant_id: None,
+                        entry_intent: "admin_console".to_string(),
+                        expires_at: String::new(),
+                        ua_fingerprint: String::new(),
+                        proof_salt: String::new(),
+                    },
+                )
+                .await;
+            let (otp, otp_data) = make_console_otp(
+                session_secret,
+                "platform_admin",
+                "",
+                None,
+                &user_id.to_string(),
+                300.0,
+            );
+            otp_store.insert(otp.clone(), otp_data).await;
+            let (miniapp_url, browser_url) =
+                console_entry_urls(frontend_url, "admin_console", &grant, Some(&otp), None, None);
+            build_console_entry_card(&locale, &miniapp_url, &browser_url, false)
+        }
+        "merchant_web_otp" => {
+            let merchant = merchant_console_by_owner(pool, user_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            match merchant {
+                Some((tenant_id, legacy_merchant_id)) => {
+                    let grant = uuid::Uuid::new_v4().simple().to_string();
+                    grant_store
+                        .insert(
+                            grant.clone(),
+                            GrantData {
+                                grant_hash: String::new(),
+                                issued_for: user_id.to_string(),
+                                role_hint: "merchant_owner".to_string(),
+                                tenant_id: tenant_id.clone(),
+                                merchant_id: legacy_merchant_id,
+                                entry_intent: "merchant_console".to_string(),
+                                expires_at: String::new(),
+                                ua_fingerprint: String::new(),
+                                proof_salt: String::new(),
+                            },
+                        )
+                        .await;
+                    let (otp, otp_data) = make_console_otp(
+                        session_secret,
+                        "merchant_owner",
+                        &tenant_id,
+                        legacy_merchant_id,
+                        &user_id.to_string(),
+                        300.0,
+                    );
+                    otp_store.insert(otp.clone(), otp_data).await;
+                    let (miniapp_url, browser_url) = console_entry_urls(
+                        frontend_url,
+                        "merchant_console",
+                        &grant,
+                        Some(&otp),
+                        Some(&tenant_id),
+                        legacy_merchant_id,
+                    );
+                    build_console_entry_card(&locale, &miniapp_url, &browser_url, true)
+                }
+                None => (
+                    "⚠️ 当前 Telegram 账号未绑定商户".to_string(),
+                    Some(json!({
+                        "inline_keyboard": [[{
+                            "text": "⬅️ 返回主菜单",
+                            "callback_data": "back_to_start"
+                        }]]
+                    })),
+                ),
+            }
+        }
+        "contact_admin" => (
+            "🎧 人工客服\n\n请直接在当前私聊窗口发送文字、图片、语音或文件，消息会进入客服双向会话。\n客服回复后，你也会在这里继续收到消息。"
+                .to_string(),
+            Some(json!({
+                "inline_keyboard": [[{
+                    "text": "⬅️ 返回主菜单",
+                    "callback_data": "back_to_start"
+                }]]
+            })),
+        ),
+        _ => unreachable!(),
+    };
+
+    match telegram
+        .edit_message_text(EditMessageTextParams {
+            chat_id: user_id,
+            message_id,
+            text: text.clone(),
+            parse_mode: None,
+            reply_markup: reply_markup.clone(),
+        })
+        .await
+    {
+        Ok(_) => {}
+        Err(edit_error) => {
+            // edit 失败（消息已被删/不存在等）→ 发送新消息兜底（对齐 Python）
+            warn!(
+                bot_id = entry.bot_id,
+                error = %edit_error,
+                "console callback edit_message_text failed, falling back to send_message"
+            );
+            if let Err(send_error) = telegram
+                .send_message(SendMessageParams {
+                    chat_id: user_id,
+                    text,
+                    parse_mode: None,
+                    reply_markup,
+                    reply_to_message_id: None,
+                })
+                .await
+            {
+                warn!(
+                    bot_id = entry.bot_id,
+                    error = %send_error,
+                    "console callback send_message fallback failed"
+                );
+            }
+        }
+    }
+    answer_console_callback(telegram_api_base_url, entry, callback_id, "", false).await?;
+    Ok(true)
+}
+
+/// 生成控制台入口 OTP（含预签发的 session token），返回 (otp, otp_data)
+fn make_console_otp(
+    session_secret: &str,
+    role: &str,
+    tenant_id: &str,
+    merchant_id: Option<i64>,
+    issued_for: &str,
+    ttl_secs: f64,
+) -> (String, OtpData) {
+    let otp = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+    let token = issue_session_token(
+        session_secret,
+        role,
+        tenant_id,
+        merchant_id,
+        Some(issued_for),
+        24 * 3600,
+    )
+    .unwrap_or_default();
+    let expire_at = chrono::Utc::now().timestamp() as f64 + ttl_secs;
+    (
+        otp,
+        OtpData {
+            token,
+            expire_at,
+            role: role.to_string(),
+            tenant_id: tenant_id.to_string(),
+            merchant_id,
+            issued_for: Some(issued_for.to_string()),
+        },
+    )
+}
+
+async fn answer_console_callback(
+    telegram_api_base_url: &str,
+    entry: &BotEntry,
+    callback_id: &str,
+    text: &str,
+    show_alert: bool,
+) -> Result<(), String> {
+    let telegram = TelegramClient::new(TelegramConfig {
+        bot_token: entry.bot_token.clone(),
+        api_base_url: telegram_api_base_url.to_string(),
+        timeout_secs: 30,
+    })
+    .map_err(|_| "failed to initialize Telegram client".to_string())?;
+    telegram
+        .answer_callback_query(AnswerCallbackQueryParams {
+            callback_query_id: callback_id.to_string(),
+            text: (!text.is_empty()).then(|| text.to_string()),
+            show_alert: Some(show_alert),
+        })
+        .await
+        .map_err(|_| "Telegram console callback acknowledgement failed".to_string())
+}
+
 /// 客服系统回调：cs_mark_read / cs_quick_reply / cs_close_session
 /// + 批量补发（quick_send / select_other_user / cancel_send / user_page / confirm_send_to）。
 /// （Python cs_callback_handler 的 Rust 版本）。
@@ -3540,14 +3851,22 @@ async fn handle_wallet_callback(
                 })),
             )
         }
-        WalletCallback::BackToStart => localized_start_menu_reply(
-            callback
-                .get("from")
-                .and_then(|from| from.get("first_name"))
-                .and_then(Value::as_str)
-                .unwrap_or("朋友"),
-            &locale,
-        ),
+        WalletCallback::BackToStart => {
+            let (is_platform_admin, has_merchant) = user_console_roles(pool, user_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            build_full_start_menu(
+                is_platform_admin,
+                has_merchant,
+                callback
+                    .get("from")
+                    .and_then(|from| from.get("first_name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("朋友"),
+                user_id,
+                &locale,
+            )
+        }
         WalletCallback::Deactivate(monitor_id) => {
             let deactivated = sqlx::query(
                 "UPDATE address_monitors SET is_active = false, updated_at = now() \
@@ -3670,12 +3989,18 @@ async fn handle_language_callback(
             let locale = set_telegram_locale(pool, &entry.tenant_id, user_id, locale)
                 .await
                 .map_err(|_| "failed to save Telegram language preference".to_string())?;
-            let (text, reply_markup) = localized_start_menu_reply(
+            let (is_platform_admin, has_merchant) = user_console_roles(pool, user_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let (text, reply_markup) = build_full_start_menu(
+                is_platform_admin,
+                has_merchant,
                 callback
                     .get("from")
                     .and_then(|from| from.get("first_name"))
                     .and_then(Value::as_str)
                     .unwrap_or("朋友"),
+                user_id,
                 &locale,
             );
             let answer_text = if locale == "en" {

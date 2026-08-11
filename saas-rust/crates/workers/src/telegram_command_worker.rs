@@ -11,7 +11,7 @@ use tgbot_services::telegram_commands::{
     parse_unmute_start_payload, TelegramCommand,
 };
 use tgbot_services::telegram_preferences::{
-    localized_command_reply, localized_start_menu_reply, telegram_locale,
+    build_full_start_menu, localized_command_reply, telegram_locale, user_console_roles,
 };
 use tgbot_services::telegram_wallet::{
     normalize_wallet_address, register_wallet_monitor, wallet_list_reply_for_locale,
@@ -131,7 +131,16 @@ impl Worker for TelegramCommandWorker {
                 start_payload_reply(pool, &key.tenant_id, &telegram, user_id, payload).await?
             }
             TelegramCommand::Start(None) => {
-                localized_start_menu_reply(first_name.as_deref().unwrap_or("朋友"), &locale)
+                let (is_platform_admin, has_merchant) = user_console_roles(pool, user_id)
+                    .await
+                    .context("failed to resolve console roles")?;
+                build_full_start_menu(
+                    is_platform_admin,
+                    has_merchant,
+                    first_name.as_deref().unwrap_or("朋友"),
+                    user_id,
+                    &locale,
+                )
             }
             TelegramCommand::Wallets => {
                 wallet_list_reply_for_locale(pool, &key.tenant_id, user_id, &locale).await?
