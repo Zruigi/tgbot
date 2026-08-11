@@ -15,6 +15,7 @@ pub mod miniapp;
 pub mod monitor;
 pub mod platform;
 pub mod potential_users;
+pub mod identity;
 pub mod session;
 pub mod telegram_auto_reply;
 pub mod telegram_webhook;
@@ -288,6 +289,15 @@ pub fn router() -> Router<AppState> {
             "/api/potential_users/:user_id/promote",
             post(potential_users::promote_user),
         )
+        // Identity — 智能身份识别与绑定（官方 Telegram API）
+        .route(
+            "/api/identity/identify",
+            get(identity::identify),
+        )
+        .route(
+            "/api/identity/bind",
+            post(identity::bind),
+        )
         // Broadcast / Push Task routes
         .route(
             "/api/broadcast/targets",
@@ -423,6 +433,7 @@ pub fn router() -> Router<AppState> {
         )
         // AI / Agent routes
         .route("/api/ai/chat", post(ai::ai_chat))
+        .route("/api/ai/conversations", get(ai::get_conversations))
         .route("/api/ai/detect_ad", post(ai::detect_ad))
         .route(
             "/api/ai/pipeline_mode",

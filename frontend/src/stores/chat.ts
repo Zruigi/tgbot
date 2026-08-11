@@ -27,6 +27,27 @@ const token = () => {
 }
 const authH = () => ({ 'Authorization': `Bearer ${token()}`, 'Content-Type': 'application/json' })
 
+// Agent 助手虚拟发送者 ID（与 ChatPanel.vue 的 AI_ASSISTANT_USER_ID 一致）
+const AI_ASSISTANT_SENDER_ID = -99999
+
+/** 把后端 agent.conversations 行映射为聊天渲染字段 */
+function mapAgentConversations(list: any[], fallbackUserId: number): any[] {
+  return (list || []).map((m: any) => ({
+    msg_id: m.id,
+    from_userid: m.role === 'user' ? (m.user_id || fallbackUserId) : AI_ASSISTANT_SENDER_ID,
+    to_userid: 0,
+    content: m.content || '',
+    media_url: m.media_url || null,
+    timestamp: m.created_at,
+    status: m.status === 'error' ? 'error' : 'received',
+    type: m.msg_type || 'text',
+    msg_type: m.msg_type || 'text',
+    requires_confirmation: !!m.requires_confirmation,
+    ui_actions: Array.isArray(m.ui_actions) ? m.ui_actions : [],
+    job: m.job || null,
+  }))
+}
+
 export const useChatStore = defineStore('chat', () => {
   const users = ref<any[]>([])
   const messages = ref<any[]>([])
@@ -79,6 +100,24 @@ export const useChatStore = defineStore('chat', () => {
     const res = await fetch(`/api/messages/${userId}?page=${page}`, { headers: authH(), keepalive: true })
     const d = await res.json()
     if (d.status === 'ok') return d.data || []
+    return []
+  }
+
+  /** ★ Agent 会话历史：走 /api/ai/conversations（替代 /api/messages/-99999，后者会 400/403） */
+  async function fetchAgentMessages(userId: number, page = 1) {
+    const res = await fetch(`/api/ai/conversations?page=${page}`, { headers: authH(), keepalive: true })
+    const d = await res.json()
+    console.log('Agent Conversations Received:', d)
+    if (d.status === 'ok') {
+      messages.value = mapAgentConversations(d.data || [], userId)
+      autoLoadMedia()
+    }
+  }
+
+  async function fetchMoreAgentMessages(userId: number, page: number): Promise<any[]> {
+    const res = await fetch(`/api/ai/conversations?page=${page}`, { headers: authH(), keepalive: true })
+    const d = await res.json()
+    if (d.status === 'ok') return mapAgentConversations(d.data || [], userId)
     return []
   }
 
@@ -143,6 +182,8 @@ export const useChatStore = defineStore('chat', () => {
     fetchUsers,
     fetchMessages,
     fetchMoreMessages,
+    fetchAgentMessages,
+    fetchMoreAgentMessages,
     loadFile,
     autoLoadFile,
     autoLoadMedia,

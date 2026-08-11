@@ -4,6 +4,7 @@ pub mod ad_pipeline;
 pub mod ad_text;
 pub mod feature_gate;
 pub mod group_policy;
+pub mod identity_service;
 pub mod telegram_auto_replies;
 pub mod telegram_commands;
 pub mod telegram_preferences;

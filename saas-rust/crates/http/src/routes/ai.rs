@@ -17,6 +17,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
+use uuid::Uuid;
 use std::{
     collections::BTreeMap,
     path::{Component, Path, PathBuf},
@@ -468,6 +469,51 @@ async fn record_agent_usage(
     .bind(0.0f64)
     .execute(pool)
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Agent 对话历史持久化（agent.conversations）
+// 落库失败仅告警，不阻断主流程 —— 历史是可恢复的非关键数据
+// ---------------------------------------------------------------------------
+
+struct AgentConversation<'a> {
+    tenant_id: &'a str,
+    merchant_id: Option<Uuid>,
+    actor_key: &'a str,
+    user_id: i64,
+    role: &'a str,
+    content: &'a str,
+    tool_calls_made: &'a [String],
+    requires_confirmation: bool,
+    media_url: Option<&'a str>,
+    status: &'a str,
+}
+
+async fn persist_agent_conversation(state: &AppState, msg: AgentConversation<'_>) {
+    let Ok(pool) = state.db() else {
+        return;
+    };
+    if let Err(err) = sqlx::query(
+        "INSERT INTO agent.conversations \
+         (tenant_id, merchant_id, actor_key, user_id, role, content, msg_type, \
+          tool_calls_made, requires_confirmation, media_url, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'text', $7::jsonb, $8, $9, $10)",
+    )
+    .bind(msg.tenant_id)
+    .bind(msg.merchant_id)
+    .bind(msg.actor_key)
+    .bind(msg.user_id)
+    .bind(msg.role)
+    .bind(msg.content)
+    .bind(serde_json::to_string(msg.tool_calls_made).unwrap_or_else(|_| "[]".to_string()))
+    .bind(msg.requires_confirmation)
+    .bind(msg.media_url)
+    .bind(msg.status)
+    .execute(pool)
+    .await
+    {
+        warn!("persist_agent_conversation failed: {err}");
+    }
 }
 
 fn agent_response_json(response: &AgentResponse, pending_preserved: bool) -> Json<Value> {
@@ -1043,6 +1089,24 @@ pub async fn ai_chat(
         merchant_id_str.as_deref(),
     );
 
+    // Persist user message to chat history (agent.conversations)
+    persist_agent_conversation(
+        &state,
+        AgentConversation {
+            tenant_id,
+            merchant_id: scope.merchant_id,
+            actor_key,
+            user_id,
+            role: "user",
+            content: &truncated_input,
+            tool_calls_made: &[],
+            requires_confirmation: false,
+            media_url: None,
+            status: "ok",
+        },
+    )
+    .await;
+
     let mut session = session_store
         .get(&session_key)
         .unwrap_or_else(|| AgentSession::new(AgentContext::new(user_id)));
@@ -1066,6 +1130,23 @@ pub async fn ai_chat(
             session.clear_pending();
             session_store.update(&session_key, session);
 
+            persist_agent_conversation(
+                &state,
+                AgentConversation {
+                    tenant_id,
+                    merchant_id: scope.merchant_id,
+                    actor_key,
+                    user_id,
+                    role: "assistant",
+                    content: "已取消待确认操作，没有执行任何动作。",
+                    tool_calls_made: &[],
+                    requires_confirmation: false,
+                    media_url: None,
+                    status: "ok",
+                },
+            )
+            .await;
+
             return Ok(Json(json!({
                 "status": "ok",
                 "reply": "已取消待确认操作，没有执行任何动作。",
@@ -1086,6 +1167,24 @@ pub async fn ai_chat(
                 Err(_) => {
                     session.pending = Some(pending);
                     session_store.update(&session_key, session);
+
+                    persist_agent_conversation(
+                        &state,
+                        AgentConversation {
+                            tenant_id,
+                            merchant_id: scope.merchant_id,
+                            actor_key,
+                            user_id,
+                            role: "assistant",
+                            content: "确认执行环境暂不可用，本次未执行任何操作。待确认操作仍已保留，可输入“取消”撤销。",
+                            tool_calls_made: &[],
+                            requires_confirmation: true,
+                            media_url: None,
+                            status: "error",
+                        },
+                    )
+                    .await;
+
                     return Ok(Json(json!({
                         "status": "error",
                         "reply": "确认执行环境暂不可用，本次未执行任何操作。待确认操作仍已保留，可输入“取消”撤销。",
@@ -1115,6 +1214,24 @@ pub async fn ai_chat(
             session.ctx.trim_history(40);
             session.update_timestamp();
             session_store.update(&session_key, session);
+
+            persist_agent_conversation(
+                &state,
+                AgentConversation {
+                    tenant_id,
+                    merchant_id: scope.merchant_id,
+                    actor_key,
+                    user_id,
+                    role: "assistant",
+                    content: &response.text,
+                    tool_calls_made: &response.tool_calls_made,
+                    requires_confirmation: pending_preserved || response.requires_confirmation,
+                    media_url: None,
+                    status: if pending_preserved { "pending" } else { "ok" },
+                },
+            )
+            .await;
+
             return Ok(agent_response_json(&response, pending_preserved));
         } else {
             // Not a confirmation, restore pending and continue
@@ -1163,6 +1280,23 @@ pub async fn ai_chat(
     let (agent, usage) = match build_agent(&state, &scope.role, Some(tenant_id)).await {
         Ok(agent) => agent,
         Err(_) => {
+            persist_agent_conversation(
+                &state,
+                AgentConversation {
+                    tenant_id,
+                    merchant_id: scope.merchant_id,
+                    actor_key,
+                    user_id,
+                    role: "assistant",
+                    content: "AI 执行环境暂不可用，本次未执行任何操作。",
+                    tool_calls_made: &[],
+                    requires_confirmation: false,
+                    media_url: None,
+                    status: "error",
+                },
+            )
+            .await;
+
             return Ok(Json(json!({
                 "status": "error",
                 "reply": "AI 执行环境暂不可用，本次未执行任何操作。",
@@ -1193,7 +1327,123 @@ pub async fn ai_chat(
         usage,
     )
     .await;
+
+    // Persist assistant reply to chat history (agent.conversations)
+    persist_agent_conversation(
+        &state,
+        AgentConversation {
+            tenant_id,
+            merchant_id: scope.merchant_id,
+            actor_key,
+            user_id,
+            role: "assistant",
+            content: &response.text,
+            tool_calls_made: &response.tool_calls_made,
+            requires_confirmation: response.requires_confirmation,
+            media_url: None,
+            status: if response.requires_confirmation { "pending" } else { "ok" },
+        },
+    )
+    .await;
+
     Ok(agent_response_json(&response, false))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/ai/conversations — Agent 对话历史查询（分页）
+// 商户角色强制本租户 + 本人 actor_key；平台管理员可跨租户并可选过滤
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ConversationsQuery {
+    pub actor_key: Option<String>,
+    pub tenant_id: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+pub async fn get_conversations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConversationsQuery>,
+) -> ApiResult<Json<Value>> {
+    let scope = resolve_scope(&state, &headers).await?;
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = (page - 1) * limit;
+
+    let (tenant_filter, actor_filter) = if scope.role == Role::PlatformAdmin {
+        (
+            query
+                .tenant_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            query
+                .actor_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        )
+    } else {
+        (scope.tenant_id.clone(), scope.actor_key.clone())
+    };
+
+    let rows = sqlx::query(
+        "SELECT id, tenant_id, merchant_id, actor_key, user_id, role, content, msg_type, \
+                tool_calls_made, requires_confirmation, media_url, status, created_at, \
+                COUNT(*) OVER()::bigint AS total \
+         FROM agent.conversations \
+         WHERE ($1::text IS NULL OR tenant_id = $1) \
+           AND ($2::text IS NULL OR actor_key = $2) \
+         ORDER BY id DESC \
+         LIMIT $3 OFFSET $4",
+    )
+    .bind(tenant_filter)
+    .bind(actor_filter)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(state.db()?)
+    .await?;
+
+    let data: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.try_get::<i64, _>("id").unwrap_or(0),
+                "tenant_id": row.try_get::<String, _>("tenant_id").unwrap_or_default(),
+                "merchant_id": row.try_get::<Option<Uuid>, _>("merchant_id").unwrap_or(None),
+                "actor_key": row.try_get::<String, _>("actor_key").unwrap_or_default(),
+                "user_id": row.try_get::<i64, _>("user_id").unwrap_or(0),
+                "role": row.try_get::<String, _>("role").unwrap_or_default(),
+                "content": row.try_get::<Option<String>, _>("content").unwrap_or(None),
+                "msg_type": row.try_get::<String, _>("msg_type").unwrap_or_else(|_| "text".into()),
+                "tool_calls_made": row
+                    .try_get::<Value, _>("tool_calls_made")
+                    .unwrap_or(Value::Array(vec![])),
+                "requires_confirmation": row.try_get::<bool, _>("requires_confirmation").unwrap_or(false),
+                "media_url": row.try_get::<Option<String>, _>("media_url").unwrap_or(None),
+                "status": row.try_get::<String, _>("status").unwrap_or_else(|_| "ok".into()),
+                "created_at": row
+                    .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+        })
+        .collect();
+    let total = rows
+        .first()
+        .and_then(|row| row.try_get::<i64, _>("total").ok())
+        .unwrap_or(0);
+
+    Ok(Json(json!({
+        "status": "ok",
+        "data": data,
+        "total": total,
+        "page": page,
+        "limit": limit,
+    })))
 }
 
 // ---------------------------------------------------------------------------

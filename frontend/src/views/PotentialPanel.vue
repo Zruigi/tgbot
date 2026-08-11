@@ -39,9 +39,16 @@
           <div class="text-xs font-bold text-slate-600 truncate max-w-[120px]">{{ user.group_title }}</div>
           <div class="text-[10px] text-slate-400">{{ formatTime(user.captured_at) }}</div>
         </div>
-        <div class="flex space-x-3">
+        <div class="flex space-x-2">
           <button @click="promote(user.user_id)" class="flex-1 py-3 bg-primary text-on-primary text-xs font-black rounded-xl shadow-lg hover:scale-105 active:scale-95 transition-all">一键转正</button>
+          <button @click="identifyAndBind(user.user_id)" :disabled="bindingUserId===user.user_id" class="flex-1 py-3 bg-emerald-50 text-emerald-700 text-xs font-black rounded-xl border border-emerald-200 hover:bg-emerald-100 transition-all disabled:opacity-50">
+            <span v-if="bindingUserId===user.user_id">识别中...</span><span v-else>识别并绑定</span>
+          </button>
           <button @click="emit('chat',user.user_id,user.first_name||user.username)" class="flex-1 py-3 bg-surface-container text-primary text-xs font-black rounded-xl hover:bg-primary/10 transition-all flex items-center justify-center space-x-2"><span class="material-symbols-outlined text-sm">chat</span><span>进入会话</span></button>
+        </div>
+        <div v-if="bindResults[user.user_id]" class="mt-3 px-3 py-2 rounded-xl text-[11px] font-bold leading-relaxed"
+             :class="bindResults[user.user_id]?.error ? 'bg-rose-50 text-rose-600 border border-rose-100' : 'bg-emerald-50 text-emerald-700 border border-emerald-100'">
+          {{ bindResultText(user.user_id) }}
         </div>
       </div>
     </div>
@@ -96,6 +103,36 @@ async function load() {
 async function loadTags() { const res=await fetch('/api/potential_users/tags',{headers:authH()}); const d=await res.json(); if(d.status==='ok') availableTags.value=d.data||[] }
 async function sync() { isSyncing.value=true; try { await fetch('/api/potential_users/sync',{method:'POST',headers:authH()}); await load() } finally { isSyncing.value=false } }
 async function promote(userId:number) { await fetch(`/api/potential_users/${userId}/promote`,{method:'POST',headers:authH()}); await load() }
+
+// ★ 智能绑定：通过官方 Telegram API 识别该用户在哪些群/频道、是否管理员，并把管理员身份绑定到本租户
+const bindingUserId = ref<number | null>(null)
+const bindResults = reactive<Record<number, any>>({})
+async function identifyAndBind(userId: number) {
+  bindingUserId.value = userId
+  try {
+    const res = await fetch('/api/identity/bind', { method: 'POST', headers: authH(), body: JSON.stringify({ user_id: userId }) })
+    const d = await res.json()
+    if (d.status === 'ok') {
+      bindResults[userId] = d.data
+      await load()
+    } else {
+      bindResults[userId] = { error: d.message || (d.error?.message) || '识别失败' }
+    }
+  } catch (e: any) {
+    bindResults[userId] = { error: String(e?.message || e) }
+  } finally {
+    bindingUserId.value = null
+  }
+}
+function bindResultText(userId: number): string {
+  const r = bindResults[userId]
+  if (!r) return ''
+  if (r.error) return `识别失败：${r.error}`
+  if (r.bound_as === 'none') return '识别完成：该用户在本租户群/频道中未发现管理员身份'
+  const roleText = r.bound_as === 'merchant_owner' ? '商户 Owner' : '商户管理员'
+  const chats = (r.bound_chats || []).map((c: any) => `${c.chat_title || c.chat_id}(${c.role === 'admin' ? '管理员' : '成员'})`).join('、')
+  return `已识别并绑定为${roleText}：${chats || '（无）'}`
+}
 function changePage(dir:'prev'|'next') { if(dir==='prev') offset.value=Math.max(0,offset.value-limit); else offset.value+=limit; load() }
 function formatTime(ts:string|null|undefined):string { if(!ts) return '-'; const d=new Date(ts.replace(' ','T')); return isNaN(d.getTime())?'-':d.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) }
 </script>

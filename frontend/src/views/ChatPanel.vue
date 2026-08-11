@@ -563,7 +563,23 @@ async function fetchUsers() { await chatStore.fetchUsers() }
 // Polling: fetch page 1 and merge any new messages at the end
 async function pollLatestMessages() {
   if (!chatStore.selectedUserId) return
-  if (isSelectedAiAssistant.value) return
+  if (isSelectedAiAssistant.value) {
+    // Agent 会话：拉 agent.conversations 历史（page 1）并合并新增
+    try {
+      const fresh = await chatStore.fetchMoreAgentMessages(chatStore.selectedUserId, 1)
+      if (!fresh || fresh.length === 0) return
+      const { appendedCount, updatedRows } = upsertMessagesFromLatest(fresh)
+      if (appendedCount === 0 && updatedRows.length === 0) return
+      triggerAutoLoadForMessages([...updatedRows, ...fresh])
+      if (!isNearBottom.value && appendedCount > 0) {
+        newMsgCount.value += appendedCount
+      } else {
+        await nextTick()
+        scrollToBottom()
+      }
+    } catch {}
+    return
+  }
   try {
     const res = await fetch(`/api/messages/${chatStore.selectedUserId}?page=1`, {
       headers: authH(),
@@ -652,7 +668,12 @@ const isLoadingMore = ref(false)
 async function fetchMessages() {
   if (!chatStore.selectedUserId) return
   // Always fetch page 1 (latest messages), reset state
-  await chatStore.fetchMessages(chatStore.selectedUserId, 1)
+  if (isSelectedAiAssistant.value) {
+    // Agent 会话历史走 /api/ai/conversations（/api/messages/-99999 会 400/403 → 空白）
+    await chatStore.fetchAgentMessages(chatStore.selectedUserId, 1)
+  } else {
+    await chatStore.fetchMessages(chatStore.selectedUserId, 1)
+  }
   cleanupPendingMediaPreviews(chatStore.messages)
   triggerAutoLoadForMessages(chatStore.messages)
   for (const msg of chatStore.messages) {
@@ -672,7 +693,9 @@ async function loadMoreMessages() {
   const prevScrollHeight = el?.scrollHeight || 0
   try {
     const nextPage = msgPage.value + 1
-    const older = await chatStore.fetchMoreMessages(chatStore.selectedUserId, nextPage)
+    const older = isSelectedAiAssistant.value
+      ? await chatStore.fetchMoreAgentMessages(chatStore.selectedUserId, nextPage)
+      : await chatStore.fetchMoreMessages(chatStore.selectedUserId, nextPage)
     if (older.length < BACKEND_PAGE_SIZE) hasMoreMessages.value = false
     if (older.length > 0) {
       chatStore.messages = [...older, ...chatStore.messages]
