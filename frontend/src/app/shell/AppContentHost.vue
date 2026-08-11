@@ -17,8 +17,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useChatStore } from '@/stores/chat'
+import { useFileStore } from '@/stores/fileStore'
 import type { AppTabId } from '@/app/navigation/app-tabs'
 import { resolveAppModule } from '@/app/modules/app-modules'
 import TopScopeBar from '@/app/shell/TopScopeBar.vue'
@@ -34,7 +35,13 @@ const emit = defineEmits<{
 }>()
 
 const chatStore = useChatStore()
+const fileStore = useFileStore()
 const activeModule = computed(() => resolveAppModule(props.activeTab))
+
+// ★ 进入主界面立即水合租户头像/文件缓存（冷启动秒出，不等接口返回）
+onMounted(() => {
+  try { fileStore.ensureHydrated() } catch { /* ignore */ }
+})
 
 function onOpenChat(userId: number, name: string) {
   chatStore.selectedUserId = userId

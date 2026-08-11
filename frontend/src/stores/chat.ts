@@ -1,6 +1,18 @@
 import { defineStore } from 'pinia'
 import { ref, reactive } from 'vue'
 
+// ★ 按租户隔离的 localStorage 冷加载缓存（A 商户进来看 A 的缓存，B 商户看 B 的）
+import {
+  cacheGet,
+  cacheSet,
+  getCurrentTenantId,
+  tenantCacheKey,
+  readMessagesCache,
+  writeMessagesCache,
+  readFileCache,
+  writeFileCache,
+} from '@/utils/cache'
+
 const readCookieToken = () => {
   if (typeof document === 'undefined') return ''
   const cookie = document.cookie
@@ -58,6 +70,30 @@ export const useChatStore = defineStore('chat', () => {
   const fileErrors = reactive<Record<string, boolean>>({})
 
   async function fetchUsers() {
+    // ★ 冷启动：先出租户隔离的用户列表缓存（秒出），再后台刷新
+    const tenantId = getCurrentTenantId()
+    if (users.value.length === 0) {
+      const cachedUsers = cacheGet<any[]>(tenantCacheKey(tenantId, 'users'))
+      if (Array.isArray(cachedUsers) && cachedUsers.length > 0) {
+        users.value = [...cachedUsers]
+        // 预加载缓存头像；未缓存的走后台加载
+        const cachedFiles = readFileCache(tenantId)
+        for (const u of users.value) {
+          if (!u.avatar_file_id) continue
+          if (cachedFiles[u.avatar_file_id]) {
+            fileUrls[u.avatar_file_id] = cachedFiles[u.avatar_file_id]
+          } else {
+            autoLoadFile(u.avatar_file_id)
+          }
+        }
+      } else {
+        // 无用户缓存也先把头像缓存捞出来（聊天记录里的图片/语音秒出）
+        const cachedFiles = readFileCache(tenantId)
+        for (const [fileId, url] of Object.entries(cachedFiles)) {
+          if (!fileUrls[fileId]) fileUrls[fileId] = url
+        }
+      }
+    }
     isLoading.value = true
     try {
       const res = await fetch('/api/users', { headers: authH(), keepalive: true })
@@ -69,6 +105,8 @@ export const useChatStore = defineStore('chat', () => {
         console.log(`Setting users: ${newData.length} items`, newData)
         users.value = [...newData]
         console.log(`Users updated: ${users.value.length}`)
+        // 刷新成功 → 写回租户缓存，下次冷启动直接命中
+        cacheSet(tenantCacheKey(tenantId, 'users'), users.value)
         for (const u of users.value) {
           if (u.avatar_file_id && !fileUrls[u.avatar_file_id]) {
             autoLoadFile(u.avatar_file_id)
@@ -87,11 +125,23 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function fetchMessages(userId: number, page = 1) {
+    // ★ 冷启动：进入会话先出该联系人的最近消息缓存（秒出），再后台刷新
+    const tenantId = getCurrentTenantId()
+    if (page === 1 && messages.value.length === 0) {
+      const cached = readMessagesCache(tenantId, userId)
+      if (cached && cached.length > 0) {
+        messages.value = cached
+        autoLoadMedia()
+      }
+    }
     const res = await fetch(`/api/messages/${userId}?page=${page}`, { headers: authH(), keepalive: true })
     const d = await res.json()
     console.log('Chat Data Received:', d)
     if (d.status === 'ok') {
       messages.value = d.data || []
+      if (page === 1 && messages.value.length > 0) {
+        writeMessagesCache(tenantId, userId, messages.value)
+      }
       autoLoadMedia()
     }
   }
@@ -142,6 +192,8 @@ export const useChatStore = defineStore('chat', () => {
       const d = await res.json()
       if (d.url) {
         fileUrls[fileId] = d.url
+        // ★ 头像/文件 URL（base64 data URL，自包含不过期）写回租户缓存
+        writeFileCache(getCurrentTenantId(), fileId, d.url)
       } else {
         // ★ 不立即标记为永久失败 —— 允许后续重试（5秒自动重试一次）
         setTimeout(() => { delete fileErrors[fileId]; }, 5000)

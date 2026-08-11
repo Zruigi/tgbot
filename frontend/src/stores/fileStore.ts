@@ -1,16 +1,31 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
+// ★ 按租户隔离的 localStorage 冷加载缓存（头像/文件 data URL 自包含、不过期，可持久化）
+import { getCurrentTenantId, readFileCache, writeFileCache } from '@/utils/cache'
+
 /**
  * 全局文件/头像 URL 缓存 Store
  * 无论群聊、私聊、潜在用户还是群发，只要 file_id 相同，直接复用缓存。
  * 严禁使用 $set！使用展开运算符触发响应式更新。
+ * 冷启动：先读租户隔离的 localStorage 缓存（头像秒出），再后台加载新文件。
  */
 export const useFileStore = defineStore('file', () => {
   // 全局响应式缓存 file_id -> url
   const fileUrls = ref<Record<string, string>>({})
   // 正在加载中的 file_id，防止重复请求
   const loading = ref<Set<string>>(new Set())
+  // 是否已从 localStorage 水合过（每个页面生命周期只做一次）
+  let hydrated = false
+
+  function ensureHydrated() {
+    if (hydrated) return
+    hydrated = true
+    const cached = readFileCache(getCurrentTenantId())
+    if (Object.keys(cached).length > 0) {
+      fileUrls.value = { ...cached }
+    }
+  }
 
 const getToken = () => {
   const sessionRaw = sessionStorage.getItem('adm_s')
@@ -41,6 +56,7 @@ const getToken = () => {
    */
   async function autoLoadFile(fileId: string | null | undefined): Promise<string | null> {
     if (!fileId) return null
+    ensureHydrated()
     if (fileUrls.value[fileId]) return fileUrls.value[fileId]
     if (loading.value.has(fileId)) return null
 
@@ -53,6 +69,8 @@ const getToken = () => {
       if (data.url) {
         // 使用展开运算符触发 Vue 3 响应式更新
         fileUrls.value = { ...fileUrls.value, [fileId]: data.url }
+        // ★ 写回租户缓存，下次冷启动直接命中
+        writeFileCache(getCurrentTenantId(), fileId, data.url)
         return data.url
       }
     } catch {
@@ -67,10 +85,11 @@ const getToken = () => {
    * 批量预加载一组 file_id（并发加载，跳过已有缓存）
    */
   async function preloadFiles(fileIds: (string | null | undefined)[]): Promise<void> {
+    ensureHydrated()
     const unique = [...new Set(fileIds.filter((id): id is string => !!id && !fileUrls.value[id]))]
     if (unique.length === 0) return
     await Promise.allSettled(unique.map(id => autoLoadFile(id)))
   }
 
-  return { fileUrls, autoLoadFile, preloadFiles }
+  return { fileUrls, autoLoadFile, preloadFiles, ensureHydrated }
 })

@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api'
+import { clearAllTenantCaches } from '@/utils/cache'
 
 const TOKEN_KEY = 'adm_s'
 const SESSION_CTX_KEY = 'adm_ctx'
@@ -325,6 +326,8 @@ export const useAuthStore = defineStore('auth', () => {
     token.value = ''
     clearToken()
     clearSessionContext()
+    // ★ 退出登录时清空所有租户冷加载缓存，避免跨账号数据残留
+    clearAllTenantCaches()
     sessionContext.value = { role: '', actorRole: '', tenantId: '', merchantId: null }
     landingRoute.value = '/saas'
     landingMode.value = 'normal'
