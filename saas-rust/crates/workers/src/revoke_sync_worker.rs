@@ -9,13 +9,17 @@
 //!        删除 DB 记录（对齐 Python delete_group_message）。
 //!      - 触发限速（flood/too many）→ 暂停 5s 再继续。
 //!
-//! 暂存频道 id 从环境变量 `REVOKE_PROBE_CHAT_ID` 读取；未配置时整轮跳过
-//! （防止 forward 回原群造成死循环，对齐 Python revoke_sync_chat_id 未配置跳过）。
+//! 暂存频道 id 优先从 DB 读取（`tenant_saas.tenant_configs['revoke_sync_chat_id']`，
+//! 即 Rust 后台 `POST /api/group_listen/create_sync_chat` 的写入位置，对齐 Python
+//! `admin_settings['revoke_sync_chat_id']` 的门控语义）；DB 缺失时回退到环境变量
+//! `REVOKE_PROBE_CHAT_ID`（兼容旧部署）。两者都未配置时整轮跳过（防止 forward
+//! 回原群造成死循环，对齐 Python revoke_sync_chat_id 未配置跳过）。
 //!
 //! 该 worker 不依赖 job_queue：由 `main.rs` 以 `tokio::spawn` 启动常驻循环
 //! （与 scheduler 的 channel_reminder_cleanup 周期任务同构）。
 
 use anyhow::{Context, Result};
+use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,15 +34,20 @@ const MAX_MESSAGES_PER_GROUP: i64 = 200;
 
 /// 常驻对账循环：每 `interval` 执行一轮（对齐 Python `while True: sleep(30); process`）。
 /// 由 `main.rs` 以 `tokio::spawn` 启动；进程退出时随 runtime 一并回收，无需优雅停机。
+/// `ws_tx` 为 WebSocket 广播发送端：删除被撤回消息时推送 `group_message_deleted` 事件
+/// （对齐 Python `notify_web_clients("group_message_deleted", ...)`），可为 None（无前端）。
 pub async fn run_revoke_sync_loop(
     pool: PgPool,
     telegram_resolver: Arc<dyn TelegramClientResolver>,
     interval: Duration,
+    ws_tx: Option<tokio::sync::broadcast::Sender<String>>,
 ) {
     info!("revoke sync loop started, interval={:?}", interval);
     loop {
         tokio::time::sleep(interval).await;
-        if let Err(error) = run_revoke_sync_round(&pool, telegram_resolver.clone()).await {
+        if let Err(error) = run_revoke_sync_round(&pool, telegram_resolver.clone(), ws_tx.clone())
+            .await
+        {
             debug!("revoke sync round error: {}", error);
         }
     }
@@ -48,25 +57,26 @@ pub async fn run_revoke_sync_loop(
 pub async fn run_revoke_sync_round(
     pool: &PgPool,
     telegram_resolver: Arc<dyn TelegramClientResolver>,
+    ws_tx: Option<tokio::sync::broadcast::Sender<String>>,
 ) -> Result<usize> {
-    // 暂存频道 id（环境变量；未配置跳过，避免 forward 回原群死循环）
-    let probe_chat_id: Option<i64> = std::env::var("REVOKE_PROBE_CHAT_ID")
+    // 全局门控兜底：环境变量 REVOKE_PROBE_CHAT_ID（DB 未配置时的回退项，兼容旧部署）
+    let env_probe: Option<i64> = std::env::var("REVOKE_PROBE_CHAT_ID")
         .ok()
         .and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|value| *value != 0);
-    let Some(probe_chat_id) = probe_chat_id else {
-        debug!("REVOKE_PROBE_CHAT_ID 未配置，跳过本轮防撤回对账");
-        return Ok(0);
-    };
 
     // 开启信息校对 + 监听的群（对齐 Python get_groups_with_revoke_sync）。
     // 每个群使用自己的 revoke_sync_chat_id 作为试探目标（Python 行为）；
-    // 环境变量 REVOKE_PROBE_CHAT_ID 作为全局门控（未配置则整轮跳过）。
+    // 租户级门控取 tenant_configs['revoke_sync_chat_id']（Rust 后台写入位置），
+    // 缺失时回退到环境变量 REVOKE_PROBE_CHAT_ID。
     let groups = sqlx::query(
-        "SELECT group_id, revoke_sync_chat_id, tenant_id \
-         FROM groups.tracked_groups \
-         WHERE delete_on_revoke = true AND is_monitored = true \
-           AND revoke_sync_chat_id IS NOT NULL",
+        "SELECT g.group_id, g.revoke_sync_chat_id, g.tenant_id, g.revoke_sync_mirror, \
+                tc.config_value AS tenant_probe \
+         FROM groups.tracked_groups g \
+         LEFT JOIN tenant_saas.tenant_configs tc \
+           ON tc.tenant_id = g.tenant_id AND tc.config_key = 'revoke_sync_chat_id' \
+         WHERE g.delete_on_revoke = true AND g.is_monitored = true \
+           AND g.revoke_sync_chat_id IS NOT NULL",
     )
     .fetch_all(pool)
     .await
@@ -82,18 +92,42 @@ pub async fn run_revoke_sync_round(
         let group_id: i64 = group.try_get("group_id")?;
         let target_chat_id: i64 = group.try_get("revoke_sync_chat_id")?;
         let tenant_id: String = group.try_get("tenant_id")?;
+        let mirror: bool = group.try_get("revoke_sync_mirror")?;
+        let tenant_probe: Option<String> = group.try_get("tenant_probe").ok();
+        // 租户门控：tenant_configs 优先，其次环境变量（对齐 Python admin_settings 门控）
+        let tenant_probe_id: Option<i64> = tenant_probe
+            .as_deref()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|value| *value != 0);
+        let probe = match tenant_probe_id.or(env_probe) {
+            Some(id) if id != 0 => id,
+            _ => {
+                debug!("revoke sync: tenant {} 未配置校对群，跳过", tenant_id);
+                continue;
+            }
+        };
         let permit = semaphore.clone();
         let pool = pool.clone();
         let resolver = telegram_resolver.clone();
-        // 优先使用群自身配置的暂存频道，缺失时回退到全局 env（对齐 Python 行为）
+        let ws_tx = ws_tx.clone();
+        // 优先使用群自身配置的暂存频道，缺失时回退到租户/全局门控（对齐 Python 行为）
         let probe = if target_chat_id != 0 {
             target_chat_id
         } else {
-            probe_chat_id
+            probe
         };
         handles.push(tokio::spawn(async move {
             let _guard = permit.acquire_owned().await;
-            check_group_revoke(&pool, resolver.as_ref(), group_id, probe, &tenant_id).await
+            check_group_revoke(
+                &pool,
+                resolver.as_ref(),
+                group_id,
+                probe,
+                &tenant_id,
+                mirror,
+                ws_tx,
+            )
+            .await
         }));
     }
 
@@ -112,12 +146,16 @@ pub async fn run_revoke_sync_round(
 }
 
 /// 校对单个群：返回已删除的 tg_msg_id 数量。
+/// `mirror` 为 true 时保留转发副本在校对群（双模式·镜像，供人工核验）；
+/// false 时保持探测式（转发成功后立即删除副本，对齐 Python）。
 async fn check_group_revoke(
     pool: &PgPool,
     telegram_resolver: &dyn TelegramClientResolver,
     group_id: i64,
     probe_chat_id: i64,
     tenant_id: &str,
+    mirror: bool,
+    ws_tx: Option<tokio::sync::broadcast::Sender<String>>,
 ) -> Result<usize> {
     let telegram = telegram_resolver
         .resolve(pool, tenant_id)
@@ -149,8 +187,11 @@ async fn check_group_revoke(
             .await
         {
             Ok(forwarded) => {
-                // 消息还在：删除暂存副本 + 标记已校对（防止重复试探死循环）
-                let _ = telegram.delete_message(probe_chat_id, forwarded.message_id).await;
+                // 镜像模式：保留副本在校对群供人工核验；探测模式：删除副本（对齐 Python）
+                if !mirror {
+                    let _ = telegram.delete_message(probe_chat_id, forwarded.message_id).await;
+                }
+                // 两种模式都标记已校对（防止重复试探死循环）
                 let _ = sqlx::query(
                     "UPDATE groups.group_messages SET revoke_checked = true \
                      WHERE group_id = $1 AND tg_msg_id = $2 AND tenant_id = $3",
@@ -181,6 +222,16 @@ async fn check_group_revoke(
                     if result.rows_affected() > 0 {
                         deleted += 1;
                         info!(group_id, tg_msg_id, "message revoked, synced deletion");
+                        // 实时通知前端移除消息（对齐 Python notify_web_clients group_message_deleted）
+                        if let Some(tx) = ws_tx.as_ref() {
+                            let _ = tx.send(
+                                json!({
+                                    "type": "group_message_deleted",
+                                    "data": { "group_id": group_id, "tg_msg_id": tg_msg_id }
+                                })
+                                .to_string(),
+                            );
+                        }
                     }
                 } else if err.contains("flood") || err.contains("too many") {
                     // 限速：暂停 5s 再继续（对齐 Python）

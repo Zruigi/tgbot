@@ -36,7 +36,7 @@ const MAX_TOOL_CALL_ROUNDS: usize = 5;
 const MAX_HISTORY: usize = 40;
 
 /// 默认 LLM 模型
-const DEFAULT_MODEL: &str = "gpt-5.6-luna";
+pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
 // ---------------------------------------------------------------------------
 // LlmCaller trait — 抽象 LLM 调用
@@ -81,6 +81,11 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
+    /// 获取所有工具实例快照（供审计/调试）
+    pub fn snapshot(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.values().cloned().collect()
+    }
+
     /// 获取所有已注册的工具
     pub fn all(&self) -> Vec<&Arc<dyn Tool>> {
         self.tools.values().collect()
@@ -123,16 +128,38 @@ pub struct AIAgent {
     llm_caller: Arc<dyn LlmCaller>,
     safety: SafetyGuardrail,
     tools: Arc<ToolRegistry>,
+    runner: crate::runner::Runner,
 }
 
 impl AIAgent {
     /// 创建新的 Agent 实例
     pub fn new(llm_caller: Arc<dyn LlmCaller>, tools: Arc<ToolRegistry>) -> Self {
+        // ★ 开发/测试构建：工具集一致性审计（名称唯一/关键词互斥/声明覆盖）。
+        // 发现问题仅告警不中断（测试环境可能用 mock 工具），完整回归由 prompt_audit 专项测试断言。
+        #[cfg(debug_assertions)]
+        {
+            let report = crate::prompt_audit::audit_toolset(
+                &tools.snapshot(),
+                crate::router::dispatcher().keyword_map(),
+                crate::prompts::DECLARED_TOOLS,
+                false,
+            );
+            if !report.is_clean() {
+                tracing::warn!("toolset audit issues: {:?}", report.issues);
+            }
+        }
+        let runner = crate::runner::Runner::new(Arc::clone(&llm_caller));
         Self {
             llm_caller,
             safety: SafetyGuardrail::new(),
             tools,
+            runner,
         }
+    }
+
+    /// 获取所有工具实例快照（供审计/调试）
+    pub fn snapshot(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.snapshot()
     }
 
     /// 获取所有可用工具名
@@ -167,12 +194,29 @@ impl AIAgent {
             return deletion_response;
         }
 
-        // 构建初始消息
-        let system_prompt = build_system_prompt(Some(ctx));
+        // ★ 广告检查类请求（"检查/查看/检测 XX 广告"）→ 确定性路由到广告快照查询，
+        //   避免模糊自然语言依赖 LLM function calling 被误路由（如路由到 system_query 答非所问）
+        if let Some(inspection_response) = self.prepare_ad_inspection(user_message, ctx).await {
+            ctx.conversation_history
+                .push(ChatMessage::user(user_message));
+            ctx.conversation_history
+                .push(ChatMessage::assistant(&inspection_response.text));
+            if ctx.conversation_history.len() > MAX_HISTORY {
+                ctx.conversation_history = ctx.conversation_history
+                    [ctx.conversation_history.len() - MAX_HISTORY..]
+                    .to_vec();
+            }
+            return inspection_response;
+        }
 
-        let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&system_prompt)];
-        messages.extend(ctx.conversation_history.iter().cloned());
-        messages.push(ChatMessage::user(user_message));
+        // ★ 会话摘要：编排层 Runner 负责历史压缩（控制上下文长度、保持记忆延续）
+        self.runner.maybe_summarize_history(ctx).await;
+
+        // 构建初始消息（编排层 Runner 组装 system + 摘要 + 历史 + 当前消息）
+        let system_prompt = build_system_prompt(Some(ctx));
+        let mut messages = self
+            .runner
+            .build_messages(&system_prompt, ctx, user_message);
 
         // 获取工具 schemas
         let tool_schemas = self.tools.schemas_for_llm();
@@ -188,7 +232,7 @@ impl AIAgent {
         while round_num < MAX_TOOL_CALL_ROUNDS {
             round_num += 1;
 
-            let result = match self
+            let mut result = match self
                 .call_llm(&messages, model, &tool_schemas, round_num)
                 .await
             {
@@ -203,10 +247,36 @@ impl AIAgent {
                 }
             };
 
-            // 如果没有 tool_calls，这就是最终回复
+            // 如果没有 tool_calls：第一轮尝试 keyword 兜底（防"模型未调用工具"答非所问），
+            // 后续轮次（工具已执行）空 tool_calls 视为最终回复
             if result.tool_calls.is_empty() {
-                final_text = result.text;
-                break;
+                if round_num == 1 {
+                    let fallback = crate::router::dispatcher()
+                        .match_tool_from_text(user_message.trim(), &tool_schemas)
+                        .map(|name| {
+                            let args = crate::router::dispatcher()
+                                .build_fallback_args(&name, user_message.trim());
+                            ToolCall {
+                                function: ToolCallFunction {
+                                    name,
+                                    arguments: serde_json::to_string(&args)
+                                        .unwrap_or_else(|_| "{}".into()),
+                                },
+                            }
+                        });
+                    if let Some(tc) = fallback {
+                        result = LlmCallResult {
+                            text: result.text,
+                            tool_calls: vec![tc],
+                        };
+                    } else {
+                        final_text = result.text;
+                        break;
+                    }
+                } else {
+                    final_text = result.text;
+                    break;
+                }
             }
 
             // 处理 tool_calls
@@ -394,7 +464,13 @@ impl AIAgent {
                 }
 
                 // 只有执行成功且需要确认时才走确认流程
-                let tool_needs_confirm = exec_result.needs_confirmation && exec_result.success;
+                // ★ 查询类工具（query_recent_ad_messages）不触发确认：查询无副作用，
+                //   删除动作统一由"清理广告"确定性路由负责，避免用户误确认导致重放删除
+                let tool_needs_confirm = if tool_name == "query_recent_ad_messages" {
+                    false
+                } else {
+                    exec_result.needs_confirmation && exec_result.success
+                };
 
                 all_results.push(SingleToolResult {
                     tool_name: tool_name.clone(),
@@ -423,9 +499,27 @@ impl AIAgent {
                 && all_results[0].tool_name == "system_query"
                 && all_results[0].success
             {
-                if let Some(result) = all_results[0].result.as_ref() {
-                    final_text = format_system_query_result(result);
-                    break;
+                // ★ 只对纯查询类短路；活跃群列表/广告类查询交给 LLM 总结，避免"检查XX广告"答非所问
+                let query_type = all_results[0]
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.get("_params"))
+                    .and_then(|p| p.get("query_type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let short_circuit_types = [
+                    "stats_overview",
+                    "recent_senders",
+                    "recent_messages",
+                    "potential_users",
+                    "bound_chats",
+                    "monitors_list",
+                ];
+                if short_circuit_types.contains(&query_type) {
+                    if let Some(result) = all_results[0].result.as_ref() {
+                        final_text = format_system_query_result(result);
+                        break;
+                    }
                 }
             }
 
@@ -697,8 +791,12 @@ impl AIAgent {
 
                     let stripped = latest_user_text.trim();
                     if stripped.len() >= 4 {
-                        if let Some(matched_name) = self.match_tool_from_text(stripped, tools) {
-                            let fallback_args = self.build_fallback_args(&matched_name, stripped);
+                        // ★ 路由层独立：启发式匹配 + fallback 参数构造由 router::Dispatcher 负责
+                        if let Some(matched_name) =
+                            crate::router::dispatcher().match_tool_from_text(stripped, tools)
+                        {
+                            let fallback_args = crate::router::dispatcher()
+                                .build_fallback_args(&matched_name, stripped);
                             tool_calls.push(ToolCall {
                                 function: ToolCallFunction {
                                     name: matched_name,
@@ -723,352 +821,6 @@ impl AIAgent {
                     tool_calls: vec![],
                 })
             }
-        }
-    }
-
-    /// 根据用户文本做启发式工具匹配（仅作为 LLM 未显式返回 tool_call 时的兜底）
-    fn match_tool_from_text(&self, text: &str, tools: &[Value]) -> Option<String> {
-        if text.is_empty() {
-            return None;
-        }
-
-        let normalized = text.to_lowercase();
-
-        let keyword_map: HashMap<&str, Vec<&str>> = {
-            let mut m = HashMap::new();
-            m.insert(
-                "finance_query",
-                vec![
-                    "查财务",
-                    "财务摘要",
-                    "财务查询",
-                    "财务报表",
-                    "财务分析",
-                    "查账目",
-                    "查流水",
-                    "看账目",
-                    "看流水",
-                    "未核销",
-                    "待核销",
-                    "核销流水",
-                    "对账单",
-                    "对个账",
-                ],
-            );
-            m.insert(
-                "broadcast_message",
-                vec![
-                    "群发消息",
-                    "群发通知",
-                    "发送广播",
-                    "给所有人发",
-                    "群发公告",
-                    "批量发送",
-                ],
-            );
-            m.insert(
-                "detect_advertising",
-                vec![
-                    "检测广告",
-                    "是不是广告",
-                    "广告检测",
-                    "垃圾信息检测",
-                    "是否广告",
-                    "鉴别广告",
-                    "这条是不是广告",
-                    "这段是不是广告",
-                    "鉴别这条",
-                    "检测这条消息",
-                ],
-            );
-            m.insert(
-                "telegram_sdk_query",
-                vec![
-                    "机器人权限",
-                    "bot权限",
-                    "删除权限",
-                    "群权限",
-                    "频道权限",
-                    "机器人能不能删除",
-                    "为什么删除失败",
-                    "telegram sdk",
-                ],
-            );
-            m.insert(
-                "generate_content",
-                vec![
-                    "帮我写",
-                    "生成文案",
-                    "写一段",
-                    "生成内容",
-                    "帮我生成",
-                    "写个文案",
-                    "写公告",
-                ],
-            );
-            m.insert(
-                "system_query",
-                vec![
-                    "系统状态",
-                    "系统概览",
-                    "机器人绑定",
-                    "绑定聊天",
-                    "绑定群",
-                    "绑定频道",
-                    "有多少群",
-                    "群组统计",
-                    "系统信息",
-                    "活跃群组",
-                    "最近消息",
-                    "最近有谁",
-                    "谁给我发",
-                    "谁给我发送",
-                    "最近发消息",
-                    "广告消息",
-                    "群广告",
-                    "疑似广告",
-                ],
-            );
-            m.insert(
-                "query_ad_clusters",
-                vec![
-                    "广告聚合",
-                    "广告簇",
-                    "广告聚类",
-                    "查广告簇",
-                    "查重复广告",
-                    "重复广告",
-                    "聚合广告",
-                ],
-            );
-            m.insert(
-                "skill_manage",
-                vec![
-                    "新增skill",
-                    "增加skill",
-                    "添加skill",
-                    "技能管理",
-                    "列出技能",
-                    "查看技能",
-                    "更新技能",
-                    "导入技能",
-                    "新增技能",
-                    "添加技能",
-                ],
-            );
-            m
-        };
-
-        let mut best_match: Option<String> = None;
-        let mut best_score: u32 = 0;
-
-        for tool in tools {
-            let (name, desc) = if let Some(func) = tool.get("function") {
-                let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let desc = func
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                (name.to_string(), desc)
-            } else {
-                continue;
-            };
-
-            let mut score: u32 = 0;
-
-            if let Some(keywords) = keyword_map.get(name.as_str()) {
-                for keyword in keywords {
-                    if normalized.contains(keyword) {
-                        score += 8;
-                    }
-                }
-            }
-
-            if !name.is_empty() && normalized.contains(&name) {
-                score += 6;
-            }
-
-            if score == 0 {
-                for token in normalized.split_whitespace() {
-                    if !token.is_empty() && desc.contains(token) {
-                        score += 1;
-                    }
-                }
-            }
-
-            if score > best_score {
-                best_score = score;
-                best_match = Some(name);
-            }
-        }
-
-        // 白名单工具 >= 8 即匹配,其他工具需 >= 16（deb8eaf 确定性路由）
-        const WHITELIST: &[&str] = &[
-            "finance_query",
-            "system_query",
-            "telegram_sdk_query",
-            "detect_advertising",
-            "query_ad_clusters",
-            "query_recent_ad_messages",
-        ];
-        match &best_match {
-            Some(name) if WHITELIST.contains(&name.as_str()) && best_score >= 8 => best_match,
-            Some(_) if best_score >= 16 => best_match,
-            _ => None,
-        }
-    }
-
-    /// 当模型未返回参数时，基于用户原文构造一组可执行参数
-    fn build_fallback_args(&self, tool_name: &str, user_text: &str) -> Value {
-        let text = user_text.trim();
-        if text.is_empty() {
-            return serde_json::json!({});
-        }
-
-        match tool_name {
-            "broadcast_message" => {
-                let mut content = text.to_string();
-                for kw in &[
-                    "群发消息",
-                    "群发通知",
-                    "发送广播",
-                    "给所有人发",
-                    "群发公告",
-                    "批量发送",
-                    "测试",
-                ] {
-                    content = content.replace(kw, "");
-                }
-                let content = content
-                    .trim_matches(|c: char| c.is_whitespace() || "：:，,。.!！？?".contains(c));
-                let content = if content.is_empty() { text } else { content };
-                serde_json::json!({"content": content, "target_type": "users"})
-            }
-            "finance_query" => {
-                if text.contains("摘要") {
-                    serde_json::json!({"action": "summary"})
-                } else if text.contains("未核销") || text.contains("待核销") {
-                    serde_json::json!({"action": "unreconciled"})
-                } else if text.contains("科目") || text.contains("分类") {
-                    serde_json::json!({"action": "categories"})
-                } else {
-                    serde_json::json!({"action": "analysis"})
-                }
-            }
-            "detect_advertising" => {
-                serde_json::json!({"text": text, "context_type": "private_message"})
-            }
-            "query_ad_clusters" => {
-                let mut params = serde_json::json!({
-                    "status": "pending",
-                    "limit": 20,
-                    "window_minutes": 60,
-                });
-                if let Ok(group_pattern) =
-                    regex::Regex::new(r"(?i)(?:group_id|chat_id|群|群组)\s*[:：=]?\s*(-?\d{5,})")
-                {
-                    if let Some(captures) = group_pattern.captures(text) {
-                        if let Some(group_id) = captures
-                            .get(1)
-                            .and_then(|value| value.as_str().parse::<i64>().ok())
-                        {
-                            params["group_id"] = serde_json::json!(group_id);
-                        }
-                    }
-                }
-                params
-            }
-            "telegram_sdk_query" => {
-                // 4c3f1dc: 数字 group_id 优先于群名解析
-                if let Ok(re) =
-                    regex::Regex::new(r"(?i)(?:group_id|chat_id|群|群组)\s*[:：=]?\s*(-?\d{5,})")
-                {
-                    if let Some(caps) = re.captures(text) {
-                        if let Some(id_str) = caps.get(1) {
-                            if let Ok(chat_id) = id_str.as_str().parse::<i64>() {
-                                return serde_json::json!({
-                                    "operation": "chat_capabilities",
-                                    "chat_id": chat_id,
-                                    "include_admins": false,
-                                });
-                            }
-                        }
-                    }
-                }
-                // 42bafb0: bound_chats SDK 验证 limit 50
-                serde_json::json!({
-                    "operation": "bound_chat_capabilities",
-                    "limit": 50,
-                    "include_admins": false,
-                })
-            }
-            "generate_content" => {
-                serde_json::json!({
-                    "topic": text,
-                    "style": "professional",
-                    "length": "medium",
-                    "purpose": "announcement"
-                })
-            }
-            "system_query" => {
-                let _lower = text.to_lowercase();
-                if text.contains("最近有谁")
-                    || text.contains("谁给我发")
-                    || text.contains("谁给我发送")
-                    || text.contains("最近发消息")
-                    || text.contains("谁发了消息")
-                {
-                    serde_json::json!({"query_type": "recent_senders", "limit": 10})
-                } else if text.contains("最近消息") {
-                    serde_json::json!({"query_type": "recent_messages", "limit": 10})
-                } else if text.contains("广告消息")
-                    || text.contains("群广告")
-                    || text.contains("疑似广告")
-                    || text.contains("广告群消息")
-                {
-                    serde_json::json!({"query_type": "group_ad_messages", "limit": 20})
-                } else if text.contains("潜在用户") {
-                    serde_json::json!({"query_type": "potential_users", "limit": 10})
-                } else if text.contains("绑定")
-                    && (text.contains("群") || text.contains("频道") || text.contains("聊天"))
-                {
-                    serde_json::json!({"query_type": "bound_chats", "limit": 50})
-                } else if text.contains("监听")
-                    || text.contains("地址列表")
-                    || text.contains("监控地址")
-                {
-                    serde_json::json!({"query_type": "monitors_list", "limit": 10})
-                } else if text.contains("群") || text.contains("群组") {
-                    serde_json::json!({"query_type": "active_groups", "limit": 10})
-                } else if text.contains("统计") || text.contains("概览") || text.contains("状态")
-                {
-                    serde_json::json!({"query_type": "stats_overview"})
-                } else {
-                    serde_json::json!({"query_type": "stats_overview"})
-                }
-            }
-            "skill_manage" => {
-                let lower = text.to_lowercase();
-                if text.contains("导入") {
-                    serde_json::json!({"action": "import_builtin"})
-                } else if (lower.contains("新增")
-                    || lower.contains("添加")
-                    || lower.contains("增加"))
-                    && lower.contains("skill")
-                {
-                    serde_json::json!({"action": "add"})
-                } else if text.contains("启用") {
-                    serde_json::json!({"action": "enable"})
-                } else if text.contains("停用") || text.contains("禁用") {
-                    serde_json::json!({"action": "disable"})
-                } else if text.contains("更新") || text.contains("修改") {
-                    serde_json::json!({"action": "update"})
-                } else {
-                    serde_json::json!({"action": "list"})
-                }
-            }
-            _ => serde_json::json!({}),
         }
     }
 
@@ -1119,6 +871,117 @@ impl AIAgent {
         }
 
         true
+    }
+
+    /// Check if user text is requesting ad inspection (查看/检查/检测广告)
+    /// 排除删除类（由 prepare_recent_ad_deletion 处理），避免与删除路由冲突
+    fn is_ad_inspection_request(&self, text: &str) -> bool {
+        let normalized = text
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+
+        let has_ad = ["广告", "垃圾信息", "牛皮癣"]
+            .iter()
+            .any(|w| normalized.contains(w));
+        if !has_ad {
+            return false;
+        }
+
+        // 删除类请求交给删除路由
+        let has_delete = ["删除", "清理", "移除", "删掉", "执行删除"]
+            .iter()
+            .any(|w| normalized.contains(w));
+        if has_delete {
+            return false;
+        }
+
+        // 检查类意图
+        let has_inspect = [
+            "检查", "查看", "检测", "看看", "查一下", "查查", "查询", "有什么广告",
+            "多少广告", "广告检查", "广告情况", "广告状态", "有没有广告", "有哪些广告",
+            "群广告", "广告消息", "广告记录",
+        ]
+        .iter()
+        .any(|w| normalized.contains(w));
+        has_inspect
+    }
+
+    /// Deterministic pre-route for ad inspection: 检查/查看/检测广告 → 查询最近广告快照，
+    /// 返回中文摘要，避免 LLM 误路由（如 system_query 答非所问）
+    async fn prepare_ad_inspection(
+        &self,
+        user_text: &str,
+        ctx: &mut AgentContext,
+    ) -> Option<AgentResponse> {
+        if !self.is_ad_inspection_request(user_text) {
+            return None;
+        }
+
+        // 解析小时窗口（默认 168h=7d）
+        let hours = if let Some(caps) = regex::Regex::new(r"(\d{1,3})\s*(?:小时|h|天|日|d)")
+            .ok()
+            .and_then(|re| re.captures(user_text))
+        {
+            let raw = caps
+                .get(1)
+                .and_then(|m| m.as_str().parse::<i64>().ok())
+                .unwrap_or(168);
+            let unit = caps
+                .get(0)
+                .and_then(|m| m.as_str().chars().next_back())
+                .unwrap_or('h');
+            match unit {
+                '天' | '日' | 'd' | 'D' => raw * 24,
+                _ => raw,
+            }
+            .max(1)
+            .min(720)
+        } else {
+            168
+        };
+
+        let params = serde_json::json!({ "hours": hours, "limit": 50 });
+        let Some(tool) = self.tools.get("query_recent_ad_messages") else {
+            return Some(AgentResponse {
+                text: "广告查询工具未注册，本次没有执行任何查询。".into(),
+                tool_calls_made: vec![],
+                tool_results: HashMap::new(),
+                is_action_taken: false,
+                action_summary: "query_recent_ad_messages unavailable".into(),
+                requires_confirmation: false,
+                confidence: 1.0,
+                raw_response: None,
+            });
+        };
+        let exec_result = tool.execute(&params, ctx).await;
+        let message = exec_result
+            .message
+            .clone()
+            .unwrap_or_else(|| "广告查询未完成".into());
+        let text = if exec_result.success && exec_result.needs_confirmation {
+            format!("{}。如需删除，请回复「清理最近广告」。", message)
+        } else {
+            message.clone()
+        };
+        let mut tool_results = HashMap::new();
+        let mut result_value = exec_result.to_json_value();
+        if let Some(obj) = result_value.as_object_mut() {
+            obj.insert("needs_confirmation".into(), Value::Bool(false));
+        }
+        tool_results.insert("query_recent_ad_messages".into(), result_value);
+
+        Some(AgentResponse {
+            text,
+            tool_calls_made: vec!["query_recent_ad_messages".to_string()],
+            tool_results,
+            is_action_taken: false,
+            action_summary: format!("广告检查（{} 小时窗口）: {}", hours, message),
+            requires_confirmation: false,
+            confidence: if exec_result.success { 1.0 } else { 0.0 },
+            raw_response: None,
+        })
     }
 
     /// Deterministic pre-route for ad deletion: if user requests deletion, query and snapshot
@@ -2006,10 +1869,10 @@ mod tests {
 
         let tool_schemas = agent.tools.schemas_for_llm();
 
-        let result = agent.match_tool_from_text("帮我查一下财务分析", &tool_schemas);
+        let result = crate::router::dispatcher().match_tool_from_text("帮我查一下财务分析", &tool_schemas);
         assert_eq!(result, Some("finance_query".to_string()));
 
-        let result = agent.match_tool_from_text("你好", &tool_schemas);
+        let result = crate::router::dispatcher().match_tool_from_text("你好", &tool_schemas);
         assert!(result.is_none());
     }
 
@@ -2019,10 +1882,10 @@ mod tests {
         let tools = Arc::new(default_tool_registry());
         let agent = AIAgent::new(llm, tools);
 
-        let args = agent.build_fallback_args("finance_query", "帮我查财务分析");
+        let args = crate::router::dispatcher().build_fallback_args("finance_query", "帮我查财务分析");
         assert_eq!(args["action"], "analysis");
 
-        let args = agent.build_fallback_args("detect_advertising", "检测这条消息是不是广告");
+        let args = crate::router::dispatcher().build_fallback_args("detect_advertising", "检测这条消息是不是广告");
         assert_eq!(args["context_type"], "private_message");
     }
 
@@ -2191,7 +2054,7 @@ mod tests {
         let agent = AIAgent::new(llm, tools);
         let tool_schemas: Vec<serde_json::Value> = agent.tools.schemas_for_llm();
         // "查财务" 命中一个关键词 = score 8, 白名单工具应匹配
-        let result = agent.match_tool_from_text("查财务", &tool_schemas);
+        let result = crate::router::dispatcher().match_tool_from_text("查财务", &tool_schemas);
         assert_eq!(result, Some("finance_query".to_string()));
     }
 
@@ -2202,7 +2065,7 @@ mod tests {
         let agent = AIAgent::new(llm, tools);
         let tool_schemas: Vec<serde_json::Value> = agent.tools.schemas_for_llm();
         // "群发消息" 命中 broadcast_message 一个关键词 = score 8, 非白名单需 >= 16 → 不匹配
-        let result = agent.match_tool_from_text("群发消息", &tool_schemas);
+        let result = crate::router::dispatcher().match_tool_from_text("群发消息", &tool_schemas);
         assert_eq!(result, None);
     }
 
@@ -2212,7 +2075,7 @@ mod tests {
         let tools = Arc::new(default_tool_registry());
         let agent = AIAgent::new(llm, tools);
         // "摘要" 应优先于 "未核销"
-        let args = agent.build_fallback_args("finance_query", "财务摘要和未核销");
+        let args = crate::router::dispatcher().build_fallback_args("finance_query", "财务摘要和未核销");
         assert_eq!(args["action"], "summary");
     }
 
@@ -2221,7 +2084,7 @@ mod tests {
         let llm = Arc::new(MockLlmCaller);
         let tools = Arc::new(default_tool_registry());
         let agent = AIAgent::new(llm, tools);
-        let args = agent.build_fallback_args("telegram_sdk_query", "查看群 -1002222222222 的权限");
+        let args = crate::router::dispatcher().build_fallback_args("telegram_sdk_query", "查看群 -1002222222222 的权限");
         assert_eq!(args["operation"], "chat_capabilities");
         assert_eq!(args["chat_id"], -1002222222222i64);
     }
@@ -2231,7 +2094,7 @@ mod tests {
         let llm = Arc::new(MockLlmCaller);
         let tools = Arc::new(default_tool_registry());
         let agent = AIAgent::new(llm, tools);
-        let args = agent.build_fallback_args("telegram_sdk_query", "查看机器人权限");
+        let args = crate::router::dispatcher().build_fallback_args("telegram_sdk_query", "查看机器人权限");
         assert_eq!(args["operation"], "bound_chat_capabilities");
         assert_eq!(args["limit"], 50);
     }
@@ -2241,7 +2104,7 @@ mod tests {
         let llm = Arc::new(MockLlmCaller);
         let tools = Arc::new(default_tool_registry());
         let agent = AIAgent::new(llm, tools);
-        let args = agent.build_fallback_args("system_query", "机器人绑定了哪些群和频道");
+        let args = crate::router::dispatcher().build_fallback_args("system_query", "机器人绑定了哪些群和频道");
         assert_eq!(args["query_type"], "bound_chats");
         assert_eq!(args["limit"], 50);
     }

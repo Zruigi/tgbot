@@ -37,6 +37,7 @@ pub struct GroupConfigRequest {
     pub custom_keywords: Option<String>,
     pub delete_on_revoke: Option<bool>,
     pub revoke_sync_chat_id: Option<i64>,
+    pub revoke_sync_mirror: Option<bool>,
     pub verify_enabled: Option<bool>,
     pub verify_type: Option<String>,
     pub verify_timeout: Option<i32>,
@@ -189,12 +190,13 @@ pub async fn update_group_config(
                 custom_keywords    = COALESCE($3, custom_keywords),
                 delete_on_revoke   = COALESCE($4, delete_on_revoke),
                 revoke_sync_chat_id = COALESCE($5, revoke_sync_chat_id),
-                verify_enabled     = COALESCE($6, verify_enabled),
-                verify_type        = COALESCE($7, verify_type),
-                verify_timeout     = COALESCE($8, verify_timeout),
-                verify_channel_id  = COALESCE($9, verify_channel_id),
-                verify_questions   = COALESCE($10, verify_questions),
-                verify_msg_template = COALESCE($11, verify_msg_template),
+                revoke_sync_mirror = COALESCE($6, revoke_sync_mirror),
+                verify_enabled     = COALESCE($7, verify_enabled),
+                verify_type        = COALESCE($8, verify_type),
+                verify_timeout     = COALESCE($9, verify_timeout),
+                verify_channel_id  = COALESCE($10, verify_channel_id),
+                verify_questions   = COALESCE($11, verify_questions),
+                verify_msg_template = COALESCE($12, verify_msg_template),
                 updated_at = now()
             WHERE group_id = $1
             RETURNING *
@@ -205,6 +207,7 @@ pub async fn update_group_config(
         .bind(body.custom_keywords)
         .bind(body.delete_on_revoke)
         .bind(body.revoke_sync_chat_id)
+        .bind(body.revoke_sync_mirror)
         .bind(body.verify_enabled)
         .bind(body.verify_type)
         .bind(body.verify_timeout)
@@ -222,12 +225,13 @@ pub async fn update_group_config(
                 custom_keywords    = COALESCE($4, custom_keywords),
                 delete_on_revoke   = COALESCE($5, delete_on_revoke),
                 revoke_sync_chat_id = COALESCE($6, revoke_sync_chat_id),
-                verify_enabled     = COALESCE($7, verify_enabled),
-                verify_type        = COALESCE($8, verify_type),
-                verify_timeout     = COALESCE($9, verify_timeout),
-                verify_channel_id  = COALESCE($10, verify_channel_id),
-                verify_questions   = COALESCE($11, verify_questions),
-                verify_msg_template = COALESCE($12, verify_msg_template),
+                revoke_sync_mirror = COALESCE($7, revoke_sync_mirror),
+                verify_enabled     = COALESCE($8, verify_enabled),
+                verify_type        = COALESCE($9, verify_type),
+                verify_timeout     = COALESCE($10, verify_timeout),
+                verify_channel_id  = COALESCE($11, verify_channel_id),
+                verify_questions   = COALESCE($12, verify_questions),
+                verify_msg_template = COALESCE($13, verify_msg_template),
                 updated_at = now()
             WHERE group_id = $2 AND tenant_id = $1
             RETURNING *
@@ -239,6 +243,7 @@ pub async fn update_group_config(
         .bind(body.custom_keywords)
         .bind(body.delete_on_revoke)
         .bind(body.revoke_sync_chat_id)
+        .bind(body.revoke_sync_mirror)
         .bind(body.verify_enabled)
         .bind(body.verify_type)
         .bind(body.verify_timeout)

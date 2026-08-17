@@ -18,6 +18,7 @@ pub fn is_agent_cancellation_text(text: &str) -> bool {
 
 /// Check if user text is a confirmation request
 /// Confirmation words include: 确认、确定、同意、yes、can、ok等
+/// 放宽：支持前缀匹配（"确认删除"/"确定执行"/"同意发送"等习惯用语）
 pub fn is_agent_confirmation_text(text: &str) -> bool {
     let normalized = text
         .to_lowercase()
@@ -25,10 +26,17 @@ pub fn is_agent_confirmation_text(text: &str) -> bool {
         .filter(|c| !c.is_whitespace())
         .collect::<String>();
 
-    matches!(
+    if matches!(
         normalized.as_str(),
         "确认" | "确定" | "同意" | "yes" | "ok" | "可以" | "go" | "yes."
-    )
+    ) {
+        return true;
+    }
+
+    // 放宽：以确认类词开头的习惯用语（确认删除/确定执行/同意群发等）
+    ["确认", "确定", "同意", "可以", "ok", "yes"]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
 }
 
 #[cfg(test)]

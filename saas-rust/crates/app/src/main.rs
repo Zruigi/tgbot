@@ -225,6 +225,10 @@ async fn main() -> anyhow::Result<()> {
 
     let worker_enabled = worker_handle.is_some();
 
+    // WebSocket 实时事件广播通道（对齐 Python notify_web_clients）。
+    // 所有 /ws 连接订阅该通道；HTTP 端点与 worker 通过 Sender 推送事件。
+    let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel::<String>(256);
+
     // Spawn revoke-sync reconciliation loop (30s round, aligned with Python revoke_sync_loop).
     // Detached tokio task; it dies with the process on shutdown. Requires REVOKE_PROBE_CHAT_ID
     // to be configured (the worker skips rounds when absent).
@@ -236,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
             pg.clone(),
             resolver,
             env_duration("REVOKE_SYNC_INTERVAL_SECS", 30),
+            Some(ws_tx.clone()),
         ));
     }
 
@@ -251,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
         worker_enabled,
         worker_telemetry,
         update_dispatcher: Some(dispatcher),
+        ws_tx,
     };
 
     // CORS

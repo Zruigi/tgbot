@@ -608,23 +608,49 @@ pub async fn get_file(
 // GET /ws — WebSocket endpoint for real-time admin updates
 // ---------------------------------------------------------------------------
 
-pub async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_socket(socket))
+pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    let ws_tx = state.ws_tx.clone();
+    ws.on_upgrade(move |socket| handle_ws_socket(socket, ws_tx))
 }
 
-async fn handle_ws_socket(mut socket: WebSocket) {
-    // Simple ping/pong read loop
+async fn handle_ws_socket(
+    mut socket: WebSocket,
+    ws_tx: tokio::sync::broadcast::Sender<String>,
+) {
+    // 订阅全局广播：ping/pong 心跳（前端保活）与业务事件（对齐 Python notify_web_clients）并行处理
+    let mut rx = ws_tx.subscribe();
     loop {
-        match socket.recv().await {
-            Some(Ok(Message::Text(text))) => {
-                if text == "ping" {
-                    if socket.send(Message::Text("pong".into())).await.is_err() {
-                        break;
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        if text == "ping" {
+                            if socket.send(Message::Text("pong".into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            event = rx.recv() => {
+                match event {
+                    Ok(payload) => {
+                        if socket.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // 客户端消费过慢被丢弃：继续接收后续事件
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // 发送端已全部关闭（服务关闭广播通道）：保持心跳连接
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 }
             }
-            Some(Ok(Message::Close(_))) | None => break,
-            _ => {}
         }
     }
     tracing::info!("WebSocket client disconnected");

@@ -74,17 +74,21 @@ impl Tool for QueryRecentAdMessagesTool {
             .min(200);
         let group_id = params.get("group_id").and_then(|v| v.as_i64());
 
-        let tenant_id = context
+        // 平台 admin 会话（ai.rs fallback "platform"）→ 视为 default 租户，与头像/财务回退策略一致
+        let tenant_id: String = context
             .metadata
             .get("tenant_id")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let Some(tenant_id) = tenant_id else {
-            return ToolExecuteResult::fail(
-                "query_recent_ad_messages requires an explicit tenant scope",
-            );
-        };
+            .filter(|value| !value.is_empty())
+            .map(|v| {
+                if v == "platform" {
+                    "default".to_string()
+                } else {
+                    v.to_string()
+                }
+            })
+            .unwrap_or_else(|| "default".to_string());
 
         // Query recent ad messages using ad_pipeline logic
         let cutoff_ts = chrono::Utc::now().timestamp() - (hours * 3600);
@@ -112,7 +116,7 @@ impl Tool for QueryRecentAdMessagesTool {
         .bind(cutoff_ts)
         .bind(group_id)
         .bind(limit)
-        .bind(tenant_id)
+        .bind(&tenant_id)
         .fetch_all(self.pool.as_ref())
         .await
         {
@@ -131,6 +135,31 @@ impl Tool for QueryRecentAdMessagesTool {
         };
 
         if rows.is_empty() {
+            // 空结果时附带"系统近24h自动清理统计"，避免 agent 冷冰冰回答"没有广告"
+            let cleaned_24h: i64 = sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*)::bigint
+                FROM groups.ad_governance_actions
+                WHERE tenant_id = $1
+                  AND action_type IN ('delete', 'mute')
+                  AND status = 'executed'
+                  AND executed_at >= now() - interval '24 hours'
+                "#,
+            )
+            .bind(&tenant_id)
+            .fetch_one(self.pool.as_ref())
+            .await
+            .unwrap_or(0);
+
+            let message = if cleaned_24h > 0 {
+                format!(
+                    "当前查询窗口内没有待删除的广告消息。系统近 24 小时已自动清理 {} 条广告消息，无需手动处理。",
+                    cleaned_24h
+                )
+            } else {
+                "当前查询窗口内没有待删除的广告消息。广告治理服务持续运行中，暂无需要手动处理的内容。"
+                    .to_string()
+            };
             return ToolExecuteResult {
                 success: true,
                 data: Some(json!({
@@ -138,8 +167,9 @@ impl Tool for QueryRecentAdMessagesTool {
                     "snapshot_id": "",
                     "message_refs": [],
                     "evidence_count": 0,
+                    "auto_cleaned_24h": cleaned_24h,
                 })),
-                message: Some("No ad messages found in query window".into()),
+                message: Some(message),
                 action_taken: false,
                 needs_confirmation: false,
                 requires_llm_generation: false,
@@ -176,7 +206,7 @@ impl Tool for QueryRecentAdMessagesTool {
             "#,
         )
         .bind(&snapshot_id)
-        .bind(tenant_id)
+        .bind(&tenant_id)
         .bind(group_id)
         .bind(serde_json::to_value(&refs).unwrap_or(Value::Null))
         .bind(0i32)
@@ -206,7 +236,7 @@ impl Tool for QueryRecentAdMessagesTool {
                 "snapshot_created_at": now_ts,
                 "evidence_count": refs.len(),
             })),
-            message: Some(format!("Locked {} ad messages in snapshot", refs.len())),
+            message: Some(format!("已锁定 {} 条广告消息快照", refs.len())),
             action_taken: false,
             needs_confirmation: true,
             requires_llm_generation: false,

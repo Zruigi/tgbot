@@ -32,6 +32,8 @@ pub struct AppState {
     pub worker_telemetry: WorkerTelemetry,
     /// Update dispatcher for routing Telegram updates to handlers.
     pub update_dispatcher: Option<Arc<UpdateDispatcher>>,
+    /// WebSocket 广播通道：向所有 /ws 连接推送实时事件（对齐 Python notify_web_clients）。
+    pub ws_tx: tokio::sync::broadcast::Sender<String>,
 }
 
 impl AppState {
@@ -40,6 +42,14 @@ impl AppState {
         self.pool
             .as_ref()
             .ok_or_else(|| ApiError::BadRequest("PostgreSQL unavailable — REST mode only".into()))
+    }
+
+    /// 向所有 WebSocket 客户端广播一条事件（对齐 Python web_admin.notify_web_clients）。
+    /// 事件格式 `{"type": ..., "data": {...}}`，前端 ws.ts JSON.parse 后按 type 分发。
+    pub fn broadcast(&self, event_type: &str, data: serde_json::Value) {
+        let payload =
+            serde_json::json!({ "type": event_type, "data": data }).to_string();
+        let _ = self.ws_tx.send(payload);
     }
 
     pub async fn tenant_telegram(&self, tenant_id: &str) -> ApiResult<(i64, TelegramClient)> {

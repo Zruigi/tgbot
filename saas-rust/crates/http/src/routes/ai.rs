@@ -340,7 +340,8 @@ async fn build_agent(
     let pool = Arc::new(state.db()?.clone());
     let telegram_client = match tenant_id
         .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != "platform")
+        .filter(|value| !value.is_empty())
+        .map(|value| if value == "platform" { "default" } else { value })
     {
         Some(tenant_id) => match state.tenant_telegram(tenant_id).await {
             Ok((_, telegram)) => Some(Arc::new(telegram)),
@@ -408,9 +409,11 @@ fn refresh_agent_context_scope(
     chat_id: Option<i64>,
 ) {
     context.user_id = user_id;
+    // 平台 admin 会话（"platform"）统一回退到 default 租户，与各工具/头像/财务回退策略一致
+    let scoped_tenant = if tenant_id == "platform" { "default" } else { tenant_id };
     context
         .metadata
-        .insert("tenant_id".into(), json!(tenant_id));
+        .insert("tenant_id".into(), json!(scoped_tenant));
     context
         .metadata
         .insert("merchant_id".into(), json!(merchant_id));
@@ -2450,4 +2453,115 @@ mod tests {
         assert_eq!(context.metadata["chat_id"], json!(-1002));
         assert_eq!(context.metadata["group_id"], json!(-1002));
     }
+}
+
+
+// ============================================================================
+// SSE Streaming Chat — POST /api/ai/chat/stream
+// 纯对话场景逐 token 推送；含工具意图（广告/财务/系统等）走非流式完整结果（单事件）
+// ============================================================================
+pub async fn ai_chat_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AiChatRequest>,
+) -> ApiResult<
+    axum::response::Sse<
+        impl futures_util::Stream<
+            Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+        >,
+    >,
+> {
+    use axum::response::sse::{Event, Sse};
+    use futures_util::{StreamExt, stream};
+    use std::convert::Infallible;
+
+    let scope = resolve_scope(&state, &headers).await?;
+    let tenant_id = scope
+        .tenant_id
+        .clone()
+        .or_else(|| {
+            if scope.role == Role::PlatformAdmin {
+                explicit_tenant_id(&body)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "platform".into());
+
+    let content = body.content.as_deref().unwrap_or("").trim().to_string();
+    if content.is_empty() {
+        return Err(ApiError::BadRequest("消息内容不能为空".into()));
+    }
+
+    let (agent, _) = build_agent(&state, &scope.role, Some(&tenant_id)).await?;
+
+    // 工具型判断：keyword 命中 或 广告类确定性意图 → 非流式完整结果
+    let schemas: Vec<Value> = agent
+        .available_tools()
+        .iter()
+        .map(|n| json!({"function": {"name": n, "description": ""}}))
+        .collect();
+    let mut needs_tool = tgbot_agent::router::dispatcher()
+        .match_tool_from_text(&content, &schemas)
+        .is_some();
+    let lower = content.to_lowercase();
+    let ad_intent = ["广告", "垃圾信息", "牛皮癣"]
+        .iter()
+        .any(|w| lower.contains(w))
+        && [
+            "删除", "清理", "检查", "查看", "检测", "看看", "群广告", "广告情况", "广告消息",
+        ]
+        .iter()
+        .any(|w| lower.contains(w));
+    needs_tool = needs_tool || ad_intent;
+
+    let model = body
+        .model
+        .clone()
+        .unwrap_or_else(|| state.llm.default_model().to_string());
+
+    let stream = if needs_tool {
+        // 非流式：完整结果单事件（复用现有 process_message）
+        let mut ctx = tgbot_agent::schema::AgentContext::new(body.user_id.unwrap_or(0));
+        let resp = agent.process_message(&content, &mut ctx, &model).await;
+        let text = resp.text.clone();
+        stream::once(async move { Ok(Event::default().event("result").data(text)) }).boxed()
+    } else {
+        // 流式：litellm SSE token
+        let system_prompt = tgbot_agent::prompts::build_system_prompt(None);
+        let messages = vec![
+            tgbot_agent::schema::ChatMessage::system(&system_prompt),
+            tgbot_agent::schema::ChatMessage::user(&content),
+        ];
+        let req = tgbot_integrations::litellm::ChatCompletionRequest {
+            model: model.clone(),
+            messages: messages
+                .iter()
+                .map(|m| tgbot_integrations::litellm::ChatMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone().unwrap_or_default(),
+                })
+                .collect(),
+            temperature: None,
+            max_tokens: None,
+            response_format: None,
+            extra: json!({}),
+            override_base_url: None,
+            override_api_key: None,
+        };
+        match state.llm.chat_completion_stream(&req).await {
+            Ok(s) => s
+                .map(|tok| {
+                    let t = tok.unwrap_or_default();
+                    Ok(Event::default().event("token").data(t))
+                })
+                .boxed(),
+            Err(e) => stream::once(async move {
+                Ok(Event::default().event("error").data(e.to_string()))
+            })
+            .boxed(),
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new()))
 }

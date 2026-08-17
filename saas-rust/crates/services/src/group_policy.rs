@@ -109,7 +109,8 @@ pub async fn apply_group_message_policy(
     let findings = serde_json::to_string(&advertising.findings).unwrap_or_else(|_| "[]".into());
     let updated = sqlx::query(
         "UPDATE groups.group_messages \
-         SET is_advertising = $4, ad_score = $5, ad_confidence = $6, ad_findings = $7 \
+         SET is_advertising = $4, ad_score = $5, ad_confidence = $6, ad_findings = $7, \
+             ad_checked_at = now() \
          WHERE tenant_id = $1 AND group_id = $2 AND tg_msg_id = $3",
     )
     .bind(input.tenant_id)

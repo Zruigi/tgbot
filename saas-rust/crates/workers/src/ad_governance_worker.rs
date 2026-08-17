@@ -976,7 +976,7 @@ async fn load_group_messages(
                is_advertising, ad_score, media_unique_id, sender_type, is_deleted
         FROM groups.group_messages
         WHERE tenant_id = $1 AND group_id = $2
-          AND sender_type = 'user'
+          AND sender_type IN ('user', 'bot')
           AND (NULLIF(btrim(COALESCE(content, '')), '') IS NOT NULL
                OR NULLIF(btrim(COALESCE(media_unique_id, '')), '') IS NOT NULL)
           AND NOT is_deleted

@@ -3,6 +3,20 @@
 
 use crate::schema::AgentContext;
 
+/// 所有已声明/注册工具的清单（供工具集审计：注册工具必须在此声明，反之亦然）
+/// 注意：必须与 ai.rs build_agent 的 retain_names 白名单对齐（ocr/n8n 生产未注册，不声明）
+pub const DECLARED_TOOLS: &[&str] = &[
+    "finance_query",
+    "broadcast_message",
+    "generate_content",
+    "detect_advertising",
+    "system_query",
+    "skill_manage",
+    "query_ad_clusters",
+    "query_recent_ad_messages",
+    "delete_recent_ad_messages",
+];
+
 // ---------------------------------------------------------------------------
 // 主 System Prompt 模板
 // ---------------------------------------------------------------------------
@@ -37,8 +51,30 @@ const AGENT_SYSTEM_TEMPLATE: &str = r#"你是 {bot_name} 的 AI 助手 Agent，�
 | "这条是不是广告" | 调用 detect_advertising |
 | "系统现在什么状态" | 调用 system_query(stats_overview) |
 | "最近有谁给我发消息" | 调用 system_query(recent_senders) |
-| "查下最近群广告消息" | 调用 system_query(group_ad_messages) |
+| "查下最近群广告消息" | 调用 query_recent_ad_messages |
+| "清理/删除最近广告" | 调用 query_recent_ad_messages，确认后走 delete_recent_ad_messages |
 | "查最近广告聚合" | 调用 query_ad_clusters |
+
+## 🧭 意图路由铁律（模糊表达不要反问，直接执行）
+
+用户用模糊语言时，**不要反问"你想做什么"**，按下列规则直接路由到对应动作：
+
+| 用户说（模糊表达） | 必须执行 |
+|---|---|
+| "检查/查看/检测/看看 广告"、"有没有广告"、"群广告"、"广告情况"、"广告消息" | 立即调用 query_recent_ad_messages 查询最近广告快照并汇报数量/摘要 |
+| "清理/删除/移除 广告"、"广告太多" | 调用 query_recent_ad_messages 锁定快照，提示确认后删除 |
+| "谁给我发了消息"、"最近消息"、"谁私聊我" | 调用 system_query(recent_senders / recent_messages) |
+| "系统/群/频道 状态、统计、有多少群" | 调用 system_query(stats_overview / active_groups) |
+| "财务、账目、流水、对账、钱" | 调用 finance_query |
+| "群发、通知、广播、告诉大家" | 生成文案 → broadcast_message（需确认）|
+| "写个 文案/公告/介绍/话术" | 调用 generate_content |
+| "这条是不是广告、判断一下" | detect_advertising（需用户提供具体文本）|
+| "重复广告、广告簇、聚合" | 调用 query_ad_clusters |
+
+原则：
+1. **能查就查**——涉及数据/群/广告/财务的模糊表达，一律先调用工具查真实数据，再基于结果回答
+2. **不凭空编造**——工具返回空或失败时，如实说明（如"当前窗口没有广告，系统近24h已自动清理 N 条"），不要猜测
+3. **删除/群发类操作永远先确认**，查询类直接执行
 
 当前时间: {current_time}
 运行环境: Telegram Bot 管理后台
@@ -71,7 +107,7 @@ const TOOL_INSTRUCTIONS: &str = r#"### 1. 💰 财务管理 (finance_query)
 
 ### 5. 🔍 系统查询 (system_query)
 - 统计概览、活跃群组、监听地址列表
-- 最近消息、潜在用户统计、群广告消息
+- 最近消息、潜在用户统计
 - 用途："系统状态"、"有多少群"、"最近动态"
 
 ### 6. 🧩 Skill 管理 (skill_manage)
@@ -83,11 +119,48 @@ const TOOL_INSTRUCTIONS: &str = r#"### 1. 💰 财务管理 (finance_query)
 - 查询当前租户已落库群消息中的重复广告候选
 - 没有已落库数据时明确说明数据不足，不推断为没有广告
 - 用途："查广告簇"、"查重复广告"、"最近广告聚合"
+
+### 8. 🔎 最近广告快照 (query_recent_ad_messages)
+- 查询指定时间窗口（默认 7 天）内的广告消息并生成快照，供确认删除
+- 查询窗口为空时，务必引用返回中的"近 24 小时自动清理统计"，不要直接回答"没有广告"了事
+- 用途："清理最近广告"、"查最近广告消息"、"删除广告"
+
+### 9. 🗑️ 删除广告 · 需确认 (delete_recent_ad_messages)
+- 删除已锁定快照中的广告消息；必须先经 query_recent_ad_messages 生成快照并获管理员确认
+- ⚠️ 危险操作：永远不能由模型直接触发，必须走确认流程
+- 用途：管理员确认后执行广告删除
 "#;
 
 // ---------------------------------------------------------------------------
 // 构建完整 system prompt
 // ---------------------------------------------------------------------------
+
+/// 优先从文件系统加载 prompt 模板（改 md 重启即生效，无需重新编译）；
+/// 找不到文件时回退到编译期内置默认值（保证任何环境可运行）。
+fn load_prompt_file(file_name: &str, fallback: &str) -> String {
+    let base_candidates: Vec<String> = [
+        std::env::var("TGBOT_PROJECT_ROOT").ok(),
+        std::env::current_dir().ok().map(|p| p.display().to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut candidates = Vec::new();
+    for base in &base_candidates {
+        candidates.push(format!("{}/crates/agent/prompts/{}", base, file_name));
+        candidates.push(format!("{}/prompts/{}", base, file_name));
+        candidates.push(format!("{}/{}", base, file_name));
+    }
+    for path in candidates {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if !content.trim().is_empty() {
+                return content;
+            }
+        }
+    }
+    fallback.to_string()
+}
 
 /// 构建完整的 system prompt
 pub fn build_system_prompt(ctx: Option<&AgentContext>) -> String {
@@ -111,15 +184,21 @@ pub fn build_system_prompt(ctx: Option<&AgentContext>) -> String {
                 }
                 if !lines.is_empty() {
                     extra_skill_text =
-                        format!("\n\n### 7. 🧠 已启用自定义技能\n{}", lines.join("\n"));
+                        format!("\n\n### 12. 🧠 已启用自定义技能\n{}", lines.join("\n"));
                 }
             }
         }
     }
 
-    let tool_instructions = format!("{}{}", TOOL_INSTRUCTIONS, extra_skill_text);
+    // 声明式：优先 prompts/*.md 文件（改 md 重启生效），回退内置 const
+    let tool_instructions = format!(
+        "{}{}",
+        load_prompt_file("tools.md", TOOL_INSTRUCTIONS),
+        extra_skill_text
+    );
+    let template = load_prompt_file("system.md", AGENT_SYSTEM_TEMPLATE);
 
-    AGENT_SYSTEM_TEMPLATE
+    template
         .replace("{bot_name}", "TGBot AI")
         .replace("{tool_instructions}", &tool_instructions)
         .replace("{current_time}", &current_time)

@@ -13,7 +13,7 @@
 //!   GET  /api/group_photo                           — get group photo file_id
 //!   GET  /api/group_member_count                    — get group member count
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{extract::State, http::{header, HeaderMap}, response::IntoResponse, Json};
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -121,7 +121,8 @@ pub async fn toggle_revoke_sync(
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
-    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
+    // 平台管理员会话无 tenant_id：回退到默认租户（与服务器 b15815167 一致）
+    let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
 
     let group_id = body
         .get("group_id")
@@ -145,6 +146,12 @@ pub async fn toggle_revoke_sync(
         return Err(ApiError::NotFound("group_not_found".into()));
     }
 
+    // 实时通知前端（对齐 Python notify_web_clients group_revoke_sync_update）
+    state.broadcast(
+        "group_revoke_sync_update",
+        json!({"group_id": group_id, "enabled": enabled}),
+    );
+
     Ok(Json(
         json!({"status": "ok", "group_id": group_id, "delete_on_revoke": enabled}),
     ))
@@ -161,7 +168,8 @@ pub async fn create_revoke_sync_chat(
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
-    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
+    // 平台管理员会话无 tenant_id：回退到默认租户（与服务器 b15815167 一致）
+    let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
 
     let chat_id = body.get("chat_id").and_then(|value| {
         value
@@ -213,7 +221,8 @@ pub async fn get_revoke_sync_chat(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
+    // 平台管理员会话无 tenant_id：回退到默认租户（与服务器 b15815167 一致）
+    let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
 
     let chat_id = sqlx::query_scalar::<_, String>(
         "SELECT config_value FROM tenant_saas.tenant_configs \
@@ -224,7 +233,7 @@ pub async fn get_revoke_sync_chat(
     .await?
     .and_then(|value| value.parse::<i64>().ok());
     let rows = sqlx::query(
-        "SELECT group_id, group_title FROM groups.tracked_groups \
+        "SELECT group_id, group_title, revoke_sync_mirror FROM groups.tracked_groups \
          WHERE tenant_id = $1 AND revoke_sync_chat_id = $2 ORDER BY group_id",
     )
     .bind(tenant_id)
@@ -237,6 +246,7 @@ pub async fn get_revoke_sync_chat(
             json!({
                 "group_id": row.try_get::<i64, _>("group_id").unwrap_or_default(),
                 "group_title": row.try_get::<Option<String>, _>("group_title").unwrap_or_default(),
+                "revoke_sync_mirror": row.try_get::<bool, _>("revoke_sync_mirror").unwrap_or(false),
             })
         })
         .collect();
@@ -498,7 +508,8 @@ pub async fn save_sync_chat_assignments(
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     require_write_access(&scope)?;
-    let tenant_id = scope.tenant_id.as_deref().ok_or(ApiError::Forbidden)?;
+    // 平台管理员会话无 tenant_id：回退到默认租户（与服务器 b15815167 一致）
+    let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
     let chat_id = body
         .get("chat_id")
         .and_then(|value| {
@@ -516,6 +527,17 @@ pub async fn save_sync_chat_assignments(
         .collect();
     group_ids.sort_unstable();
     group_ids.dedup();
+    // 镜像保留开关：仅对 group_ids 中勾选的群生效（双模式·镜像）
+    let mirror_group_ids: Vec<i64> = body
+        .get("mirror_group_ids")
+        .and_then(Value::as_array)
+        .map(|array| {
+            let mut ids: Vec<i64> = array.iter().filter_map(Value::as_i64).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        })
+        .unwrap_or_default();
 
     let configured_chat_id = sqlx::query_scalar::<_, String>(
         "SELECT config_value FROM tenant_saas.tenant_configs \
@@ -594,6 +616,16 @@ pub async fn save_sync_chat_assignments(
         .execute(&mut *transaction)
         .await?;
     }
+    // 镜像保留开关：作用于当前校对群的授权群（未授权群不受影响）
+    sqlx::query(
+        "UPDATE groups.tracked_groups SET revoke_sync_mirror = (group_id = ANY($1)), updated_at = now() \
+         WHERE tenant_id = $2 AND revoke_sync_chat_id = $3",
+    )
+    .bind(&mirror_group_ids)
+    .bind(tenant_id)
+    .bind(chat_id)
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
     Ok(Json(json!({
         "status": "ok",
@@ -610,9 +642,9 @@ pub async fn get_group_photo(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<GroupIdQuery>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<impl IntoResponse> {
     let scope = resolve_scope(&state, &headers).await?;
-    // 平台管理员会话无 tenant_id：回退到默认租户（生产主 bot），并跳过归属校验
+    // 平台管理员会话无 tenant_id：回退到默认租户（生产主 bot），并跳过归属校验（与服务器 b15815167 一致）
     let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
     if !matches!(scope.role, Role::PlatformAdmin) {
         ensure_group_owned(&state, tenant_id, query.group_id).await?;
@@ -626,10 +658,13 @@ pub async fn get_group_photo(
         .get("photo")
         .and_then(|photo| photo.get("small_file_id"))
         .and_then(Value::as_str);
-    Ok(Json(json!({
-        "status": "ok",
-        "file_id": file_id,
-    })))
+    Ok((
+        [(header::CACHE_CONTROL, "max-age=86400")],
+        Json(json!({
+            "status": "ok",
+            "file_id": file_id,
+        })),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -642,7 +677,7 @@ pub async fn get_group_member_count(
     axum::extract::Query(query): axum::extract::Query<GroupIdQuery>,
 ) -> ApiResult<Json<Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    // 平台管理员会话无 tenant_id：回退到默认租户（生产主 bot），并跳过归属校验
+    // 平台管理员会话无 tenant_id：回退到默认租户（生产主 bot），并跳过归属校验（与服务器 b15815167 一致）
     let tenant_id = scope.tenant_id.as_deref().unwrap_or("default");
     if !matches!(scope.role, Role::PlatformAdmin) {
         ensure_group_owned(&state, tenant_id, query.group_id).await?;

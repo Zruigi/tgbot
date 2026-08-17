@@ -31,6 +31,15 @@ fn map_ad_scan_error(error: anyhow::Error) -> ApiError {
     }
 }
 
+/// Platform admin (empty tenant) falls back to `default` tenant, same as finance/group_photo
+fn resolve_scan_tenant(scope: &tgbot_domain::scope::Scope) -> Result<String, ApiError> {
+    match scope.tenant_id.as_deref() {
+        Some(tenant_id) if !tenant_id.is_empty() => Ok(tenant_id.to_string()),
+        _ if scope.role == Role::PlatformAdmin => Ok("default".to_string()),
+        _ => Err(ApiError::Forbidden),
+    }
+}
+
 fn require_ad_scan_write(role: &Role) -> ApiResult<()> {
     if matches!(
         role,
@@ -79,7 +88,7 @@ pub async fn list_ad_scan_groups(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _) = scope.require_merchant()?;
+    let tenant_id = resolve_scan_tenant(&scope)?;
 
     let service = AdGovernanceService::new(Arc::new(state.db()?.clone()));
     let groups = service.list_groups(&tenant_id).await?;
@@ -101,7 +110,7 @@ pub async fn create_ad_scan(
 ) -> ApiResult<Json<serde_json::Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     require_ad_scan_write(&scope.role)?;
-    let (tenant_id, _) = scope.require_merchant()?;
+    let tenant_id = resolve_scan_tenant(&scope)?;
 
     // Validate group_id
     if payload.group_id == 0 {
@@ -158,7 +167,7 @@ pub async fn get_ad_scan(
     Path(job_id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _) = scope.require_merchant()?;
+    let tenant_id = resolve_scan_tenant(&scope)?;
 
     let service = AdGovernanceService::new(Arc::new(state.db()?.clone()));
     let job = service
@@ -181,7 +190,7 @@ pub async fn get_ad_scan_clusters(
     Query(query): Query<AdScanClustersQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let scope = resolve_scope(&state, &headers).await?;
-    let (tenant_id, _) = scope.require_merchant()?;
+    let tenant_id = resolve_scan_tenant(&scope)?;
 
     let tier = query.tier.as_deref();
     let limit = query.limit.unwrap_or(100);
@@ -210,7 +219,7 @@ pub async fn confirm_ad_scan(
 ) -> ApiResult<Json<serde_json::Value>> {
     let scope = resolve_scope(&state, &headers).await?;
     require_ad_scan_write(&scope.role)?;
-    let (tenant_id, _) = scope.require_merchant()?;
+    let tenant_id = resolve_scan_tenant(&scope)?;
 
     let dry_run = payload.dry_run.unwrap_or(true);
     let activate_policy = payload.activate_policy.unwrap_or(false);

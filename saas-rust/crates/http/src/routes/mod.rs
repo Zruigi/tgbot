@@ -433,6 +433,7 @@ pub fn router() -> Router<AppState> {
         )
         // AI / Agent routes
         .route("/api/ai/chat", post(ai::ai_chat))
+        .route("/api/ai/chat/stream", post(ai::ai_chat_stream))
         .route("/api/ai/conversations", get(ai::get_conversations))
         .route("/api/ai/detect_ad", post(ai::detect_ad))
         .route(

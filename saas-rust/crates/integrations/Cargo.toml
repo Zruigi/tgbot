@@ -13,6 +13,8 @@ tgbot-domain = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+futures-util = { workspace = true }
+bytes = "1"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }

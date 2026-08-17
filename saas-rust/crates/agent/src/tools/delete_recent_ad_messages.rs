@@ -90,25 +90,28 @@ impl Tool for DeleteRecentAdMessagesTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // Extract tenant_id from context metadata for scoping
-        let tenant_id = context
+        // 平台 admin 会话（ai.rs fallback "platform"）→ 视为 default 租户，与头像/财务回退策略一致
+        let tenant_id: String = context
             .metadata
             .get("tenant_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let Some(tenant_id) = tenant_id else {
-            return ToolExecuteResult::fail(
-                "delete_recent_ad_messages requires an explicit tenant scope",
-            );
-        };
+            .filter(|value| !value.is_empty())
+            .map(|v| {
+                if v == "platform" {
+                    "default".to_string()
+                } else {
+                    v.to_string()
+                }
+            })
+            .unwrap_or_else(|| "default".to_string());
 
         // Load snapshot with TENANT SCOPING (fix #3)
         let snapshot_row = match sqlx::query(
             "SELECT snapshot_id, tenant_id, refs, cutoff_ts, created_at, consumed_at FROM groups.ad_delete_snapshots WHERE snapshot_id = $1 AND tenant_id = $2"
         )
         .bind(snapshot_id)
-        .bind(tenant_id)
+        .bind(&tenant_id)
         .fetch_optional(self.pool.as_ref())
         .await
         {
@@ -392,7 +395,7 @@ impl Tool for DeleteRecentAdMessagesTool {
                 VALUES ($1, $2, $3, $4, $5, $6, now())
                 "#,
             )
-            .bind(tenant_id)
+            .bind(&tenant_id)
             .bind(&actor)
             .bind("delete_recent_ad_messages")
             .bind("group_messages")
@@ -428,12 +431,22 @@ impl Tool for DeleteRecentAdMessagesTool {
                 "action_taken": deleted > 0 && !dry_run,
                 "dry_run": dry_run,
             })),
-            message: Some(format!(
-                "{} {} ad messages, skipped {}",
-                if dry_run { "Would delete" } else { "Deleted" },
-                deleted,
-                skipped
-            )),
+            message: Some(if dry_run {
+                format!(
+                    "预计删除 {} 条广告消息（{} 条超 Telegram 48 小时删除时限将跳过）",
+                    deleted, skipped
+                )
+            } else if deleted > 0 {
+                format!(
+                    "已删除 {} 条广告消息；{} 条因超过 Telegram 48 小时删除时限跳过（本地记录保留）。",
+                    deleted, skipped
+                )
+            } else {
+                format!(
+                    "未能删除：{} 条广告消息均超过 Telegram 48 小时删除时限（bot 只能删除 48 小时内的消息），已跳过。",
+                    skipped
+                )
+            }),
             action_taken: deleted > 0 && !dry_run,
             needs_confirmation: false,
             requires_llm_generation: false,

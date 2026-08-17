@@ -3378,6 +3378,7 @@ dependencies = [
  "axum 0.7.9",
  "base64",
  "chrono",
+ "futures-util",
  "hex",
  "hmac",
  "jsonwebtoken",
@@ -3406,7 +3407,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "bytes",
  "chrono",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",

@@ -120,6 +120,104 @@ static AD_KEYWORDS: &[&str] = &[
     "PayPal",
     "klarna",
     "签到",
+    // P0 补充(2026-08-13): 实测高频广告词
+    "claude",
+    "gpt",
+    "openai",
+    "订阅",
+    "信用卡",
+    "证件",
+    "通道",
+    "代收",
+    "口令",
+];
+
+/// 强广告信号词：命中任一即基本确定是广告/引流/黑产（群聊场景），直接加分越过阈值
+static STRONG_AD_KEYWORDS: &[&str] = &[
+    // 虚拟卡/卡商
+    "vcc",
+    "卡段",
+    "开卡",
+    "无限开卡",
+    "超刷",
+    "免拒付",
+    "丝滑付",
+    "无视一切风控",
+    "无风控",
+    "订阅卡",
+    "虚拟信用卡",
+    "海外卡",
+    "amex",
+    "mastercard",
+    "卡商",
+    "卡台",
+    "号段",
+    "测活",
+    // 代充/账号交易
+    "代充",
+    "代开",
+    "成品号",
+    "邮箱号",
+    "直登",
+    "api key",
+    "api密钥",
+    // 币商/换汇
+    "收u",
+    "出u",
+    "u商",
+    "usdt",
+    "泰达",
+    "换汇",
+    "汇率",
+    // 引流/群发
+    "引流",
+    "爆粉",
+    "涨粉",
+    "群发脚本",
+    "群发工具",
+    "挂机",
+    "拉群",
+    "代发",
+    "留痕",
+    // 菠菜/色情引流
+    "博彩",
+    "百家乐",
+    "时时彩",
+    "六合彩",
+    "盘口",
+    "上分",
+    "返水",
+    "福利姬",
+    "私密直播",
+    "速约",
+    "约炮",
+    "裸聊",
+    "上门服务",
+    "同城约",
+    // 黑产
+    "接码",
+    "跑分",
+    "水军",
+    "刷量",
+    "黑u",
+    "料子",
+    "三件套",
+    "企业套件",
+    // 偏门/刷单/收益承诺（群聊高频引流话术）
+    "保底",
+    "无套路",
+    "日赚",
+    "日入过千",
+    "保底2",
+    // P0 补充(2026-08-13): 实测高频广告词（VCC/KYC/2D/3D/证件类）
+    "kyc",
+    "人脸验证",
+    "2d",
+    "3d",
+    "自拍",
+    "手持",
+    "上押",
+    "派利",
 ];
 
 // ---------------------------------------------------------------------------
@@ -190,7 +288,19 @@ pub struct AdDetectionResult {
 
 /// 识别文本中的广告/推广特征并返回结构化评分结果
 pub fn detect_advertising_signals(text: &str, context_type: &str) -> AdDetectionResult {
-    let raw = text.trim();
+    // P0(2026-08-13): 广告主用零宽字符(U+200B-200F/2060-2064/FEFF/00AD等)拆词绕过关键词匹配，先剥离
+    let raw = text
+        .chars()
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{200e}' | '\u{200f}'
+                    | '\u{2060}' | '\u{2061}' | '\u{2062}' | '\u{2063}' | '\u{2064}'
+                    | '\u{feff}' | '\u{00ad}' | '\u{2009}' | '\u{200a}'
+            )
+        })
+        .collect::<String>();
+    let raw = raw.trim();
     if raw.is_empty() {
         return AdDetectionResult {
             is_advertising: false,
@@ -219,6 +329,17 @@ pub fn detect_advertising_signals(text: &str, context_type: &str) -> AdDetection
     if !matched_keywords.is_empty() {
         ad_score += std::cmp::min((matched_keywords.len() as u32) * 15, 45);
         findings.push(format!("命中广告关键词: {}", matched_keywords.join(", ")));
+    }
+
+    // 1b. 强广告信号：命中任一直接 +50（群聊场景基本即广告/引流/黑产）
+    let strong_hits: Vec<&str> = STRONG_AD_KEYWORDS
+        .iter()
+        .filter(|kw| raw_lower.contains(**kw))
+        .copied()
+        .collect();
+    if !strong_hits.is_empty() {
+        ad_score += 50;
+        findings.push(format!("命中强广告信号: {}", strong_hits.join(", ")));
     }
 
     // 2. URL 检测
@@ -271,6 +392,15 @@ pub fn detect_advertising_signals(text: &str, context_type: &str) -> AdDetection
             "发现多个 Telegram 联系方式: {}",
             telegram_contacts.join(", ")
         ));
+    }
+
+    // 5b. 引流 bot（@xxx_bot）额外加分
+    if telegram_contacts
+        .iter()
+        .any(|c| c.to_lowercase().ends_with("_bot"))
+    {
+        ad_score += 20;
+        findings.push("发现引流 bot 联系方式".into());
     }
 
     // 6. 推广话术检测
@@ -331,6 +461,27 @@ mod tests {
         let result = detect_advertising_signals("", "group_message");
         assert!(!result.is_advertising);
         assert_eq!(result.ad_score, 0);
+    }
+
+    #[test]
+    fn test_real_ad_examples_from_production_group() {
+        // 大鹅群（-1001991086404）2026-08-12 实际广告抽查：规则增强后必须全部判定为广告
+        let cases = [
+            "虚拟信用卡 免跨境手续费 无限开卡（订阅 广告 采购）",
+            "Openai/Claude/GPT 专用visa卡，订阅 投流丝滑付！",
+            "黑猫✅稳：@HMCVV_Bot",
+            "全面支持claude20刀超刷-200刀VCC卡段~无视一切风控~=",
+            "普通人想富只有走偏们，这里有个风险不大的路子，一天保底2w无套路 我简杰了解",
+        ];
+        for text in cases {
+            let result = detect_advertising_signals(text, "group_message");
+            assert!(
+                result.is_advertising,
+                "未判定为广告: {} (score={})",
+                text,
+                result.ad_score
+            );
+        }
     }
 
     #[test]

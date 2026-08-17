@@ -1726,9 +1726,12 @@ async fn handle_incoming_message(
     let Some(from) = message.get("from") else {
         return Ok(());
     };
-    if from.get("is_bot").and_then(Value::as_bool).unwrap_or(false) {
-        return Ok(());
-    }
+    // P0(2026-08-13): 不再丢弃 bot 消息——广告刷屏小号几乎全是 bot。
+    // bot 消息照常走入库链路(sender_type='bot')，让广告检测/实时扫描能治理它们。
+    let is_bot_sender = from
+        .get("is_bot")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let user_id = from
         .get("id")
         .and_then(Value::as_i64)
@@ -2162,7 +2165,7 @@ async fn handle_incoming_message(
                      (group_id, user_id, username, tg_msg_id, sender_type, content, msg_type, \
                       file_id, media_unique_id, ad_text_hash, quoted_tg_msg_id, quoted_text, \
                       tenant_id, message_ts, timestamp) \
-                     SELECT $1, $2, $3, $4, 'user', $5, $6, $7, $8, $9, $10, $11, $12, $13, \
+                     SELECT $1, $2, $3, $4, $14, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
                             COALESCE(to_timestamp($13), now()) \
                      WHERE NOT EXISTS (SELECT 1 FROM groups.group_messages \
                        WHERE group_id = $1 AND tg_msg_id = $4 AND tenant_id = $12)",
@@ -2180,6 +2183,7 @@ async fn handle_incoming_message(
                 .bind(quoted_text)
                 .bind(&entry.tenant_id)
                 .bind(message_ts)
+                .bind(if is_bot_sender { "bot" } else { "user" })
                 .execute(pool)
                 .await
                 .map_err(|_| "failed to persist group message".to_string())?;

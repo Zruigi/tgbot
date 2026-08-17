@@ -60,6 +60,17 @@ fn join_endpoint(base_url: &str, path: &str) -> String {
     }
 }
 
+/// LLM 调用失败的重试类别
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryClass {
+    /// 不重试（4xx 配置/权限错误、响应解析失败）
+    No,
+    /// 短退避重试（网络错误、5xx 瞬时故障）
+    Short,
+    /// 长退避重试（429 限流）
+    Throttle,
+}
+
 // ---------------------------------------------------------------------------
 // Request / Response types (OpenAI-compatible)
 // ---------------------------------------------------------------------------
@@ -132,6 +143,152 @@ pub struct ChatCompletionResponse {
     pub model: Option<String>,
     pub choices: Vec<Choice>,
     pub usage: Option<Usage>,
+}
+
+/// SSE 流式响应分块（OpenAI `chat.completion.chunk`），Streaming 前置类型
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChatCompletionChunk {
+    pub id: Option<String>,
+    pub object: Option<String>,
+    pub created: Option<i64>,
+    pub model: Option<String>,
+    pub choices: Vec<ChunkChoice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// 流式分块中的一个 choice
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChunkChoice {
+    pub index: Option<u32>,
+    pub delta: ChunkDelta,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+}
+
+/// 流式 delta（增量内容/工具调用）
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ChunkDelta {
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<Value>>,
+}
+
+/// 从 SSE 行解析一个 chunk（"data: {...}" 或裸 JSON）；`data: [DONE]`/空行返回 None
+pub fn parse_chunk_line(line: &str) -> Option<ChatCompletionChunk> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed == "data: [DONE]" {
+        return None;
+    }
+    let json_str = trimmed.strip_prefix("data:").unwrap_or(trimmed).trim();
+    serde_json::from_str::<ChatCompletionChunk>(json_str).ok()
+}
+
+/// 把 reqwest 字节流切成 SSE 行（处理跨 chunk 的行边界）
+fn sse_lines<S>(
+    bytes: S,
+) -> impl futures_util::Stream<Item = Result<String, anyhow::Error>>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+{
+    use futures_util::{StreamExt, stream};
+
+    stream::unfold((Box::pin(bytes), Vec::<u8>::new()), |(mut bytes, mut buf)| async move {
+        loop {
+            match bytes.next().await {
+                Some(Ok(chunk)) => {
+                    buf.extend_from_slice(&chunk);
+                    if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = buf.drain(..=pos).collect();
+                        let s = String::from_utf8_lossy(&line).trim().to_string();
+                        if s.is_empty() {
+                            continue;
+                        }
+                        return Some((Ok(s), (bytes, buf)));
+                    }
+                }
+                Some(Err(e)) => return Some((Err(anyhow::Error::new(e)), (bytes, buf))),
+                None => {
+                    // 最后一行无换行
+                    if !buf.is_empty() {
+                        let s = String::from_utf8_lossy(&buf).trim().to_string();
+                        buf.clear();
+                        if !s.is_empty() {
+                            return Some((Ok(s), (bytes, buf)));
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+    })
+}
+
+impl LiteLLMClient {
+    /// 默认模型（LITELLM_DEFAULT_MODEL）
+    pub fn default_model(&self) -> &str {
+        &self.config.default_model
+    }
+
+    /// 流式 chat completion（OpenAI SSE）：返回逐 token 的内容增量流
+    ///
+    /// 请求侧通过 `extra.stream = true` 开启；消费方逐条拿到 delta.content。
+    pub async fn chat_completion_stream(
+        &self,
+        req: &ChatCompletionRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<dyn futures_util::Stream<Item = Result<String, anyhow::Error>> + Send>,
+        >,
+        anyhow::Error,
+    > {
+        use futures_util::StreamExt;
+
+        let base_url = req
+            .override_base_url
+            .as_deref()
+            .unwrap_or(&self.config.base_url);
+        let api_key = req
+            .override_api_key
+            .as_deref()
+            .unwrap_or(&self.config.api_key);
+        let url = join_endpoint(base_url, "/chat/completions");
+
+        let mut stream_req = req.clone();
+        stream_req.extra["stream"] = serde_json::Value::Bool(true);
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(api_key)
+            .json(&stream_req)
+            .send()
+            .await
+            .context("LiteLLM stream request failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "LiteLLM stream failed (HTTP {}): {}",
+                status,
+                body.chars().take(500).collect::<String>()
+            ));
+        }
+
+        let byte_stream = resp.bytes_stream();
+        let content_stream = sse_lines(byte_stream).filter_map(|line| {
+            let content = line
+                .ok()
+                .and_then(|l| parse_chunk_line(&l))
+                .and_then(|chunk| {
+                    chunk.choices.first().and_then(|c| c.delta.content.clone())
+                });
+            async move { content.map(Ok) }
+        });
+
+        Ok(Box::pin(content_stream))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -237,29 +394,85 @@ impl LiteLLMClient {
         let url = join_endpoint(base_url, "/chat/completions");
         debug!(url, "sending chat completion request");
 
-        let resp = self
+        // 429 限流（长退避 2s->4s）/ 5xx 与网络错误（短退避 400ms->800ms）可重试，其余立即返回
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.send_chat_completion_once(&url, api_key, req).await {
+                Ok(resp) => return Ok(resp),
+                Err((err, retry_class)) => {
+                    last_err = Some(err);
+                    let backoff_ms = match retry_class {
+                        RetryClass::No => break,
+                        RetryClass::Short => 400u64 << attempt,
+                        RetryClass::Throttle => 2000u64 << attempt,
+                    };
+                    if attempt + 1 >= MAX_ATTEMPTS {
+                        break;
+                    }
+                    debug!(attempt, backoff_ms, "retrying LiteLLM chat completion");
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("LiteLLM chat completion failed")))
+    }
+
+    /// 单次 chat completion 尝试；错误时返回 (error, 重试类别)
+    async fn send_chat_completion_once(
+        &self,
+        url: &str,
+        api_key: &str,
+        req: &ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, (anyhow::Error, RetryClass)> {
+        let resp = match self
             .http
-            .post(&url)
+            .post(url)
             .bearer_auth(api_key)
             .json(req)
             .send()
             .await
-            .context("LiteLLM chat completion request failed")?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                // 网络层错误（超时/连接失败/重置）→ 短退避重试
+                return Err((
+                    anyhow::Error::new(e).context("LiteLLM chat completion request failed"),
+                    RetryClass::Short,
+                ));
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             warn!(status = %status, body, "LiteLLM chat completion error");
-            return Err(anyhow!(
-                "LiteLLM chat completion failed (HTTP {}): {}",
-                status,
-                body.chars().take(500).collect::<String>()
+            let retry_class = if status.as_u16() == 429 {
+                RetryClass::Throttle
+            } else if status.as_u16() >= 500 {
+                RetryClass::Short
+            } else {
+                RetryClass::No
+            };
+            return Err((
+                anyhow!(
+                    "LiteLLM chat completion failed (HTTP {}): {}",
+                    status,
+                    body.chars().take(500).collect::<String>()
+                ),
+                retry_class,
             ));
         }
 
         resp.json::<ChatCompletionResponse>()
             .await
-            .context("failed to parse LiteLLM chat completion response")
+            .map_err(|e| {
+                (
+                    anyhow::Error::new(e)
+                        .context("failed to parse LiteLLM chat completion response"),
+                    RetryClass::No,
+                )
+            })
     }
 
     // -- Claude Messages format ---------------------------------------------
