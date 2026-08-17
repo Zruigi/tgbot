@@ -312,7 +312,7 @@ import { useRouter } from 'vue-router'
 import { useChatStore } from '@/stores/chat'
 import { useThemeStore } from '@/stores/theme'
 import { openExternalLink } from '@/lib/telegram'
-import { apiJson, apiFormData } from '@/utils/api'
+import { apiJson, apiFormData, streamAiChat } from '@/utils/api'
 import { isLikelyTgUsername, openTgUserProfile, tgUserProfileHref, tgUserLinkLabel } from '@/utils/tgUserLink'
 
 const chatStore = useChatStore()
@@ -1166,12 +1166,25 @@ async function sendMessageAsync(
       }, 1800)
 
       try {
-        // AI 请求统一走独立路由，避免与 /api/messages/{user_id} 发生匹配歧义
-        const res = await apiJson('/api/ai/chat', 'POST', {
-          userId,
-          content,
-          // model: 由后端根据配置自动选择，不传则用默认值
-        }, { isAiCall: true })
+        // ★ SSE 流式获取 AI 回复（纯对话逐 token 累积；工具类完整结果）
+        let streamedText = ''
+        let streamResult = ''
+        let streamError = ''
+        await streamAiChat('/api/ai/chat/stream', { userId, content }, {
+          onToken: (t) => {
+            streamedText += t
+            aiTypingText.value = streamedText
+          },
+          onResult: (r) => { streamResult = r; streamedText = r },
+          onError: (e) => { streamError = e },
+        })
+        const res = streamResult
+          ? { status: 'ok', reply: streamResult }
+          : streamError
+            ? { status: 'error', message: streamError, reply: streamError }
+            : streamedText
+              ? { status: 'ok', reply: streamedText }
+              : { status: 'error', message: 'AI 未返回内容', reply: '' }
         console.log('[发送消息] AI 响应:', res)
         ok = res.status === 'ok'
         const aiReplyRaw = String((res as any).reply ?? (res as any).data?.reply ?? '')
@@ -1243,6 +1256,23 @@ async function sendMessageAsync(
           chatStore.messages = [...chatStore.messages, aiMsg]
           if (isAgentJobRunning((aiMsg as any).job)) {
             startAgentJobPolling(String((aiMsg as any).job.job_id), aiMsg)
+          }
+          // ★ 打字机效果：长文本回复逐字显示，体感响应更快（短回复/图片/带任务直接展示）
+          if (aiMsgType === "text" && aiReplyText.length > 30 && !(aiMsg as any).job) {
+            chatStore.messages = chatStore.messages.map((m: any) =>
+              m.msg_id === aiMsg.msg_id ? { ...m, content: "" } : m
+            )
+            let typeIndex = 0
+            const TYPE_STEP = 2
+            const typeTimer = setInterval(() => {
+              typeIndex = Math.min(typeIndex + TYPE_STEP, aiReplyText.length)
+              chatStore.messages = chatStore.messages.map((m: any) =>
+                m.msg_id === aiMsg.msg_id ? { ...m, content: aiReplyText.slice(0, typeIndex) } : m
+              )
+              if (typeIndex >= aiReplyText.length) {
+                clearInterval(typeTimer)
+              }
+            }, 16)
           }
           await nextTick()
           scrollToBottom()

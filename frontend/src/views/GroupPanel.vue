@@ -856,6 +856,17 @@
                         : (themeStore.isDark ? 'bg-[#17304a] text-slate-400' : 'bg-surface-container text-slate-500')">
                   {{ revokeSyncAssignedGroupIds.includes(g.group_id) ? '已授权' : '未授权' }}
                 </span>
+                <button
+                  v-if="revokeSyncAssignedGroupIds.includes(g.group_id)"
+                  @click.stop="toggleRevokeSyncGroupMirror(g.group_id)"
+                  :title="revokeSyncMirrorGroupIds.includes(g.group_id) ? '镜像保留中：消息副本保留在校对群供人工核验' : '开启镜像保留：消息副本保留在校对群供人工核验'"
+                  class="w-7 h-7 rounded-full border flex items-center justify-center flex-shrink-0 transition-colors"
+                  :class="revokeSyncMirrorGroupIds.includes(g.group_id)
+                    ? (themeStore.isDark ? 'bg-amber-500/20 border-amber-400/40 text-amber-300' : 'bg-amber-100 border-amber-300 text-amber-700')
+                    : (themeStore.isDark ? 'border-[#4f6b92] text-slate-500 hover:border-amber-400/50 hover:text-amber-300' : 'border-slate-300 text-slate-400 hover:border-amber-400 hover:text-amber-600')"
+                >
+                  <span class="material-symbols-outlined text-[14px]">content_copy</span>
+                </button>
               </button>
             </div>
           </div>
@@ -1073,6 +1084,7 @@ const revokeSyncSavingAssignments = ref(false)
 const revokeSyncChatInfo = ref<any | null>(null)
 const revokeSyncBindingInput = ref('')
 const revokeSyncAssignedGroupIds = ref<number[]>([])
+const revokeSyncMirrorGroupIds = ref<number[]>([])
 const revokeSyncAssignmentSearchQuery = ref('')
 const revokeSyncToast = ref<{ type: 'success' | 'error', message: string } | null>(null)
 let revokeSyncToastTimer: ReturnType<typeof setTimeout> | null = null
@@ -1142,9 +1154,13 @@ async function loadRevokeSyncChatInfo() {
     revokeSyncAssignedGroupIds.value = Array.isArray(revokeSyncChatInfo.value?.assigned_groups)
       ? revokeSyncChatInfo.value.assigned_groups.map((g: any) => Number(g.group_id)).filter((id: number) => Number.isFinite(id))
       : []
+    revokeSyncMirrorGroupIds.value = Array.isArray(revokeSyncChatInfo.value?.assigned_groups)
+      ? revokeSyncChatInfo.value.assigned_groups.filter((g: any) => g.revoke_sync_mirror).map((g: any) => Number(g.group_id)).filter((id: number) => Number.isFinite(id))
+      : []
   } catch {
     revokeSyncChatInfo.value = null
     revokeSyncAssignedGroupIds.value = []
+    revokeSyncMirrorGroupIds.value = []
   }
 }
 
@@ -1221,6 +1237,17 @@ function toggleRevokeSyncGroupAssignment(groupId: number) {
   revokeSyncAssignedGroupIds.value = [...current]
 }
 
+function toggleRevokeSyncGroupMirror(groupId: number) {
+  if (!revokeSyncChatInfo.value?.chat_id || !revokeSyncAssignedGroupIds.value.includes(groupId)) {
+    showRevokeSyncToast('请先授权该群使用校对群。', 'error')
+    return
+  }
+  const current = new Set(revokeSyncMirrorGroupIds.value)
+  if (current.has(groupId)) current.delete(groupId)
+  else current.add(groupId)
+  revokeSyncMirrorGroupIds.value = [...current]
+}
+
 function toggleAssignAllFiltered() {
   if (!revokeSyncChatInfo.value?.chat_id) {
     showRevokeSyncToast('请先绑定校对信息群。', 'error')
@@ -1246,6 +1273,7 @@ async function saveRevokeSyncAssignments() {
       body: JSON.stringify({
         chat_id: revokeSyncChatInfo.value.chat_id,
         group_ids: revokeSyncAssignedGroupIds.value,
+        mirror_group_ids: revokeSyncMirrorGroupIds.value,
       }),
     })
     const d = await res.json()

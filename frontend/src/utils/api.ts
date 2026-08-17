@@ -240,3 +240,59 @@ export async function apiFormData(
   }
 }
 // cache bust Sun Apr  5 17:43:42 CST 2026
+
+
+/**
+ * SSE 流式 AI 对话：POST /api/ai/chat/stream
+ * token 事件逐字追加；result 事件一次性完整结果；error 事件错误
+ */
+
+/**
+ * SSE 流式 AI 对话：POST /api/ai/chat/stream
+ * token 事件逐字追加；result 事件一次性完整结果；error 事件错误
+ */
+export async function streamAiChat(
+  url: string,
+  body: any,
+  handlers: {
+    onToken: (t: string) => void
+    onResult: (r: string) => void
+    onError: (e: string) => void
+  }
+): Promise<void> {
+  if (!csrfToken) await refreshCsrf()
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: getAuthHeaders(true),
+      body: JSON.stringify(body),
+    })
+    if (!response.ok || !response.body) {
+      handlers.onError(`HTTP ${response.status}`)
+      return
+    }
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let eventType = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (trimmed.startsWith('event:')) eventType = trimmed.slice(6).trim()
+        else if (trimmed.startsWith('data:')) {
+          const data = trimmed.slice(5).trim()
+          if (eventType === 'token') handlers.onToken(data)
+          else if (eventType === 'result') handlers.onResult(data)
+          else if (eventType === 'error') handlers.onError(data)
+        }
+      }
+    }
+  } catch (err: any) {
+    handlers.onError(err?.message || String(err))
+  }
+}
