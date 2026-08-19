@@ -6,24 +6,28 @@ use std::{sync::Arc, time::Duration};
 use tgbot_domain::config::Config;
 use tgbot_domain::worker_telemetry::WorkerTelemetry;
 use tgbot_http::middleware;
+use tgbot_http::polling::{start_polling_supervisor, PollingOptions};
 use tgbot_http::routes;
 use tgbot_http::routes::auth::{CsrfStore, OtpStore};
 use tgbot_http::routes::miniapp::GrantStore;
 use tgbot_http::routes::telegram_webhook::{
-    install_default_handlers, load_bots_from_db, BotRegistry, UpdateDispatcher,
+    install_default_handlers, load_bots_from_db, register_webhooks_for_all, BotRegistry,
+    UpdateDispatcher,
 };
 use tgbot_http::state::AppState;
+use tgbot_integrations::binance::BinanceClient;
 use tgbot_integrations::bscscan::BscScanClient;
 use tgbot_integrations::litellm::LiteLLMClient;
+use tgbot_integrations::paddleocr::PaddleOCRClient;
 use tgbot_integrations::supabase_rest::SupabaseRestClient;
 use tgbot_integrations::telegram::{TelegramClient, TelegramConfig};
 use tgbot_integrations::trongrid::TronGridClient;
 use tgbot_repos::user_repo;
 use tgbot_workers::{
     AdGovernanceWorker, AddressMonitorAlertWorker, AddressMonitorWorker,
-    Dispatcher as WorkerDispatcher, GroupMessagePolicyWorker, PushTaskWorker, Scheduler,
-    SchedulerConfig, TelegramAutoReplyWorker, TelegramClientResolver, TelegramCommandWorker,
-    VerifyTimeoutWorker, Worker, WorkerHandle,
+    Dispatcher as WorkerDispatcher, GroupMessagePolicyWorker, MonitorWorker, OcrWorker,
+    PushTaskWorker, Scheduler, SchedulerConfig, TelegramAutoReplyWorker, TelegramClientResolver,
+    TelegramCommandWorker, VerifyTimeoutWorker, Worker, WorkerHandle,
 };
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -55,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
     let telegram_auto_replies_enabled = config.telegram_auto_replies_enabled;
     let telegram_commands_enabled = config.telegram_commands_enabled;
     let telegram_wallet_monitors_enabled = config.telegram_wallet_monitors_enabled;
+    let telegram_ocr_enabled = config.telegram_ocr_enabled;
     let pg_result = sqlx::postgres::PgPoolOptions::new()
         .max_connections(config.database_max_connections)
         .after_connect(move |connection, _metadata| {
@@ -82,6 +87,14 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
                 sqlx::query("SELECT set_config('tgbot.telegram_wallet_monitors_enabled', $1, false)")
                     .bind(if telegram_wallet_monitors_enabled {
+                        "true"
+                    } else {
+                        "false"
+                    })
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("SELECT set_config('tgbot.ocr_enabled', $1, false)")
+                    .bind(if telegram_ocr_enabled {
                         "true"
                     } else {
                         "false"
@@ -145,6 +158,38 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
+    // Receive-mode switch: polling (getUpdates long-poll) vs webhook.
+    // TGBOT_POLLING_ENABLED defaults to true (fail-open to polling) so the bot
+    // keeps receiving updates even when the public webhook ingress is down.
+    // The two modes are mutually exclusive: polling deletes each bot's webhook
+    // on start; webhook mode re-registers them at boot (required fallback).
+    let (polling_shutdown_tx, polling_handle) = if config.telegram_polling_enabled {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = start_polling_supervisor(
+            bot_registry.clone(),
+            dispatcher.clone(),
+            PollingOptions {
+                api_base_url: std::env::var("TELEGRAM_API_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.telegram.org".into()),
+                long_poll_secs: 50,
+                limit: 100,
+                client_timeout_secs: 75, // must exceed long_poll_secs
+                reconcile_interval: Duration::from_secs(30),
+                db: pool.clone(),
+            },
+            shutdown_rx,
+        )
+        .await;
+        tracing::info!("Polling receive mode enabled (getUpdates long-poll)");
+        (Some(shutdown_tx), Some(handle))
+    } else {
+        // Webhook mode: re-register every bot's webhook. Required fallback
+        // after running in polling mode, which deletes them.
+        tracing::info!("Polling receive mode disabled; registering webhooks");
+        register_webhooks_for_all(&bot_registry, &config).await;
+        (None, None)
+    };
+
     // Spawn background rate limiter cleanup
     tokio::spawn(middleware::rate_limiter_cleanup_task());
 
@@ -153,6 +198,21 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(TronGridClient::from_env()?),
             Arc::new(BscScanClient::from_env()?),
         ))
+    } else {
+        None
+    };
+    // D4：价格告警监控客户端（TGBOT_PRICE_MONITOR_ENABLED 开关，默认关闭）
+    let price_monitor_clients = if config.telegram_price_monitors_enabled {
+        Some((
+            Arc::new(TronGridClient::from_env()?),
+            Arc::new(BinanceClient::from_env()?),
+        ))
+    } else {
+        None
+    };
+    // D3：OCR 客户端（TGBOT_OCR_ENABLED 开关，默认关闭）
+    let ocr_client = if config.telegram_ocr_enabled {
+        Some(Arc::new(PaddleOCRClient::from_env()?))
     } else {
         None
     };
@@ -177,6 +237,22 @@ async fn main() -> anyhow::Result<()> {
             );
             workers.push(
                 Arc::new(AddressMonitorAlertWorker::new(resolver.clone())) as Arc<dyn Worker>
+            );
+        }
+        // 价格告警监控（TGBOT_PRICE_MONITOR_ENABLED 开关，默认关闭）
+        if let Some((trongrid, binance)) = price_monitor_clients.as_ref() {
+            workers.push(
+                Arc::new(MonitorWorker::new(
+                    resolver.clone(),
+                    trongrid.clone(),
+                    binance.clone(),
+                )) as Arc<dyn Worker>,
+            );
+        }
+        // OCR 图片文字识别（TGBOT_OCR_ENABLED 开关，默认关闭；tgbot.ocr_enabled 由 after_connect 设置）
+        if let Some(ocr) = ocr_client.as_ref() {
+            workers.push(
+                Arc::new(OcrWorker::new(ocr.clone(), resolver.clone())) as Arc<dyn Worker>,
             );
         }
         if config.telegram_commands_enabled {
@@ -214,6 +290,14 @@ async fn main() -> anyhow::Result<()> {
                 .with_job_type_filter("monitor_check")
                 .with_job_type_filter("monitor_alert")
                 .with_address_monitor_cron();
+        }
+        if config.telegram_price_monitors_enabled {
+            scheduler = scheduler
+                .with_job_type_filter("price_monitor_check")
+                .with_price_monitor_cron();
+        }
+        if config.telegram_ocr_enabled {
+            scheduler = scheduler.with_job_type_filter("ocr_process");
         }
         scheduler
             .with_channel_reminder_cleanup(
@@ -323,7 +407,11 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!("tgbot Rust backend listening on {}", config.bind_addr);
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(worker_handle))
+        .with_graceful_shutdown(shutdown_signal(
+            worker_handle,
+            polling_shutdown_tx,
+            polling_handle,
+        ))
         .await?;
     Ok(())
 }
@@ -376,7 +464,11 @@ fn env_usize(name: &str, default_value: usize) -> usize {
         .unwrap_or(default_value)
 }
 
-async fn shutdown_signal(worker_handle: Option<WorkerHandle>) {
+async fn shutdown_signal(
+    worker_handle: Option<WorkerHandle>,
+    polling_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    polling_handle: Option<tokio::task::JoinHandle<()>>,
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -398,6 +490,20 @@ async fn shutdown_signal(worker_handle: Option<WorkerHandle>) {
         _ = terminate => {},
     }
 
+    // Signal the polling supervisor first so all poll tasks abort cleanly
+    // before the axum server and workers wind down.
+    if let Some(polling_shutdown) = polling_shutdown {
+        let _ = polling_shutdown.send(true);
+        tracing::info!("Signalled polling supervisor to shut down");
+    }
+    if let Some(polling_handle) = polling_handle {
+        if tokio::time::timeout(Duration::from_secs(5), polling_handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!("Polling supervisor did not exit within 5s; continuing shutdown");
+        }
+    }
     if let Some(worker_handle) = worker_handle {
         worker_handle.shutdown().await;
     }

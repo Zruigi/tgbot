@@ -15,10 +15,11 @@ use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
 use crate::job_queue::ClaimedJob;
+use crate::push_task_worker::TelegramClientResolver;
 use crate::scheduler::Worker;
 
 use tgbot_integrations::paddleocr::PaddleOCRClient;
-use tgbot_integrations::telegram::TelegramClient;
+use tgbot_integrations::telegram::GetFileParams;
 
 // ---------------------------------------------------------------------------
 // OCR worker
@@ -26,12 +27,15 @@ use tgbot_integrations::telegram::TelegramClient;
 
 pub struct OcrWorker {
     ocr: Arc<PaddleOCRClient>,
-    telegram: Arc<TelegramClient>,
+    telegram_resolver: Arc<dyn TelegramClientResolver>,
 }
 
 impl OcrWorker {
-    pub fn new(ocr: Arc<PaddleOCRClient>, telegram: Arc<TelegramClient>) -> Self {
-        Self { ocr, telegram }
+    pub fn new(ocr: Arc<PaddleOCRClient>, telegram_resolver: Arc<dyn TelegramClientResolver>) -> Self {
+        Self {
+            ocr,
+            telegram_resolver,
+        }
     }
 }
 
@@ -114,16 +118,21 @@ impl Worker for OcrWorker {
 
 impl OcrWorker {
     /// Extract text from a Telegram image using file_id.
-    async fn process_image_extraction(&self, _pool: &PgPool, payload: &Value) -> Result<Value> {
+    async fn process_image_extraction(&self, pool: &PgPool, payload: &Value) -> Result<Value> {
         let file_id = payload
             .get("file_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("missing file_id in payload"))?;
+        let tenant_id = payload
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("default");
+        let telegram = self.telegram_resolver.resolve(pool, tenant_id).await?;
 
         // Download the file from Telegram
-        let file_info = self
-            .telegram
-            .get_file(tgbot_integrations::telegram::GetFileParams {
+        let file_info = telegram
+            .get_file(GetFileParams {
                 file_id: file_id.to_string(),
             })
             .await?;
@@ -132,7 +141,7 @@ impl OcrWorker {
         // Note: In a production system, we'd download to a temp file or buffer.
         // For now, we use a temp path.
         let temp_path = format!("/tmp/ocr_{}", uuid::Uuid::new_v4());
-        self.telegram.download_file(&file_info, &temp_path).await?;
+        telegram.download_file(&file_info, &temp_path).await?;
 
         // Read file bytes
         let image_bytes = tokio::fs::read(&temp_path).await?;
@@ -152,22 +161,27 @@ impl OcrWorker {
     }
 
     /// Detect cryptocurrency addresses in an image.
-    async fn process_address_detection(&self, _pool: &PgPool, payload: &Value) -> Result<Value> {
+    async fn process_address_detection(&self, pool: &PgPool, payload: &Value) -> Result<Value> {
         let file_id = payload
             .get("file_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("missing file_id in payload"))?;
+        let tenant_id = payload
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("default");
+        let telegram = self.telegram_resolver.resolve(pool, tenant_id).await?;
 
         // Download image from Telegram
-        let file_info = self
-            .telegram
-            .get_file(tgbot_integrations::telegram::GetFileParams {
+        let file_info = telegram
+            .get_file(GetFileParams {
                 file_id: file_id.to_string(),
             })
             .await?;
 
         let temp_path = format!("/tmp/ocr_addr_{}", uuid::Uuid::new_v4());
-        self.telegram.download_file(&file_info, &temp_path).await?;
+        telegram.download_file(&file_info, &temp_path).await?;
         let image_bytes = tokio::fs::read(&temp_path).await?;
 
         // Run OCR
@@ -187,21 +201,26 @@ impl OcrWorker {
     }
 
     /// Extract text from a document image (higher accuracy mode).
-    async fn process_document_scan(&self, _pool: &PgPool, payload: &Value) -> Result<Value> {
+    async fn process_document_scan(&self, pool: &PgPool, payload: &Value) -> Result<Value> {
         let file_id = payload
             .get("file_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("missing file_id in payload"))?;
+        let tenant_id = payload
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("default");
+        let telegram = self.telegram_resolver.resolve(pool, tenant_id).await?;
 
-        let file_info = self
-            .telegram
-            .get_file(tgbot_integrations::telegram::GetFileParams {
+        let file_info = telegram
+            .get_file(GetFileParams {
                 file_id: file_id.to_string(),
             })
             .await?;
 
         let temp_path = format!("/tmp/ocr_doc_{}", uuid::Uuid::new_v4());
-        self.telegram.download_file(&file_info, &temp_path).await?;
+        telegram.download_file(&file_info, &temp_path).await?;
         let image_bytes = tokio::fs::read(&temp_path).await?;
 
         let lang = payload.get("lang").and_then(|v| v.as_str()).unwrap_or("ch");

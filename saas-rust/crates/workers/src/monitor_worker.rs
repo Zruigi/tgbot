@@ -16,12 +16,12 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
-use crate::job_queue::{self, ClaimedJob, JobType};
+use crate::job_queue::ClaimedJob;
+use crate::push_task_worker::TelegramClientResolver;
 use crate::scheduler::Worker;
 
 use tgbot_integrations::binance::BinanceClient;
 use tgbot_integrations::telegram::SendMessageParams;
-use tgbot_integrations::telegram::TelegramClient;
 use tgbot_integrations::trongrid::TronGridClient;
 
 // ---------------------------------------------------------------------------
@@ -29,19 +29,19 @@ use tgbot_integrations::trongrid::TronGridClient;
 // ---------------------------------------------------------------------------
 
 pub struct MonitorWorker {
-    telegram: Arc<TelegramClient>,
+    telegram_resolver: Arc<dyn TelegramClientResolver>,
     trongrid: Arc<TronGridClient>,
     binance: Arc<BinanceClient>,
 }
 
 impl MonitorWorker {
     pub fn new(
-        telegram: Arc<TelegramClient>,
+        telegram_resolver: Arc<dyn TelegramClientResolver>,
         trongrid: Arc<TronGridClient>,
         binance: Arc<BinanceClient>,
     ) -> Self {
         Self {
-            telegram,
+            telegram_resolver,
             trongrid,
             binance,
         }
@@ -87,7 +87,7 @@ impl MonitorTaskType {
 #[async_trait]
 impl Worker for MonitorWorker {
     fn job_type(&self) -> &str {
-        "monitor_check"
+        "price_monitor_check"
     }
 
     #[instrument(skip(self, pool, claimed), fields(job_id = claimed.job.id))]
@@ -125,7 +125,12 @@ impl Worker for MonitorWorker {
                 // If there are alerts, send notifications
                 if let Some(alerts) = output.get("alerts").and_then(|v| v.as_array()) {
                     if !alerts.is_empty() {
-                        if let Err(e) = self.send_alerts(pool, alerts).await {
+                        let tenant_id = payload
+                            .get("tenant_id")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or("default");
+                        if let Err(e) = self.send_alerts(pool, tenant_id, alerts).await {
                             warn!(error = %e, "failed to send monitor alerts");
                         }
                     }
@@ -208,7 +213,14 @@ impl MonitorWorker {
     }
 
     /// Check token prices against configured thresholds.
-    async fn process_price_alert(&self, _pool: &PgPool, payload: &Value) -> Result<Value> {
+    async fn process_price_alert(&self, pool: &PgPool, payload: &Value) -> Result<Value> {
+        let alert_id = payload.get("alert_id").and_then(Value::as_i64);
+        let tenant_id = payload
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("default");
+        let notify_chat_id = payload.get("notify_chat_id").and_then(Value::as_i64);
         let symbol = payload
             .get("symbol")
             .and_then(|v| v.as_str())
@@ -230,6 +242,7 @@ impl MonitorWorker {
                             "symbol": symbol,
                             "price": price,
                             "threshold": high,
+                            "notify_chat_id": notify_chat_id,
                         }));
                     }
                 }
@@ -241,6 +254,7 @@ impl MonitorWorker {
                             "symbol": symbol,
                             "price": price,
                             "threshold": low,
+                            "notify_chat_id": notify_chat_id,
                         }));
                     }
                 }
@@ -250,8 +264,27 @@ impl MonitorWorker {
             }
         }
 
+        // 无论是否命中阈值，都刷新 last_checked_at；命中时刷新 last_triggered_at
+        if let Some(alert_id) = alert_id {
+            let triggered = !alerts.is_empty();
+            let _ = sqlx::query(
+                "UPDATE platform.price_alerts SET \
+                     last_checked_at = now(), \
+                     last_triggered_at = CASE WHEN $3 THEN now() ELSE last_triggered_at END, \
+                     updated_at = now() \
+                 WHERE alert_id = $1 AND tenant_id = $2",
+            )
+            .bind(alert_id)
+            .bind(tenant_id)
+            .bind(triggered)
+            .execute(pool)
+            .await;
+        }
+
         Ok(json!({
             "symbol": symbol,
+            "alert_id": alert_id,
+            "tenant_id": tenant_id,
             "alerts": alerts,
         }))
     }
@@ -267,7 +300,7 @@ impl MonitorWorker {
             .and_then(|v| v.as_str())
             .unwrap_or("tron");
 
-        let mut alerts: Vec<Value> = Vec::new();
+        let alerts: Vec<Value> = Vec::new();
 
         if chain == "tron" {
             match self.trongrid.get_account_transactions(address, 5).await {
@@ -330,7 +363,8 @@ impl MonitorWorker {
     }
 
     /// Send alert notifications via Telegram.
-    async fn send_alerts(&self, _pool: &PgPool, alerts: &[Value]) -> Result<()> {
+    async fn send_alerts(&self, pool: &PgPool, tenant_id: &str, alerts: &[Value]) -> Result<()> {
+        let telegram = self.telegram_resolver.resolve(pool, tenant_id).await?;
         for alert in alerts {
             let alert_text = format!(
                 "**Monitor Alert**\nType: {}\n{}",
@@ -347,8 +381,7 @@ impl MonitorWorker {
 
             // If a notify_chat_id is present, send directly
             if let Some(chat_id) = alert.get("notify_chat_id").and_then(|v| v.as_i64()) {
-                let _ = self
-                    .telegram
+                let _ = telegram
                     .send_message(SendMessageParams {
                         chat_id,
                         text: alert_text.clone(),

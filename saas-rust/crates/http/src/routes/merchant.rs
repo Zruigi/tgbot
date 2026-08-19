@@ -113,7 +113,9 @@ pub async fn save_bot_token_ref(
         .unwrap_or_default()
         .trim_end_matches('/')
         .to_string();
-    let webhook_url = if webhook_base_url.is_empty() {
+    let webhook_url = if state.config.telegram_polling_enabled || webhook_base_url.is_empty() {
+        // Polling mode: never re-register the webhook (it would conflict with
+        // getUpdates via HTTP 409). The receive-mode switch is a boot-time decision.
         None
     } else {
         if !(webhook_base_url.starts_with("https://")

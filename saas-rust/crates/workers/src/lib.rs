@@ -48,7 +48,7 @@ pub mod group_message_policy_worker;
 #[cfg(feature = "legacy-workers")]
 pub mod group_policy_worker;
 pub mod job_queue;
-#[cfg(feature = "legacy-workers")]
+pub mod monitor_worker;
 pub mod ocr_worker;
 #[cfg(feature = "legacy-workers")]
 pub mod payment_worker;
@@ -64,8 +64,6 @@ pub use ad_governance_worker::AdGovernanceWorker;
 pub use address_monitor_worker::{AddressMonitorAlertWorker, AddressMonitorWorker};
 #[cfg(feature = "legacy-workers")]
 pub mod ai_worker;
-#[cfg(feature = "legacy-workers")]
-pub mod monitor_worker;
 
 #[cfg(feature = "legacy-workers")]
 pub use ai_worker::{AiWorker, AnalysisType};
@@ -76,9 +74,7 @@ pub use group_message_policy_worker::GroupMessagePolicyWorker;
 #[cfg(feature = "legacy-workers")]
 pub use group_policy_worker::GroupPolicyWorker;
 pub use job_queue::{ClaimedJob, EnqueueOpts, Job, JobStatus, JobType};
-#[cfg(feature = "legacy-workers")]
 pub use monitor_worker::{MonitorTaskType, MonitorWorker};
-#[cfg(feature = "legacy-workers")]
 pub use ocr_worker::{OcrTaskType, OcrWorker};
 #[cfg(feature = "legacy-workers")]
 pub use payment_worker::{PaymentTaskType, PaymentWorker};
@@ -87,8 +83,8 @@ pub use revoke_sync_worker::{run_revoke_sync_loop, run_revoke_sync_round};
 #[cfg(feature = "legacy-workers")]
 pub use scheduler::{run_cron_checks, schedule_monitor_checks};
 pub use scheduler::{
-    schedule_address_monitor_checks, schedule_group_policy_syncs, schedule_push_tasks, Dispatcher,
-    Scheduler, SchedulerConfig, Worker,
+    schedule_address_monitor_checks, schedule_group_policy_syncs, schedule_price_alerts,
+    schedule_push_tasks, Dispatcher, Scheduler, SchedulerConfig, Worker,
 };
 pub use telegram_auto_reply_worker::TelegramAutoReplyWorker;
 pub use telegram_command_worker::TelegramCommandWorker;

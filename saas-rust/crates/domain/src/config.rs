@@ -17,6 +17,9 @@ pub struct Config {
     pub telegram_auto_replies_enabled: bool,
     pub telegram_commands_enabled: bool,
     pub telegram_wallet_monitors_enabled: bool,
+    pub telegram_price_monitors_enabled: bool,
+    pub telegram_ocr_enabled: bool,
+    pub telegram_polling_enabled: bool,
     pub cors_allowed_origin: String,
     /// 前端门户域名（拼 Mini App / 浏览器兜底 OTP 链接），来自 FRONTEND_URL 或 WEB_BASE_URL
     pub frontend_url: String,
@@ -78,6 +81,19 @@ impl Config {
                     .ok()
                     .as_deref(),
             ),
+            telegram_price_monitors_enabled: parse_telegram_commands_enabled(
+                std::env::var("TGBOT_PRICE_MONITOR_ENABLED")
+                    .ok()
+                    .as_deref(),
+            ),
+            telegram_ocr_enabled: parse_telegram_commands_enabled(
+                std::env::var("TGBOT_OCR_ENABLED")
+                    .ok()
+                    .as_deref(),
+            ),
+            telegram_polling_enabled: std::env::var("TGBOT_POLLING_ENABLED")
+                .map(|v| parse_telegram_commands_enabled(Some(&v)))
+                .unwrap_or(true),
             cors_allowed_origin: std::env::var("CORS_ALLOWED_ORIGIN")
                 .unwrap_or_else(|_| "*".to_string()),
             frontend_url: std::env::var("FRONTEND_URL")
@@ -166,5 +182,37 @@ mod tests {
         assert!(!parse_rest_only_enabled(None));
         assert!(!parse_rest_only_enabled(Some("false")));
         assert!(parse_rest_only_enabled(Some("true")));
+    }
+
+    #[test]
+    fn test_polling_enabled_defaults_true_fail_open() {
+        // Config::from_env() requires these; satisfy them so the switch can be
+        // exercised. They are never read by the pure parse tests above.
+        std::env::set_var("SUPABASE_DATABASE_URL", "postgres://localhost/test");
+        std::env::set_var("INTERNAL_SAAS_SECRET", "test-internal-secret");
+        std::env::set_var(
+            "SAAS_SESSION_SECRET",
+            "01234567890123456789012345678901",
+        );
+        std::env::set_var(
+            "TGBOT_SECRET_ENCRYPTION_KEY",
+            "01234567890123456789012345678901",
+        );
+        // Fail-open: unset => true; explicit false/0 => false.
+        std::env::remove_var("TGBOT_POLLING_ENABLED");
+        let cfg = Config::from_env().expect("config from env");
+        assert!(cfg.telegram_polling_enabled, "unset must default to true");
+
+        std::env::set_var("TGBOT_POLLING_ENABLED", "false");
+        let cfg = Config::from_env().expect("config from env");
+        assert!(!cfg.telegram_polling_enabled, "explicit false must disable");
+
+        std::env::set_var("TGBOT_POLLING_ENABLED", "0");
+        let cfg = Config::from_env().expect("config from env");
+        assert!(!cfg.telegram_polling_enabled, "explicit 0 must disable");
+
+        std::env::set_var("TGBOT_POLLING_ENABLED", "true");
+        let cfg = Config::from_env().expect("config from env");
+        assert!(cfg.telegram_polling_enabled, "explicit true must enable");
     }
 }

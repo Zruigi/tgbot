@@ -182,6 +182,7 @@ pub struct Scheduler {
     job_type_filters: Vec<String>,
     push_task_cron: bool,
     address_monitor_cron: bool,
+    price_monitor_cron: bool,
     channel_reminder_cleanup: Option<(Arc<dyn TelegramClientResolver>, Duration)>,
 }
 
@@ -196,6 +197,7 @@ impl Scheduler {
             job_type_filters: Vec::new(),
             push_task_cron: false,
             address_monitor_cron: false,
+            price_monitor_cron: false,
             channel_reminder_cleanup: None,
         }
     }
@@ -220,6 +222,11 @@ impl Scheduler {
 
     pub fn with_address_monitor_cron(mut self) -> Self {
         self.address_monitor_cron = true;
+        self
+    }
+
+    pub fn with_price_monitor_cron(mut self) -> Self {
+        self.price_monitor_cron = true;
         self
     }
 
@@ -318,6 +325,14 @@ impl Scheduler {
             tasks.push(tokio::spawn(async move {
                 Self::run_address_monitor_cron(monitor_pool, monitor_interval, monitor_shutdown)
                     .await;
+            }));
+        }
+        if self.price_monitor_cron {
+            let price_pool = self.pool.clone();
+            let price_interval = self.config.cron_check_interval;
+            let price_shutdown = shutdown_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                Self::run_price_monitor_cron(price_pool, price_interval, price_shutdown).await;
             }));
         }
         if let Some((telegram_resolver, cleanup_interval)) = self.channel_reminder_cleanup {
@@ -459,6 +474,30 @@ impl Scheduler {
                 _ = interval.tick() => {
                     if let Err(error) = schedule_address_monitor_checks(&pool).await {
                         error!(%error, "failed to schedule address monitor checks");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_price_monitor_cron(
+        pool: PgPool,
+        check_interval: Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        info!(?check_interval, "price monitor cron started");
+        let mut interval = tokio::time::interval(check_interval);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("price monitor cron shutting down");
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = schedule_price_alerts(&pool).await {
+                        error!(%error, "failed to schedule price monitor checks");
                     }
                 }
             }
@@ -826,6 +865,72 @@ pub async fn schedule_address_monitor_checks(pool: &PgPool) -> Result<usize> {
             }
             Err(error) => {
                 error!(monitor_id, tenant_id, %error, "failed to enqueue address monitor check");
+            }
+        }
+    }
+
+    Ok(enqueued)
+}
+
+/// Check formal `platform.price_alerts` entries and enqueue tenant-scoped jobs.
+#[instrument(skip(pool))]
+pub async fn schedule_price_alerts(pool: &PgPool) -> Result<usize> {
+    let rows = sqlx::query(
+        r#"
+        SELECT alert_id, tenant_id, user_id, symbol,
+               threshold_high::float8 AS threshold_high,
+               threshold_low::float8 AS threshold_low,
+               notify_chat_id
+        FROM platform.price_alerts
+        WHERE is_active = true
+          AND (last_checked_at IS NULL OR last_checked_at < now() - interval '5 minutes')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM job_queue queued
+              WHERE queued.job_type = 'price_monitor_check'
+                AND queued.payload ->> 'alert_id' = platform.price_alerts.alert_id::text
+                AND queued.status IN ('pending', 'running')
+          )
+        ORDER BY last_checked_at ASC NULLS FIRST
+        LIMIT 50
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut enqueued = 0;
+    for row in rows {
+        let alert_id: i64 = row.try_get("alert_id")?;
+        let tenant_id: String = row.try_get("tenant_id")?;
+        let symbol: String = row.try_get("symbol")?;
+        let threshold_high: Option<f64> = row.try_get("threshold_high").ok().flatten();
+        let threshold_low: Option<f64> = row.try_get("threshold_low").ok().flatten();
+        let notify_chat_id: Option<i64> = row.try_get("notify_chat_id").ok().flatten();
+        let opts = job_queue::EnqueueOpts::new(
+            JobType::Custom("price_monitor_check".into()),
+            json!({
+                "tenant_id": tenant_id,
+                "alert_id": alert_id,
+                "symbol": symbol,
+                "threshold_high": threshold_high,
+                "threshold_low": threshold_low,
+                "monitor_task_type": "price_alert",
+                "notify_chat_id": notify_chat_id,
+            }),
+        )
+        .with_priority(2)
+        .with_max_attempts(3);
+
+        match job_queue::enqueue(pool, opts).await {
+            Ok(job_id) => {
+                info!(
+                    alert_id,
+                    tenant_id, job_id, "enqueued price monitor check"
+                );
+                enqueued += 1;
+            }
+            Err(error) => {
+                error!(alert_id, tenant_id, %error, "failed to enqueue price monitor check");
             }
         }
     }

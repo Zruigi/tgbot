@@ -180,6 +180,15 @@ pub struct EditMessageTextParams {
     pub reply_markup: Option<Value>,
 }
 
+/// Parameters for `editMessageReplyMarkup`.
+#[derive(Clone, Debug, Serialize)]
+pub struct EditMessageReplyMarkupParams {
+    pub chat_id: i64,
+    pub message_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_markup: Option<Value>,
+}
+
 /// Parameters for `sendPhoto`.
 #[derive(Clone, Debug, Serialize)]
 pub struct SendPhotoParams {
@@ -344,6 +353,14 @@ impl TelegramClient {
         self.request("getUpdates", params).await
     }
 
+    /// Fetch raw JSON updates (preserves all fields, e.g. `file_unique_id` in
+    /// photo sizes, which the typed `Update`/`PhotoSize` structs drop).
+    /// Used by the long-polling receive mode; consumed via the same path as
+    /// the webhook payload (serde_json::from_value into the webhook `TelegramUpdate`).
+    pub async fn get_updates_raw(&self, params: GetUpdatesParams) -> Result<Vec<Value>> {
+        self.request("getUpdates", params).await
+    }
+
     /// Send a text message.
     pub async fn send_message(&self, params: SendMessageParams) -> Result<Message> {
         self.request("sendMessage", params).await
@@ -351,6 +368,14 @@ impl TelegramClient {
 
     pub async fn edit_message_text(&self, params: EditMessageTextParams) -> Result<Message> {
         self.request("editMessageText", params).await
+    }
+
+    /// Edit only the inline keyboard of a message (used for quick-reply menus).
+    pub async fn edit_message_reply_markup(
+        &self,
+        params: EditMessageReplyMarkupParams,
+    ) -> Result<Message> {
+        self.request("editMessageReplyMarkup", params).await
     }
 
     /// Send a photo.

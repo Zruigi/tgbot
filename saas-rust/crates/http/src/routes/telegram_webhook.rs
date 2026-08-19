@@ -21,11 +21,12 @@ use crate::routes::miniapp::{GrantData, GrantStore};
 use crate::secret_crypto::SecretCipher;
 use crate::state::AppState;
 use crate::translate;
+use tgbot_domain::config::Config;
 use tgbot_domain::error::{ApiError, ApiResult};
 use tgbot_integrations::litellm::LiteLLMClient;
 use tgbot_integrations::telegram::{
-    AnswerCallbackQueryParams, EditMessageTextParams, SendMessageParams, TelegramClient,
-    TelegramConfig,
+    AnswerCallbackQueryParams, EditMessageReplyMarkupParams, EditMessageTextParams,
+    SendMessageParams, SetWebhookParams, TelegramClient, TelegramConfig,
 };
 use tgbot_repos::{audit_repo, message_repo};
 use tgbot_services::ad_text::ad_text_hash;
@@ -549,6 +550,62 @@ pub fn derive_webhook_secret(
         .map_err(|_| "failed to initialize webhook secret".to_string())?;
     mac.update(format!("telegram-webhook\0{bot_id}\0{bot_token}").as_bytes());
     Ok(format!("wh_{}", hex::encode(mac.finalize().into_bytes())))
+}
+
+/// (Re)register the Telegram webhook for every bot currently in the registry.
+/// This is the webhook-mode fallback path: after running with polling enabled
+/// (which deletes each bot's webhook), switching back to webhook mode MUST
+/// re-register webhooks, otherwise the bots stop receiving updates entirely.
+/// Failures are logged as warnings only - the boot path must not panic.
+pub async fn register_webhooks_for_all(registry: &BotRegistry, config: &Config) -> () {
+    let webhook_base_url = std::env::var("TELEGRAM_WEBHOOK_BASE_URL")
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string();
+    if webhook_base_url.is_empty() {
+        warn!("TELEGRAM_WEBHOOK_BASE_URL not set; skipping webhook registration");
+        return;
+    }
+    let api_base_url = std::env::var("TELEGRAM_API_BASE_URL")
+        .unwrap_or_else(|_| "https://api.telegram.org".into());
+    for entry in registry.list_entries().await {
+        let client = match TelegramClient::new(TelegramConfig {
+            bot_token: entry.bot_token.clone(),
+            api_base_url: api_base_url.clone(),
+            timeout_secs: 10,
+        }) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(bot_id = entry.bot_id, error = %e, "failed to init Telegram client; webhook not registered");
+                continue;
+            }
+        };
+        let secret = match derive_webhook_secret(
+            &config.secret_encryption_key,
+            entry.bot_id,
+            &entry.bot_token,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(bot_id = entry.bot_id, error = %e, "failed to derive webhook secret; webhook not registered");
+                continue;
+            }
+        };
+        let url = format!("{webhook_base_url}/telegram/webhook/{}", entry.bot_id);
+        if let Err(e) = client
+            .set_webhook(SetWebhookParams {
+                url: url.clone(),
+                secret_token: Some(secret),
+                max_connections: Some(40),
+                allowed_updates: None,
+            })
+            .await
+        {
+            warn!(bot_id = entry.bot_id, error = %e, url = %url, "setWebhook failed");
+        } else {
+            info!(bot_id = entry.bot_id, url = %url, "webhook registered");
+        }
+    }
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
@@ -1749,6 +1806,11 @@ async fn handle_incoming_message(
         .and_then(|reply| reply.get("message_id"))
         .and_then(Value::as_i64);
     let inbound = extract_inbound_content(message);
+    // D3 OCR 接线：photo/document 且开关开启时 best-effort 入队（edited 跳过、media_unique_id 去重）。
+    // 失败仅 warn，绝不阻断 webhook 主流程。
+    if let Some(inbound_ref) = inbound.as_ref() {
+        enqueue_ocr_if_applicable(pool, entry, inbound_ref, edited).await;
+    }
 
     match chat_type {
         "private" => {
@@ -2039,13 +2101,7 @@ async fn handle_incoming_message(
                         )
                     };
                     let telegram = telegram_for_bot(entry, telegram_api_base_url);
-                    let markup = serde_json::json!({
-                        "inline_keyboard": [[
-                            {"text": "📥 已读", "callback_data": format!("cs_mark_read:{user_id}")},
-                            {"text": "⚡ 回复", "callback_data": format!("cs_quick_reply:{user_id}")},
-                            {"text": "✖ 结束", "callback_data": format!("cs_close_session:{user_id}")}
-                        ]]
-                    });
+                    let markup = cs_card_keyboard(user_id);
                     match telegram
                         .send_message(tgbot_integrations::telegram::SendMessageParams {
                             chat_id: admin_id,
@@ -2527,6 +2583,63 @@ fn extract_inbound_content(message: &Value) -> Option<InboundContent> {
     None
 }
 
+/// best-effort OCR 入队；失败仅 warn，绝不阻断 webhook 主流程。
+/// 仅 photo/document 入队、edited 跳过、media_unique_id 幂等去重、max_attempts=2。
+async fn enqueue_ocr_if_applicable(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    inbound: &InboundContent,
+    edited: bool,
+) {
+    if edited {
+        return; // 编辑消息不重复 OCR
+    }
+    if !matches!(inbound.msg_type.as_str(), "photo" | "document") {
+        return;
+    }
+    let Some(file_id) = inbound.file_id.as_deref() else {
+        return;
+    };
+    let dedup_key = inbound
+        .media_unique_id
+        .as_deref()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| format!("fileid:{file_id}")); // media_unique_id 为 NULL 时回退 file_id
+    // 开关：main.rs after_connect 已 set_config('tgbot.ocr_enabled', ...)，默认 false
+    let enabled: Option<String> = sqlx::query_scalar(
+        "SELECT current_setting('tgbot.ocr_enabled', true)",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if enabled.as_deref() != Some("true") {
+        return;
+    }
+    let result = sqlx::query(
+        "INSERT INTO job_queue (tenant_id, job_type, payload, priority, max_attempts, run_at, status)
+         SELECT $1, 'ocr_process',
+                jsonb_build_object('tenant_id', $1, 'file_id', $2, 'media_unique_id', $3,
+                                   'ocr_task_type', 'image_extraction', 'lang', 'ch'),
+                3, 2, now(), 'pending'
+         WHERE NOT EXISTS (
+             SELECT 1 FROM job_queue q
+             WHERE q.job_type = 'ocr_process'
+               AND q.status IN ('pending','running')
+               AND COALESCE(q.payload->>'media_unique_id', 'fileid:'||q.payload->>'file_id') = $4
+         )",
+    )
+    .bind(&entry.tenant_id)
+    .bind(file_id)
+    .bind(inbound.media_unique_id.as_deref())
+    .bind(&dedup_key)
+    .execute(pool)
+    .await;
+    if let Err(error) = result {
+        warn!(bot_id = entry.bot_id, %error, "failed to enqueue OCR job");
+    }
+}
+
 fn persisted_member_status(member: &Value) -> &'static str {
     match member.get("status").and_then(Value::as_str) {
         Some("creator" | "administrator") => "admin",
@@ -2881,6 +2994,43 @@ async fn answer_console_callback(
         .map_err(|_| "Telegram console callback acknowledgement failed".to_string())
 }
 
+/// 客服卡片主按钮键盘（已读/回复/结束 + 一键群发）。D1/D2 共用同一来源。
+fn cs_card_keyboard(user_id: i64) -> Value {
+    json!({
+        "inline_keyboard": [
+            [
+                {"text": "📥 已读", "callback_data": format!("cs_mark_read:{user_id}")},
+                {"text": "⚡ 回复", "callback_data": format!("cs_quick_reply:{user_id}")},
+                {"text": "✖ 结束", "callback_data": format!("cs_close_session:{user_id}")}
+            ],
+            [
+                {"text": "📢 一键群发", "callback_data": format!("batch_send:{user_id}")}
+            ]
+        ]
+    })
+}
+
+/// D2 快捷回复预设语菜单（3 条 + 🔙 返回），对齐 Python customer_service.py 预设语。
+fn build_quick_reply_keyboard(user_id: i64) -> Value {
+    let quick_replies = [
+        ("👋 你好，请问有什么可以帮您？", 1),
+        ("⏳ 请稍等，正在为您查询...", 2),
+        ("✅ 好的，没问题。", 3),
+    ];
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for (text, n) in quick_replies {
+        rows.push(vec![json!({
+            "text": text,
+            "callback_data": format!("do_quick:{user_id}:{n}"),
+        })]);
+    }
+    rows.push(vec![json!({
+        "text": "🔙 返回",
+        "callback_data": format!("back_to_main:{user_id}"),
+    })]);
+    json!({ "inline_keyboard": rows })
+}
+
 /// 客服系统回调：cs_mark_read / cs_quick_reply / cs_close_session
 /// + 批量补发（quick_send / select_other_user / cancel_send / user_page / confirm_send_to）。
 /// （Python cs_callback_handler 的 Rust 版本）。
@@ -2943,6 +3093,32 @@ async fn handle_customer_callback(
         return Ok(true);
     }
 
+    // D2：quick_reply 编辑出预设语菜单（不再仅提示），对齐 Python customer_service.py 快捷回复菜单。
+    if action == "quick_reply" {
+        let Some(menu_message_id) = callback
+            .get("message")
+            .and_then(|message| message.get("message_id"))
+            .and_then(Value::as_i64)
+        else {
+            return Ok(true);
+        };
+        let _ = telegram
+            .edit_message_reply_markup(EditMessageReplyMarkupParams {
+                chat_id: actor,
+                message_id: menu_message_id,
+                reply_markup: Some(build_quick_reply_keyboard(user_id)),
+            })
+            .await;
+        let _ = telegram
+            .answer_callback_query(AnswerCallbackQueryParams {
+                callback_query_id: callback_id.to_string(),
+                text: Some("请选择快捷回复语".to_string()),
+                show_alert: Some(false),
+            })
+            .await;
+        return Ok(true);
+    }
+
     let (ok_text, err_text) = match action {
         "mark_read" => {
             sqlx::query(
@@ -2965,7 +3141,6 @@ async fn handle_customer_callback(
             .map_err(|_| "failed to reset inbox unread".to_string())?;
             ("已标记为已读 ✅", "标记已读失败")
         }
-        "quick_reply" => ("请直接回复这条消息 👆", "操作失败"),
         "close_session" => {
             sqlx::query(
                 "UPDATE chat.admin_inbox SET unread_count = 0, updated_at = now() \
@@ -3141,6 +3316,7 @@ async fn fetch_pending_admin_batch(
 }
 
 /// 发送待确认消息给目标用户（带客服身份标签 + 入库 + 标记 sent）。
+/// 实际发送逻辑抽取到 send_admin_message_to_user，本函数负责 pending 行状态流转。
 async fn send_pending_message_to_user(
     pool: &sqlx::PgPool,
     entry: &BotEntry,
@@ -3150,62 +3326,19 @@ async fn send_pending_message_to_user(
     target_user: i64,
     pending: &PendingAdminMessage,
 ) -> Result<(), String> {
-    let telegram = telegram_for_bot(entry, telegram_api_base_url);
-    let esc_name = html_escape(admin_name);
     let body = pending.content.as_deref().unwrap_or("");
-    let esc_body = html_escape(body);
-    let text = format!("客服 <a href=\"tg://user?id={admin_id}\">{esc_name}</a>：\n{esc_body}");
-
-    let sent = if pending.msg_type == "photo" && pending.file_id.is_some() {
-        telegram
-            .send_photo(tgbot_integrations::telegram::SendPhotoParams {
-                chat_id: target_user,
-                photo: pending.file_id.clone().unwrap_or_default(),
-                caption: Some(text),
-                parse_mode: Some("HTML".to_string()),
-                reply_to_message_id: None,
-                reply_markup: None,
-            })
-            .await
-            .map_err(|_| "failed to send pending photo".to_string())?
-    } else if pending.msg_type == "document" && pending.file_id.is_some() {
-        telegram
-            .send_document(tgbot_integrations::telegram::SendDocumentParams {
-                chat_id: target_user,
-                document: pending.file_id.clone().unwrap_or_default(),
-                caption: Some(text),
-                parse_mode: Some("HTML".to_string()),
-            })
-            .await
-            .map_err(|_| "failed to send pending document".to_string())?
-    } else {
-        telegram
-            .send_message(tgbot_integrations::telegram::SendMessageParams {
-                chat_id: target_user,
-                text,
-                parse_mode: Some("HTML".to_string()),
-                reply_markup: None,
-                reply_to_message_id: None,
-            })
-            .await
-            .map_err(|_| "failed to send pending admin message".to_string())?
-    };
-
-    message_repo::save_message(
+    send_admin_message_to_user(
         pool,
-        entry.bot_id,
+        entry,
+        telegram_api_base_url,
+        admin_id,
+        admin_name,
         target_user,
-        Some(body),
+        body,
         &pending.msg_type,
         pending.file_id.as_deref(),
-        None,
-        true,
-        Some(sent.message_id),
-        &entry.tenant_id,
-        None,
     )
-    .await
-    .map_err(|_| "failed to persist pending admin message".to_string())?;
+    .await?;
 
     sqlx::query(
         "UPDATE platform.pending_admin_messages \
@@ -3218,6 +3351,111 @@ async fn send_pending_message_to_user(
     .await
     .map_err(|_| "failed to mark pending message sent".to_string())?;
     Ok(())
+}
+
+/// 客服身份发送：管理员 → 目标用户，带身份标签 + 入库。text/photo/document 三态。
+/// content 为空时文案用 [媒体消息]（对齐 Python）。不涉及 pending 行状态更新。
+/// D1（一键群发）与 D2（快捷回复）共用本函数。
+async fn send_admin_message_to_user(
+    pool: &sqlx::PgPool,
+    entry: &BotEntry,
+    telegram_api_base_url: &str,
+    admin_id: i64,
+    admin_name: &str,
+    target_user: i64,
+    content: &str,
+    msg_type: &str,
+    file_id: Option<&str>,
+) -> Result<(), String> {
+    let telegram = telegram_for_bot(entry, telegram_api_base_url);
+    let esc_name = html_escape(admin_name);
+    let display = if content.trim().is_empty() {
+        "[媒体消息]"
+    } else {
+        content
+    };
+    let esc_body = html_escape(display);
+    let text = format!("客服 <a href=\"tg://user?id={admin_id}\">{esc_name}</a>：\n{esc_body}");
+
+    let sent = if msg_type == "photo" && file_id.is_some() {
+        telegram
+            .send_photo(tgbot_integrations::telegram::SendPhotoParams {
+                chat_id: target_user,
+                photo: file_id.unwrap_or_default().to_string(),
+                caption: Some(text),
+                parse_mode: Some("HTML".to_string()),
+                reply_to_message_id: None,
+                reply_markup: None,
+            })
+            .await
+            .map_err(|_| "failed to send photo to user".to_string())?
+    } else if msg_type == "document" && file_id.is_some() {
+        telegram
+            .send_document(tgbot_integrations::telegram::SendDocumentParams {
+                chat_id: target_user,
+                document: file_id.unwrap_or_default().to_string(),
+                caption: Some(text),
+                parse_mode: Some("HTML".to_string()),
+            })
+            .await
+            .map_err(|_| "failed to send document to user".to_string())?
+    } else {
+        telegram
+            .send_message(SendMessageParams {
+                chat_id: target_user,
+                text,
+                parse_mode: Some("HTML".to_string()),
+                reply_markup: None,
+                reply_to_message_id: None,
+            })
+            .await
+            .map_err(|_| "failed to send admin message to user".to_string())?
+    };
+
+    message_repo::save_message(
+        pool,
+        entry.bot_id,
+        target_user,
+        Some(content),
+        msg_type,
+        file_id,
+        None,
+        true,
+        Some(sent.message_id),
+        &entry.tenant_id,
+        None,
+    )
+    .await
+    .map_err(|_| "failed to persist admin message".to_string())?;
+
+    Ok(())
+}
+
+/// 取用户最近一条消息（text/photo/document 均可，含 file_id），用于一键群发预览与发送。
+/// 返回 (content, msg_type, file_id)。
+async fn latest_user_message(
+    pool: &sqlx::PgPool,
+    tenant_id: &str,
+    user_id: i64,
+) -> Result<Option<(String, String, Option<String>)>, String> {
+    let row = sqlx::query(
+        "SELECT content, msg_type, file_id FROM chat.messages \
+         WHERE from_userid = $1 AND tenant_id = $2 AND is_deleted = false \
+           AND msg_type IN ('text','photo','document') \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| "failed to load user last message".to_string())?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let content: Option<String> = row.try_get("content").ok().flatten();
+    let msg_type: String = row.try_get("msg_type").unwrap_or_else(|_| "text".to_string());
+    let file_id: Option<String> = row.try_get("file_id").ok().flatten();
+    Ok(Some((content.unwrap_or_default(), msg_type, file_id)))
 }
 
 /// 租户活跃用户列表（对齐 Python get_inbox_list，按最近活跃排序）。
@@ -3273,7 +3511,11 @@ async fn handle_pending_send_callback(
         || data.starts_with("select_other_user:")
         || data.starts_with("cancel_send:")
         || data.starts_with("user_page:")
-        || data.starts_with("confirm_send_to:"))
+        || data.starts_with("confirm_send_to:")
+        || data.starts_with("batch_send:")
+        || data.starts_with("confirm_batch_send:")
+        || data.starts_with("do_quick:")
+        || data.starts_with("back_to_main:"))
     {
         return Ok(false);
     }
@@ -3680,6 +3922,237 @@ async fn handle_pending_send_callback(
                     })
                     .await;
             }
+        }
+        return Ok(true);
+    }
+
+    // D1：batch_send:{source_user_id}：预检 + 确认卡。
+    // callback_data 只带源用户 ID 不塞 file_id，规避 Telegram 64 字节上限。
+    if let Some(source_str) = data.strip_prefix("batch_send:") {
+        let Ok(source) = source_str.parse::<i64>() else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 源用户无效".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        let Some((content, _msg_type, _file_id)) =
+            latest_user_message(pool, &entry.tenant_id, source).await?
+        else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("⚠️ 该用户暂无消息可群发".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        let users = active_inbox_users(pool, &entry.tenant_id)
+            .await?
+            .into_iter()
+            .filter(|(uid, _)| *uid != source)
+            .collect::<Vec<_>>();
+        if users.is_empty() {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("⚠️ 暂无活跃用户".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        }
+        let preview: String = content.chars().take(50).collect();
+        let _ = telegram
+            .edit_message_text(EditMessageTextParams {
+                chat_id: actor,
+                message_id: message_id.unwrap_or(0),
+                text: format!(
+                    "Batch Send Confirm\n\nPreview: {preview}\nTarget: {} users",
+                    users.len()
+                ),
+                parse_mode: None,
+                reply_markup: Some(json!({
+                    "inline_keyboard": [[
+                        {"text": format!("✅ Confirm send to {} users", users.len()),
+                         "callback_data": format!("confirm_batch_send:{source}")},
+                        {"text": "❌ 取消", "callback_data": format!("back_to_main:{source}")}
+                    ]]
+                })),
+            })
+            .await;
+        return Ok(true);
+    }
+
+    // D1：confirm_batch_send:{source_user_id}：重新查询最近消息，逐用户群发，完成后汇总。
+    if let Some(source_str) = data.strip_prefix("confirm_batch_send:") {
+        let Ok(source) = source_str.parse::<i64>() else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 源用户无效".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        let Some((content, msg_type, file_id)) =
+            latest_user_message(pool, &entry.tenant_id, source).await?
+        else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("⚠️ 该用户暂无消息可群发".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        let targets = active_inbox_users(pool, &entry.tenant_id)
+            .await?
+            .into_iter()
+            .filter(|(uid, _)| *uid != source)
+            .map(|(uid, _)| uid)
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("⚠️ 暂无活跃用户".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        }
+        let mut success = 0usize;
+        let mut failed = 0usize;
+        for target in &targets {
+            match send_admin_message_to_user(
+                pool,
+                entry,
+                telegram_api_base_url,
+                actor,
+                admin_name,
+                *target,
+                &content,
+                &msg_type,
+                file_id.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => success += 1,
+                Err(error) => {
+                    failed += 1;
+                    warn!(target, %error, "batch send failed for user");
+                }
+            }
+        }
+        let _ = telegram
+            .edit_message_text(EditMessageTextParams {
+                chat_id: actor,
+                message_id: message_id.unwrap_or(0),
+                text: format!("Batch Send Complete\n\nSuccess: {success}\nFailed: {failed}"),
+                parse_mode: None,
+                reply_markup: None,
+            })
+            .await;
+        let _ = telegram
+            .answer_callback_query(AnswerCallbackQueryParams {
+                callback_query_id: callback_id.to_string(),
+                text: Some(format!("✅ 群发完成：成功 {success}，失败 {failed}")),
+                show_alert: Some(false),
+            })
+            .await;
+        return Ok(true);
+    }
+
+    // D2：do_quick:{user_id}:{choice}：发送预设快捷回复语并恢复主按钮。
+    if let Some(rest) = data.strip_prefix("do_quick:") {
+        let mut parts = rest.splitn(2, ':');
+        let (Some(user_str), Some(choice)) = (parts.next(), parts.next()) else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 参数无效".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        let Ok(user_id) = user_str.parse::<i64>() else {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some("❌ 目标用户无效".to_string()),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        };
+        let reply_text = match choice {
+            "1" => "你好，请问有什么可以帮您？",
+            "2" => "好的，请稍等，正在为您查询中，请保持关注。",
+            "3" => "好的，没问题。",
+            _ => "收到",
+        };
+        if let Err(error) = send_admin_message_to_user(
+            pool,
+            entry,
+            telegram_api_base_url,
+            actor,
+            admin_name,
+            user_id,
+            reply_text,
+            "text",
+            None,
+        )
+        .await
+        {
+            let _ = telegram
+                .answer_callback_query(AnswerCallbackQueryParams {
+                    callback_query_id: callback_id.to_string(),
+                    text: Some(format!("❌ 发送失败: {error}")),
+                    show_alert: Some(true),
+                })
+                .await;
+            return Ok(true);
+        }
+        let _ = telegram
+            .answer_callback_query(AnswerCallbackQueryParams {
+                callback_query_id: callback_id.to_string(),
+                text: Some("✅ 快捷回复已发送".to_string()),
+                show_alert: Some(false),
+            })
+            .await;
+        if let Some(message_id) = message_id {
+            let _ = telegram
+                .edit_message_reply_markup(EditMessageReplyMarkupParams {
+                    chat_id: actor,
+                    message_id,
+                    reply_markup: Some(cs_card_keyboard(user_id)),
+                })
+                .await;
+        }
+        return Ok(true);
+    }
+
+    // D2：back_to_main:{user_id}：仅恢复主按钮，不发送任何消息。
+    if let Some(user_str) = data.strip_prefix("back_to_main:") {
+        let Ok(user_id) = user_str.parse::<i64>() else {
+            return Ok(false);
+        };
+        if let Some(message_id) = message_id {
+            let _ = telegram
+                .edit_message_reply_markup(EditMessageReplyMarkupParams {
+                    chat_id: actor,
+                    message_id,
+                    reply_markup: Some(cs_card_keyboard(user_id)),
+                })
+                .await;
         }
         return Ok(true);
     }
@@ -4435,7 +4908,17 @@ mod channel_subscription_tests {
             timeout_secs: 5,
         })
         .unwrap();
-        install_default_handlers(&dispatcher, None, llm, "http://127.0.0.1".to_string()).await;
+        install_default_handlers(
+            &dispatcher,
+            None,
+            llm,
+            "http://127.0.0.1".to_string(),
+            GrantStore::new(),
+            OtpStore::new(),
+            String::new(),
+            String::new(),
+        )
+        .await;
         let update: TelegramUpdate = serde_json::from_value(json!({
             "update_id": 1,
             "message": {
