@@ -1,0 +1,4 @@
+# Normalize Rust source line endings to LF.
+# main.rs / config.rs historically had CRLF in HEAD; working tree is LF.
+# This keeps every future checkout/add on LF, matching rustfmt / cargo.
+*.rs text eol=lf
